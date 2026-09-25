@@ -1,33 +1,32 @@
 # ADR-0001: API-first modular monolith
 
-Status: Accepted for project bootstrap
+Status: Accepted for bootstrap; **amended by ADR-0003 and ADR-0005**
 
 ## Context
 
-The legacy Facebook system depended on browser automation and a large monolithic script. The new product targets Threads, which exposes official APIs for many core workflows.
+The project began by intentionally avoiding a direct port of the legacy Facebook browser bot. Official Threads APIs cover many core workflows and were the safest foundation for a greenfield codebase.
 
-Starting from browser automation would import unnecessary operational fragility into a greenfield system. Starting with microservices would introduce deployment and distributed-systems complexity before scale requires it.
+The product requirements were later clarified: the system must operate as a distributed tool across multiple machines with persistent browser profiles for capabilities that are not adequately covered by official APIs.
 
 ## Decision
 
-Build a modular monolith around the official Threads API.
+The following parts of ADR-0001 remain accepted:
+- modular monolith Control Plane;
+- official API preferred where it satisfies the capability;
+- explicit ports/adapters;
+- browser libraries excluded from domain/application business models;
+- capability verification before implementation.
 
-Business modules remain isolated by explicit package boundaries and ports/adapters.
+The following original restriction is superseded:
+- browser automation is no longer treated as merely hypothetical.
 
-Browser automation is not a core dependency. A future browser adapter requires a separate ADR proving an official API capability gap and business necessity.
+ADR-0003 authorizes distributed hybrid execution.
+ADR-0005 defines the browser capability boundary.
+
+Browser execution is therefore allowed only as an isolated Worker/infrastructure adapter through the approved WorkerJob/Capability Router architecture.
 
 ## Consequences
 
-Positive:
+API-first now means **preferred executor**, not **API-only product architecture**.
 
-- fewer UI-breakage risks;
-- easier unit/contract testing;
-- simpler deployment;
-- explicit domain boundaries;
-- future service extraction remains possible.
-
-Tradeoffs:
-
-- module boundaries require review discipline;
-- some Threads product features may not be exposed in official API;
-- capability verification is required continuously.
+The project still rejects literal legacy-bot cloning, browser logic in domain, anti-detect/fingerprint-evasion objectives and undocumented bypass behavior.
