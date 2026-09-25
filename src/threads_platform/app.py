@@ -54,6 +54,11 @@ def create_app(
         engine = create_database_engine(resolved_settings.database_url)
         session_factory = create_session_factory(engine)
         unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(session_factory)
+        if resolved_job_service is None:
+            resolved_job_service = WorkerJobService(
+                unit_of_work_factory,
+                notifications=notifications,
+            )
         if command_runtime is None:
             handlers = {}
             if threads_access_token_provider is not None:
@@ -68,14 +73,13 @@ def create_app(
                 handlers = create_threads_command_handlers(
                     api, threads_access_token_provider, unit_of_work_factory
                 )
-            command_runtime = CommandRuntime(unit_of_work_factory, handlers)
+            command_runtime = CommandRuntime(
+                unit_of_work_factory,
+                handlers,
+                worker_job_service=resolved_job_service,
+            )
         if resolved_worker_service is None:
             resolved_worker_service = WorkerControlService(unit_of_work_factory)
-        if resolved_job_service is None:
-            resolved_job_service = WorkerJobService(
-                unit_of_work_factory,
-                notifications=notifications,
-            )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:

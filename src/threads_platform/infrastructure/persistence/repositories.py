@@ -1,16 +1,18 @@
 from datetime import datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
+    AccountExecutionLeaseRepository,
     AccountRepository,
     AccountWorkerAssignmentRepository,
     BrowserProfileRepository,
     CommandAttemptRepository,
     CommandRepository,
+    CommandRouteDecisionRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
     OutboxEventRepository,
@@ -24,10 +26,21 @@ from threads_platform.application.ports.repositories import (
     WorkerRepository,
     WorkerSecurityRepository,
 )
+from threads_platform.domain.account_execution import (
+    AccountExecutionLease,
+    AccountExecutionOwnerType,
+)
 from threads_platform.domain.accounts import (
     AccountExecutionMode,
     AccountStatus,
     ThreadsAccount,
+)
+from threads_platform.domain.capabilities import (
+    CapabilityExecutionClass,
+    CapabilityExecutor,
+    CapabilityRouteDecision,
+    OperationClass,
+    RouteTarget,
 )
 from threads_platform.domain.commands import (
     AttemptStatus,
@@ -67,11 +80,13 @@ from threads_platform.domain.workers import (
     WorkerStatus,
 )
 from threads_platform.infrastructure.persistence.models import (
+    AccountExecutionLeaseRecord,
     AccountRecord,
     AccountWorkerAssignmentRecord,
     BrowserProfileRecord,
     CommandAttemptRecord,
     CommandRecord,
+    CommandRouteDecisionRecord,
     IntegrationDeliveryRecord,
     NetworkProfileRecord,
     OutboxEventRecord,
@@ -124,6 +139,23 @@ class SQLAlchemyAccountRepository(AccountRepository):
             updated_at=record.updated_at,
         )
 
+    async def get_for_update(self, account_id: UUID) -> ThreadsAccount | None:
+        record = await self._session.scalar(
+            select(AccountRecord).where(AccountRecord.id == account_id).with_for_update()
+        )
+        if record is None:
+            return None
+        return ThreadsAccount(
+            id=record.id,
+            threads_user_id=record.threads_user_id,
+            username=record.username,
+            display_name=record.display_name,
+            status=AccountStatus(record.status),
+            execution_mode=AccountExecutionMode(record.execution_mode),
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
     async def update(self, account: ThreadsAccount) -> None:
         record = await self._session.get(AccountRecord, account.id)
         if record is None:
@@ -135,6 +167,149 @@ class SQLAlchemyAccountRepository(AccountRepository):
         record.execution_mode = account.execution_mode
         record.updated_at = account.updated_at
         await self._session.flush()
+
+
+class SQLAlchemyAccountExecutionLeaseRepository(AccountExecutionLeaseRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def try_acquire(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        operation_class: OperationClass,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> AccountExecutionLease | None:
+        occurred_at = normalize_utc(now)
+        expires_at = normalize_utc(lease_expires_at)
+        if operation_class is OperationClass.READ:
+            raise ValueError("READ operations do not acquire account execution leases")
+        if not owner_id.strip() or expires_at <= occurred_at:
+            raise ValueError("account execution lease owner and future expiry are required")
+        await self._session.execute(
+            postgres_insert(AccountExecutionLeaseRecord)
+            .values(
+                account_id=account_id,
+                owner_type=owner_type,
+                owner_id=owner_id,
+                operation_class=operation_class,
+                fencing_generation=0,
+                lease_expires_at=occurred_at,
+                updated_at=occurred_at,
+            )
+            .on_conflict_do_nothing(index_elements=[AccountExecutionLeaseRecord.account_id])
+        )
+        record = await self._session.scalar(
+            select(AccountExecutionLeaseRecord)
+            .where(AccountExecutionLeaseRecord.account_id == account_id)
+            .with_for_update()
+        )
+        if record is None:
+            raise RuntimeError("account execution lease row disappeared")
+        if record.lease_expires_at > occurred_at:
+            return None
+        record.owner_type = owner_type
+        record.owner_id = owner_id
+        record.operation_class = operation_class
+        record.fencing_generation += 1
+        record.lease_expires_at = expires_at
+        record.updated_at = occurred_at
+        await self._session.flush()
+        return self._domain(record)
+
+    async def get_active(self, account_id: UUID, now: datetime) -> AccountExecutionLease | None:
+        occurred_at = normalize_utc(now)
+        record = await self._session.scalar(
+            select(AccountExecutionLeaseRecord).where(
+                AccountExecutionLeaseRecord.account_id == account_id,
+                AccountExecutionLeaseRecord.lease_expires_at > occurred_at,
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    async def renew(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        fencing_generation: int,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> bool:
+        occurred_at = normalize_utc(now)
+        expires_at = normalize_utc(lease_expires_at)
+        result = await self._session.scalar(
+            update(AccountExecutionLeaseRecord)
+            .where(
+                AccountExecutionLeaseRecord.account_id == account_id,
+                AccountExecutionLeaseRecord.owner_type == owner_type,
+                AccountExecutionLeaseRecord.owner_id == owner_id,
+                AccountExecutionLeaseRecord.fencing_generation == fencing_generation,
+                AccountExecutionLeaseRecord.lease_expires_at > occurred_at,
+            )
+            .values(lease_expires_at=expires_at, updated_at=occurred_at)
+            .returning(AccountExecutionLeaseRecord.account_id)
+        )
+        return result is not None
+
+    async def owns(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        fencing_generation: int,
+        now: datetime,
+    ) -> bool:
+        occurred_at = normalize_utc(now)
+        result = await self._session.scalar(
+            select(AccountExecutionLeaseRecord.account_id)
+            .where(
+                AccountExecutionLeaseRecord.account_id == account_id,
+                AccountExecutionLeaseRecord.owner_type == owner_type,
+                AccountExecutionLeaseRecord.owner_id == owner_id,
+                AccountExecutionLeaseRecord.fencing_generation == fencing_generation,
+                AccountExecutionLeaseRecord.lease_expires_at > occurred_at,
+            )
+            .with_for_update()
+        )
+        return result is not None
+
+    async def release(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        fencing_generation: int,
+        now: datetime,
+    ) -> bool:
+        occurred_at = normalize_utc(now)
+        result = await self._session.scalar(
+            update(AccountExecutionLeaseRecord)
+            .where(
+                AccountExecutionLeaseRecord.account_id == account_id,
+                AccountExecutionLeaseRecord.owner_type == owner_type,
+                AccountExecutionLeaseRecord.owner_id == owner_id,
+                AccountExecutionLeaseRecord.fencing_generation == fencing_generation,
+                AccountExecutionLeaseRecord.lease_expires_at > occurred_at,
+            )
+            .values(lease_expires_at=occurred_at, updated_at=occurred_at)
+            .returning(AccountExecutionLeaseRecord.account_id)
+        )
+        return result is not None
+
+    @staticmethod
+    def _domain(record: AccountExecutionLeaseRecord) -> AccountExecutionLease:
+        return AccountExecutionLease(
+            account_id=record.account_id,
+            owner_type=AccountExecutionOwnerType(record.owner_type),
+            owner_id=record.owner_id,
+            operation_class=OperationClass(record.operation_class),
+            fencing_generation=record.fencing_generation,
+            lease_expires_at=record.lease_expires_at,
+            updated_at=record.updated_at,
+        )
 
 
 class SQLAlchemyCommandRepository(CommandRepository):
@@ -183,6 +358,14 @@ class SQLAlchemyCommandRepository(CommandRepository):
                 or_(
                     CommandRecord.execution_lease_expires_at.is_(None),
                     CommandRecord.execution_lease_expires_at <= now,
+                ),
+            ),
+            and_(
+                CommandRecord.status == CommandStatus.WAITING_EXECUTION,
+                ~exists(
+                    select(WorkerJobRecord.id).where(
+                        WorkerJobRecord.command_id == CommandRecord.command_id
+                    )
                 ),
             ),
         )
@@ -303,6 +486,92 @@ class SQLAlchemyCommandRepository(CommandRepository):
             execution_lease_token=record.execution_lease_token,
             execution_lease_expires_at=record.execution_lease_expires_at,
             checkpoint=record.checkpoint,
+        )
+
+
+class SQLAlchemyCommandRouteDecisionRepository(CommandRouteDecisionRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, decision: CapabilityRouteDecision) -> None:
+        self._session.add(
+            CommandRouteDecisionRecord(
+                id=uuid4(),
+                command_id=decision.command_id,
+                account_id=decision.account_id,
+                capability_name=decision.capability_name,
+                capability_version=decision.capability_version,
+                execution_class=decision.execution_class,
+                operation_class=decision.operation_class,
+                account_mode=decision.account_mode,
+                target=decision.target,
+                executor=decision.executor,
+                reason_code=decision.reason_code,
+                attempt_count=decision.attempt_count,
+                created_at=decision.created_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_latest_for_command(self, command_id: str) -> CapabilityRouteDecision | None:
+        record = await self._session.scalar(
+            select(CommandRouteDecisionRecord)
+            .where(CommandRouteDecisionRecord.command_id == command_id)
+            .order_by(
+                CommandRouteDecisionRecord.attempt_count.desc(),
+                CommandRouteDecisionRecord.created_at.desc(),
+                CommandRouteDecisionRecord.id.desc(),
+            )
+            .limit(1)
+        )
+        if record is None:
+            return None
+        return CapabilityRouteDecision(
+            command_id=record.command_id,
+            account_id=record.account_id,
+            capability_name=record.capability_name,
+            capability_version=record.capability_version,
+            execution_class=CapabilityExecutionClass(record.execution_class),
+            operation_class=OperationClass(record.operation_class),
+            account_mode=AccountExecutionMode(record.account_mode),
+            target=RouteTarget(record.target),
+            executor=CapabilityExecutor(record.executor) if record.executor is not None else None,
+            reason_code=record.reason_code,
+            attempt_count=record.attempt_count,
+            created_at=record.created_at,
+        )
+
+    async def get_latest_execution_for_command(
+        self, command_id: str
+    ) -> CapabilityRouteDecision | None:
+        record = await self._session.scalar(
+            select(CommandRouteDecisionRecord)
+            .where(
+                CommandRouteDecisionRecord.command_id == command_id,
+                CommandRouteDecisionRecord.executor.is_not(None),
+            )
+            .order_by(
+                CommandRouteDecisionRecord.attempt_count.desc(),
+                CommandRouteDecisionRecord.created_at.desc(),
+                CommandRouteDecisionRecord.id.desc(),
+            )
+            .limit(1)
+        )
+        if record is None:
+            return None
+        return CapabilityRouteDecision(
+            command_id=record.command_id,
+            account_id=record.account_id,
+            capability_name=record.capability_name,
+            capability_version=record.capability_version,
+            execution_class=CapabilityExecutionClass(record.execution_class),
+            operation_class=OperationClass(record.operation_class),
+            account_mode=AccountExecutionMode(record.account_mode),
+            target=RouteTarget(record.target),
+            executor=CapabilityExecutor(record.executor),
+            reason_code=record.reason_code,
+            attempt_count=record.attempt_count,
+            created_at=record.created_at,
         )
 
 
@@ -988,6 +1257,9 @@ class SQLAlchemyAccountWorkerAssignmentRepository(AccountWorkerAssignmentReposit
         self._session = session
 
     async def add(self, assignment: AccountWorkerAssignment) -> None:
+        await self._session.scalar(
+            select(AccountRecord).where(AccountRecord.id == assignment.account_id).with_for_update()
+        )
         self._session.add(
             AccountWorkerAssignmentRecord(
                 id=assignment.id,
@@ -1015,6 +1287,9 @@ class SQLAlchemyAccountWorkerAssignmentRepository(AccountWorkerAssignmentReposit
         record = await self._session.get(AccountWorkerAssignmentRecord, assignment.id)
         if record is None:
             raise LookupError(f"account-worker assignment not found: {assignment.id}")
+        await self._session.scalar(
+            select(AccountRecord).where(AccountRecord.id == record.account_id).with_for_update()
+        )
         record.is_active = assignment.is_active
         record.ended_at = assignment.ended_at
         await self._session.flush()
@@ -1200,6 +1475,12 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
         )
         return self._domain(record) if record is not None else None
 
+    async def get_by_command_id(self, command_id: str) -> WorkerJob | None:
+        record = await self._session.scalar(
+            select(WorkerJobRecord).where(WorkerJobRecord.command_id == command_id)
+        )
+        return self._domain(record) if record is not None else None
+
     async def update(self, job: WorkerJob) -> None:
         record = await self._session.get(WorkerJobRecord, job.id)
         if record is None:
@@ -1207,14 +1488,15 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
         self._write(record, job)
         await self._session.flush()
 
-    async def claim_next(
+    async def list_claimable(
         self,
         worker: WorkerNode,
         now: datetime,
-        lease_expires_at: datetime,
-        lease_token: UUID,
-    ) -> WorkerJob | None:
+        limit: int = 50,
+    ) -> list[WorkerJob]:
         occurred_at = normalize_utc(now)
+        if limit < 1:
+            raise ValueError("WorkerJob claim limit must be positive")
         if (
             worker.status is not WorkerStatus.ONLINE
             or worker.protocol_version != 1
@@ -1222,7 +1504,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
             or worker.presence_expires_at is None
             or worker.presence_expires_at <= occurred_at
         ):
-            return None
+            return []
         active_count = await self._session.scalar(
             select(func.count())
             .select_from(WorkerJobRecord)
@@ -1233,7 +1515,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
             )
         )
         if (active_count or 0) >= worker.max_concurrent_jobs:
-            return None
+            return []
 
         has_capability = exists(
             select(WorkerCapabilityRecord.id).where(
@@ -1261,7 +1543,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
                 WorkerJobRecord.lease_expires_at <= occurred_at,
             ),
         )
-        candidate = await self._session.scalar(
+        candidates = await self._session.scalars(
             select(WorkerJobRecord)
             .where(
                 available_status,
@@ -1292,16 +1574,30 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
                 WorkerJobRecord.id,
             )
             .with_for_update(skip_locked=True)
-            .limit(1)
+            .limit(limit)
         )
-        if candidate is None:
-            return None
+        return [self._domain(record) for record in candidates]
 
-        if candidate.status is WorkerJobStatus.RUNNING:
+    async def claim(
+        self,
+        job: WorkerJob,
+        worker_id: UUID,
+        now: datetime,
+        lease_expires_at: datetime,
+        lease_token: UUID,
+        account_coordination_generation: int | None,
+    ) -> WorkerJob | None:
+        occurred_at = normalize_utc(now)
+        record = await self._session.scalar(
+            select(WorkerJobRecord).where(WorkerJobRecord.id == job.id).with_for_update()
+        )
+        if record is None:
+            return None
+        if record.status is WorkerJobStatus.RUNNING:
             previous = await self._session.scalar(
                 select(WorkerJobAttemptRecord)
                 .where(
-                    WorkerJobAttemptRecord.worker_job_id == candidate.id,
+                    WorkerJobAttemptRecord.worker_job_id == record.id,
                     WorkerJobAttemptRecord.status == WorkerJobAttemptStatus.RUNNING,
                 )
                 .order_by(WorkerJobAttemptRecord.attempt_number.desc())
@@ -1312,11 +1608,20 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
                 previous.finished_at = occurred_at
                 previous.error_code = "LEASE_EXPIRED"
 
-        job = self._domain(candidate)
-        job.claim(worker.worker_id, occurred_at, lease_expires_at, lease_token)
-        self._write(candidate, job)
+        claimed = self._domain(record)
+        try:
+            claimed.claim(
+                worker_id,
+                occurred_at,
+                lease_expires_at,
+                lease_token,
+                account_coordination_generation=account_coordination_generation,
+            )
+        except ValueError:
+            return None
+        self._write(record, claimed)
         await self._session.flush()
-        return job
+        return claimed
 
     async def list_expired_for_update(self, now: datetime, limit: int) -> list[WorkerJob]:
         occurred_at = normalize_utc(now)
@@ -1438,6 +1743,8 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
         record.lease_worker_id = job.lease_worker_id
         record.lease_token = job.lease_token
         record.lease_expires_at = job.lease_expires_at
+        record.operation_class = job.operation_class
+        record.account_coordination_generation = job.account_coordination_generation
         record.checkpoint = job.checkpoint
         record.result = job.result
         record.error_code = job.error_code
@@ -1455,6 +1762,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
             account_affinity_required=record.account_affinity_required,
             capability_name=record.capability_name,
             capability_version=record.capability_version,
+            operation_class=OperationClass(record.operation_class),
             status=WorkerJobStatus(record.status),
             priority=record.priority,
             preemptible=record.preemptible,
@@ -1467,6 +1775,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
             lease_worker_id=record.lease_worker_id,
             lease_token=record.lease_token,
             lease_expires_at=record.lease_expires_at,
+            account_coordination_generation=record.account_coordination_generation,
             checkpoint=record.checkpoint,
             result=record.result,
             error_code=record.error_code,

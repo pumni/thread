@@ -6,11 +6,13 @@ from typing import cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
+    AccountExecutionLeaseRepository,
     AccountRepository,
     AccountWorkerAssignmentRepository,
     BrowserProfileRepository,
     CommandAttemptRepository,
     CommandRepository,
+    CommandRouteDecisionRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
     OutboxEventRepository,
@@ -25,11 +27,13 @@ from threads_platform.application.ports.repositories import (
     WorkerSecurityRepository,
 )
 from threads_platform.infrastructure.persistence.repositories import (
+    SQLAlchemyAccountExecutionLeaseRepository,
     SQLAlchemyAccountRepository,
     SQLAlchemyAccountWorkerAssignmentRepository,
     SQLAlchemyBrowserProfileRepository,
     SQLAlchemyCommandAttemptRepository,
     SQLAlchemyCommandRepository,
+    SQLAlchemyCommandRouteDecisionRepository,
     SQLAlchemyIntegrationDeliveryRepository,
     SQLAlchemyNetworkProfileRepository,
     SQLAlchemyOutboxEventRepository,
@@ -49,7 +53,13 @@ class SQLAlchemyUnitOfWork:
     def __init__(self, session_factory: Callable[[], AsyncSession]) -> None:
         self._session = session_factory()
         self.accounts: AccountRepository = SQLAlchemyAccountRepository(self._session)
+        self.account_execution_leases: AccountExecutionLeaseRepository = (
+            SQLAlchemyAccountExecutionLeaseRepository(self._session)
+        )
         self.commands: CommandRepository = SQLAlchemyCommandRepository(self._session)
+        self.command_route_decisions: CommandRouteDecisionRepository = (
+            SQLAlchemyCommandRouteDecisionRepository(self._session)
+        )
         self.attempts: CommandAttemptRepository = SQLAlchemyCommandAttemptRepository(self._session)
         self.posts: PostRepository = SQLAlchemyPostRepository(self._session)
         self.replies: ReplyRepository = SQLAlchemyReplyRepository(self._session)

@@ -23,11 +23,22 @@ from threads_platform.application.crm_protocol_v1 import (
 from threads_platform.application.errors import CRMUnavailable, RetryableCommandError
 from threads_platform.application.outbox_delivery import OutboxDeliveryWorker
 from threads_platform.application.retry import RetryPolicy
+from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.config.settings import Settings
-from threads_platform.domain.accounts import ThreadsAccount
+from threads_platform.domain.account_execution import AccountExecutionOwnerType
+from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
+from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
 from threads_platform.domain.commands import AttemptStatus, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxEvent, OutboxStatus
 from threads_platform.domain.publishing import ThreadPost
+from threads_platform.domain.worker_jobs import WorkerJobStatus
+from threads_platform.domain.workers import (
+    AccountWorkerAssignment,
+    BrowserProfile,
+    WorkerCapability,
+    WorkerNode,
+    WorkerStatus,
+)
 from threads_platform.infrastructure.persistence.models import (
     CommandAttemptRecord,
     OutboxEventRecord,
@@ -605,3 +616,152 @@ async def test_http_ingress_authenticates_and_only_delegates_to_runtime(
     assert unauthorized.status_code == 401
     assert accepted.status_code == 202
     assert accepted.json()["status"] == CommandStatus.RECEIVED
+
+
+async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account = ThreadsAccount(
+        threads_user_id=f"hybrid-user-{uuid4()}",
+        username="hybrid-test",
+        execution_mode=AccountExecutionMode.HYBRID,
+    )
+    worker_id = uuid4()
+    worker = WorkerNode(
+        worker_id=worker_id,
+        display_name="Hybrid test worker",
+        hostname="test-host",
+        platform="windows",
+        agent_version="1.0.0",
+        protocol_version=1,
+        capabilities_schema_version=1,
+        status=WorkerStatus.ONLINE,
+        last_heartbeat_at=clock.now(),
+        presence_expires_at=clock.now() + timedelta(hours=1),
+        created_at=clock.now(),
+        updated_at=clock.now(),
+    )
+    profile = BrowserProfile(worker_id, f"hybrid-profile-{uuid4()}")
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(account)
+        await unit_of_work.workers.add(worker)
+        await unit_of_work.browser_profiles.add(profile)
+        await unit_of_work.assignments.add(
+            AccountWorkerAssignment(account.id, worker_id, profile.profile_ref)
+        )
+        await unit_of_work.worker_capabilities.replace_for_worker(
+            worker_id,
+            [WorkerCapability(worker_id, "threads.publish_text", 1, advertised_at=clock.now())],
+        )
+
+    worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    remote_runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=clock,
+        worker_job_service=worker_jobs,
+    )
+    remote_receipt = await remote_runtime.receive(command_body(account.id, clock))
+    remote_result = await remote_runtime.process(remote_receipt.command_id)
+    account.execution_mode = AccountExecutionMode.API_ONLY
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.update(account)
+    assert await worker_jobs.claim_next(worker_id) is None
+    account.execution_mode = AccountExecutionMode.HYBRID
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.update(account)
+    claimed = await worker_jobs.claim_next(worker_id)
+
+    assert remote_result.status is CommandStatus.WAITING_EXECUTION
+    assert claimed is not None
+    assert claimed.status is WorkerJobStatus.RUNNING
+    assert claimed.account_coordination_generation == 1
+
+    api_handler = RecordingHandler()
+    api_runtime = CommandRuntime(
+        unit_of_work_factory,
+        {"threads.publish_text": api_handler},
+        clock=clock,
+        worker_job_service=worker_jobs,
+    )
+    api_receipt = await api_runtime.receive(command_body(account.id, clock))
+    blocked_api = await api_runtime.process(api_receipt.command_id)
+
+    assert blocked_api.status is CommandStatus.WAITING_EXECUTION
+    assert api_handler.calls == 0
+
+    assert claimed.lease_token is not None
+    await worker_jobs.complete(
+        claimed.id,
+        worker_id,
+        claimed.lease_token,
+        {"remote_result_id": "worker-result"},
+    )
+    api_result = await api_runtime.process(api_receipt.command_id)
+
+    assert api_result.status is CommandStatus.SUCCEEDED
+    assert api_handler.calls == 1
+    async with unit_of_work_factory() as unit_of_work:
+        worker_route = await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+            remote_receipt.command_id
+        )
+        api_route = await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+            api_receipt.command_id
+        )
+        assert worker_route is not None
+        assert api_route is not None
+        assert worker_route.executor is CapabilityExecutor.WORKER
+        assert api_route.executor is CapabilityExecutor.API
+
+
+async def test_account_execution_lease_has_one_owner_and_fences_reclaim(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+
+    async def acquire(owner_id: str):
+        async with unit_of_work_factory() as unit_of_work:
+            return await unit_of_work.account_execution_leases.try_acquire(
+                account_id,
+                AccountExecutionOwnerType.COMMAND,
+                owner_id,
+                OperationClass.MUTATION,
+                clock.now(),
+                clock.now() + timedelta(minutes=1),
+            )
+
+    leases = await asyncio.gather(acquire("owner-a"), acquire("owner-b"))
+    owners = [lease for lease in leases if lease is not None]
+
+    assert len(owners) == 1
+    first_lease = owners[0]
+    clock.advance(timedelta(minutes=1))
+    async with unit_of_work_factory() as unit_of_work:
+        replacement = await unit_of_work.account_execution_leases.try_acquire(
+            account_id,
+            AccountExecutionOwnerType.WORKER_JOB,
+            "job-c",
+            OperationClass.MUTATION,
+            clock.now(),
+            clock.now() + timedelta(minutes=1),
+        )
+    assert replacement is not None
+    assert replacement.fencing_generation == first_lease.fencing_generation + 1
+
+    async with unit_of_work_factory() as unit_of_work:
+        assert not await unit_of_work.account_execution_leases.owns(
+            account_id,
+            first_lease.owner_type,
+            first_lease.owner_id,
+            first_lease.fencing_generation,
+            clock.now(),
+        )
+        assert await unit_of_work.account_execution_leases.owns(
+            account_id,
+            replacement.owner_type,
+            replacement.owner_id,
+            replacement.fencing_generation,
+            clock.now(),
+        )

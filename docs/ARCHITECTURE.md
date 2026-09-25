@@ -135,6 +135,34 @@ HYBRID does not mean automatic fallback for every failure. Fallback is allowed o
 - executor has sufficient evidence/authorization;
 - switching executor does not violate recovery/idempotency semantics.
 
+### Deterministic Capability Router
+
+After command validation, the application Capability Router evaluates a versioned
+business capability policy and account execution mode before selecting an executor.
+The policy describes the business operation, its preferred executor, any explicitly
+safe fallback, and the corresponding WorkerCapability name/version. WorkerCapability
+advertisements are evidence about a particular worker; they do not define business
+policy.
+
+Current mode semantics are:
+- API_ONLY uses an available API handler and waits if it is unavailable;
+- BROWSER_ONLY queues work for the active assigned worker and never selects the API;
+- HYBRID follows the capability's preference and permits fallback only before the
+  first execution attempt when the policy explicitly allows it;
+- MANUAL enters WAITING_INTERVENTION.
+
+Once an executor has attempted a command, routing will not switch executors. An
+existing WorkerJob remains authoritative for remote work, and reconciliation-required
+work waits for intervention. API execution reuses its existing handler. Remote routing
+persists the decision, Command transition, and WorkerJob through WorkerJobService in
+one PostgreSQL transaction. WebSocket notifications remain advisory.
+
+Exclusive account operations share one PostgreSQL account-execution lease across API
+and WorkerJob execution. Its monotonically increasing generation fences stale owners;
+claims and renewals hold the lease briefly, and checkpoints/finalization verify it.
+Read operations do not take this exclusive lease. Account assignment changes lock the
+account row so a worker claim cannot race a reassignment.
+
 ## 6. Persistent browser affinity
 
 Browser identity is persistent:
@@ -465,10 +493,9 @@ The current TP-004A/Batch-B runtime remains valid.
 
 Official API adapter is not replaced by the worker design.
 
-C2 decides when a capability uses:
-- local official API execution;
-- remote browser execution;
-- human-assisted state.
+The C2 Capability Router selects local API execution, a durable WorkerJob, a human
+intervention state, or explicit unsupported status. C3 supplies the browser runtime;
+the router does not launch a browser.
 
 ## 25. Reliability invariants
 
