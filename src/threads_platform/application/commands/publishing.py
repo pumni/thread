@@ -78,6 +78,8 @@ class ThreadsPublishingHandler:
                     )
                     if parent_reply is None:
                         raise PermanentCommandError("LOCAL_PARENT_REPLY_NOT_FOUND")
+                    if parent_reply.root_post_id != root_post.id:
+                        raise PermanentCommandError("PARENT_REPLY_ROOT_MISMATCH")
 
         media_type, text, containers = self._media_requests(command, payload, reply_to_id)
         recovery = self._read_recovery(context)
