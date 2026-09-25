@@ -1,175 +1,132 @@
-# Acceptance and Review Protocol
+# Acceptance and Review Protocol v2
 
-The reviewer/coordinator is responsible for deciding whether a Codex implementation satisfies the issue and project architecture.
+## 1. Review order
 
-## 1. Acceptance order
-
-Review in this order:
-
-1. issue scope
+1. authorized scope
 2. behavior
 3. architecture
-4. data correctness
-5. failure/recovery semantics
-6. security
-7. tests
-8. observability
-9. maintainability
-10. documentation
+4. data/protocol correctness
+5. ownership/concurrency
+6. failure/recovery
+7. security
+8. tests
+9. observability
+10. maintainability/docs
 
-A PR that fails an earlier gate should normally be returned before polishing later concerns.
+Earlier failures normally block acceptance.
 
-## 2. Scope gate
+## 2. Architecture gate
 
-Confirm:
-
-- every acceptance criterion is addressed;
-- no required deliverable is omitted;
-- unrelated refactors are absent;
-- out-of-scope features have not been smuggled in.
-
-## 3. Architecture gate
-
-Reject or request change when:
-
-- domain imports infrastructure;
+Reject/request changes when:
+- domain imports infrastructure/browser/Windows dependencies;
 - transport contains business logic;
-- Meta response DTOs leak into domain;
-- global state controls business lifecycle;
-- a god service owns unrelated capabilities;
-- a new major dependency lacks justification;
-- browser automation appears without approved ADR.
+- Command and WorkerJob are conflated;
+- WebSocket becomes source of truth;
+- worker owns authoritative business state;
+- profile affinity can be bypassed;
+- new broker/DB/microservice architecture appears without ADR;
+- browser code appears before/without approved scope.
 
-## 4. Data gate
+## 3. Data gate
 
 For schema changes verify:
+- Alembic migration;
+- reversible where practical;
+- UTC timestamps;
+- unique/FK/check constraints enforce invariants;
+- claim/routing indexes;
+- external IDs typed appropriately;
+- secrets excluded from ordinary business/loggable rows.
 
-- Alembic migration exists;
-- migration is reversible where practical;
-- uniqueness constraints enforce idempotency/deduplication;
-- external IDs have appropriate types;
-- timestamps are UTC;
-- indexes support expected queries;
-- no credential appears in ordinary business tables/loggable models.
+## 4. Command/API side-effect reliability
 
-## 5. Reliability gate
+Verify duplicate safety, timeout ambiguity, bounded retry, crash recovery, stale command-lease fencing, and atomic business-result-outbox finalization.
 
-For external side effects verify:
+## 5. WorkerJob reliability gate
 
-- duplicate delivery is safe;
-- timeout does not imply assumed failure;
-- retry classification is explicit;
-- retry has bounded attempts/deadline;
-- partial success can be reconciled;
-- crash after remote success cannot cause blind duplicate execution.
+Required where WorkerJob changes:
+- concurrent claim -> one winner;
+- wrong worker rejected;
+- account affinity enforced;
+- OFFLINE/DRAINING/UPGRADE_REQUIRED cannot claim;
+- short claim transaction;
+- lease renewal;
+- stale checkpoint rejected;
+- stale completion rejected;
+- expired lease reclaim gets new token;
+- WebSocket-loss recovery;
+- worker reconnect;
+- Control Plane restart;
+- intervention/requeue;
+- bounded attempts/deadline.
 
-## 6. Security gate
+Any stale-owner overwrite is BLOCKER.
 
-Reject immediately for:
+## 6. Worker authentication/security gate
 
-- committed access token/password/secret;
-- token in logs;
-- Authorization header in test snapshot;
-- plaintext production credential storage;
-- disabled TLS verification without an approved development-only rationale;
-- overly broad OAuth scope without reason.
+Reject for:
+- fleet-wide shared static password as final design;
+- private worker key in Git/DB/log;
+- replayable enrollment/challenge;
+- non-expiring enrollment credential;
+- worker token in logs;
+- disabled TLS verification;
+- secret-bearing diagnostic payload.
 
-## 7. Test gate
+## 7. Browser gate
 
-Required standard commands:
+When browser work is authorized:
+- browser library stays outside domain/application business types;
+- capability is explicit/versioned;
+- account/session requirement explicit;
+- UI mismatch fails closed;
+- challenge/login produces intervention;
+- no anti-detect/fingerprint spoofing;
+- no random human-emulation requirement;
+- no click-unknown fallback;
+- lease loss prevents new irreversible mutation;
+- ambiguous outcome has reconciliation/operator path.
 
-~~~
+## 8. Account/session gate
+
+Verify persistent affinity, logical profile_ref, no auto migration, execution mode, explicit session state, no plaintext-password default model, and NetworkProfile redaction.
+
+## 9. Discovery gate
+
+Verify API-first behavior, browser enrichment through Capability Router/WorkerJob only, pagination/resume, dedupe, source traceability and bounded lead data.
+
+## 10. Scheduler/activity gate
+
+Verify Control Plane-created activities, durable schedule, deterministic priority, cooperative safe-boundary preemption and restart recovery.
+
+## 11. Standard quality gate
+
+~~~bash
 uv sync --locked
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
+uv run alembic check
 uv run pytest
 ~~~
 
-Additional tests depend on issue type.
+CI + Secret scan must be green for merge unless reviewer explicitly documents an infrastructure-only exception.
 
-### Publishing
+## 12. Severity
 
-- success
-- duplicate command
-- timeout
-- server error
-- invalid input
-- auth failure
-- partial/recovery state
+BLOCKER: secret leak, data corruption, duplicate external side effect, stale-owner write, broken migration, account-affinity violation, architecture/security boundary break.
 
-### Conversation sync
+MAJOR: incorrect state transition, missing recovery, incomplete concurrency tests, unsafe fallback, protocol mismatch not handled.
 
-- pagination
-- nested parent mapping
-- repeated sync
-- cursor resume
-- deleted/missing remote object behavior where applicable
+MINOR: limited observability/docs/maintainability issue.
 
-### Scheduler
+NIT: style preference only.
 
-- restart durability
-- duplicate claim protection
-- overdue/expired job behavior
-- retry timing
+## 13. Verdict
 
-### OAuth
+- ACCEPTED
+- ACCEPTED WITH FOLLOW-UP
+- CHANGES REQUIRED
+- BLOCKED BY PRODUCT/API DECISION
 
-- token refresh success
-- refresh failure
-- reauth required
-- concurrent refresh protection
-- redaction
-
-## 8. Observability gate
-
-Important operations should expose enough context to diagnose failures without secrets.
-
-Expected context where relevant:
-
-- command_id
-- correlation_id
-- account_id
-- operation
-- attempt
-- duration
-
-## 9. Review severity
-
-### BLOCKER
-
-Security leak, data corruption, duplicate side effects, broken migration, architectural violation that will spread.
-
-### MAJOR
-
-Incorrect behavior, missing failure handling, incomplete tests, bad API abstraction.
-
-### MINOR
-
-Naming, maintainability, small observability/documentation gap.
-
-### NIT
-
-Style preference with no meaningful correctness/maintenance impact.
-
-## 10. Acceptance output
-
-Each reviewed PR should receive a concise verdict containing:
-
-- Verdict
-- Acceptance criteria status
-- Blocking findings
-- Non-blocking findings
-- Verification evidence
-- Follow-up issue(s), if any
-
-No PR is considered done solely because CI is green.
-
-## 11. Regression responsibility
-
-When a bug is discovered after merge:
-
-1. create a focused regression issue;
-2. write a failing regression test first where feasible;
-3. implement the fix;
-4. evaluate whether the original acceptance checklist needs strengthening.
+Every review states criteria status, blocking findings, non-blocking findings, verification evidence and follow-ups. CI green alone is not acceptance.
