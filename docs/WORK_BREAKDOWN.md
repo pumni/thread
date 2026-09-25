@@ -8,10 +8,11 @@ Completed:
 - TP-004A / partial TP-002 PR #18.
 - Batch B PR #20.
 - C1 PR #32 — issues #21, #22, #23 accepted and merged.
+- C2 PR #33 — issue #24 accepted and merged.
 
 Current authorized implementation checkpoint:
-- **C2 — Capability Router**
-  - #24 C2-01
+- **C3-01 — Windows Worker Agent / profile-session foundation**
+  - #25 only
 
 Issue #3 remains a production/release gate.
 
@@ -85,7 +86,7 @@ Recommended branch: batch/c1-distributed-worker-foundation
 
 Issue #24.
 
-Status: **CURRENT AUTHORIZED CHECKPOINT** after C1 acceptance.
+Status: **ACCEPTED / MERGED** in PR #33, merge commit `29895a987d12b7325671fb8ca7c30272f865cd73`.
 
 Must separate business capability from executor.
 
@@ -103,8 +104,8 @@ No browser business action is implemented here.
 ## 6. C3 — Windows Browser Worker Foundation
 
 Order:
-1. #25 Worker Agent/profile/session/network foundation.
-2. #26 browser engine ADR + fail-closed adapter.
+1. #25 Worker Agent/profile/session/network foundation — **CURRENT AUTHORIZED ITEM**.
+2. #26 browser engine ADR + fail-closed adapter — not authorized until #25 is reviewed.
 
 C3 establishes infrastructure only.
 
