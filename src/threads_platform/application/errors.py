@@ -15,6 +15,10 @@ class CommandNotFound(LookupError):
     """No inbox entry exists for the requested command id."""
 
 
+class ExecutionLeaseLost(RuntimeError):
+    """The current worker no longer owns the durable command execution lease."""
+
+
 class RetryableCommandError(Exception):
     def __init__(self, code: str, retry_after: timedelta | None = None) -> None:
         super().__init__(code)

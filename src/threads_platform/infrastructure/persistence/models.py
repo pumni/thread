@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -98,6 +99,11 @@ class CommandRecord(Base):
     __table_args__ = (
         UniqueConstraint("command_id", name="uq_commands_command_id"),
         Index("ix_commands_status_deadline", "status", "deadline_at"),
+        Index("ix_commands_execution_lease", "status", "execution_lease_expires_at"),
+        CheckConstraint(
+            "(execution_lease_token IS NULL) = (execution_lease_expires_at IS NULL)",
+            name="ck_commands_execution_lease_pair",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -125,6 +131,9 @@ class CommandRecord(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
     error_code: Mapped[str | None] = mapped_column(String(120))
+    execution_lease_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    execution_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
 
 
 class CommandAttemptRecord(Base):

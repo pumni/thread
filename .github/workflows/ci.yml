@@ -57,5 +57,8 @@ jobs:
       - name: Apply migrations to empty PostgreSQL database
         run: uv run --locked alembic upgrade head
 
+      - name: Check migration metadata
+        run: uv run --locked alembic check
+
       - name: Run tests
         run: uv run --locked pytest

@@ -36,6 +36,7 @@ _VALID_TRANSITIONS = frozenset(
         (CommandStatus.PROCESSING, CommandStatus.SUCCEEDED),
         (CommandStatus.PROCESSING, CommandStatus.FAILED_RETRYABLE),
         (CommandStatus.PROCESSING, CommandStatus.FAILED_FINAL),
+        (CommandStatus.PROCESSING, CommandStatus.EXPIRED),
         (CommandStatus.FAILED_RETRYABLE, CommandStatus.PROCESSING),
         (CommandStatus.FAILED_RETRYABLE, CommandStatus.EXPIRED),
         (CommandStatus.FAILED_RETRYABLE, CommandStatus.FAILED_FINAL),
@@ -62,6 +63,9 @@ class Command:
     completed_at: datetime | None = None
     result: dict[str, object] | None = None
     error_code: str | None = None
+    execution_lease_token: UUID | None = None
+    execution_lease_expires_at: datetime | None = None
+    checkpoint: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not self.command_id.strip() or not self.correlation_id.strip():
@@ -81,6 +85,13 @@ class Command:
         self.completed_at = (
             normalize_utc(self.completed_at) if self.completed_at is not None else None
         )
+        self.execution_lease_expires_at = (
+            normalize_utc(self.execution_lease_expires_at)
+            if self.execution_lease_expires_at is not None
+            else None
+        )
+        if (self.execution_lease_token is None) != (self.execution_lease_expires_at is None):
+            raise ValueError("execution lease token and expiry must be set together")
 
     def transition(
         self,
@@ -124,6 +135,16 @@ class Command:
             self.completed_at = occurred_at
         if target == CommandStatus.SUCCEEDED:
             self.result = result or {}
+
+    def reclaim(self, at: datetime) -> None:
+        occurred_at = normalize_utc(at)
+        if self.status != CommandStatus.PROCESSING:
+            raise ValueError("only an expired processing command can be reclaimed")
+        if self.deadline_at is not None and occurred_at >= self.deadline_at:
+            raise ValueError("expired command cannot be reclaimed")
+        self.started_at = occurred_at
+        self.error_code = None
+        self.next_retry_at = None
 
 
 @dataclass(slots=True)

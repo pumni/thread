@@ -1,3 +1,4 @@
+import asyncio
 import secrets
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -10,7 +11,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.app import create_app
-from threads_platform.application.commands.handlers import CommandExecutionContext
+from threads_platform.application.commands.handlers import (
+    CommandExecutionContext,
+    CommandExecutionOutput,
+)
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.crm_protocol_v1 import (
     CommandEnvelopeV1,
@@ -21,10 +25,11 @@ from threads_platform.application.outbox_delivery import OutboxDeliveryWorker
 from threads_platform.application.retry import RetryPolicy
 from threads_platform.config.settings import Settings
 from threads_platform.domain.accounts import ThreadsAccount
-from threads_platform.domain.commands import CommandStatus
+from threads_platform.domain.commands import AttemptStatus, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxEvent, OutboxStatus
 from threads_platform.domain.publishing import ThreadPost
 from threads_platform.infrastructure.persistence.models import (
+    CommandAttemptRecord,
     OutboxEventRecord,
     PostRecord,
 )
@@ -51,16 +56,14 @@ class RecordingHandler:
 
     async def execute(
         self, command: CommandEnvelopeV1, context: CommandExecutionContext
-    ) -> dict[str, object]:
+    ) -> CommandExecutionOutput:
         self.calls += 1
-        await context.posts.add(
-            ThreadPost(
-                account_id=command.account_id,
-                threads_post_id=f"local-result-{command.command_id}",
-                text=command.payload.text,
-            )
+        post = ThreadPost(
+            account_id=command.account_id,
+            threads_post_id=f"local-result-{command.command_id}",
+            text=command.payload.text,
         )
-        return {"local_result_id": command.command_id}
+        return CommandExecutionOutput(result={"local_result_id": command.command_id}, posts=(post,))
 
 
 class RetryOnceHandler(RecordingHandler):
@@ -70,7 +73,7 @@ class RetryOnceHandler(RecordingHandler):
 
     async def execute(
         self, command: CommandEnvelopeV1, context: CommandExecutionContext
-    ) -> dict[str, object]:
+    ) -> CommandExecutionOutput:
         if self.failures_remaining:
             self.failures_remaining -= 1
             self.calls += 1
@@ -93,6 +96,50 @@ class CRMStub:
             self.disconnect_once = False
             raise ConnectionError("simulated CRM connection loss")
         return f"delivery-{len(self.results)}"
+
+
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
+class CheckpointingHandler(RecordingHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observed_checkpoints: list[dict[str, object]] = []
+
+    async def execute(
+        self, command: CommandEnvelopeV1, context: CommandExecutionContext
+    ) -> CommandExecutionOutput:
+        self.calls += 1
+        self.observed_checkpoints.append(dict(context.checkpoint.data))
+        if self.calls == 1:
+            await context.checkpoint.save({"remote_container_id": "container-test"})
+            raise SimulatedProcessCrash
+        assert context.checkpoint.data == {"remote_container_id": "container-test"}
+        return CommandExecutionOutput(result={"remote_container_id": "container-test"})
+
+
+class BlockingHandler(RecordingHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(
+        self, command: CommandEnvelopeV1, context: CommandExecutionContext
+    ) -> CommandExecutionOutput:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return CommandExecutionOutput(result={"done": True})
+
+
+class UnexpectedFailureHandler(RecordingHandler):
+    async def execute(
+        self, command: CommandEnvelopeV1, context: CommandExecutionContext
+    ) -> CommandExecutionOutput:
+        self.calls += 1
+        raise ValueError("details are deliberately not persisted")
 
 
 async def add_account(unit_of_work_factory: SQLAlchemyUnitOfWorkFactory) -> UUID:
@@ -260,7 +307,7 @@ async def test_retryable_command_waits_for_typed_bounded_backoff(
     assert handler.calls == 2
 
 
-async def test_business_state_and_outbox_roll_back_atomically_on_outbox_conflict(
+async def test_business_state_and_result_outbox_roll_back_atomically_on_conflict(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
     clock = FixedClock(datetime.now(UTC))
@@ -299,10 +346,158 @@ async def test_business_state_and_outbox_roll_back_atomically_on_outbox_conflict
         existing_event = await unit_of_work.outbox_events.get(colliding_event_id)
 
     assert command is not None
-    assert command.status is CommandStatus.RECEIVED
-    assert attempt_count == 0
+    assert command.status is CommandStatus.PROCESSING
+    assert command.execution_lease_token is not None
+    assert attempt_count == 1
     assert post is None
     assert existing_event is not None
+
+
+async def test_concurrent_workers_do_not_execute_an_active_claim_twice(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+    handler = BlockingHandler()
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {"threads.publish_text": handler},
+        clock=clock,
+        execution_lease_duration=timedelta(seconds=3),
+    )
+    receipt = await runtime.receive(command_body(account_id, clock))
+
+    first_worker = asyncio.create_task(runtime.process_next())
+    await handler.started.wait()
+    second_worker = await runtime.process_next()
+    duplicate_direct_call = await runtime.process(receipt.command_id)
+    handler.release.set()
+    first_result = await first_worker
+
+    assert first_result is not None
+    assert first_result.status is CommandStatus.SUCCEEDED
+    assert second_worker is None
+    assert duplicate_direct_call.status is CommandStatus.PROCESSING
+    assert duplicate_direct_call.executed is False
+    assert handler.calls == 1
+
+
+async def test_active_execution_heartbeat_extends_the_durable_lease(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+    handler = BlockingHandler()
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {"threads.publish_text": handler},
+        clock=clock,
+        execution_lease_duration=timedelta(milliseconds=300),
+    )
+    await runtime.receive(command_body(account_id, clock))
+
+    first_worker = asyncio.create_task(runtime.process_next())
+    await handler.started.wait()
+    clock.advance(timedelta(milliseconds=150))
+    await asyncio.sleep(0.12)
+    clock.advance(timedelta(milliseconds=200))
+    second_worker = asyncio.create_task(runtime.process_next())
+    await asyncio.sleep(0.02)
+    handler.release.set()
+    first_result = await first_worker
+    second_result = await second_worker
+
+    assert first_result is not None
+    assert first_result.status is CommandStatus.SUCCEEDED
+    assert second_result is None
+    assert handler.calls == 1
+
+
+async def test_expired_execution_lease_reclaims_and_resumes_from_checkpoint(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+    handler = CheckpointingHandler()
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {"threads.publish_text": handler},
+        clock=clock,
+        retry_policy=deterministic_retry_policy(),
+        execution_lease_duration=timedelta(seconds=5),
+    )
+    receipt = await runtime.receive(command_body(account_id, clock))
+
+    with pytest.raises(SimulatedProcessCrash):
+        await runtime.process(receipt.command_id)
+
+    async with unit_of_work_factory() as unit_of_work:
+        abandoned = await unit_of_work.commands.get_by_command_id(receipt.command_id)
+    assert abandoned is not None
+    assert abandoned.status is CommandStatus.PROCESSING
+    assert abandoned.checkpoint == {"remote_container_id": "container-test"}
+
+    clock.advance(timedelta(seconds=5))
+    recovered = await runtime.process_next()
+    attempts = list(
+        await db_session.scalars(
+            select(CommandAttemptRecord)
+            .where(CommandAttemptRecord.command_id == receipt.command_id)
+            .order_by(CommandAttemptRecord.attempt_number)
+        )
+    )
+
+    assert recovered is not None
+    assert recovered.status is CommandStatus.SUCCEEDED
+    assert handler.observed_checkpoints == [{}, {"remote_container_id": "container-test"}]
+    assert len(attempts) == 2
+    assert attempts[0].status is AttemptStatus.FAILED_RETRYABLE
+    assert attempts[0].error_code == "EXECUTION_LEASE_EXPIRED"
+    assert attempts[1].status is AttemptStatus.SUCCEEDED
+
+
+async def test_unexpected_handler_error_is_durable_and_bounded(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+    handler = UnexpectedFailureHandler()
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {"threads.publish_text": handler},
+        clock=clock,
+        retry_policy=RetryPolicy(
+            max_attempts=2,
+            base_delay=timedelta(seconds=1),
+            max_delay=timedelta(seconds=1),
+            jitter_ratio=0,
+            jitter_source=lambda lower, _: lower,
+        ),
+    )
+    receipt = await runtime.receive(command_body(account_id, clock))
+
+    first = await runtime.process(receipt.command_id)
+    early_retry = await runtime.process(receipt.command_id)
+    clock.advance(timedelta(seconds=1))
+    second = await runtime.process(receipt.command_id)
+    third = await runtime.process(receipt.command_id)
+    attempts = list(
+        await db_session.scalars(
+            select(CommandAttemptRecord).where(
+                CommandAttemptRecord.command_id == receipt.command_id
+            )
+        )
+    )
+
+    assert first.status is CommandStatus.FAILED_RETRYABLE
+    assert early_retry.executed is False
+    assert second.status is CommandStatus.FAILED_FINAL
+    assert third.executed is False
+    assert handler.calls == 2
+    assert len(attempts) == 2
+    assert all(attempt.error_code == "UNEXPECTED_HANDLER_ERROR" for attempt in attempts)
 
 
 async def test_crm_unavailable_keeps_result_in_outbox_until_reconnect(

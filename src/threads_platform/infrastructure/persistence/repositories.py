@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,7 @@ from threads_platform.application.ports.repositories import (
 )
 from threads_platform.domain.accounts import AccountStatus, ThreadsAccount
 from threads_platform.domain.commands import (
+    AttemptStatus,
     Command,
     CommandAttempt,
     CommandStatus,
@@ -123,6 +124,13 @@ class SQLAlchemyCommandRepository(CommandRepository):
                 CommandRecord.status == CommandStatus.FAILED_RETRYABLE,
                 CommandRecord.next_retry_at <= now,
             ),
+            and_(
+                CommandRecord.status == CommandStatus.PROCESSING,
+                or_(
+                    CommandRecord.execution_lease_expires_at.is_(None),
+                    CommandRecord.execution_lease_expires_at <= now,
+                ),
+            ),
         )
         record = await self._session.scalar(
             select(CommandRecord)
@@ -132,6 +140,46 @@ class SQLAlchemyCommandRepository(CommandRepository):
             .limit(1)
         )
         return self._domain(record) if record is not None else None
+
+    async def save_checkpoint_if_leased(
+        self,
+        command_id: str,
+        lease_token: UUID,
+        now: datetime,
+        checkpoint: dict[str, object],
+    ) -> bool:
+        result = await self._session.scalar(
+            update(CommandRecord)
+            .where(
+                CommandRecord.command_id == command_id,
+                CommandRecord.status == CommandStatus.PROCESSING,
+                CommandRecord.execution_lease_token == lease_token,
+                CommandRecord.execution_lease_expires_at > now,
+            )
+            .values(checkpoint=checkpoint)
+            .returning(CommandRecord.id)
+        )
+        return result is not None
+
+    async def renew_execution_lease(
+        self,
+        command_id: str,
+        lease_token: UUID,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> bool:
+        result = await self._session.scalar(
+            update(CommandRecord)
+            .where(
+                CommandRecord.command_id == command_id,
+                CommandRecord.status == CommandStatus.PROCESSING,
+                CommandRecord.execution_lease_token == lease_token,
+                CommandRecord.execution_lease_expires_at > now,
+            )
+            .values(execution_lease_expires_at=lease_expires_at)
+            .returning(CommandRecord.id)
+        )
+        return result is not None
 
     async def update(self, command: Command) -> None:
         record = await self._session.get(CommandRecord, command.id)
@@ -144,6 +192,9 @@ class SQLAlchemyCommandRepository(CommandRepository):
         record.next_retry_at = command.next_retry_at
         record.result = command.result
         record.error_code = command.error_code
+        record.execution_lease_token = command.execution_lease_token
+        record.execution_lease_expires_at = command.execution_lease_expires_at
+        record.checkpoint = command.checkpoint
         await self._session.flush()
 
     @staticmethod
@@ -166,6 +217,9 @@ class SQLAlchemyCommandRepository(CommandRepository):
             "completed_at": command.completed_at,
             "result": command.result,
             "error_code": command.error_code,
+            "execution_lease_token": command.execution_lease_token,
+            "execution_lease_expires_at": command.execution_lease_expires_at,
+            "checkpoint": command.checkpoint,
         }
 
     @classmethod
@@ -192,6 +246,9 @@ class SQLAlchemyCommandRepository(CommandRepository):
             completed_at=record.completed_at,
             result=record.result,
             error_code=record.error_code,
+            execution_lease_token=record.execution_lease_token,
+            execution_lease_expires_at=record.execution_lease_expires_at,
+            checkpoint=record.checkpoint,
         )
 
 
@@ -304,6 +361,29 @@ class SQLAlchemyCommandAttemptRepository(CommandAttemptRepository):
             .where(CommandAttemptRecord.command_id == command_id)
         )
         return int(count or 0)
+
+    async def get_processing_for_command_for_update(self, command_id: str) -> CommandAttempt | None:
+        record = await self._session.scalar(
+            select(CommandAttemptRecord)
+            .where(
+                CommandAttemptRecord.command_id == command_id,
+                CommandAttemptRecord.status == AttemptStatus.PROCESSING,
+            )
+            .order_by(CommandAttemptRecord.attempt_number.desc())
+            .with_for_update()
+            .limit(1)
+        )
+        if record is None:
+            return None
+        return CommandAttempt(
+            id=record.id,
+            command_id=record.command_id,
+            attempt_number=record.attempt_number,
+            status=AttemptStatus(record.status),
+            started_at=record.started_at,
+            finished_at=record.finished_at,
+            error_code=record.error_code,
+        )
 
     async def update(self, attempt: CommandAttempt) -> None:
         record = await self._session.get(CommandAttemptRecord, attempt.id)

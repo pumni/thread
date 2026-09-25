@@ -29,6 +29,22 @@ class CommandRepository(Protocol):
 
     async def get_next_ready_for_update(self, now: datetime) -> Command | None: ...
 
+    async def save_checkpoint_if_leased(
+        self,
+        command_id: str,
+        lease_token: UUID,
+        now: datetime,
+        checkpoint: dict[str, object],
+    ) -> bool: ...
+
+    async def renew_execution_lease(
+        self,
+        command_id: str,
+        lease_token: UUID,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> bool: ...
+
     async def update(self, command: Command) -> None: ...
 
 
@@ -52,6 +68,10 @@ class CommandAttemptRepository(Protocol):
     async def add(self, attempt: CommandAttempt) -> None: ...
 
     async def count_for_command(self, command_id: str) -> int: ...
+
+    async def get_processing_for_command_for_update(
+        self, command_id: str
+    ) -> CommandAttempt | None: ...
 
     async def update(self, attempt: CommandAttempt) -> None: ...
 
