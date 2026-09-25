@@ -18,11 +18,11 @@ Engineering completed:
 - Batch B — Threads API publishing/conversation core;
 - C1 — Distributed Worker Foundation;
 - C2 — Capability Router and per-account execution policy;
-- C3-01 — Windows Worker Agent, profile/session and NetworkProfile foundation.
+- C3 — Windows Worker Agent + fail-closed browser adapter foundation.
 
-The next authorized implementation milestone is **C3-02 — Browser engine ADR and fail-closed browser adapter foundation (#26)**.
+The next authorized implementation milestone is **C4 — Discovery, public-profile enrichment and Leads pipeline (#8)**.
 
-Do not start the Threads UI capability pack, C4 browser enrichment, C5 or C6 until the coordinator explicitly authorizes the corresponding checkpoint.
+C4 is API-first. Do not start C5 browser capability pack, AccountActivityPlan or C6 scheduling/operations until the coordinator explicitly authorizes the corresponding checkpoint.
 
 ## 3. Important merged checkpoints
 
@@ -68,6 +68,12 @@ C3-01 — Windows Worker Agent foundation:
 - Accepted head: 644aedc05b3305bf2e2b05373c863498db5c7873.
 - Merge commit: 6b9984fecf7167ce02389be9bd935983f8ab7f1d.
 - Issue #25 closed completed after coordinator acceptance.
+
+C3-02 — Browser adapter foundation:
+- PR #35 — ADR-0006 selecting Playwright/Chromium, isolated browser infrastructure, versioned synthetic UI contract, typed browser failures, WorkerJob-fenced mutation boundary and restart reconciliation.
+- Accepted head: 1fb1055d4f1680b8d7ac4bbb073e2863b6bde348.
+- Merge commit: 0021517b55b1e7bcddc9f3fd9d2099feb3e0b6ab.
+- Issue #26 closed completed after coordinator acceptance.
 
 ## 4. Current open gates
 
@@ -154,9 +160,9 @@ uv run alembic check
 uv run pytest
 ~~~
 
-At the C3-01 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `644aedc05b3305bf2e2b05373c863498db5c7873`.
+At the C3-02 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `1fb1055d4f1680b8d7ac4bbb073e2863b6bde348`.
 
-Final reported C3-01 local gate: Ruff/format/Pyright/Alembic green, migration downgrade/re-upgrade through revision 0008 green, 108 tests passed, and the native Windows DPAPI persistence/reload test passed locally.
+Final reported C3-02 evidence: locked Playwright/Chromium install green in CI, 121 tests passed with 1 skipped and one upstream Starlette/httpx deprecation warning, targeted browser-adapter suite 14 passed, and no schema migration was required.
 
 ## 8. Threads API baseline
 
@@ -177,13 +183,13 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 ## 9. Next action for a new coordinator
 
 1. Read root `AGENTS.md` and this handoff.
-2. Confirm `main` includes C3-01 merge commit `6b9984fecf7167ce02389be9bd935983f8ab7f1d`.
-3. Inspect issue #26, ADR-0005, Worker Protocol v1/v2, the C3-01 worker/session contracts, and the current WorkerJob lease/recovery code.
-4. Authorize only C3-02: browser-engine ADR plus isolated fail-closed browser lifecycle/navigation/contract adapter.
-5. Reuse C3-01 profile/session/network foundations and C1 WorkerJob fencing rather than creating a parallel execution model.
-6. Stop after #26 for coordinator review before any production Threads UI capability pack.
+2. Confirm `main` includes C3-02 merge commit `0021517b55b1e7bcddc9f3fd9d2099feb3e0b6ab`.
+3. Inspect issue #8, `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/FEATURE_PARITY_MATRIX.md`, existing Threads API ports/adapters, conversation sync persistence and C2 capability routing.
+4. Authorize C4 as API-first discovery: keyword/tag search, public profile/profile posts, mentions, conversation enrichment, dedupe/resume and LeadCandidate persistence.
+5. Keep documentation-contract fixtures clearly labeled; issue #3 remains the required live Meta validation gate before production.
+6. Stop after #8 for coordinator review before C5 browser capability work.
 
-Do not implement production Threads selectors/actions, like/follow, publishing through the UI, anti-detect/fingerprint behavior, or automated challenge bypass in C3-02.
+Do not add production browser enrichment actions in C4 unless separately approved through the capability model; do not implement uncontrolled scraping, DM automation or unrestricted personal-data collection.
 
 ## 10. Coordinator acceptance vocabulary
 
