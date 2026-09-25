@@ -19,7 +19,7 @@ from threads_platform.application.ports.threads import (
     ThreadsTransportError,
 )
 from threads_platform.domain.commands import CommandStatus
-from threads_platform.domain.publishing import ThreadReply
+from threads_platform.domain.publishing import ThreadPost, ThreadReply
 from threads_platform.domain.sync import SyncState
 from threads_platform.infrastructure.persistence.models import (
     ReplyRecord,
@@ -245,6 +245,46 @@ async def test_reply_to_post_and_reply_to_reply_are_persisted_relationally(
         ).parent_reply_id
         == parent.id
     )
+
+
+async def test_reply_to_reply_rejects_parent_from_different_root(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    account_id, root = await seed_account_and_post(unit_of_work_factory)
+    other_root = ThreadPost(
+        account_id=account_id,
+        threads_post_id="other-root-doc-example",
+    )
+    cross_root_parent = ThreadReply(
+        account_id=account_id,
+        threads_reply_id="cross-root-parent-doc-example",
+        root_post_id=other_root.id,
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.posts.add(other_root)
+        await unit_of_work.replies.add(cross_root_parent)
+
+    api = FakeThreadsAPI()
+    clock = FixedClock()
+    runtime = make_runtime(unit_of_work_factory, api, clock)
+    receipt = await runtime.receive(
+        command_body(
+            account_id,
+            clock,
+            "threads.create_reply",
+            {
+                "threads_post_id": root.threads_post_id,
+                "reply_to_reply_id": cross_root_parent.threads_reply_id,
+                "text": "Must not cross conversation roots",
+            },
+        )
+    )
+
+    outcome = await runtime.process(receipt.command_id)
+
+    assert outcome.status is CommandStatus.FAILED_FINAL
+    assert api.created == []
+    assert api.publish_calls == 0
 
 
 async def test_sync_missing_or_deleted_remote_object_is_a_typed_success_result(
