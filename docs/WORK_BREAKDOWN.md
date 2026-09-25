@@ -11,10 +11,11 @@ Completed:
 - C2 PR #33 — issue #24 accepted and merged.
 - C3-01 PR #34 — issue #25 accepted and merged.
 - C3-02 PR #35 — issue #26 accepted and merged.
+- C4 PR #36 — issue #8 accepted and merged.
 
 Current authorized implementation checkpoint:
-- **C4 — Discovery, public-profile enrichment and Leads pipeline**
-  - #8 only
+- **C5-01 — Browser capability pack v1**
+  - #27 only
 
 Issue #3 remains a production/release gate.
 
@@ -117,7 +118,7 @@ Do not expand C3 into the full Threads UI feature set.
 
 Issue #8.
 
-Status: **CURRENT AUTHORIZED CHECKPOINT** after C3 acceptance.
+Status: **ACCEPTED / MERGED** in PR #36, merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 
 Scope:
 - keyword/topic;
@@ -134,8 +135,8 @@ Browser enrichment waits for C3 and must route through C2.
 ## 8. C5 — Browser Capabilities and Account Activity
 
 Issues:
-- #27 capability pack v1;
-- #28 AccountActivityPlan/priority/preemption.
+- #27 capability pack v1 — **CURRENT AUTHORIZED ITEM**;
+- #28 AccountActivityPlan/priority/preemption — not authorized until #27 checkpoint review.
 
 Browser capabilities must be explicit and independently reviewable.
 
