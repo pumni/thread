@@ -12,6 +12,7 @@ from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.application.worker_sessions import WorkerSessionService
 from threads_platform.config.settings import Settings
 from threads_platform.domain.accounts import ThreadsAccount
+from threads_platform.domain.worker_jobs import WorkerJobStatus
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
@@ -103,7 +104,7 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
     presence = await client.hello(
         worker_id,
         agent_version="0.1.0",
-        capabilities=(),
+        capabilities=(("synthetic.echo", 1),),
         max_concurrent_jobs=2,
         max_browser_sessions=3,
         active_browser_sessions=0,
@@ -155,4 +156,47 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
     assert stored is not None
     assert stored.state is BrowserSessionState.LOGIN_REQUIRED
     assert stored.requires_intervention
+
+    queued = await jobs.enqueue("synthetic.echo", 1, account_id=account.id)
+    claimed = await client.claim_next()
+    assert claimed is not None and claimed.job_id == queued.id
+    assert claimed.lease_worker_id == worker_id and claimed.lease_token is not None
+    renewed = await client.renew_job(claimed.job_id, claimed.lease_token)
+    assert renewed.lease_token == claimed.lease_token
+    checkpointed = await client.checkpoint_job(
+        claimed.job_id,
+        claimed.lease_token,
+        {"phase": "BROWSER_PREPARED"},
+    )
+    assert checkpointed.checkpoint == {"phase": "BROWSER_PREPARED"}
+    completed = await client.complete_job(
+        claimed.job_id,
+        claimed.lease_token,
+        {"result_code": "SYNTHETIC_OK"},
+    )
+    assert completed.status is WorkerJobStatus.SUCCEEDED
+
+    retry_job = await jobs.enqueue("synthetic.echo", 1, account_id=account.id)
+    retry_claim = await client.claim_next()
+    assert retry_claim is not None and retry_claim.job_id == retry_job.id
+    assert retry_claim.lease_token is not None
+    failed = await client.fail_job(
+        retry_claim.job_id,
+        retry_claim.lease_token,
+        error_code="SYNTHETIC_RETRYABLE",
+        retryable=False,
+    )
+    assert failed.status is WorkerJobStatus.FAILED_FINAL
+
+    intervention_job = await jobs.enqueue("synthetic.echo", 1, account_id=account.id)
+    intervention_claim = await client.claim_next()
+    assert intervention_claim is not None and intervention_claim.job_id == intervention_job.id
+    assert intervention_claim.lease_token is not None
+    waiting = await client.request_intervention(
+        intervention_claim.job_id,
+        intervention_claim.lease_token,
+        intervention_type="CHALLENGE_REQUIRED",
+        detail_code="CHALLENGE_REQUIRED",
+    )
+    assert waiting.status is WorkerJobStatus.WAITING_INTERVENTION
     await client.aclose()

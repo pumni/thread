@@ -17,7 +17,7 @@ from threads_platform.application.ports.worker_agent import (
     WorkerControlClientError,
     WorkerJobSnapshot,
 )
-from threads_platform.domain.worker_jobs import WorkerJobStatus
+from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
 from threads_platform.domain.workers import NetworkProfile, NetworkProtocol, WorkerStatus
 from threads_platform.infrastructure.security.worker_auth import challenge_message
 from threads_platform.workers.key_store import WorkerDeviceIdentity
@@ -211,6 +211,89 @@ class HttpWorkerControlClient:
         )
         return None if response is None else _job_snapshot(response)
 
+    async def renew_job(self, job_id: UUID, lease_token: UUID) -> WorkerJobSnapshot:
+        response = await self._request(
+            "POST",
+            f"/v1/workers/jobs/{job_id}/renew",
+            json={"lease_token": str(lease_token)},
+            authenticated=True,
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return _job_snapshot(response)
+
+    async def checkpoint_job(
+        self, job_id: UUID, lease_token: UUID, checkpoint: dict[str, object]
+    ) -> WorkerJobSnapshot:
+        response = await self._request(
+            "POST",
+            f"/v1/workers/jobs/{job_id}/checkpoint",
+            json={"lease_token": str(lease_token), "checkpoint": checkpoint},
+            authenticated=True,
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return _job_snapshot(response)
+
+    async def complete_job(
+        self, job_id: UUID, lease_token: UUID, result: dict[str, object]
+    ) -> WorkerJobSnapshot:
+        response = await self._request(
+            "POST",
+            f"/v1/workers/jobs/{job_id}/complete",
+            json={"lease_token": str(lease_token), "result": result},
+            authenticated=True,
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return _job_snapshot(response)
+
+    async def fail_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        error_code: str,
+        retryable: bool,
+        outcome_ambiguous: bool = False,
+    ) -> WorkerJobSnapshot:
+        response = await self._request(
+            "POST",
+            f"/v1/workers/jobs/{job_id}/fail",
+            json={
+                "lease_token": str(lease_token),
+                "error_code": error_code,
+                "retryable": retryable,
+                "outcome_ambiguous": outcome_ambiguous,
+            },
+            authenticated=True,
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return _job_snapshot(response)
+
+    async def request_intervention(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        intervention_type: str,
+        detail_code: str,
+    ) -> WorkerJobSnapshot:
+        response = await self._request(
+            "POST",
+            f"/v1/workers/jobs/{job_id}/interventions",
+            json={
+                "lease_token": str(lease_token),
+                "intervention_type": intervention_type,
+                "detail_code": detail_code,
+            },
+            authenticated=True,
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return _job_snapshot(response)
+
     async def account_context(self, account_id: UUID) -> WorkerAccountContext:
         response = await self._request(
             "GET",
@@ -331,8 +414,10 @@ def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
             status=WorkerJobStatus(_text_field(payload, "status")),
             account_id=_optional_uuid_field(payload, "account_id"),
             assigned_worker_id=_optional_uuid_field(payload, "assigned_worker_id"),
+            lease_worker_id=_optional_uuid_field(payload, "lease_worker_id"),
             lease_token=_optional_uuid_field(payload, "lease_token"),
             lease_expires_at=_optional_datetime_field(payload, "lease_expires_at"),
+            retry_safety=WorkerJobRetrySafety(_text_field(payload, "retry_safety")),
             checkpoint=_optional_object_field(payload, "checkpoint"),
         )
     except (ValueError, TypeError) as error:

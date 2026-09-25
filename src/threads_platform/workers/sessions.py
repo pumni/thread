@@ -36,6 +36,7 @@ _SESSION_TRANSITIONS: dict[BrowserSessionState, frozenset[BrowserSessionState]] 
     BrowserSessionState.AUTHENTICATED: frozenset(
         {
             BrowserSessionState.BUSY,
+            BrowserSessionState.LOGIN_REQUIRED,
             BrowserSessionState.SESSION_EXPIRED,
             BrowserSessionState.CHALLENGE_REQUIRED,
             BrowserSessionState.ERROR,
@@ -45,6 +46,7 @@ _SESSION_TRANSITIONS: dict[BrowserSessionState, frozenset[BrowserSessionState]] 
     BrowserSessionState.BUSY: frozenset(
         {
             BrowserSessionState.AUTHENTICATED,
+            BrowserSessionState.LOGIN_REQUIRED,
             BrowserSessionState.SESSION_EXPIRED,
             BrowserSessionState.CHALLENGE_REQUIRED,
             BrowserSessionState.ERROR,
