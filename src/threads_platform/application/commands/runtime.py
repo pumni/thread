@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -7,7 +8,12 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from threads_platform.application.clock import Clock, SystemClock
-from threads_platform.application.commands.handlers import CommandExecutionContext, CommandHandler
+from threads_platform.application.commands.handlers import (
+    CommandCheckpoint,
+    CommandExecutionContext,
+    CommandExecutionOutput,
+    CommandHandler,
+)
 from threads_platform.application.crm_protocol_v1 import (
     COMMAND_ENVELOPE_ADAPTER,
     CommandEnvelopeHeader,
@@ -19,6 +25,7 @@ from threads_platform.application.crm_protocol_v1 import (
 from threads_platform.application.errors import (
     CommandInputError,
     CommandNotFound,
+    ExecutionLeaseLost,
     IdempotencyConflict,
     PermanentCommandError,
     RetryableCommandError,
@@ -44,6 +51,13 @@ class CommandExecutionResult:
     executed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionClaim:
+    command: Command
+    lease_token: UUID
+    attempt_number: int
+
+
 class CommandRuntime:
     def __init__(
         self,
@@ -54,17 +68,23 @@ class CommandRuntime:
         retry_policy: RetryPolicy | None = None,
         max_command_lifetime: timedelta = timedelta(minutes=15),
         delivery_lifetime: timedelta = timedelta(hours=24),
+        execution_lease_duration: timedelta = timedelta(minutes=2),
         crm_destination: str = "crm",
         event_id_factory: Callable[[], UUID] = uuid4,
     ) -> None:
-        if max_command_lifetime <= timedelta(0) or delivery_lifetime <= timedelta(0):
-            raise ValueError("command and delivery lifetimes must be positive")
+        if (
+            max_command_lifetime <= timedelta(0)
+            or delivery_lifetime <= timedelta(0)
+            or execution_lease_duration <= timedelta(0)
+        ):
+            raise ValueError("command, delivery, and execution lease lifetimes must be positive")
         self._unit_of_work_factory = unit_of_work_factory
         self._handlers = dict(handlers)
         self._clock = clock or SystemClock()
         self._retry_policy = retry_policy or RetryPolicy()
         self._max_command_lifetime = max_command_lifetime
         self._delivery_lifetime = delivery_lifetime
+        self._execution_lease_duration = execution_lease_duration
         self._crm_destination = crm_destination
         self._event_id_factory = event_id_factory
 
@@ -143,7 +163,12 @@ class CommandRuntime:
             command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
             if command is None:
                 raise CommandNotFound(command_id)
-            return await self._process_locked(unit_of_work, command)
+            claim_or_result = await self._claim_locked(
+                unit_of_work, command, normalize_utc(self._clock.now())
+            )
+        if isinstance(claim_or_result, CommandExecutionResult):
+            return claim_or_result
+        return await self._execute_claim(claim_or_result)
 
     async def process_next(self) -> CommandExecutionResult | None:
         now = normalize_utc(self._clock.now())
@@ -151,21 +176,45 @@ class CommandRuntime:
             command = await unit_of_work.commands.get_next_ready_for_update(now)
             if command is None:
                 return None
-            return await self._process_locked(unit_of_work, command)
+            claim_or_result = await self._claim_locked(unit_of_work, command, now)
+        if isinstance(claim_or_result, CommandExecutionResult):
+            return claim_or_result
+        return await self._execute_claim(claim_or_result)
 
-    async def _process_locked(
-        self, unit_of_work: UnitOfWork, command: Command
-    ) -> CommandExecutionResult:
+    async def _claim_locked(
+        self,
+        unit_of_work: UnitOfWork,
+        command: Command,
+        now: datetime,
+    ) -> _ExecutionClaim | CommandExecutionResult:
         if command.status in self._terminal_statuses():
             return CommandExecutionResult(command.command_id, command.status, executed=False)
 
-        now = normalize_utc(self._clock.now())
+        previous_attempt: CommandAttempt | None = None
+        if command.status == CommandStatus.PROCESSING:
+            if (
+                command.execution_lease_expires_at is not None
+                and command.execution_lease_expires_at > now
+            ):
+                return CommandExecutionResult(command.command_id, command.status, executed=False)
+            previous_attempt = await unit_of_work.attempts.get_processing_for_command_for_update(
+                command.command_id
+            )
+            if previous_attempt is None:
+                raise RuntimeError("expired command lease has no processing attempt")
+
         if command.deadline_at is not None and now >= command.deadline_at:
+            if previous_attempt is not None:
+                previous_attempt.status = AttemptStatus.FAILED_FINAL
+                previous_attempt.finished_at = now
+                previous_attempt.error_code = "COMMAND_EXPIRED"
+                await unit_of_work.attempts.update(previous_attempt)
             command.transition(
                 CommandStatus.EXPIRED,
                 now,
                 error_code="COMMAND_EXPIRED",
             )
+            self._clear_execution_lease(command)
             await unit_of_work.commands.update(command)
             await self._enqueue_result(unit_of_work, command, now)
             return CommandExecutionResult(command.command_id, command.status, executed=False)
@@ -177,82 +226,247 @@ class CommandRuntime:
         ):
             return CommandExecutionResult(command.command_id, command.status, executed=False)
 
+        attempt_count = await unit_of_work.attempts.count_for_command(command.command_id)
+        if previous_attempt is not None:
+            if attempt_count >= self._retry_policy.max_attempts:
+                previous_attempt.status = AttemptStatus.FAILED_FINAL
+                previous_attempt.finished_at = now
+                previous_attempt.error_code = "EXECUTION_LEASE_EXPIRED"
+                await unit_of_work.attempts.update(previous_attempt)
+                command.transition(
+                    CommandStatus.FAILED_FINAL,
+                    now,
+                    error_code="EXECUTION_LEASE_EXPIRED",
+                )
+                self._clear_execution_lease(command)
+                await unit_of_work.commands.update(command)
+                await self._enqueue_result(unit_of_work, command, now)
+                return CommandExecutionResult(command.command_id, command.status, executed=False)
+            previous_attempt.status = AttemptStatus.FAILED_RETRYABLE
+            previous_attempt.finished_at = now
+            previous_attempt.error_code = "EXECUTION_LEASE_EXPIRED"
+            await unit_of_work.attempts.update(previous_attempt)
+
         if command.status == CommandStatus.RECEIVED:
             command.transition(CommandStatus.VALIDATED, now)
-            await unit_of_work.commands.update(command)
 
         handler = self._handlers.get(command.command_type)
         if handler is None:
+            unavailable_status = (
+                CommandStatus.FAILED_FINAL
+                if command.status == CommandStatus.PROCESSING
+                else CommandStatus.REJECTED
+            )
             command.transition(
-                CommandStatus.REJECTED,
+                unavailable_status,
                 now,
                 error_code="HANDLER_UNAVAILABLE",
             )
+            self._clear_execution_lease(command)
             await unit_of_work.commands.update(command)
             await self._enqueue_result(unit_of_work, command, now)
             return CommandExecutionResult(command.command_id, command.status, executed=False)
 
-        typed_command = self._rebuild_envelope(command)
-        command.transition(CommandStatus.PROCESSING, now)
-        await unit_of_work.commands.update(command)
-        attempt_number = await unit_of_work.attempts.count_for_command(command.command_id) + 1
+        if previous_attempt is not None:
+            command.reclaim(now)
+        else:
+            command.transition(CommandStatus.PROCESSING, now)
+        attempt_number = attempt_count + 1
+        lease_token = uuid4()
+        command.execution_lease_token = lease_token
+        command.execution_lease_expires_at = now + self._execution_lease_duration
         attempt = CommandAttempt(command.command_id, attempt_number, started_at=now)
         await unit_of_work.attempts.add(attempt)
-        context = CommandExecutionContext(posts=unit_of_work.posts, replies=unit_of_work.replies)
+        await unit_of_work.commands.update(command)
+        return _ExecutionClaim(command, lease_token, attempt_number)
 
+    async def _execute_claim(self, claim: _ExecutionClaim) -> CommandExecutionResult:
+        command = claim.command
+        handler = self._handlers[command.command_type]
+
+        async def persist_checkpoint(data: dict[str, object]) -> bool:
+            now = normalize_utc(self._clock.now())
+            async with self._unit_of_work_factory() as unit_of_work:
+                return await unit_of_work.commands.save_checkpoint_if_leased(
+                    command.command_id, claim.lease_token, now, data
+                )
+
+        context = CommandExecutionContext(
+            attempt_number=claim.attempt_number,
+            checkpoint=CommandCheckpoint(dict(command.checkpoint or {}), persist_checkpoint),
+        )
         try:
-            async with unit_of_work.savepoint():
-                result = await handler.execute(typed_command, context)
+            output = await self._execute_with_heartbeat(
+                handler, self._rebuild_envelope(command), context, claim
+            )
+        except ExecutionLeaseLost:
+            return await self._current_result(command.command_id)
         except RetryableCommandError as error:
-            retry_at = self._retry_policy.next_attempt_at(
-                attempt_number,
-                now,
-                command.deadline_at or now + self._max_command_lifetime,
-                retry_after=error.retry_after,
+            return await self._finish_failure(
+                claim, error.code, retryable=True, retry_after=error.retry_after
+            )
+        except PermanentCommandError as error:
+            return await self._finish_failure(claim, error.code, retryable=False)
+        except Exception:
+            return await self._finish_failure(claim, "UNEXPECTED_HANDLER_ERROR", retryable=True)
+        return await self._finish_success(claim, output)
+
+    async def _execute_with_heartbeat(
+        self,
+        handler: CommandHandler,
+        command: CommandEnvelopeV1,
+        context: CommandExecutionContext,
+        claim: _ExecutionClaim,
+    ) -> CommandExecutionOutput:
+        handler_task = asyncio.create_task(handler.execute(command, context))
+        heartbeat_task = asyncio.create_task(self._maintain_lease(claim))
+        try:
+            done, _ = await asyncio.wait(
+                {handler_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if heartbeat_task in done:
+                await heartbeat_task
+            return await handler_task
+        finally:
+            for task in (handler_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(handler_task, heartbeat_task, return_exceptions=True)
+
+    async def _maintain_lease(self, claim: _ExecutionClaim) -> None:
+        interval = max(self._execution_lease_duration.total_seconds() / 3, 0.05)
+        while True:
+            await asyncio.sleep(interval)
+            now = normalize_utc(self._clock.now())
+            async with self._unit_of_work_factory() as unit_of_work:
+                renewed = await unit_of_work.commands.renew_execution_lease(
+                    claim.command.command_id,
+                    claim.lease_token,
+                    now,
+                    now + self._execution_lease_duration,
+                )
+            if not renewed:
+                raise ExecutionLeaseLost("command execution lease could not be renewed")
+
+    async def _finish_success(
+        self, claim: _ExecutionClaim, output: CommandExecutionOutput
+    ) -> CommandExecutionResult:
+        now = normalize_utc(self._clock.now())
+        async with self._unit_of_work_factory() as unit_of_work:
+            command = await unit_of_work.commands.get_by_command_id_for_update(
+                claim.command.command_id
+            )
+            attempt = await unit_of_work.attempts.get_processing_for_command_for_update(
+                claim.command.command_id
+            )
+            if command is None or attempt is None:
+                return CommandExecutionResult(
+                    claim.command.command_id, CommandStatus.FAILED_FINAL, executed=False
+                )
+            if not self._owns_claim(command, attempt, claim, now):
+                return CommandExecutionResult(
+                    claim.command.command_id,
+                    command.status,
+                    executed=False,
+                )
+            for post in output.posts:
+                await unit_of_work.posts.add(post)
+            for reply in output.replies:
+                await unit_of_work.replies.add(reply)
+            command.transition(CommandStatus.SUCCEEDED, now, result=output.result)
+            self._clear_execution_lease(command)
+            attempt.status = AttemptStatus.SUCCEEDED
+            attempt.finished_at = now
+            await unit_of_work.attempts.update(attempt)
+            await unit_of_work.commands.update(command)
+            await self._enqueue_result(unit_of_work, command, now)
+            return CommandExecutionResult(command.command_id, command.status, executed=True)
+
+    async def _finish_failure(
+        self,
+        claim: _ExecutionClaim,
+        error_code: str,
+        *,
+        retryable: bool,
+        retry_after: timedelta | None = None,
+    ) -> CommandExecutionResult:
+        now = normalize_utc(self._clock.now())
+        async with self._unit_of_work_factory() as unit_of_work:
+            command = await unit_of_work.commands.get_by_command_id_for_update(
+                claim.command.command_id
+            )
+            attempt = await unit_of_work.attempts.get_processing_for_command_for_update(
+                claim.command.command_id
+            )
+            if command is None or attempt is None:
+                return CommandExecutionResult(
+                    claim.command.command_id, CommandStatus.FAILED_FINAL, executed=False
+                )
+            if not self._owns_claim(command, attempt, claim, now):
+                return CommandExecutionResult(
+                    claim.command.command_id,
+                    command.status,
+                    executed=False,
+                )
+            deadline = command.deadline_at or now + self._max_command_lifetime
+            retry_at = (
+                self._retry_policy.next_attempt_at(
+                    claim.attempt_number,
+                    now,
+                    deadline,
+                    retry_after=retry_after,
+                )
+                if retryable
+                else None
             )
             if retry_at is None:
-                command.transition(
-                    CommandStatus.FAILED_FINAL,
-                    now,
-                    error_code=error.code,
-                )
+                command.transition(CommandStatus.FAILED_FINAL, now, error_code=error_code)
                 attempt.status = AttemptStatus.FAILED_FINAL
             else:
                 command.transition(
                     CommandStatus.FAILED_RETRYABLE,
                     now,
-                    error_code=error.code,
+                    error_code=error_code,
                     next_retry_at=retry_at,
                 )
                 attempt.status = AttemptStatus.FAILED_RETRYABLE
+            self._clear_execution_lease(command)
             attempt.finished_at = now
-            attempt.error_code = error.code
+            attempt.error_code = error_code
             await unit_of_work.attempts.update(attempt)
             await unit_of_work.commands.update(command)
             if command.status == CommandStatus.FAILED_FINAL:
                 await self._enqueue_result(unit_of_work, command, now)
             return CommandExecutionResult(command.command_id, command.status, executed=True)
-        except PermanentCommandError as error:
-            command.transition(
-                CommandStatus.FAILED_FINAL,
-                now,
-                error_code=error.code,
-            )
-            attempt.status = AttemptStatus.FAILED_FINAL
-            attempt.finished_at = now
-            attempt.error_code = error.code
-            await unit_of_work.attempts.update(attempt)
-            await unit_of_work.commands.update(command)
-            await self._enqueue_result(unit_of_work, command, now)
-            return CommandExecutionResult(command.command_id, command.status, executed=True)
 
-        command.transition(CommandStatus.SUCCEEDED, now, result=result)
-        attempt.status = AttemptStatus.SUCCEEDED
-        attempt.finished_at = now
-        await unit_of_work.attempts.update(attempt)
-        await unit_of_work.commands.update(command)
-        await self._enqueue_result(unit_of_work, command, now)
-        return CommandExecutionResult(command.command_id, command.status, executed=True)
+    async def _current_result(self, command_id: str) -> CommandExecutionResult:
+        async with self._unit_of_work_factory() as unit_of_work:
+            command = await unit_of_work.commands.get_by_command_id(command_id)
+        if command is None:
+            raise CommandNotFound(command_id)
+        return CommandExecutionResult(command_id, command.status, executed=False)
+
+    @staticmethod
+    def _owns_claim(
+        command: Command | None,
+        attempt: CommandAttempt | None,
+        claim: _ExecutionClaim,
+        now: datetime,
+    ) -> bool:
+        return (
+            command is not None
+            and attempt is not None
+            and attempt.attempt_number == claim.attempt_number
+            and command.status == CommandStatus.PROCESSING
+            and command.execution_lease_token == claim.lease_token
+            and command.execution_lease_expires_at is not None
+            and command.execution_lease_expires_at > now
+        )
+
+    @staticmethod
+    def _clear_execution_lease(command: Command) -> None:
+        command.execution_lease_token = None
+        command.execution_lease_expires_at = None
 
     async def _enqueue_result(
         self,
