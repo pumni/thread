@@ -56,6 +56,31 @@ Security requirements:
 
 Exact algorithms/key storage must be documented in the implementation PR and security-reviewed.
 
+### C1 implementation binding
+
+- Device identity uses Ed25519 (RFC 8032) through the `cryptography` Python package. The
+  worker generates the keypair locally and sends only the 32-byte raw public key during
+  enrollment. PostgreSQL stores that public key; it has no private-key column.
+- The signed challenge message is the UTF-8 bytes of
+  `threads-platform-worker-auth-v1\n{canonical-lowercase-worker-challenge-uuid}\n{nonce}`.
+  The nonce is 256 bits of random URL-safe text. Challenges expire after one minute and are
+  consumed under a row lock; a failed signature consumes the challenge too.
+- Enrollment codes and access tokens each contain 256 bits of random material. Enrollment
+  codes expire after ten minutes and are single-use. PostgreSQL stores SHA-256 digests of
+  enrollment codes and access tokens, never their raw values. Worker sessions expire after
+  fifteen minutes.
+- `WorkerKeyStore` is the worker-side secure-storage boundary. The later Windows adapter
+  will protect the generated private key with DPAPI and expose signing operations without
+  returning key bytes. C1 includes the interface and in-memory signer; it does not persist
+  private key material.
+- Worker HTTPS and WSS routes reject non-TLS ASGI schemes by default. TLS terminates at the
+  trusted deployment ingress. Workers must retain normal certificate verification. WSS
+  authenticates with the `Authorization: Bearer` header, never a query parameter.
+- C1 supports protocol version 1 and capability schema version 1. Unsupported versions put
+  the worker in `UPGRADE_REQUIRED`. Heartbeat presence expires after 90 seconds and the
+  Control Plane marks stale ONLINE/DEGRADED workers OFFLINE. WSS notifications are process
+  local and advisory; workers recover from PostgreSQL-backed HTTPS operations.
+
 ## 5. Worker states
 
 - REGISTERING
@@ -156,6 +181,22 @@ All state-mutating job requests require:
 - current lease_token;
 - protocol version where applicable.
 
+### C1 route mapping
+
+- `POST /v1/workers/jobs/claim` returns one claimed job or HTTP 204 when none is eligible.
+- `GET /v1/workers/jobs/reconcile` returns the worker's owned or claimable durable jobs.
+- `POST /v1/workers/jobs/{job_id}/renew`
+- `POST /v1/workers/jobs/{job_id}/checkpoint`
+- `POST /v1/workers/jobs/{job_id}/complete`
+- `POST /v1/workers/jobs/{job_id}/fail`
+- `POST /v1/workers/jobs/{job_id}/interventions`
+- `POST /v1/workers/interventions/{intervention_id}/resolve` (Control Plane administrator)
+
+Every worker route uses the short-lived bearer session from the challenge exchange. The
+intervention resolution route uses the configured Control Plane administrator credential.
+Workers should poll claim/reconcile over HTTPS after reconnect and periodically while online;
+they must treat `job.available` only as a prompt to pull durable state.
+
 ## 9. WorkerJob claim
 
 Eligibility checks:
@@ -205,11 +246,18 @@ A stale worker receives a lease-lost response and cannot overwrite newer state.
 ## 12. Retry/reclaim
 
 RUNNING job with expired lease:
-- prior attempt is closed as retryable/final according to policy;
-- job may become reclaimable;
-- new claim receives a different lease token.
+- a `SAFE_TO_RETRY` job can be reclaimed within its attempt bound;
+- a `RECONCILIATION_REQUIRED` job enters `WAITING_INTERVENTION` instead of being replayed;
+- the previous attempt is closed and a later safe requeue creates a new attempt;
+- every new claim receives a different lease token.
 
 Old token never becomes valid again.
+
+Explicit retryable failures use a two-second default delay and the default attempt bound is three.
+An operator requeue after an ambiguous outcome requires explicit confirmation that retry is safe.
+Expired deadlines finalize the job and its linked Command; an open intervention is cancelled.
+Checkpoint and result documents are bounded to 64 KiB and reject recognized secret-bearing keys
+and URLs containing credentials.
 
 ## 13. Intervention
 
