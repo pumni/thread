@@ -31,6 +31,7 @@ No API calls were made with a development account. No response fixtures were cap
 - Scrubbed live request/response fixtures: **not available**; no live fixtures were fabricated from example schemas. Mock tests use documentation-contract fixtures only.
 - `FEATURE_PARITY_MATRIX.md`: repost is now marked **VERIFY** because the documented endpoint has no safe lost-response reconciliation contract; quote-post remains documented. Live permissions and behavior remain unverified.
 - TP-005/TP-006 implementation against the documented contract is authorized. TP-002 remains a **production/release gate**, not a coding gate. No undocumented response behavior or browser automation is assumed.
+- Threads command handlers obtain a `SecretStr` through an injected access-token provider. This batch does not implement credential storage, OAuth exchange, or refresh coordination; those remain outside this code scope and require TP-002/operations review before production.
 
 To complete TP-002 before production/release certification, use a dedicated development app/account and record only scrubbed evidence. Still requiring live verification: **effective OAuth scopes; refresh response and token lifecycle; actual quota; Meta error payload/status/header behavior; account-specific permissions; actual media processing behavior; and moderation permissions**. Never record tokens, app secrets, authorization codes, or sensitive account identifiers.
 
