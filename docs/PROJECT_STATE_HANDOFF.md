@@ -18,11 +18,12 @@ Engineering completed:
 - Batch B — Threads API publishing/conversation core;
 - C1 — Distributed Worker Foundation;
 - C2 — Capability Router and per-account execution policy;
-- C3 — Windows Worker Agent + fail-closed browser adapter foundation.
+- C3 — Windows Worker Agent + fail-closed browser adapter foundation;
+- C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-The next authorized implementation milestone is **C4 — Discovery, public-profile enrichment and Leads pipeline (#8)**.
+The next authorized implementation milestone is **C5-01 — Browser capability pack v1 (#27)**.
 
-C4 is API-first. Do not start C5 browser capability pack, AccountActivityPlan or C6 scheduling/operations until the coordinator explicitly authorizes the corresponding checkpoint.
+Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or production release work until the coordinator explicitly authorizes the corresponding checkpoint.
 
 ## 3. Important merged checkpoints
 
@@ -74,6 +75,13 @@ C3-02 — Browser adapter foundation:
 - Accepted head: 1fb1055d4f1680b8d7ac4bbb073e2863b6bde348.
 - Merge commit: 0021517b55b1e7bcddc9f3fd9d2099feb3e0b6ab.
 - Issue #26 closed completed after coordinator acceptance.
+
+C4 — API-first Discovery and Leads:
+- PR #36 — typed discovery commands, keyword/tag search, public profile/profile-post/mentions/conversation enrichment, durable cursor resume, canonical dedupe/provenance and audited LeadCandidate lifecycle.
+- Accepted head: 9119bbcd754abd969c99ff7388b7ab221857dca1.
+- Merge commit: 3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9.
+- Issue #8 closed completed after coordinator acceptance.
+- Issue #3 remains open for live Meta verification; C4 repository fixtures are documentation-contract evidence only.
 
 ## 4. Current open gates
 
@@ -160,9 +168,9 @@ uv run alembic check
 uv run pytest
 ~~~
 
-At the C3-02 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `1fb1055d4f1680b8d7ac4bbb073e2863b6bde348`.
+At the C4 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `9119bbcd754abd969c99ff7388b7ab221857dca1`.
 
-Final reported C3-02 evidence: locked Playwright/Chromium install green in CI, 121 tests passed with 1 skipped and one upstream Starlette/httpx deprecation warning, targeted browser-adapter suite 14 passed, and no schema migration was required.
+Final reported C4 evidence: 142 local tests passed, C4 PostgreSQL/migration suite 10 passed, migration 0009 downgrade/re-upgrade passed, crash rollback/replay and monotonic canonical enrichment regressions passed.
 
 ## 8. Threads API baseline
 
@@ -183,13 +191,13 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 ## 9. Next action for a new coordinator
 
 1. Read root `AGENTS.md` and this handoff.
-2. Confirm `main` includes C3-02 merge commit `0021517b55b1e7bcddc9f3fd9d2099feb3e0b6ab`.
-3. Inspect issue #8, `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/FEATURE_PARITY_MATRIX.md`, existing Threads API ports/adapters, conversation sync persistence and C2 capability routing.
-4. Authorize C4 as API-first discovery: keyword/tag search, public profile/profile posts, mentions, conversation enrichment, dedupe/resume and LeadCandidate persistence.
-5. Keep documentation-contract fixtures clearly labeled; issue #3 remains the required live Meta validation gate before production.
-6. Stop after #8 for coordinator review before C5 browser capability work.
+2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
+3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
+4. Authorize only C5-01: explicit browser capability contracts and the first reviewed capability pack.
+5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
+6. Stop after #27 for coordinator review before #28 AccountActivityPlan/preemption.
 
-Do not add production browser enrichment actions in C4 unless separately approved through the capability model; do not implement uncontrolled scraping, DM automation or unrestricted personal-data collection.
+Do not guess production Threads selectors from synthetic fixtures. Any production UI contract must be based on reviewed observed UI evidence and must fail closed when the contract does not match.
 
 ## 10. Coordinator acceptance vocabulary
 
