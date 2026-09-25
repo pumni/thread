@@ -367,9 +367,15 @@ PostgreSQL remains authoritative.
 Control Plane stores logical references, not Windows paths.
 
 Example:
-- profile_ref = profile://<account_uuid>
+- profile_ref = profile-<account_uuid>
 
 Worker resolves the logical ref under its own local data root.
+
+The Windows Worker Agent defaults to `%LOCALAPPDATA%/ThreadsOperations` and keeps paths in
+worker infrastructure. Profile directories are derived beneath that root from `worker_id` and
+the logical `profile_ref`; durable profile ownership prevents one account from claiming
+another account's local directory. C3-01 defines session lifecycle and status reporting only;
+it does not launch a browser engine.
 
 Target session states:
 - UNINITIALIZED
@@ -383,6 +389,8 @@ Target session states:
 - STOPPED
 
 Login/challenge handling is human-assisted. No automatic challenge bypass.
+Session state and its intervention-required flag are persisted by the Control Plane. The
+worker keeps a bounded local report journal and retries durable HTTPS reports after reconnect.
 
 ## 18. NetworkProfile
 
@@ -433,6 +441,9 @@ Worker config:
 - current active sessions
 - resource health
 
+Protocol v2 reports aggregate browser-session capacity independently from generic WorkerJob
+concurrency. Protocol v1 workers remain compatible and report no browser-session summary.
+
 ### Account coordination
 At most one mutating browser job for one account at a time.
 
@@ -475,6 +486,7 @@ Expected future tables:
 - worker_jobs
 - worker_job_attempts
 - worker_interventions
+- worker_account_sessions
 - discovery_campaigns
 - discovered_threads
 - discovered_authors

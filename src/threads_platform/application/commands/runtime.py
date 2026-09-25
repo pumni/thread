@@ -33,6 +33,7 @@ from threads_platform.application.errors import (
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.application.retry import RetryPolicy
 from threads_platform.application.worker_jobs import WorkerJobService
+from threads_platform.application.worker_protocol import is_worker_protocol_supported
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.capabilities import (
     CapabilityExecutor,
@@ -371,8 +372,9 @@ class CommandRuntime:
                     and worker.status.value == "ONLINE"
                     and worker.presence_expires_at is not None
                     and worker.presence_expires_at > now
-                    and worker.protocol_version == 1
-                    and worker.capabilities_schema_version == 1
+                    and is_worker_protocol_supported(
+                        worker.protocol_version, worker.capabilities_schema_version
+                    )
                 ),
                 worker_advertises_capability=advertises_capability,
                 account_mutation_busy=account_mutation_busy,

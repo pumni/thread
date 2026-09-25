@@ -47,6 +47,7 @@ from threads_platform.domain.worker_jobs import (
     WorkerJobStatus,
 )
 from threads_platform.domain.workers import (
+    BrowserSessionState,
     NetworkProtocol,
     WorkerStatus,
 )
@@ -442,6 +443,17 @@ class WorkerNodeRecord(Base):
     __table_args__ = (
         CheckConstraint("max_concurrent_jobs > 0", name="ck_worker_nodes_positive_capacity"),
         CheckConstraint(
+            "max_browser_sessions > 0", name="ck_worker_nodes_positive_browser_capacity"
+        ),
+        CheckConstraint(
+            "active_browser_sessions >= 0",
+            name="ck_worker_nodes_nonnegative_active_browser_sessions",
+        ),
+        CheckConstraint(
+            "active_browser_sessions <= max_browser_sessions",
+            name="ck_worker_nodes_active_within_browser_capacity",
+        ),
+        CheckConstraint(
             "capabilities_schema_version IS NULL OR capabilities_schema_version > 0",
             name="ck_worker_nodes_capabilities_schema_version",
         ),
@@ -465,6 +477,12 @@ class WorkerNodeRecord(Base):
     )
     max_concurrent_jobs: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1")
+    )
+    max_browser_sessions: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    active_browser_sessions: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
     )
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     presence_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -804,6 +822,13 @@ class AccountWorkerAssignmentRecord(Base):
             unique=True,
             postgresql_where=text("is_active"),
         ),
+        Index(
+            "uq_account_worker_assignments_active_profile",
+            "worker_id",
+            "profile_ref",
+            unique=True,
+            postgresql_where=text("is_active"),
+        ),
         Index("ix_account_worker_assignments_worker_active", "worker_id", "is_active"),
     )
 
@@ -821,3 +846,44 @@ class AccountWorkerAssignmentRecord(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkerAccountSessionRecord(Base):
+    __tablename__ = "worker_account_sessions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["worker_id", "profile_ref"],
+            ["browser_profiles.worker_id", "browser_profiles.profile_ref"],
+            ondelete="RESTRICT",
+            name="fk_worker_account_session_profile",
+        ),
+        CheckConstraint("revision > 0", name="ck_worker_account_sessions_positive_revision"),
+        CheckConstraint(
+            "state IN ('UNINITIALIZED', 'LOGIN_REQUIRED', 'STARTING', 'AUTHENTICATED', 'BUSY', "
+            "'SESSION_EXPIRED', 'CHALLENGE_REQUIRED', 'ERROR', 'STOPPED')",
+            name="ck_worker_account_sessions_state",
+        ),
+        CheckConstraint(
+            "intervention_required = (state IN ('LOGIN_REQUIRED', 'SESSION_EXPIRED', "
+            "'CHALLENGE_REQUIRED'))",
+            name="ck_worker_account_sessions_intervention_state",
+        ),
+        Index("ix_worker_account_sessions_worker", "worker_id"),
+    )
+
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("threads_accounts.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    worker_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    profile_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    state: Mapped[BrowserSessionState] = mapped_column(String(40), nullable=False)
+    intervention_required: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

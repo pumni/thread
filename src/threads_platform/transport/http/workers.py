@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import binascii
@@ -6,7 +8,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Response, WebSocket
 from fastapi.responses import JSONResponse
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from threads_platform.application.worker_control import (
     WorkerControlError,
@@ -15,8 +17,17 @@ from threads_platform.application.worker_control import (
 )
 from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
 from threads_platform.application.worker_notifications import WorkerNotificationHub
+from threads_platform.application.worker_sessions import (
+    WorkerSessionControlError,
+    WorkerSessionService,
+)
 from threads_platform.domain.worker_jobs import WorkerJob, WorkerJobRetrySafety, WorkerJobStatus
-from threads_platform.domain.workers import WorkerCapability
+from threads_platform.domain.workers import (
+    BrowserSessionState,
+    NetworkProtocol,
+    WorkerAccountSession,
+    WorkerCapability,
+)
 from threads_platform.transport.http.auth import CommandAuthenticator
 
 
@@ -41,6 +52,7 @@ class EnrollWorkerRequest(_WorkerRequest):
     platform: str = Field(min_length=1, max_length=80)
     public_key: str = Field(min_length=40, max_length=64)
     max_concurrent_jobs: int = Field(default=1, ge=1, le=1000)
+    max_browser_sessions: int = Field(default=1, ge=1, le=1000)
 
 
 class EnrollWorkerResponse(BaseModel):
@@ -84,11 +96,28 @@ class WorkerHelloRequest(_WorkerRequest):
     hostname: str | None = Field(default=None, min_length=1, max_length=255)
     platform: str | None = Field(default=None, min_length=1, max_length=80)
     max_concurrent_jobs: int | None = Field(default=None, ge=1, le=1000)
+    max_browser_sessions: int | None = Field(default=None, ge=1, le=1000)
+    active_browser_sessions: int | None = Field(default=None, ge=0, le=1000)
     healthy: bool = True
+
+    @model_validator(mode="after")
+    def require_v2_capacity_summary(self) -> WorkerHelloRequest:
+        if self.protocol_version == 2 and (
+            self.max_browser_sessions is None or self.active_browser_sessions is None
+        ):
+            raise ValueError("protocol version 2 requires browser session capacity summary")
+        if (
+            self.max_browser_sessions is not None
+            and self.active_browser_sessions is not None
+            and self.active_browser_sessions > self.max_browser_sessions
+        ):
+            raise ValueError("active browser sessions cannot exceed advertised capacity")
+        return self
 
 
 class WorkerHeartbeatRequest(_WorkerRequest):
     healthy: bool = True
+    active_browser_sessions: int | None = Field(default=None, ge=0, le=1000)
 
 
 class WorkerPresenceResponse(BaseModel):
@@ -97,6 +126,41 @@ class WorkerPresenceResponse(BaseModel):
     last_heartbeat_at: AwareDatetime
     presence_expires_at: AwareDatetime
     protocol_compatible: bool
+    max_browser_sessions: int | None = None
+    active_browser_sessions: int | None = None
+
+
+class WorkerNetworkProfileResponse(BaseModel):
+    id: UUID
+    protocol: NetworkProtocol
+    host: str | None
+    port: int | None
+    credential_ref: str | None
+
+
+class WorkerAccountContextResponse(BaseModel):
+    account_id: UUID
+    worker_id: UUID
+    profile_ref: str
+    network_profile: WorkerNetworkProfileResponse | None
+
+
+class WorkerSessionReportRequest(_WorkerRequest):
+    profile_ref: str = Field(min_length=1, max_length=255)
+    session_id: UUID
+    state: BrowserSessionState
+    revision: int = Field(ge=1)
+
+
+class WorkerSessionReportResponse(BaseModel):
+    account_id: UUID
+    worker_id: UUID
+    profile_ref: str
+    session_id: UUID
+    state: BrowserSessionState
+    revision: int
+    requires_intervention: bool
+    updated_at: AwareDatetime
 
 
 class WorkerJobResponse(BaseModel):
@@ -167,6 +231,7 @@ def create_worker_router(
     admin_authenticator: CommandAuthenticator,
     notifications: WorkerNotificationHub,
     job_service: WorkerJobService | None = None,
+    session_service: WorkerSessionService | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1/workers", tags=["workers"])
 
@@ -179,6 +244,13 @@ def create_worker_router(
         if job_service is None:
             raise HTTPException(status_code=503, detail={"code": "WORKER_JOB_SERVICE_UNAVAILABLE"})
         return job_service
+
+    def require_session_service() -> WorkerSessionService:
+        if session_service is None:
+            raise HTTPException(
+                status_code=503, detail={"code": "WORKER_SESSION_SERVICE_UNAVAILABLE"}
+            )
+        return session_service
 
     async def authenticated_worker(authorization: str | None) -> UUID:
         control = require_service()
@@ -226,6 +298,7 @@ def create_worker_router(
                 platform=request.platform,
                 public_key=public_key,
                 max_concurrent_jobs=request.max_concurrent_jobs,
+                max_browser_sessions=request.max_browser_sessions,
             )
         except WorkerControlError as error:
             raise _http_error(error) from error
@@ -258,7 +331,7 @@ def create_worker_router(
             expires_at=result.expires_at,
         )
 
-    @router.post("/hello", response_model=WorkerPresenceResponse)
+    @router.post("/hello", response_model=WorkerPresenceResponse, response_model_exclude_none=True)
     async def worker_hello(
         request: WorkerHelloRequest,
         authorization: Annotated[str | None, Header()] = None,
@@ -285,6 +358,8 @@ def create_worker_router(
                 hostname=request.hostname,
                 platform=request.platform,
                 max_concurrent_jobs=request.max_concurrent_jobs,
+                max_browser_sessions=request.max_browser_sessions,
+                active_browser_sessions=request.active_browser_sessions,
                 healthy=request.healthy,
                 access_token=access_token,
             )
@@ -296,7 +371,9 @@ def create_worker_router(
         )
         return _presence_response(presence)
 
-    @router.post("/heartbeat", response_model=WorkerPresenceResponse)
+    @router.post(
+        "/heartbeat", response_model=WorkerPresenceResponse, response_model_exclude_none=True
+    )
     async def worker_heartbeat(
         request: WorkerHeartbeatRequest,
         authorization: Annotated[str | None, Header()] = None,
@@ -307,6 +384,7 @@ def create_worker_router(
             presence = await require_service().heartbeat(
                 worker_id,
                 healthy=request.healthy,
+                active_browser_sessions=request.active_browser_sessions,
                 access_token=access_token,
             )
         except WorkerControlError as error:
@@ -316,6 +394,61 @@ def create_worker_router(
             {"type": "worker.presence", "status": presence.status.value},
         )
         return _presence_response(presence)
+
+    @router.get("/accounts/{account_id}/context", response_model=WorkerAccountContextResponse)
+    async def worker_account_context(
+        account_id: UUID,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerAccountContextResponse:
+        worker_id = await authenticated_worker(authorization)
+        try:
+            context = await require_session_service().account_context(worker_id, account_id)
+        except WorkerSessionControlError as error:
+            raise _worker_session_error(error) from error
+        network = context.network_profile
+        return WorkerAccountContextResponse(
+            account_id=context.account_id,
+            worker_id=context.worker_id,
+            profile_ref=context.profile_ref,
+            network_profile=(
+                WorkerNetworkProfileResponse(
+                    id=network.id,
+                    protocol=network.protocol,
+                    host=network.host,
+                    port=network.port,
+                    credential_ref=network.credential_ref,
+                )
+                if network is not None
+                else None
+            ),
+        )
+
+    @router.put(
+        "/accounts/{account_id}/session",
+        response_model=WorkerSessionReportResponse,
+    )
+    async def report_worker_session(
+        account_id: UUID,
+        request: WorkerSessionReportRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerSessionReportResponse:
+        worker_id = await authenticated_worker(authorization)
+        try:
+            session = await require_session_service().report_state(
+                worker_id,
+                account_id=account_id,
+                profile_ref=request.profile_ref,
+                session_id=request.session_id,
+                state=request.state,
+                revision=request.revision,
+            )
+        except WorkerSessionControlError as error:
+            raise _worker_session_error(error) from error
+        notifications.publish(
+            worker_id,
+            {"type": "worker.session.state", "account_id": str(account_id), "state": session.state},
+        )
+        return _worker_session_response(session)
 
     @router.get("/jobs/reconcile", response_model=WorkerJobReconcileResponse)
     async def reconcile_worker_jobs(
@@ -521,6 +654,8 @@ def create_worker_router(
                                 hostname=request.hostname,
                                 platform=request.platform,
                                 max_concurrent_jobs=request.max_concurrent_jobs,
+                                max_browser_sessions=request.max_browser_sessions,
+                                active_browser_sessions=request.active_browser_sessions,
                                 healthy=request.healthy,
                                 access_token=token,
                             )
@@ -536,6 +671,7 @@ def create_worker_router(
                             presence = await control.heartbeat(
                                 worker_id,
                                 healthy=request.healthy,
+                                active_browser_sessions=request.active_browser_sessions,
                                 access_token=token,
                             )
                             await websocket.send_json(
@@ -582,7 +718,36 @@ def _presence_response(presence: WorkerPresence) -> WorkerPresenceResponse:
         last_heartbeat_at=presence.last_heartbeat_at,
         presence_expires_at=presence.presence_expires_at,
         protocol_compatible=presence.protocol_compatible,
+        max_browser_sessions=presence.max_browser_sessions,
+        active_browser_sessions=presence.active_browser_sessions,
     )
+
+
+def _worker_session_response(session: WorkerAccountSession) -> WorkerSessionReportResponse:
+    return WorkerSessionReportResponse(
+        account_id=session.account_id,
+        worker_id=session.worker_id,
+        profile_ref=session.profile_ref,
+        session_id=session.session_id,
+        state=session.state,
+        revision=session.revision,
+        requires_intervention=session.requires_intervention,
+        updated_at=session.updated_at,
+    )
+
+
+def _worker_session_error(error: WorkerSessionControlError) -> HTTPException:
+    if error.code in {
+        "ACCOUNT_WORKER_AFFINITY_MISMATCH",
+        "SESSION_ALREADY_OWNED",
+        "SESSION_REPORT_STALE",
+    }:
+        status_code = 409
+    elif error.code in {"NETWORK_PROFILE_NOT_FOUND", "ACCOUNT_NOT_FOUND"}:
+        status_code = 404
+    else:
+        status_code = 422
+    return HTTPException(status_code=status_code, detail={"code": error.code})
 
 
 def _worker_job_response(job: WorkerJob) -> WorkerJobResponse:
@@ -611,7 +776,13 @@ def _worker_job_response(job: WorkerJob) -> WorkerJobResponse:
 
 
 def _http_error(error: WorkerControlError) -> HTTPException:
-    if error.code == "INVALID_PUBLIC_KEY":
+    if error.code in {
+        "INVALID_PUBLIC_KEY",
+        "INVALID_BROWSER_SESSION_CAPACITY",
+        "INVALID_ACTIVE_BROWSER_SESSIONS",
+        "BROWSER_CAPACITY_SUMMARY_REQUIRED",
+        "BROWSER_SESSION_CAPACITY_EXCEEDED",
+    }:
         status_code = 422
     elif error.code in {"WORKER_NOT_FOUND", "WORKER_NOT_AUTHENTICATABLE"}:
         status_code = 404

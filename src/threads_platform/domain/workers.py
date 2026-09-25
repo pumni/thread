@@ -27,6 +27,26 @@ class NetworkProtocol(StrEnum):
     SOCKS5 = "SOCKS5"
 
 
+class BrowserSessionState(StrEnum):
+    UNINITIALIZED = "UNINITIALIZED"
+    LOGIN_REQUIRED = "LOGIN_REQUIRED"
+    STARTING = "STARTING"
+    AUTHENTICATED = "AUTHENTICATED"
+    BUSY = "BUSY"
+    SESSION_EXPIRED = "SESSION_EXPIRED"
+    CHALLENGE_REQUIRED = "CHALLENGE_REQUIRED"
+    ERROR = "ERROR"
+    STOPPED = "STOPPED"
+
+    @property
+    def requires_intervention(self) -> bool:
+        return self in {
+            BrowserSessionState.LOGIN_REQUIRED,
+            BrowserSessionState.SESSION_EXPIRED,
+            BrowserSessionState.CHALLENGE_REQUIRED,
+        }
+
+
 @dataclass(slots=True)
 class WorkerNode:
     worker_id: UUID
@@ -39,6 +59,8 @@ class WorkerNode:
     public_key: bytes | None = None
     status: WorkerStatus = WorkerStatus.REGISTERING
     max_concurrent_jobs: int = 1
+    max_browser_sessions: int = 1
+    active_browser_sessions: int = 0
     last_heartbeat_at: datetime | None = None
     presence_expires_at: datetime | None = None
     created_at: datetime = field(default_factory=utc_now)
@@ -49,6 +71,12 @@ class WorkerNode:
             raise ValueError("worker display name, hostname, and platform must not be empty")
         if self.max_concurrent_jobs < 1:
             raise ValueError("worker capacity must be positive")
+        if self.max_browser_sessions < 1 or self.active_browser_sessions < 0:
+            raise ValueError(
+                "browser session capacity must be positive and active count nonnegative"
+            )
+        if self.active_browser_sessions > self.max_browser_sessions:
+            raise ValueError("active browser sessions cannot exceed browser session capacity")
         if self.protocol_version is not None and self.protocol_version < 1:
             raise ValueError("protocol_version must be positive")
         if self.capabilities_schema_version is not None and self.capabilities_schema_version < 1:
@@ -109,7 +137,7 @@ class NetworkProfile:
     host: str | None
     port: int | None
     id: UUID = field(default_factory=uuid4)
-    credential_ref: str | None = None
+    credential_ref: str | None = field(default=None, repr=False)
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 
@@ -196,6 +224,28 @@ class WorkerSession:
         self.issued_at = normalize_utc(self.issued_at)
         self.expires_at = normalize_utc(self.expires_at)
         self.revoked_at = normalize_utc(self.revoked_at) if self.revoked_at else None
+
+
+@dataclass(slots=True)
+class WorkerAccountSession:
+    account_id: UUID
+    worker_id: UUID
+    profile_ref: str
+    session_id: UUID
+    state: BrowserSessionState
+    revision: int
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not self.profile_ref.strip() or "/" in self.profile_ref or "\\" in self.profile_ref:
+            raise ValueError("session profile_ref must be a logical reference")
+        if self.revision < 1:
+            raise ValueError("session revision must be positive")
+        self.updated_at = normalize_utc(self.updated_at)
+
+    @property
+    def requires_intervention(self) -> bool:
+        return self.state.requires_intervention
 
 
 @dataclass(slots=True)

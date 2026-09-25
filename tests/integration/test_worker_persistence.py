@@ -4,16 +4,23 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from threads_platform.application.ports.repositories import UnitOfWorkFactory
+from threads_platform.application.worker_sessions import (
+    WorkerSessionControlError,
+    WorkerSessionService,
+)
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
+    BrowserSessionState,
     NetworkProfile,
     NetworkProtocol,
     WorkerCapability,
     WorkerNode,
     WorkerStatus,
 )
+from threads_platform.infrastructure.persistence.models import WorkerAccountSessionRecord
 from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyAccountRepository,
     SQLAlchemyAccountWorkerAssignmentRepository,
@@ -43,6 +50,8 @@ async def test_worker_assignment_profile_and_network_metadata_round_trip(
         hostname="WORKSTATION-04",
         platform="windows",
         status=WorkerStatus.ONLINE,
+        max_browser_sessions=4,
+        active_browser_sessions=2,
     )
     workers = SQLAlchemyWorkerRepository(db_session)
     await workers.add(worker)
@@ -86,6 +95,8 @@ async def test_worker_assignment_profile_and_network_metadata_round_trip(
     assert loaded_worker is not None
     assert loaded_worker.worker_id == worker.worker_id
     assert loaded_worker.hostname == "WORKSTATION-04"
+    assert loaded_worker.max_browser_sessions == 4
+    assert loaded_worker.active_browser_sessions == 2
     assert loaded_profile is not None and loaded_profile.profile_ref == "threads-main"
     assert loaded_network is not None
     assert loaded_network.credential_ref == "secret-store://accounts/proxy-1"
@@ -150,3 +161,108 @@ async def test_assignment_foreign_key_keeps_profile_on_the_assigned_worker(
             await assignments.add(
                 AccountWorkerAssignment(account.id, second_worker.worker_id, "profile-a")
             )
+
+
+async def test_active_profile_cannot_be_shared_between_accounts(db_session: AsyncSession) -> None:
+    accounts = SQLAlchemyAccountRepository(db_session)
+    worker = WorkerNode(uuid4(), "worker", "host")
+    await SQLAlchemyWorkerRepository(db_session).add(worker)
+    first = ThreadsAccount(threads_user_id=f"profile-owner-{uuid4()}", username="first")
+    second = ThreadsAccount(threads_user_id=f"profile-owner-{uuid4()}", username="second")
+    await accounts.add(first)
+    await accounts.add(second)
+    profile = BrowserProfile(worker.worker_id, "single-owner-profile")
+    await SQLAlchemyBrowserProfileRepository(db_session).add(profile)
+    assignments = SQLAlchemyAccountWorkerAssignmentRepository(db_session)
+    await assignments.add(AccountWorkerAssignment(first.id, worker.worker_id, profile.profile_ref))
+
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            await assignments.add(
+                AccountWorkerAssignment(second.id, worker.worker_id, profile.profile_ref)
+            )
+
+
+async def test_worker_session_context_and_intervention_state_are_durable(
+    unit_of_work_factory: UnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    account = ThreadsAccount(threads_user_id=f"session-account-{uuid4()}", username="session")
+    worker = WorkerNode(uuid4(), "session worker", "session-host", platform="windows")
+    profile = BrowserProfile(worker.worker_id, f"profile-{uuid4()}")
+    network = NetworkProfile(
+        account_id=account.id,
+        name="account route",
+        protocol=NetworkProtocol.HTTPS,
+        host="proxy.example.test",
+        port=8443,
+        credential_ref="secret-store://account/proxy",
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(account)
+        await unit_of_work.workers.add(worker)
+        await unit_of_work.browser_profiles.add(profile)
+        await unit_of_work.network_profiles.add(network)
+        await unit_of_work.assignments.add(
+            AccountWorkerAssignment(
+                account.id,
+                worker.worker_id,
+                profile.profile_ref,
+                network_profile_id=network.id,
+            )
+        )
+
+    service = WorkerSessionService(unit_of_work_factory)
+    context = await service.account_context(worker.worker_id, account.id)
+    assert context.profile_ref == profile.profile_ref
+    assert context.network_profile is not None
+    assert context.network_profile.account_id == account.id
+    with pytest.raises(WorkerSessionControlError, match="ACCOUNT_WORKER_AFFINITY_MISMATCH"):
+        await service.account_context(uuid4(), account.id)
+
+    session_id = uuid4()
+    login_required = await service.report_state(
+        worker.worker_id,
+        account_id=account.id,
+        profile_ref=profile.profile_ref,
+        session_id=session_id,
+        state=BrowserSessionState.LOGIN_REQUIRED,
+        revision=1,
+    )
+    assert login_required.requires_intervention
+    assert (
+        await service.report_state(
+            worker.worker_id,
+            account_id=account.id,
+            profile_ref=profile.profile_ref,
+            session_id=session_id,
+            state=BrowserSessionState.LOGIN_REQUIRED,
+            revision=1,
+        )
+        == login_required
+    )
+    with pytest.raises(WorkerSessionControlError, match="SESSION_REPORT_STALE"):
+        await service.report_state(
+            worker.worker_id,
+            account_id=account.id,
+            profile_ref=profile.profile_ref,
+            session_id=session_id,
+            state=BrowserSessionState.SESSION_EXPIRED,
+            revision=1,
+        )
+    challenge = await service.report_state(
+        worker.worker_id,
+        account_id=account.id,
+        profile_ref=profile.profile_ref,
+        session_id=session_id,
+        state=BrowserSessionState.CHALLENGE_REQUIRED,
+        revision=2,
+    )
+    assert challenge.requires_intervention
+
+    stored = await db_session.get(WorkerAccountSessionRecord, account.id)
+    assert stored is not None
+    assert stored.worker_id == worker.worker_id
+    assert stored.state == BrowserSessionState.CHALLENGE_REQUIRED
+    assert stored.intervention_required
+    assert "secret-store://account/proxy" not in repr(stored)
