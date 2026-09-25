@@ -56,6 +56,12 @@ class WorkerAccessSession:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthenticatedWorkerSession:
+    worker_id: UUID
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerPresence:
     worker_id: UUID
     status: WorkerStatus
@@ -241,6 +247,10 @@ class WorkerControlService:
         return WorkerAccessSession(access_token, expires_at)
 
     async def authenticate(self, access_token: str) -> UUID | None:
+        session = await self.authenticate_session(access_token)
+        return session.worker_id if session is not None else None
+
+    async def authenticate_session(self, access_token: str) -> AuthenticatedWorkerSession | None:
         if not access_token:
             return None
         now = normalize_utc(self._clock.now())
@@ -253,7 +263,13 @@ class WorkerControlService:
             worker = await unit_of_work.workers.get(session.worker_id)
             if worker is None or worker.status is WorkerStatus.DISABLED:
                 return None
-            return worker.worker_id
+            return AuthenticatedWorkerSession(worker.worker_id, session.expires_at)
+
+    def session_time_remaining(self, session: AuthenticatedWorkerSession) -> float:
+        return max(
+            0.0,
+            (session.expires_at - normalize_utc(self._clock.now())).total_seconds(),
+        )
 
     async def hello(
         self,

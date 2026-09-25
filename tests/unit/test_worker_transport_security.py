@@ -9,7 +9,11 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from threads_platform.app import create_app
-from threads_platform.application.worker_control import WorkerControlService, WorkerPresence
+from threads_platform.application.worker_control import (
+    AuthenticatedWorkerSession,
+    WorkerControlService,
+    WorkerPresence,
+)
 from threads_platform.application.worker_notifications import WorkerNotificationHub
 from threads_platform.config.settings import Settings
 from threads_platform.domain.workers import WorkerStatus
@@ -47,8 +51,17 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
     )
 
     class FakeWorkerControl:
+        async def authenticate_session(self, token: str) -> AuthenticatedWorkerSession | None:
+            if token != "session-token":
+                return None
+            return AuthenticatedWorkerSession(worker_id, now + timedelta(minutes=15))
+
         async def authenticate(self, token: str) -> object:
             return worker_id if token == "session-token" else None
+
+        def session_time_remaining(self, session: AuthenticatedWorkerSession) -> float:
+            assert session.worker_id == worker_id
+            return 60.0
 
         async def hello(self, requested_worker_id: object, **_: object) -> WorkerPresence:
             assert requested_worker_id == worker_id
@@ -93,6 +106,38 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
                 "status": "ONLINE",
                 "protocol_compatible": True,
             }
+
+
+def test_wss_closes_when_the_authenticated_session_expires() -> None:
+    worker_id = uuid4()
+    now = datetime.now(UTC)
+
+    class ExpiredWorkerControl:
+        async def authenticate_session(self, token: str) -> AuthenticatedWorkerSession | None:
+            if token != "session-token":
+                return None
+            return AuthenticatedWorkerSession(worker_id, now)
+
+        def session_time_remaining(self, session: AuthenticatedWorkerSession) -> float:
+            assert session.worker_id == worker_id
+            return 0.0
+
+        async def expire_presence(self) -> int:
+            return 0
+
+    app = create_app(
+        Settings(worker_tls_required=True),
+        worker_control_service=cast(WorkerControlService, ExpiredWorkerControl()),
+    )
+    test_client = TestClient(app, base_url="https://worker.test")
+    with test_client:
+        with test_client.websocket_connect(
+            "wss://worker.test/v1/workers/connect",
+            headers={"Authorization": "Bearer session-token"},
+        ) as websocket:
+            with pytest.raises(WebSocketDisconnect) as disconnect:
+                websocket.receive_json()
+    assert disconnect.value.code == 4401
 
 
 async def test_notification_hub_delivers_only_advisory_payloads() -> None:

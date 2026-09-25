@@ -472,10 +472,11 @@ def create_worker_router(
         if token is None:
             await websocket.close(code=4401)
             return
-        worker_id = await control.authenticate(token)
-        if worker_id is None:
+        session = await control.authenticate_session(token)
+        if session is None:
             await websocket.close(code=4401)
             return
+        worker_id = session.worker_id
         async with notifications.subscribe(worker_id) as queue:
             await websocket.accept()
 
@@ -557,12 +558,19 @@ def create_worker_router(
 
             send_task = asyncio.create_task(send_notifications())
             receive_task = asyncio.create_task(receive_messages())
-            done, pending = await asyncio.wait(
-                {send_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, *pending, return_exceptions=True)
+            tasks = {send_task, receive_task}
+            try:
+                await asyncio.wait_for(
+                    asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED),
+                    timeout=control.session_time_remaining(session),
+                )
+            except TimeoutError:
+                await websocket.close(code=4401)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     return router
 
