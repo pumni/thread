@@ -19,6 +19,13 @@ class CredentialStatus(StrEnum):
     REVOKED = "REVOKED"
 
 
+class AccountExecutionMode(StrEnum):
+    API_ONLY = "API_ONLY"
+    BROWSER_ONLY = "BROWSER_ONLY"
+    HYBRID = "HYBRID"
+    MANUAL = "MANUAL"
+
+
 @dataclass(slots=True)
 class ThreadsAccount:
     threads_user_id: str
@@ -26,6 +33,7 @@ class ThreadsAccount:
     id: UUID = field(default_factory=uuid4)
     display_name: str | None = None
     status: AccountStatus = AccountStatus.ACTIVE
+    execution_mode: AccountExecutionMode = AccountExecutionMode.API_ONLY
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 

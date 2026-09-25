@@ -7,23 +7,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
     AccountRepository,
+    AccountWorkerAssignmentRepository,
+    BrowserProfileRepository,
     CommandAttemptRepository,
     CommandRepository,
     IntegrationDeliveryRepository,
+    NetworkProfileRepository,
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
     SyncStateRepository,
+    WorkerCapabilityRepository,
+    WorkerRepository,
 )
 from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyAccountRepository,
+    SQLAlchemyAccountWorkerAssignmentRepository,
+    SQLAlchemyBrowserProfileRepository,
     SQLAlchemyCommandAttemptRepository,
     SQLAlchemyCommandRepository,
     SQLAlchemyIntegrationDeliveryRepository,
+    SQLAlchemyNetworkProfileRepository,
     SQLAlchemyOutboxEventRepository,
     SQLAlchemyPostRepository,
     SQLAlchemyReplyRepository,
     SQLAlchemySyncStateRepository,
+    SQLAlchemyWorkerCapabilityRepository,
+    SQLAlchemyWorkerRepository,
 )
 
 
@@ -39,6 +49,19 @@ class SQLAlchemyUnitOfWork:
         self.outbox_events: OutboxEventRepository = SQLAlchemyOutboxEventRepository(self._session)
         self.deliveries: IntegrationDeliveryRepository = SQLAlchemyIntegrationDeliveryRepository(
             self._session
+        )
+        self.workers: WorkerRepository = SQLAlchemyWorkerRepository(self._session)
+        self.worker_capabilities: WorkerCapabilityRepository = SQLAlchemyWorkerCapabilityRepository(
+            self._session
+        )
+        self.browser_profiles: BrowserProfileRepository = SQLAlchemyBrowserProfileRepository(
+            self._session
+        )
+        self.network_profiles: NetworkProfileRepository = SQLAlchemyNetworkProfileRepository(
+            self._session
+        )
+        self.assignments: AccountWorkerAssignmentRepository = (
+            SQLAlchemyAccountWorkerAssignmentRepository(self._session)
         )
 
     async def __aenter__(self) -> SQLAlchemyUnitOfWork:

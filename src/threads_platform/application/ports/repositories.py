@@ -9,6 +9,13 @@ from threads_platform.domain.commands import Command, CommandAttempt
 from threads_platform.domain.outbox import IntegrationDelivery, OutboxEvent
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
 from threads_platform.domain.sync import SyncState
+from threads_platform.domain.workers import (
+    AccountWorkerAssignment,
+    BrowserProfile,
+    NetworkProfile,
+    WorkerCapability,
+    WorkerNode,
+)
 
 
 class AccountRepository(Protocol):
@@ -113,6 +120,44 @@ class IntegrationDeliveryRepository(Protocol):
     async def update(self, delivery: IntegrationDelivery) -> None: ...
 
 
+class WorkerRepository(Protocol):
+    async def add(self, worker: WorkerNode) -> None: ...
+
+    async def get(self, worker_id: UUID) -> WorkerNode | None: ...
+
+    async def get_for_update(self, worker_id: UUID) -> WorkerNode | None: ...
+
+    async def update(self, worker: WorkerNode) -> None: ...
+
+
+class WorkerCapabilityRepository(Protocol):
+    async def replace_for_worker(
+        self, worker_id: UUID, capabilities: list[WorkerCapability]
+    ) -> None: ...
+
+    async def list_for_worker(self, worker_id: UUID) -> list[WorkerCapability]: ...
+
+
+class BrowserProfileRepository(Protocol):
+    async def add(self, profile: BrowserProfile) -> None: ...
+
+    async def get(self, worker_id: UUID, profile_ref: str) -> BrowserProfile | None: ...
+
+
+class NetworkProfileRepository(Protocol):
+    async def add(self, profile: NetworkProfile) -> None: ...
+
+    async def get(self, account_id: UUID, profile_id: UUID) -> NetworkProfile | None: ...
+
+
+class AccountWorkerAssignmentRepository(Protocol):
+    async def add(self, assignment: AccountWorkerAssignment) -> None: ...
+
+    async def get_active(self, account_id: UUID) -> AccountWorkerAssignment | None: ...
+
+    async def update(self, assignment: AccountWorkerAssignment) -> None: ...
+
+
 class UnitOfWork(Protocol):
     accounts: AccountRepository
     commands: CommandRepository
@@ -122,6 +167,11 @@ class UnitOfWork(Protocol):
     sync_states: SyncStateRepository
     outbox_events: OutboxEventRepository
     deliveries: IntegrationDeliveryRepository
+    workers: WorkerRepository
+    worker_capabilities: WorkerCapabilityRepository
+    browser_profiles: BrowserProfileRepository
+    network_profiles: NetworkProfileRepository
+    assignments: AccountWorkerAssignmentRepository
 
     def savepoint(self) -> AbstractAsyncContextManager[object]: ...
 

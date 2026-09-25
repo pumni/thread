@@ -1,21 +1,30 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
     AccountRepository,
+    AccountWorkerAssignmentRepository,
+    BrowserProfileRepository,
     CommandAttemptRepository,
     CommandRepository,
     IntegrationDeliveryRepository,
+    NetworkProfileRepository,
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
     SyncStateRepository,
+    WorkerCapabilityRepository,
+    WorkerRepository,
 )
-from threads_platform.domain.accounts import AccountStatus, ThreadsAccount
+from threads_platform.domain.accounts import (
+    AccountExecutionMode,
+    AccountStatus,
+    ThreadsAccount,
+)
 from threads_platform.domain.commands import (
     AttemptStatus,
     Command,
@@ -30,15 +39,29 @@ from threads_platform.domain.outbox import (
 )
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
 from threads_platform.domain.sync import SyncState
+from threads_platform.domain.workers import (
+    AccountWorkerAssignment,
+    BrowserProfile,
+    NetworkProfile,
+    NetworkProtocol,
+    WorkerCapability,
+    WorkerNode,
+    WorkerStatus,
+)
 from threads_platform.infrastructure.persistence.models import (
     AccountRecord,
+    AccountWorkerAssignmentRecord,
+    BrowserProfileRecord,
     CommandAttemptRecord,
     CommandRecord,
     IntegrationDeliveryRecord,
+    NetworkProfileRecord,
     OutboxEventRecord,
     PostRecord,
     ReplyRecord,
     SyncStateRecord,
+    WorkerCapabilityRecord,
+    WorkerNodeRecord,
 )
 
 
@@ -54,6 +77,7 @@ class SQLAlchemyAccountRepository(AccountRepository):
                 username=account.username,
                 display_name=account.display_name,
                 status=account.status,
+                execution_mode=account.execution_mode,
                 created_at=account.created_at,
                 updated_at=account.updated_at,
             )
@@ -70,6 +94,7 @@ class SQLAlchemyAccountRepository(AccountRepository):
             username=record.username,
             display_name=record.display_name,
             status=AccountStatus(record.status),
+            execution_mode=AccountExecutionMode(record.execution_mode),
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
@@ -82,6 +107,7 @@ class SQLAlchemyAccountRepository(AccountRepository):
         record.username = account.username
         record.display_name = account.display_name
         record.status = account.status
+        record.execution_mode = account.execution_mode
         record.updated_at = account.updated_at
         await self._session.flush()
 
@@ -691,4 +717,256 @@ class SQLAlchemyIntegrationDeliveryRepository(IntegrationDeliveryRepository):
             error_code=record.error_code,
             created_at=record.created_at,
             updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyWorkerRepository(WorkerRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, worker: WorkerNode) -> None:
+        self._session.add(self._record(worker))
+        await self._session.flush()
+
+    async def get(self, worker_id: UUID) -> WorkerNode | None:
+        record = await self._session.get(WorkerNodeRecord, worker_id)
+        return self._domain(record) if record is not None else None
+
+    async def get_for_update(self, worker_id: UUID) -> WorkerNode | None:
+        record = await self._session.scalar(
+            select(WorkerNodeRecord)
+            .where(WorkerNodeRecord.worker_id == worker_id)
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def update(self, worker: WorkerNode) -> None:
+        record = await self._session.get(WorkerNodeRecord, worker.worker_id)
+        if record is None:
+            raise LookupError(f"worker not found: {worker.worker_id}")
+        record.display_name = worker.display_name
+        record.hostname = worker.hostname
+        record.platform = worker.platform
+        record.agent_version = worker.agent_version
+        record.protocol_version = worker.protocol_version
+        record.status = worker.status
+        record.max_concurrent_jobs = worker.max_concurrent_jobs
+        record.last_heartbeat_at = worker.last_heartbeat_at
+        record.presence_expires_at = worker.presence_expires_at
+        record.updated_at = worker.updated_at
+        await self._session.flush()
+
+    @staticmethod
+    def _record(worker: WorkerNode) -> WorkerNodeRecord:
+        return WorkerNodeRecord(
+            worker_id=worker.worker_id,
+            display_name=worker.display_name,
+            hostname=worker.hostname,
+            platform=worker.platform,
+            agent_version=worker.agent_version,
+            protocol_version=worker.protocol_version,
+            status=worker.status,
+            max_concurrent_jobs=worker.max_concurrent_jobs,
+            last_heartbeat_at=worker.last_heartbeat_at,
+            presence_expires_at=worker.presence_expires_at,
+            created_at=worker.created_at,
+            updated_at=worker.updated_at,
+        )
+
+    @staticmethod
+    def _domain(record: WorkerNodeRecord) -> WorkerNode:
+        return WorkerNode(
+            worker_id=record.worker_id,
+            display_name=record.display_name,
+            hostname=record.hostname,
+            platform=record.platform,
+            agent_version=record.agent_version,
+            protocol_version=record.protocol_version,
+            status=WorkerStatus(record.status),
+            max_concurrent_jobs=record.max_concurrent_jobs,
+            last_heartbeat_at=record.last_heartbeat_at,
+            presence_expires_at=record.presence_expires_at,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyWorkerCapabilityRepository(WorkerCapabilityRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def replace_for_worker(
+        self, worker_id: UUID, capabilities: list[WorkerCapability]
+    ) -> None:
+        await self._session.execute(
+            delete(WorkerCapabilityRecord).where(WorkerCapabilityRecord.worker_id == worker_id)
+        )
+        self._session.add_all(
+            [
+                WorkerCapabilityRecord(
+                    id=capability.id,
+                    worker_id=worker_id,
+                    capability_name=capability.name,
+                    capability_version=capability.version,
+                    metadata_json=capability.metadata,
+                    advertised_at=capability.advertised_at,
+                )
+                for capability in capabilities
+            ]
+        )
+        await self._session.flush()
+
+    async def list_for_worker(self, worker_id: UUID) -> list[WorkerCapability]:
+        result = await self._session.scalars(
+            select(WorkerCapabilityRecord)
+            .where(WorkerCapabilityRecord.worker_id == worker_id)
+            .order_by(
+                WorkerCapabilityRecord.capability_name, WorkerCapabilityRecord.capability_version
+            )
+        )
+        return [self._domain(record) for record in result]
+
+    @staticmethod
+    def _domain(record: WorkerCapabilityRecord) -> WorkerCapability:
+        return WorkerCapability(
+            id=record.id,
+            worker_id=record.worker_id,
+            name=record.capability_name,
+            version=record.capability_version,
+            metadata=record.metadata_json,
+            advertised_at=record.advertised_at,
+        )
+
+
+class SQLAlchemyBrowserProfileRepository(BrowserProfileRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, profile: BrowserProfile) -> None:
+        self._session.add(
+            BrowserProfileRecord(
+                id=profile.id,
+                worker_id=profile.worker_id,
+                profile_ref=profile.profile_ref,
+                display_name=profile.display_name,
+                metadata_json=profile.metadata,
+                created_at=profile.created_at,
+                updated_at=profile.updated_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get(self, worker_id: UUID, profile_ref: str) -> BrowserProfile | None:
+        record = await self._session.scalar(
+            select(BrowserProfileRecord).where(
+                BrowserProfileRecord.worker_id == worker_id,
+                BrowserProfileRecord.profile_ref == profile_ref,
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    @staticmethod
+    def _domain(record: BrowserProfileRecord) -> BrowserProfile:
+        return BrowserProfile(
+            id=record.id,
+            worker_id=record.worker_id,
+            profile_ref=record.profile_ref,
+            display_name=record.display_name,
+            metadata=record.metadata_json,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyNetworkProfileRepository(NetworkProfileRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, profile: NetworkProfile) -> None:
+        self._session.add(
+            NetworkProfileRecord(
+                id=profile.id,
+                account_id=profile.account_id,
+                name=profile.name,
+                protocol=profile.protocol,
+                host=profile.host,
+                port=profile.port,
+                credential_ref=profile.credential_ref,
+                created_at=profile.created_at,
+                updated_at=profile.updated_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get(self, account_id: UUID, profile_id: UUID) -> NetworkProfile | None:
+        record = await self._session.scalar(
+            select(NetworkProfileRecord).where(
+                NetworkProfileRecord.account_id == account_id,
+                NetworkProfileRecord.id == profile_id,
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    @staticmethod
+    def _domain(record: NetworkProfileRecord) -> NetworkProfile:
+        return NetworkProfile(
+            id=record.id,
+            account_id=record.account_id,
+            name=record.name,
+            protocol=NetworkProtocol(record.protocol),
+            host=record.host,
+            port=record.port,
+            credential_ref=record.credential_ref,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyAccountWorkerAssignmentRepository(AccountWorkerAssignmentRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, assignment: AccountWorkerAssignment) -> None:
+        self._session.add(
+            AccountWorkerAssignmentRecord(
+                id=assignment.id,
+                account_id=assignment.account_id,
+                worker_id=assignment.worker_id,
+                profile_ref=assignment.profile_ref,
+                network_profile_id=assignment.network_profile_id,
+                is_active=assignment.is_active,
+                assigned_at=assignment.assigned_at,
+                ended_at=assignment.ended_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_active(self, account_id: UUID) -> AccountWorkerAssignment | None:
+        record = await self._session.scalar(
+            select(AccountWorkerAssignmentRecord).where(
+                AccountWorkerAssignmentRecord.account_id == account_id,
+                AccountWorkerAssignmentRecord.is_active.is_(True),
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    async def update(self, assignment: AccountWorkerAssignment) -> None:
+        record = await self._session.get(AccountWorkerAssignmentRecord, assignment.id)
+        if record is None:
+            raise LookupError(f"account-worker assignment not found: {assignment.id}")
+        record.is_active = assignment.is_active
+        record.ended_at = assignment.ended_at
+        await self._session.flush()
+
+    @staticmethod
+    def _domain(record: AccountWorkerAssignmentRecord) -> AccountWorkerAssignment:
+        return AccountWorkerAssignment(
+            id=record.id,
+            account_id=record.account_id,
+            worker_id=record.worker_id,
+            profile_ref=record.profile_ref,
+            network_profile_id=record.network_profile_id,
+            is_active=record.is_active,
+            assigned_at=record.assigned_at,
+            ended_at=record.ended_at,
         )

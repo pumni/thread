@@ -40,6 +40,11 @@ async def test_initial_migration_creates_all_persistence_tables(db_session: Asyn
         "insight_snapshots",
         "outbox_events",
         "integration_deliveries",
+        "worker_nodes",
+        "worker_capabilities",
+        "browser_profiles",
+        "network_profiles",
+        "account_worker_assignments",
     } <= table_names
 
 
