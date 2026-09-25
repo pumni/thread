@@ -1017,6 +1017,13 @@ class SQLAlchemyDiscoveryRepository(DiscoveryRepository):
                 "has_replies": func.coalesce(
                     excluded.has_replies, DiscoveredThreadRecord.has_replies
                 ),
+                "enrichment_status": case(
+                    (
+                        excluded.enrichment_status == DiscoveryEnrichmentStatus.ENRICHED,
+                        DiscoveryEnrichmentStatus.ENRICHED,
+                    ),
+                    else_=DiscoveredThreadRecord.enrichment_status,
+                ),
                 "updated_at": excluded.updated_at,
             },
         )

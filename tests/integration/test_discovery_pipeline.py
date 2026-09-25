@@ -25,6 +25,7 @@ from threads_platform.application.ports.threads import (
 from threads_platform.domain.commands import CommandStatus
 from threads_platform.domain.discovery import (
     DiscoveredThread,
+    DiscoveryEnrichmentStatus,
     DiscoveryRun,
     DiscoveryRunStatus,
 )
@@ -393,6 +394,96 @@ async def test_concurrent_canonical_thread_upserts_use_postgres_identity_constra
 
     assert first.id == second.id
     assert await db_session.scalar(select(func.count()).select_from(DiscoveredThreadRecord)) == 1
+
+
+async def test_thread_enrichment_status_is_monotonic_and_preserves_provenance(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    account_id, _ = await seed_account_and_post(unit_of_work_factory)
+    api = FakeThreadsAPI()
+    partial_observation = RemoteDiscoveryThread(
+        remote_thread_id="monotonic-thread",
+        author_remote_id=None,
+        username="sample",
+        text=None,
+        permalink=None,
+        media_type=None,
+        timestamp=None,
+        is_quote_post=None,
+        has_replies=None,
+    )
+    rich_observation = RemoteDiscoveryThread(
+        remote_thread_id="monotonic-thread",
+        author_remote_id=None,
+        username="sample",
+        text="Enriched public content",
+        permalink="https://www.threads.net/@sample/post/monotonic-thread",
+        media_type="TEXT_POST",
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        is_quote_post=False,
+        has_replies=True,
+    )
+    api.discovery_pages = [
+        DiscoveryPage((partial_observation,), None, False),
+        DiscoveryPage((rich_observation,), None, False),
+        DiscoveryPage((partial_observation,), None, False),
+    ]
+    clock = FixedClock()
+    runtime = make_runtime(unit_of_work_factory, api, clock)
+    campaign_id = await create_campaign(runtime, account_id, clock)
+
+    for query_text in ("partial first", "richer observation", "partial later"):
+        receipt = await runtime.receive(
+            command_body(
+                account_id,
+                clock,
+                "threads.discovery.search",
+                {
+                    "campaign_id": str(campaign_id),
+                    "query": query_text,
+                    "search_mode": "KEYWORD",
+                    "search_type": "RECENT",
+                    "max_pages": 1,
+                },
+            )
+        )
+        assert (await runtime.process(receipt.command_id)).status is CommandStatus.SUCCEEDED
+        canonical = await db_session.scalar(
+            select(DiscoveredThreadRecord)
+            .where(DiscoveredThreadRecord.remote_thread_id == "monotonic-thread")
+            .execution_options(populate_existing=True)
+        )
+        assert canonical is not None
+        if query_text == "partial first":
+            assert canonical.enrichment_status is DiscoveryEnrichmentStatus.ENRICHMENT_NEEDED
+            assert canonical.text is None
+        elif query_text == "richer observation":
+            assert canonical.enrichment_status is DiscoveryEnrichmentStatus.ENRICHED
+            assert canonical.text == "Enriched public content"
+            assert canonical.permalink is not None
+            async with unit_of_work_factory() as unit_of_work:
+                enriched = await unit_of_work.discovery.get_thread_by_remote_id("monotonic-thread")
+                assert enriched is not None
+                enriched.conversation_status = DiscoveryEnrichmentStatus.ENRICHED
+                await unit_of_work.discovery.update_thread(enriched)
+        else:
+            assert canonical.enrichment_status is DiscoveryEnrichmentStatus.ENRICHED
+            assert canonical.text == "Enriched public content"
+            assert canonical.permalink is not None
+            assert canonical.conversation_status is DiscoveryEnrichmentStatus.ENRICHED
+
+    evidence = list(
+        await db_session.scalars(
+            select(DiscoverySourceEvidenceRecord).where(
+                DiscoverySourceEvidenceRecord.thread_id == canonical.id
+            )
+        )
+    )
+    assert await db_session.scalar(select(func.count()).select_from(DiscoveredThreadRecord)) == 1
+    assert len(evidence) == 3
+    assert {item.source for item in evidence} == {"KEYWORD_SEARCH"}
+    assert len({item.run_id for item in evidence}) == 3
 
 
 async def test_discovered_conversation_reuses_reply_hierarchy_without_own_post_root(
