@@ -38,7 +38,7 @@ For the current project phase, prefer **one batch branch/PR with clear commits p
 |---|---|---|---|
 | Security | #1 TP-000 | Legacy credential remediation | Implementation merged; owner credential-status follow-up remains open |
 | A — Foundation | #2 TP-001, #4 TP-003, #5 TP-004 | Python/uv foundation, domain + PostgreSQL, reliable command runtime | Review after all three are implemented |
-| B — Threads Core | #3 TP-002, #6 TP-005, #7 TP-006 | Real Threads API validation, publishing, conversations/moderation | Review after core API workflows are implemented |
+| B — Threads Core | #3 TP-002, #16 TP-004A, #6 TP-005, #7 TP-006 | Real Threads API validation, durable external-side-effect hardening, publishing, conversations/moderation | Review after core API workflows are implemented |
 | C — Expansion & Operations | #8 TP-007, #9 TP-008, #10 TP-009 | Discovery/insights, durable workers, production hardening | Review after all three are implemented |
 | D — Release | #11 TP-010 | End-to-end certification and parity review | Final release review |
 
@@ -74,16 +74,21 @@ No production Threads side effects should be implemented before Batch A passes r
 Execution order:
 
 1. #3 TP-002 — validate real Threads OAuth/API capabilities.
-2. #6 TP-005 — publishing pipeline.
-3. #7 TP-006 — replies/conversation/moderation.
+2. #16 TP-004A — harden durable command execution for external side effects.
+3. #6 TP-005 — publishing pipeline.
+4. #7 TP-006 — replies/conversation/moderation.
 
 Continuation rule:
-- If the API spike confirms the expected contracts, Codex may continue directly into publishing and conversations.
+- If the API spike confirms the expected contracts, Codex may continue into TP-004A without waiting for review.
+- TP-004A must complete before any live Meta side-effect handler is wired into the command runtime.
+- After TP-004A passes local gates, Codex may continue directly into publishing and conversations.
 - If official API behavior materially differs from FEATURE_PARITY_MATRIX.md, required permissions are unavailable, product UI capability is not exposed through the official API, or OAuth/token lifecycle assumptions are wrong, **stop after TP-002** and report the mismatch before implementing workarounds.
 
 Checkpoint B reviewer validates:
 - real API evidence and current permissions;
 - token lifecycle;
+- command execution does not hold DB transactions/row locks across Meta network I/O;
+- durable claim/lease, checkpoint and crash-reconciliation behavior;
 - crash-safe publishing;
 - duplicate-command protection;
 - timeout/reconciliation behavior;
