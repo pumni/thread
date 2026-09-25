@@ -13,6 +13,7 @@ from threads_platform.application.ports.repositories import (
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
+    SyncStateRepository,
 )
 from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyAccountRepository,
@@ -22,6 +23,7 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyOutboxEventRepository,
     SQLAlchemyPostRepository,
     SQLAlchemyReplyRepository,
+    SQLAlchemySyncStateRepository,
 )
 
 
@@ -33,6 +35,7 @@ class SQLAlchemyUnitOfWork:
         self.attempts: CommandAttemptRepository = SQLAlchemyCommandAttemptRepository(self._session)
         self.posts: PostRepository = SQLAlchemyPostRepository(self._session)
         self.replies: ReplyRepository = SQLAlchemyReplyRepository(self._session)
+        self.sync_states: SyncStateRepository = SQLAlchemySyncStateRepository(self._session)
         self.outbox_events: OutboxEventRepository = SQLAlchemyOutboxEventRepository(self._session)
         self.deliveries: IntegrationDeliveryRepository = SQLAlchemyIntegrationDeliveryRepository(
             self._session

@@ -19,8 +19,8 @@
 | Post image | Publish image Thread | FULL | Official Threads API | Use remote media URL requirements |
 | Post video | Publish video Thread | FULL | Official Threads API | Verify processing/status behavior |
 | Multi-image/video post | Carousel | FULL | Official Threads API | Container workflow |
-| Share/re-share | Repost | ADAPTED | Official Threads API | Threads concept rather than Facebook share |
-| Quote content | Quote post | ENHANCED | Official Threads API | Threads-native capability |
+| Share/re-share | Repost | VERIFY | Official Threads API | Endpoint is documented; outcome reconciliation is not, so mutation is deferred |
+| Quote content | Quote post | ENHANCED | Official Threads API | Documented with `quote_post_id`; live permission remains part of TP-002 |
 | Comment on post | Reply to Thread | FULL | Official Threads API | Domain term becomes reply |
 | Reply to comment | Reply to reply | FULL | Official Threads API | Use reply_to_id |
 | Nested reply hierarchy | Conversation tree | ENHANCED | Official Threads API + relational model | No DOM indentation parsing |
@@ -48,7 +48,7 @@
 | Priority interruption | Command priority/scheduling | ENHANCED | Durable command scheduler | No global stop flag |
 | API result callback | CRM result event | FULL | Outbox delivery | Retry-safe |
 | Posting limit tracking | Threads publishing quota | ENHANCED | Official limit endpoint where available | No hardcoded limits |
-| Comment/reply moderation | Threads reply management | ENHANCED | Official API | Hide/unhide/pending approval where supported |
+| Comment/reply moderation | Threads reply management | ENHANCED | Official API | Hide/unhide/pending approval documented; account permissions remain VERIFY |
 | Search public discussions | Threads discovery | ENHANCED | Official API where supported | Keyword/tag capabilities must be checked |
 | Performance tracking | Threads insights | NEW/ENHANCED | Official Insights API | Snapshot time series |
 
