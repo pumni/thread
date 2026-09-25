@@ -11,6 +11,8 @@ class CommandStatus(StrEnum):
     RECEIVED = "RECEIVED"
     VALIDATED = "VALIDATED"
     PROCESSING = "PROCESSING"
+    WAITING_EXECUTION = "WAITING_EXECUTION"
+    WAITING_INTERVENTION = "WAITING_INTERVENTION"
     SUCCEEDED = "SUCCEEDED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
@@ -31,12 +33,20 @@ _VALID_TRANSITIONS = frozenset(
         (CommandStatus.RECEIVED, CommandStatus.REJECTED),
         (CommandStatus.RECEIVED, CommandStatus.EXPIRED),
         (CommandStatus.VALIDATED, CommandStatus.PROCESSING),
+        (CommandStatus.VALIDATED, CommandStatus.WAITING_EXECUTION),
         (CommandStatus.VALIDATED, CommandStatus.REJECTED),
         (CommandStatus.VALIDATED, CommandStatus.EXPIRED),
         (CommandStatus.PROCESSING, CommandStatus.SUCCEEDED),
         (CommandStatus.PROCESSING, CommandStatus.FAILED_RETRYABLE),
         (CommandStatus.PROCESSING, CommandStatus.FAILED_FINAL),
         (CommandStatus.PROCESSING, CommandStatus.EXPIRED),
+        (CommandStatus.WAITING_EXECUTION, CommandStatus.WAITING_INTERVENTION),
+        (CommandStatus.WAITING_EXECUTION, CommandStatus.SUCCEEDED),
+        (CommandStatus.WAITING_EXECUTION, CommandStatus.FAILED_FINAL),
+        (CommandStatus.WAITING_EXECUTION, CommandStatus.EXPIRED),
+        (CommandStatus.WAITING_INTERVENTION, CommandStatus.WAITING_EXECUTION),
+        (CommandStatus.WAITING_INTERVENTION, CommandStatus.FAILED_FINAL),
+        (CommandStatus.WAITING_INTERVENTION, CommandStatus.EXPIRED),
         (CommandStatus.FAILED_RETRYABLE, CommandStatus.PROCESSING),
         (CommandStatus.FAILED_RETRYABLE, CommandStatus.EXPIRED),
         (CommandStatus.FAILED_RETRYABLE, CommandStatus.FAILED_FINAL),

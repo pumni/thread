@@ -9,6 +9,11 @@ from threads_platform.domain.commands import Command, CommandAttempt
 from threads_platform.domain.outbox import IntegrationDelivery, OutboxEvent
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
 from threads_platform.domain.sync import SyncState
+from threads_platform.domain.worker_jobs import (
+    WorkerIntervention,
+    WorkerJob,
+    WorkerJobAttempt,
+)
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
@@ -143,6 +148,10 @@ class WorkerCapabilityRepository(Protocol):
 
     async def list_for_worker(self, worker_id: UUID) -> list[WorkerCapability]: ...
 
+    async def has(self, worker_id: UUID, name: str, version: int) -> bool: ...
+
+    async def list_worker_ids(self, name: str, version: int) -> list[UUID]: ...
+
 
 class BrowserProfileRepository(Protocol):
     async def add(self, profile: BrowserProfile) -> None: ...
@@ -188,6 +197,50 @@ class WorkerSecurityRepository(Protocol):
     async def list_audit_events(self, worker_id: UUID) -> list[WorkerAuditEvent]: ...
 
 
+class WorkerJobRepository(Protocol):
+    async def add(self, job: WorkerJob) -> None: ...
+
+    async def get(self, job_id: UUID) -> WorkerJob | None: ...
+
+    async def get_for_update(self, job_id: UUID) -> WorkerJob | None: ...
+
+    async def update(self, job: WorkerJob) -> None: ...
+
+    async def claim_next(
+        self,
+        worker: WorkerNode,
+        now: datetime,
+        lease_expires_at: datetime,
+        lease_token: UUID,
+    ) -> WorkerJob | None: ...
+
+    async def list_expired_for_update(self, now: datetime, limit: int) -> list[WorkerJob]: ...
+
+    async def list_for_reconcile(self, worker_id: UUID, now: datetime) -> list[WorkerJob]: ...
+
+
+class WorkerJobAttemptRepository(Protocol):
+    async def add(self, attempt: WorkerJobAttempt) -> None: ...
+
+    async def get_running_for_update(self, job_id: UUID) -> WorkerJobAttempt | None: ...
+
+    async def list_for_job(self, job_id: UUID) -> list[WorkerJobAttempt]: ...
+
+    async def update(self, attempt: WorkerJobAttempt) -> None: ...
+
+
+class WorkerInterventionRepository(Protocol):
+    async def add(self, intervention: WorkerIntervention) -> None: ...
+
+    async def get_for_update(self, intervention_id: UUID) -> WorkerIntervention | None: ...
+
+    async def get_open_for_job(self, job_id: UUID) -> WorkerIntervention | None: ...
+
+    async def list_for_worker(self, worker_id: UUID) -> list[WorkerIntervention]: ...
+
+    async def update(self, intervention: WorkerIntervention) -> None: ...
+
+
 class UnitOfWork(Protocol):
     accounts: AccountRepository
     commands: CommandRepository
@@ -203,6 +256,9 @@ class UnitOfWork(Protocol):
     network_profiles: NetworkProfileRepository
     assignments: AccountWorkerAssignmentRepository
     worker_security: WorkerSecurityRepository
+    worker_jobs: WorkerJobRepository
+    worker_job_attempts: WorkerJobAttemptRepository
+    worker_interventions: WorkerInterventionRepository
 
     def savepoint(self) -> AbstractAsyncContextManager[object]: ...
 

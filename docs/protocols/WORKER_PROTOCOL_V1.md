@@ -181,6 +181,22 @@ All state-mutating job requests require:
 - current lease_token;
 - protocol version where applicable.
 
+### C1 route mapping
+
+- `POST /v1/workers/jobs/claim` returns one claimed job or HTTP 204 when none is eligible.
+- `GET /v1/workers/jobs/reconcile` returns the worker's owned or claimable durable jobs.
+- `POST /v1/workers/jobs/{job_id}/renew`
+- `POST /v1/workers/jobs/{job_id}/checkpoint`
+- `POST /v1/workers/jobs/{job_id}/complete`
+- `POST /v1/workers/jobs/{job_id}/fail`
+- `POST /v1/workers/jobs/{job_id}/interventions`
+- `POST /v1/workers/interventions/{intervention_id}/resolve` (Control Plane administrator)
+
+Every worker route uses the short-lived bearer session from the challenge exchange. The
+intervention resolution route uses the configured Control Plane administrator credential.
+Workers should poll claim/reconcile over HTTPS after reconnect and periodically while online;
+they must treat `job.available` only as a prompt to pull durable state.
+
 ## 9. WorkerJob claim
 
 Eligibility checks:
@@ -230,11 +246,18 @@ A stale worker receives a lease-lost response and cannot overwrite newer state.
 ## 12. Retry/reclaim
 
 RUNNING job with expired lease:
-- prior attempt is closed as retryable/final according to policy;
-- job may become reclaimable;
-- new claim receives a different lease token.
+- a `SAFE_TO_RETRY` job can be reclaimed within its attempt bound;
+- a `RECONCILIATION_REQUIRED` job enters `WAITING_INTERVENTION` instead of being replayed;
+- the previous attempt is closed and a later safe requeue creates a new attempt;
+- every new claim receives a different lease token.
 
 Old token never becomes valid again.
+
+Explicit retryable failures use a two-second default delay and the default attempt bound is three.
+An operator requeue after an ambiguous outcome requires explicit confirmation that retry is safe.
+Expired deadlines finalize the job and its linked Command; an open intervention is cancelled.
+Checkpoint and result documents are bounded to 64 KiB and reject recognized secret-bearing keys
+and URLs containing credentials.
 
 ## 13. Intervention
 

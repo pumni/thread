@@ -18,6 +18,9 @@ from threads_platform.application.ports.repositories import (
     ReplyRepository,
     SyncStateRepository,
     WorkerCapabilityRepository,
+    WorkerInterventionRepository,
+    WorkerJobAttemptRepository,
+    WorkerJobRepository,
     WorkerRepository,
     WorkerSecurityRepository,
 )
@@ -34,6 +37,9 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyReplyRepository,
     SQLAlchemySyncStateRepository,
     SQLAlchemyWorkerCapabilityRepository,
+    SQLAlchemyWorkerInterventionRepository,
+    SQLAlchemyWorkerJobAttemptRepository,
+    SQLAlchemyWorkerJobRepository,
     SQLAlchemyWorkerRepository,
     SQLAlchemyWorkerSecurityRepository,
 )
@@ -67,6 +73,13 @@ class SQLAlchemyUnitOfWork:
         )
         self.worker_security: WorkerSecurityRepository = SQLAlchemyWorkerSecurityRepository(
             self._session
+        )
+        self.worker_jobs: WorkerJobRepository = SQLAlchemyWorkerJobRepository(self._session)
+        self.worker_job_attempts: WorkerJobAttemptRepository = SQLAlchemyWorkerJobAttemptRepository(
+            self._session
+        )
+        self.worker_interventions: WorkerInterventionRepository = (
+            SQLAlchemyWorkerInterventionRepository(self._session)
         )
 
     async def __aenter__(self) -> SQLAlchemyUnitOfWork:

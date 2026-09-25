@@ -32,6 +32,12 @@ from threads_platform.domain.commands import AttemptStatus, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxStatus
 from threads_platform.domain.publishing import ScheduleStatus
 from threads_platform.domain.sync import SyncRunStatus
+from threads_platform.domain.worker_jobs import (
+    WorkerInterventionStatus,
+    WorkerJobAttemptStatus,
+    WorkerJobRetrySafety,
+    WorkerJobStatus,
+)
 from threads_platform.domain.workers import (
     NetworkProtocol,
     WorkerStatus,
@@ -488,6 +494,145 @@ class WorkerAuditEventRecord(Base):
     event_type: Mapped[str] = mapped_column(String(120), nullable=False)
     detail_code: Mapped[str | None] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkerJobRecord(Base):
+    __tablename__ = "worker_jobs"
+    __table_args__ = (
+        UniqueConstraint("command_id", name="uq_worker_jobs_command_id"),
+        CheckConstraint(
+            "max_attempts > 0 AND attempt_count >= 0 AND attempt_count <= max_attempts",
+            name="ck_worker_jobs_attempt_bound",
+        ),
+        CheckConstraint(
+            "capability_version > 0", name="ck_worker_jobs_positive_capability_version"
+        ),
+        CheckConstraint(
+            "deadline_at IS NULL OR scheduled_at < deadline_at",
+            name="ck_worker_jobs_deadline_after_schedule",
+        ),
+        CheckConstraint(
+            "(lease_worker_id IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL) "
+            "OR (lease_worker_id IS NOT NULL AND lease_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL)",
+            name="ck_worker_jobs_lease_pair",
+        ),
+        CheckConstraint(
+            "(status = 'RUNNING' AND lease_worker_id IS NOT NULL) OR "
+            "(status <> 'RUNNING' AND lease_worker_id IS NULL)",
+            name="ck_worker_jobs_running_lease",
+        ),
+        CheckConstraint(
+            "NOT account_affinity_required OR "
+            "(account_id IS NOT NULL AND assigned_worker_id IS NOT NULL)",
+            name="ck_worker_jobs_affinity_assignment",
+        ),
+        Index("ix_worker_jobs_claim", "status", "scheduled_at", "priority"),
+        Index("ix_worker_jobs_lease_expiry", "status", "lease_expires_at"),
+        Index("ix_worker_jobs_assigned_worker", "assigned_worker_id", "status"),
+        Index("ix_worker_jobs_lease_worker", "lease_worker_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    command_id: Mapped[str | None] = mapped_column(
+        String(255), ForeignKey("commands.command_id", ondelete="RESTRICT")
+    )
+    account_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT")
+    )
+    assigned_worker_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT")
+    )
+    account_affinity_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    capability_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    capability_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[WorkerJobStatus] = mapped_column(
+        enum_type(WorkerJobStatus, "worker_job_status"), nullable=False
+    )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    preemptible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    retry_safety: Mapped[WorkerJobRetrySafety] = mapped_column(
+        enum_type(WorkerJobRetrySafety, "worker_job_retry_safety"), nullable=False
+    )
+    retry_authorized_by_operator: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    lease_worker_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT")
+    )
+    lease_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkerJobAttemptRecord(Base):
+    __tablename__ = "worker_job_attempts"
+    __table_args__ = (
+        UniqueConstraint("worker_job_id", "attempt_number", name="uq_worker_job_attempt_number"),
+        UniqueConstraint("lease_token", name="uq_worker_job_attempt_lease_token"),
+        Index("ix_worker_job_attempts_job_status", "worker_job_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    worker_job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    lease_token: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    status: Mapped[WorkerJobAttemptStatus] = mapped_column(
+        enum_type(WorkerJobAttemptStatus, "worker_job_attempt_status"), nullable=False
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(120))
+
+
+class WorkerInterventionRecord(Base):
+    __tablename__ = "worker_interventions"
+    __table_args__ = (
+        Index(
+            "uq_worker_interventions_open_job",
+            "worker_job_id",
+            unique=True,
+            postgresql_where=text("status = 'OPEN'"),
+        ),
+        Index("ix_worker_interventions_worker_status", "worker_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    worker_job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    account_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT")
+    )
+    worker_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT")
+    )
+    intervention_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[WorkerInterventionStatus] = mapped_column(
+        enum_type(WorkerInterventionStatus, "worker_intervention_status"), nullable=False
+    )
+    detail_code: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[str | None] = mapped_column(String(255))
 
 
 class BrowserProfileRecord(Base):

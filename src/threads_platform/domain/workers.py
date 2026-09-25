@@ -147,31 +147,6 @@ class AccountWorkerAssignment:
             raise ValueError("active assignment must not have ended_at")
 
 
-class InterventionStatus(StrEnum):
-    OPEN = "OPEN"
-    RESOLVED = "RESOLVED"
-    CANCELLED = "CANCELLED"
-
-
-@dataclass(slots=True)
-class WorkerIntervention:
-    worker_job_id: UUID
-    account_id: UUID | None
-    intervention_type: str
-    id: UUID = field(default_factory=uuid4)
-    worker_id: UUID | None = None
-    status: InterventionStatus = InterventionStatus.OPEN
-    metadata: dict[str, object] = field(default_factory=_empty_metadata)
-    created_at: datetime = field(default_factory=utc_now)
-    resolved_at: datetime | None = None
-
-    def __post_init__(self) -> None:
-        if not self.intervention_type.strip():
-            raise ValueError("intervention_type must not be empty")
-        self.created_at = normalize_utc(self.created_at)
-        self.resolved_at = normalize_utc(self.resolved_at) if self.resolved_at else None
-
-
 @dataclass(slots=True)
 class WorkerEnrollment:
     token_digest: str

@@ -60,7 +60,8 @@ async def unit_of_work_factory() -> AsyncIterator[SQLAlchemyUnitOfWorkFactory]:
     async with engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE TABLE worker_audit_events, worker_sessions, worker_auth_challenges, "
+                "TRUNCATE TABLE worker_interventions, worker_job_attempts, worker_jobs, "
+                "worker_audit_events, worker_sessions, worker_auth_challenges, "
                 "worker_enrollments, worker_capabilities, browser_profiles, "
                 "account_worker_assignments, network_profiles, worker_nodes, "
                 "integration_deliveries, outbox_events, "

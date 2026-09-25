@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +18,9 @@ from threads_platform.application.ports.repositories import (
     ReplyRepository,
     SyncStateRepository,
     WorkerCapabilityRepository,
+    WorkerInterventionRepository,
+    WorkerJobAttemptRepository,
+    WorkerJobRepository,
     WorkerRepository,
     WorkerSecurityRepository,
 )
@@ -40,6 +43,16 @@ from threads_platform.domain.outbox import (
 )
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
 from threads_platform.domain.sync import SyncState
+from threads_platform.domain.time import normalize_utc
+from threads_platform.domain.worker_jobs import (
+    WorkerIntervention,
+    WorkerInterventionStatus,
+    WorkerJob,
+    WorkerJobAttempt,
+    WorkerJobAttemptStatus,
+    WorkerJobRetrySafety,
+    WorkerJobStatus,
+)
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
@@ -69,6 +82,9 @@ from threads_platform.infrastructure.persistence.models import (
     WorkerAuthChallengeRecord,
     WorkerCapabilityRecord,
     WorkerEnrollmentRecord,
+    WorkerInterventionRecord,
+    WorkerJobAttemptRecord,
+    WorkerJobRecord,
     WorkerNodeRecord,
     WorkerSessionRecord,
 )
@@ -850,6 +866,27 @@ class SQLAlchemyWorkerCapabilityRepository(WorkerCapabilityRepository):
         )
         return [self._domain(record) for record in result]
 
+    async def has(self, worker_id: UUID, name: str, version: int) -> bool:
+        capability_id = await self._session.scalar(
+            select(WorkerCapabilityRecord.id).where(
+                WorkerCapabilityRecord.worker_id == worker_id,
+                WorkerCapabilityRecord.capability_name == name,
+                WorkerCapabilityRecord.capability_version == version,
+            )
+        )
+        return capability_id is not None
+
+    async def list_worker_ids(self, name: str, version: int) -> list[UUID]:
+        result = await self._session.scalars(
+            select(WorkerCapabilityRecord.worker_id)
+            .where(
+                WorkerCapabilityRecord.capability_name == name,
+                WorkerCapabilityRecord.capability_version == version,
+            )
+            .order_by(WorkerCapabilityRecord.worker_id)
+        )
+        return list(result)
+
     @staticmethod
     def _domain(record: WorkerCapabilityRecord) -> WorkerCapability:
         return WorkerCapability(
@@ -1142,4 +1179,434 @@ class SQLAlchemyWorkerSecurityRepository(WorkerSecurityRepository):
             event_type=record.event_type,
             detail_code=record.detail_code,
             created_at=record.created_at,
+        )
+
+
+class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, job: WorkerJob) -> None:
+        self._session.add(self._record(job))
+        await self._session.flush()
+
+    async def get(self, job_id: UUID) -> WorkerJob | None:
+        record = await self._session.get(WorkerJobRecord, job_id)
+        return self._domain(record) if record is not None else None
+
+    async def get_for_update(self, job_id: UUID) -> WorkerJob | None:
+        record = await self._session.scalar(
+            select(WorkerJobRecord).where(WorkerJobRecord.id == job_id).with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def update(self, job: WorkerJob) -> None:
+        record = await self._session.get(WorkerJobRecord, job.id)
+        if record is None:
+            raise LookupError(f"WorkerJob not found: {job.id}")
+        self._write(record, job)
+        await self._session.flush()
+
+    async def claim_next(
+        self,
+        worker: WorkerNode,
+        now: datetime,
+        lease_expires_at: datetime,
+        lease_token: UUID,
+    ) -> WorkerJob | None:
+        occurred_at = normalize_utc(now)
+        if (
+            worker.status is not WorkerStatus.ONLINE
+            or worker.protocol_version != 1
+            or worker.capabilities_schema_version != 1
+            or worker.presence_expires_at is None
+            or worker.presence_expires_at <= occurred_at
+        ):
+            return None
+        active_count = await self._session.scalar(
+            select(func.count())
+            .select_from(WorkerJobRecord)
+            .where(
+                WorkerJobRecord.lease_worker_id == worker.worker_id,
+                WorkerJobRecord.status == WorkerJobStatus.RUNNING,
+                WorkerJobRecord.lease_expires_at > occurred_at,
+            )
+        )
+        if (active_count or 0) >= worker.max_concurrent_jobs:
+            return None
+
+        has_capability = exists(
+            select(WorkerCapabilityRecord.id).where(
+                WorkerCapabilityRecord.worker_id == worker.worker_id,
+                WorkerCapabilityRecord.capability_name == WorkerJobRecord.capability_name,
+                WorkerCapabilityRecord.capability_version == WorkerJobRecord.capability_version,
+            )
+        )
+        has_current_assignment = exists(
+            select(AccountWorkerAssignmentRecord.id).where(
+                AccountWorkerAssignmentRecord.account_id == WorkerJobRecord.account_id,
+                AccountWorkerAssignmentRecord.worker_id == worker.worker_id,
+                AccountWorkerAssignmentRecord.is_active.is_(True),
+            )
+        )
+        available_status = or_(
+            and_(
+                WorkerJobRecord.status.in_(
+                    [WorkerJobStatus.QUEUED, WorkerJobStatus.FAILED_RETRYABLE]
+                ),
+                WorkerJobRecord.scheduled_at <= occurred_at,
+            ),
+            and_(
+                WorkerJobRecord.status == WorkerJobStatus.RUNNING,
+                WorkerJobRecord.lease_expires_at <= occurred_at,
+            ),
+        )
+        candidate = await self._session.scalar(
+            select(WorkerJobRecord)
+            .where(
+                available_status,
+                or_(
+                    WorkerJobRecord.deadline_at.is_(None),
+                    WorkerJobRecord.deadline_at > occurred_at,
+                ),
+                WorkerJobRecord.attempt_count < WorkerJobRecord.max_attempts,
+                or_(
+                    WorkerJobRecord.attempt_count == 0,
+                    WorkerJobRecord.retry_safety == WorkerJobRetrySafety.SAFE_TO_RETRY,
+                    WorkerJobRecord.retry_authorized_by_operator.is_(True),
+                ),
+                or_(
+                    WorkerJobRecord.assigned_worker_id.is_(None),
+                    WorkerJobRecord.assigned_worker_id == worker.worker_id,
+                ),
+                or_(
+                    WorkerJobRecord.account_affinity_required.is_(False),
+                    has_current_assignment,
+                ),
+                has_capability,
+            )
+            .order_by(
+                WorkerJobRecord.priority.desc(),
+                WorkerJobRecord.scheduled_at,
+                WorkerJobRecord.created_at,
+                WorkerJobRecord.id,
+            )
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        if candidate is None:
+            return None
+
+        if candidate.status is WorkerJobStatus.RUNNING:
+            previous = await self._session.scalar(
+                select(WorkerJobAttemptRecord)
+                .where(
+                    WorkerJobAttemptRecord.worker_job_id == candidate.id,
+                    WorkerJobAttemptRecord.status == WorkerJobAttemptStatus.RUNNING,
+                )
+                .order_by(WorkerJobAttemptRecord.attempt_number.desc())
+                .with_for_update()
+            )
+            if previous is not None:
+                previous.status = WorkerJobAttemptStatus.ABANDONED
+                previous.finished_at = occurred_at
+                previous.error_code = "LEASE_EXPIRED"
+
+        job = self._domain(candidate)
+        job.claim(worker.worker_id, occurred_at, lease_expires_at, lease_token)
+        self._write(candidate, job)
+        await self._session.flush()
+        return job
+
+    async def list_expired_for_update(self, now: datetime, limit: int) -> list[WorkerJob]:
+        occurred_at = normalize_utc(now)
+        should_reconcile = or_(
+            WorkerJobRecord.retry_safety == WorkerJobRetrySafety.RECONCILIATION_REQUIRED,
+            WorkerJobRecord.attempt_count >= WorkerJobRecord.max_attempts,
+        )
+        result = await self._session.scalars(
+            select(WorkerJobRecord)
+            .where(
+                WorkerJobRecord.status.in_(
+                    [
+                        WorkerJobStatus.QUEUED,
+                        WorkerJobStatus.FAILED_RETRYABLE,
+                        WorkerJobStatus.RUNNING,
+                        WorkerJobStatus.WAITING_INTERVENTION,
+                    ]
+                ),
+                or_(
+                    WorkerJobRecord.deadline_at <= occurred_at,
+                    and_(
+                        WorkerJobRecord.status.in_(
+                            [WorkerJobStatus.QUEUED, WorkerJobStatus.FAILED_RETRYABLE]
+                        ),
+                        WorkerJobRecord.attempt_count >= WorkerJobRecord.max_attempts,
+                    ),
+                    and_(
+                        WorkerJobRecord.status == WorkerJobStatus.RUNNING,
+                        WorkerJobRecord.lease_expires_at <= occurred_at,
+                        should_reconcile,
+                    ),
+                ),
+            )
+            .order_by(WorkerJobRecord.deadline_at, WorkerJobRecord.updated_at)
+            .with_for_update(skip_locked=True)
+            .limit(limit)
+        )
+        return [self._domain(record) for record in result]
+
+    async def list_for_reconcile(self, worker_id: UUID, now: datetime) -> list[WorkerJob]:
+        occurred_at = normalize_utc(now)
+        has_capability = exists(
+            select(WorkerCapabilityRecord.id).where(
+                WorkerCapabilityRecord.worker_id == worker_id,
+                WorkerCapabilityRecord.capability_name == WorkerJobRecord.capability_name,
+                WorkerCapabilityRecord.capability_version == WorkerJobRecord.capability_version,
+            )
+        )
+        has_current_assignment = exists(
+            select(AccountWorkerAssignmentRecord.id).where(
+                AccountWorkerAssignmentRecord.account_id == WorkerJobRecord.account_id,
+                AccountWorkerAssignmentRecord.worker_id == worker_id,
+                AccountWorkerAssignmentRecord.is_active.is_(True),
+            )
+        )
+        result = await self._session.scalars(
+            select(WorkerJobRecord)
+            .where(
+                or_(
+                    and_(
+                        WorkerJobRecord.status == WorkerJobStatus.RUNNING,
+                        WorkerJobRecord.lease_worker_id == worker_id,
+                    ),
+                    and_(
+                        WorkerJobRecord.status == WorkerJobStatus.WAITING_INTERVENTION,
+                        WorkerJobRecord.assigned_worker_id == worker_id,
+                    ),
+                    and_(
+                        WorkerJobRecord.status.in_(
+                            [WorkerJobStatus.QUEUED, WorkerJobStatus.FAILED_RETRYABLE]
+                        ),
+                        WorkerJobRecord.scheduled_at <= occurred_at,
+                        or_(
+                            WorkerJobRecord.deadline_at.is_(None),
+                            WorkerJobRecord.deadline_at > occurred_at,
+                        ),
+                        or_(
+                            WorkerJobRecord.assigned_worker_id == worker_id,
+                            and_(
+                                WorkerJobRecord.assigned_worker_id.is_(None),
+                                WorkerJobRecord.account_affinity_required.is_(False),
+                            ),
+                        ),
+                        or_(
+                            WorkerJobRecord.account_affinity_required.is_(False),
+                            has_current_assignment,
+                        ),
+                        has_capability,
+                    ),
+                )
+            )
+            .order_by(WorkerJobRecord.priority.desc(), WorkerJobRecord.scheduled_at)
+        )
+        return [self._domain(record) for record in result]
+
+    @staticmethod
+    def _record(job: WorkerJob) -> WorkerJobRecord:
+        record = WorkerJobRecord(id=job.id)
+        SQLAlchemyWorkerJobRepository._write(record, job)
+        return record
+
+    @staticmethod
+    def _write(record: WorkerJobRecord, job: WorkerJob) -> None:
+        record.command_id = job.command_id
+        record.account_id = job.account_id
+        record.assigned_worker_id = job.assigned_worker_id
+        record.account_affinity_required = job.account_affinity_required
+        record.capability_name = job.capability_name
+        record.capability_version = job.capability_version
+        record.status = job.status
+        record.priority = job.priority
+        record.preemptible = job.preemptible
+        record.scheduled_at = job.scheduled_at
+        record.deadline_at = job.deadline_at
+        record.attempt_count = job.attempt_count
+        record.max_attempts = job.max_attempts
+        record.retry_safety = job.retry_safety
+        record.retry_authorized_by_operator = job.retry_authorized_by_operator
+        record.lease_worker_id = job.lease_worker_id
+        record.lease_token = job.lease_token
+        record.lease_expires_at = job.lease_expires_at
+        record.checkpoint = job.checkpoint
+        record.result = job.result
+        record.error_code = job.error_code
+        record.created_at = job.created_at
+        record.updated_at = job.updated_at
+        record.completed_at = job.completed_at
+
+    @staticmethod
+    def _domain(record: WorkerJobRecord) -> WorkerJob:
+        return WorkerJob(
+            id=record.id,
+            command_id=record.command_id,
+            account_id=record.account_id,
+            assigned_worker_id=record.assigned_worker_id,
+            account_affinity_required=record.account_affinity_required,
+            capability_name=record.capability_name,
+            capability_version=record.capability_version,
+            status=WorkerJobStatus(record.status),
+            priority=record.priority,
+            preemptible=record.preemptible,
+            scheduled_at=record.scheduled_at,
+            deadline_at=record.deadline_at,
+            attempt_count=record.attempt_count,
+            max_attempts=record.max_attempts,
+            retry_safety=WorkerJobRetrySafety(record.retry_safety),
+            retry_authorized_by_operator=record.retry_authorized_by_operator,
+            lease_worker_id=record.lease_worker_id,
+            lease_token=record.lease_token,
+            lease_expires_at=record.lease_expires_at,
+            checkpoint=record.checkpoint,
+            result=record.result,
+            error_code=record.error_code,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            completed_at=record.completed_at,
+        )
+
+
+class SQLAlchemyWorkerJobAttemptRepository(WorkerJobAttemptRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, attempt: WorkerJobAttempt) -> None:
+        self._session.add(
+            WorkerJobAttemptRecord(
+                id=attempt.id,
+                worker_job_id=attempt.worker_job_id,
+                attempt_number=attempt.attempt_number,
+                worker_id=attempt.worker_id,
+                lease_token=attempt.lease_token,
+                status=attempt.status,
+                started_at=attempt.started_at,
+                finished_at=attempt.finished_at,
+                error_code=attempt.error_code,
+            )
+        )
+        await self._session.flush()
+
+    async def get_running_for_update(self, job_id: UUID) -> WorkerJobAttempt | None:
+        record = await self._session.scalar(
+            select(WorkerJobAttemptRecord)
+            .where(
+                WorkerJobAttemptRecord.worker_job_id == job_id,
+                WorkerJobAttemptRecord.status == WorkerJobAttemptStatus.RUNNING,
+            )
+            .order_by(WorkerJobAttemptRecord.attempt_number.desc())
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def list_for_job(self, job_id: UUID) -> list[WorkerJobAttempt]:
+        result = await self._session.scalars(
+            select(WorkerJobAttemptRecord)
+            .where(WorkerJobAttemptRecord.worker_job_id == job_id)
+            .order_by(WorkerJobAttemptRecord.attempt_number)
+        )
+        return [self._domain(record) for record in result]
+
+    async def update(self, attempt: WorkerJobAttempt) -> None:
+        record = await self._session.get(WorkerJobAttemptRecord, attempt.id)
+        if record is None:
+            raise LookupError(f"WorkerJobAttempt not found: {attempt.id}")
+        record.status = attempt.status
+        record.finished_at = attempt.finished_at
+        record.error_code = attempt.error_code
+        await self._session.flush()
+
+    @staticmethod
+    def _domain(record: WorkerJobAttemptRecord) -> WorkerJobAttempt:
+        return WorkerJobAttempt(
+            id=record.id,
+            worker_job_id=record.worker_job_id,
+            attempt_number=record.attempt_number,
+            worker_id=record.worker_id,
+            lease_token=record.lease_token,
+            status=WorkerJobAttemptStatus(record.status),
+            started_at=record.started_at,
+            finished_at=record.finished_at,
+            error_code=record.error_code,
+        )
+
+
+class SQLAlchemyWorkerInterventionRepository(WorkerInterventionRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, intervention: WorkerIntervention) -> None:
+        self._session.add(
+            WorkerInterventionRecord(
+                id=intervention.id,
+                worker_job_id=intervention.worker_job_id,
+                account_id=intervention.account_id,
+                worker_id=intervention.worker_id,
+                intervention_type=intervention.intervention_type,
+                status=intervention.status,
+                detail_code=intervention.detail_code,
+                created_at=intervention.created_at,
+                resolved_at=intervention.resolved_at,
+                resolved_by=intervention.resolved_by,
+            )
+        )
+        await self._session.flush()
+
+    async def get_for_update(self, intervention_id: UUID) -> WorkerIntervention | None:
+        record = await self._session.scalar(
+            select(WorkerInterventionRecord)
+            .where(WorkerInterventionRecord.id == intervention_id)
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def get_open_for_job(self, job_id: UUID) -> WorkerIntervention | None:
+        record = await self._session.scalar(
+            select(WorkerInterventionRecord).where(
+                WorkerInterventionRecord.worker_job_id == job_id,
+                WorkerInterventionRecord.status == WorkerInterventionStatus.OPEN,
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    async def list_for_worker(self, worker_id: UUID) -> list[WorkerIntervention]:
+        result = await self._session.scalars(
+            select(WorkerInterventionRecord)
+            .where(WorkerInterventionRecord.worker_id == worker_id)
+            .order_by(WorkerInterventionRecord.created_at)
+        )
+        return [self._domain(record) for record in result]
+
+    async def update(self, intervention: WorkerIntervention) -> None:
+        record = await self._session.get(WorkerInterventionRecord, intervention.id)
+        if record is None:
+            raise LookupError(f"WorkerIntervention not found: {intervention.id}")
+        record.status = intervention.status
+        record.detail_code = intervention.detail_code
+        record.resolved_at = intervention.resolved_at
+        record.resolved_by = intervention.resolved_by
+        await self._session.flush()
+
+    @staticmethod
+    def _domain(record: WorkerInterventionRecord) -> WorkerIntervention:
+        return WorkerIntervention(
+            id=record.id,
+            worker_job_id=record.worker_job_id,
+            account_id=record.account_id,
+            worker_id=record.worker_id,
+            intervention_type=record.intervention_type,
+            status=WorkerInterventionStatus(record.status),
+            detail_code=record.detail_code,
+            created_at=record.created_at,
+            resolved_at=record.resolved_at,
+            resolved_by=record.resolved_by,
         )
