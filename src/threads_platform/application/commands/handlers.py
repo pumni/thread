@@ -4,6 +4,7 @@ from typing import Protocol
 from threads_platform.application.crm_protocol_v1 import CommandEnvelopeV1
 from threads_platform.application.errors import ExecutionLeaseLost
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
+from threads_platform.domain.sync import SyncState
 
 
 class CheckpointWriter(Protocol):
@@ -28,10 +29,17 @@ class CommandExecutionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class SyncStateUpdate:
+    state: SyncState
+    expected_cursor: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CommandExecutionOutput:
     result: dict[str, object]
     posts: tuple[ThreadPost, ...] = ()
     replies: tuple[ThreadReply, ...] = ()
+    sync_states: tuple[SyncStateUpdate, ...] = ()
 
 
 class CommandHandler(Protocol):

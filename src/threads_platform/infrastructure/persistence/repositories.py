@@ -13,6 +13,7 @@ from threads_platform.application.ports.repositories import (
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
+    SyncStateRepository,
 )
 from threads_platform.domain.accounts import AccountStatus, ThreadsAccount
 from threads_platform.domain.commands import (
@@ -28,6 +29,7 @@ from threads_platform.domain.outbox import (
     OutboxStatus,
 )
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
+from threads_platform.domain.sync import SyncState
 from threads_platform.infrastructure.persistence.models import (
     AccountRecord,
     CommandAttemptRecord,
@@ -36,6 +38,7 @@ from threads_platform.infrastructure.persistence.models import (
     OutboxEventRecord,
     PostRecord,
     ReplyRecord,
+    SyncStateRecord,
 )
 
 
@@ -272,6 +275,15 @@ class SQLAlchemyPostRepository(PostRepository):
         )
         await self._session.flush()
 
+    async def add_if_absent(self, post: ThreadPost) -> bool:
+        statement = (
+            postgres_insert(PostRecord)
+            .values(**self._values(post))
+            .on_conflict_do_nothing(constraint="uq_posts_account_threads_id")
+            .returning(PostRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
+
     async def get_by_external_id(self, account_id: UUID, threads_post_id: str) -> ThreadPost | None:
         record = await self._session.scalar(
             select(PostRecord).where(
@@ -281,6 +293,24 @@ class SQLAlchemyPostRepository(PostRepository):
         )
         if record is None:
             return None
+        return self._domain(record)
+
+    @staticmethod
+    def _values(post: ThreadPost) -> dict[str, object]:
+        return {
+            "id": post.id,
+            "account_id": post.account_id,
+            "threads_post_id": post.threads_post_id,
+            "text": post.text,
+            "permalink": post.permalink,
+            "published_at": post.published_at,
+            "created_at": post.created_at,
+            "updated_at": post.updated_at,
+            "metadata_json": post.metadata,
+        }
+
+    @staticmethod
+    def _domain(record: PostRecord) -> ThreadPost:
         return ThreadPost(
             id=record.id,
             account_id=record.account_id,
@@ -313,6 +343,15 @@ class SQLAlchemyReplyRepository(ReplyRepository):
         )
         await self._session.flush()
 
+    async def add_if_absent(self, reply: ThreadReply) -> bool:
+        statement = (
+            postgres_insert(ReplyRecord)
+            .values(**self._values(reply))
+            .on_conflict_do_nothing(constraint="uq_replies_account_threads_id")
+            .returning(ReplyRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
+
     async def get_by_external_id(
         self, account_id: UUID, threads_reply_id: str
     ) -> ThreadReply | None:
@@ -324,6 +363,32 @@ class SQLAlchemyReplyRepository(ReplyRepository):
         )
         if record is None:
             return None
+        return self._domain(record)
+
+    async def list_for_root(self, account_id: UUID, root_post_id: UUID) -> list[ThreadReply]:
+        records = await self._session.scalars(
+            select(ReplyRecord).where(
+                ReplyRecord.account_id == account_id,
+                ReplyRecord.root_post_id == root_post_id,
+            )
+        )
+        return [self._domain(record) for record in records]
+
+    @staticmethod
+    def _values(reply: ThreadReply) -> dict[str, object]:
+        return {
+            "id": reply.id,
+            "account_id": reply.account_id,
+            "threads_reply_id": reply.threads_reply_id,
+            "root_post_id": reply.root_post_id,
+            "parent_reply_id": reply.parent_reply_id,
+            "text": reply.text,
+            "replied_at": reply.replied_at,
+            "created_at": reply.created_at,
+        }
+
+    @staticmethod
+    def _domain(record: ReplyRecord) -> ThreadReply:
         return ThreadReply(
             id=record.id,
             account_id=record.account_id,
@@ -334,6 +399,69 @@ class SQLAlchemyReplyRepository(ReplyRepository):
             replied_at=record.replied_at,
             created_at=record.created_at,
         )
+
+
+class SQLAlchemySyncStateRepository(SyncStateRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, account_id: UUID, sync_type: str) -> SyncState | None:
+        record = await self._session.scalar(
+            select(SyncStateRecord).where(
+                SyncStateRecord.account_id == account_id,
+                SyncStateRecord.sync_type == sync_type,
+            )
+        )
+        if record is None:
+            return None
+        return SyncState(
+            id=record.id,
+            account_id=record.account_id,
+            sync_type=record.sync_type,
+            cursor=record.cursor,
+            last_synced_at=record.last_synced_at,
+            updated_at=record.updated_at,
+        )
+
+    async def advance_if_current(self, state: SyncState, expected_cursor: str | None) -> bool:
+        condition = (
+            SyncStateRecord.cursor.is_(None)
+            if expected_cursor is None
+            else SyncStateRecord.cursor == expected_cursor
+        )
+        updated_id = await self._session.scalar(
+            update(SyncStateRecord)
+            .where(
+                SyncStateRecord.account_id == state.account_id,
+                SyncStateRecord.sync_type == state.sync_type,
+                condition,
+            )
+            .values(
+                cursor=state.cursor,
+                last_synced_at=state.last_synced_at,
+                updated_at=state.updated_at,
+            )
+            .returning(SyncStateRecord.id)
+        )
+        if updated_id is not None:
+            return True
+
+        if expected_cursor is not None:
+            return False
+        statement = (
+            postgres_insert(SyncStateRecord)
+            .values(
+                id=state.id,
+                account_id=state.account_id,
+                sync_type=state.sync_type,
+                cursor=state.cursor,
+                last_synced_at=state.last_synced_at,
+                updated_at=state.updated_at,
+            )
+            .on_conflict_do_nothing(constraint="uq_sync_states_account_type")
+            .returning(SyncStateRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
 
 
 class SQLAlchemyCommandAttemptRepository(CommandAttemptRepository):

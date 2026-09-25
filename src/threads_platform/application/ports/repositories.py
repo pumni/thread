@@ -8,6 +8,7 @@ from threads_platform.domain.accounts import ThreadsAccount
 from threads_platform.domain.commands import Command, CommandAttempt
 from threads_platform.domain.outbox import IntegrationDelivery, OutboxEvent
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
+from threads_platform.domain.sync import SyncState
 
 
 class AccountRepository(Protocol):
@@ -51,6 +52,8 @@ class CommandRepository(Protocol):
 class PostRepository(Protocol):
     async def add(self, post: ThreadPost) -> None: ...
 
+    async def add_if_absent(self, post: ThreadPost) -> bool: ...
+
     async def get_by_external_id(
         self, account_id: UUID, threads_post_id: str
     ) -> ThreadPost | None: ...
@@ -59,9 +62,19 @@ class PostRepository(Protocol):
 class ReplyRepository(Protocol):
     async def add(self, reply: ThreadReply) -> None: ...
 
+    async def add_if_absent(self, reply: ThreadReply) -> bool: ...
+
     async def get_by_external_id(
         self, account_id: UUID, threads_reply_id: str
     ) -> ThreadReply | None: ...
+
+    async def list_for_root(self, account_id: UUID, root_post_id: UUID) -> list[ThreadReply]: ...
+
+
+class SyncStateRepository(Protocol):
+    async def get(self, account_id: UUID, sync_type: str) -> SyncState | None: ...
+
+    async def advance_if_current(self, state: SyncState, expected_cursor: str | None) -> bool: ...
 
 
 class CommandAttemptRepository(Protocol):
@@ -106,6 +119,7 @@ class UnitOfWork(Protocol):
     attempts: CommandAttemptRepository
     posts: PostRepository
     replies: ReplyRepository
+    sync_states: SyncStateRepository
     outbox_events: OutboxEventRepository
     deliveries: IntegrationDeliveryRepository
 

@@ -58,10 +58,11 @@ class RecordingHandler:
         self, command: CommandEnvelopeV1, context: CommandExecutionContext
     ) -> CommandExecutionOutput:
         self.calls += 1
+        text = getattr(command.payload, "text", None)
         post = ThreadPost(
             account_id=command.account_id,
             threads_post_id=f"local-result-{command.command_id}",
-            text=command.payload.text,
+            text=text if isinstance(text, str) else None,
         )
         return CommandExecutionOutput(result={"local_result_id": command.command_id}, posts=(post,))
 

@@ -41,7 +41,17 @@ from threads_platform.domain.commands import (
 from threads_platform.domain.outbox import IntegrationDelivery, OutboxEvent
 from threads_platform.domain.time import normalize_utc
 
-KNOWN_COMMAND_TYPES = frozenset({"threads.publish_text", "threads.create_reply"})
+KNOWN_COMMAND_TYPES = frozenset(
+    {
+        "threads.publish_text",
+        "threads.publish_image",
+        "threads.publish_video",
+        "threads.publish_carousel",
+        "threads.create_reply",
+        "threads.sync_conversation",
+        "threads.moderate_reply",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +66,10 @@ class _ExecutionClaim:
     command: Command
     lease_token: UUID
     attempt_number: int
+
+
+class _SyncCursorConflict(Exception):
+    pass
 
 
 class CommandRuntime:
@@ -309,7 +323,10 @@ class CommandRuntime:
             return await self._finish_failure(claim, error.code, retryable=False)
         except Exception:
             return await self._finish_failure(claim, "UNEXPECTED_HANDLER_ERROR", retryable=True)
-        return await self._finish_success(claim, output)
+        try:
+            return await self._finish_success(claim, output)
+        except _SyncCursorConflict:
+            return await self._finish_failure(claim, "SYNC_CURSOR_ADVANCED", retryable=True)
 
     async def _execute_with_heartbeat(
         self,
@@ -370,9 +387,14 @@ class CommandRuntime:
                     executed=False,
                 )
             for post in output.posts:
-                await unit_of_work.posts.add(post)
+                await unit_of_work.posts.add_if_absent(post)
             for reply in output.replies:
-                await unit_of_work.replies.add(reply)
+                await unit_of_work.replies.add_if_absent(reply)
+            for sync_state in output.sync_states:
+                if not await unit_of_work.sync_states.advance_if_current(
+                    sync_state.state, sync_state.expected_cursor
+                ):
+                    raise _SyncCursorConflict
             command.transition(CommandStatus.SUCCEEDED, now, result=output.result)
             self._clear_execution_lease(command)
             attempt.status = AttemptStatus.SUCCEEDED
