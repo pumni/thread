@@ -8,7 +8,7 @@ Architecture and delivery planning. No production implementation should begin un
 
 ## Product direction
 
-This project is NOT a port of the legacy Facebook browser bot. The legacy report is retained only as a source of business requirements and parity goals.
+This project is a Threads-first platform; it does not port the legacy Facebook browser bot.
 
 Core principles:
 
@@ -30,8 +30,6 @@ Core principles:
 4. docs/CODEX_EXECUTION_GUIDE.md — rules for handing implementation tasks to Codex.
 5. docs/ACCEPTANCE_AND_REVIEW.md — acceptance process used by the reviewer/coordinator.
 6. docs/adr/ — architectural decisions.
-
-The previous BAO_CAO_CHI_TIET_DU_AN_FACEBOOK_TOOL.md is legacy reference material only and must not be treated as an implementation blueprint.
 
 ## Workflow
 
