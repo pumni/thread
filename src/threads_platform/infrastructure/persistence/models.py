@@ -37,6 +37,17 @@ from threads_platform.domain.capabilities import (
     RouteTarget,
 )
 from threads_platform.domain.commands import AttemptStatus, CommandStatus
+from threads_platform.domain.discovery import (
+    DiscoveryCampaignStatus,
+    DiscoveryEnrichmentStatus,
+    DiscoveryEvidenceClass,
+    DiscoveryEvidenceSource,
+    DiscoveryQueryKind,
+    DiscoveryRunStatus,
+    DiscoverySearchMode,
+    DiscoverySearchType,
+    LeadCandidateStatus,
+)
 from threads_platform.domain.outbox import DeliveryStatus, OutboxStatus
 from threads_platform.domain.publishing import ScheduleStatus
 from threads_platform.domain.sync import SyncRunStatus
@@ -273,6 +284,10 @@ class ReplyRecord(Base):
     __tablename__ = "replies"
     __table_args__ = (
         UniqueConstraint("account_id", "threads_reply_id", name="uq_replies_account_threads_id"),
+        CheckConstraint(
+            "(root_post_id IS NOT NULL) <> (discovered_thread_id IS NOT NULL)",
+            name="ck_replies_exactly_one_root",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -280,8 +295,16 @@ class ReplyRecord(Base):
         Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
     )
     threads_reply_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    root_post_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("posts.id", ondelete="RESTRICT"), nullable=False
+    root_post_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("posts.id", ondelete="RESTRICT")
+    )
+    discovered_thread_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "discovered_threads.id",
+            name="fk_replies_discovered_thread_id_discovered_threads",
+            ondelete="RESTRICT",
+        ),
     )
     parent_reply_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("replies.id", ondelete="RESTRICT")
@@ -291,6 +314,273 @@ class ReplyRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class DiscoveryCampaignRecord(Base):
+    __tablename__ = "discovery_campaigns"
+    __table_args__ = (Index("ix_discovery_campaign_account_status", "account_id", "status"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[DiscoveryCampaignStatus] = mapped_column(
+        enum_type(DiscoveryCampaignStatus, "discovery_campaign_status"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SearchQueryRecord(Base):
+    __tablename__ = "discovery_search_queries"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "query_fingerprint", name="uq_discovery_query_identity"),
+        Index("ix_discovery_queries_campaign_kind", "campaign_id", "kind"),
+        CheckConstraint(
+            "since IS NULL OR until IS NULL OR since < until",
+            name="ck_discovery_query_time_window",
+        ),
+        CheckConstraint(
+            "(kind <> 'SEARCH' OR (query_text IS NOT NULL AND search_mode IS NOT NULL "
+            "AND search_type IS NOT NULL)) AND "
+            "(kind <> 'PROFILE' OR username IS NOT NULL) AND "
+            "(kind <> 'CONVERSATION' OR thread_remote_id IS NOT NULL)",
+            name="ck_discovery_query_kind_fields",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    campaign_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_campaigns.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    kind: Mapped[DiscoveryQueryKind] = mapped_column(
+        enum_type(DiscoveryQueryKind, "discovery_query_kind"), nullable=False
+    )
+    query_text: Mapped[str | None] = mapped_column(String(255))
+    search_mode: Mapped[DiscoverySearchMode | None] = mapped_column(
+        enum_type(DiscoverySearchMode, "discovery_search_mode")
+    )
+    search_type: Mapped[DiscoverySearchType | None] = mapped_column(
+        enum_type(DiscoverySearchType, "discovery_search_type")
+    )
+    username: Mapped[str | None] = mapped_column(String(255))
+    thread_remote_id: Mapped[str | None] = mapped_column(String(255))
+    since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    query_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DiscoveryRunRecord(Base):
+    __tablename__ = "discovery_runs"
+    __table_args__ = (
+        UniqueConstraint("command_id", name="uq_discovery_runs_command_id"),
+        Index("ix_discovery_runs_campaign_status", "campaign_id", "status", "updated_at"),
+        CheckConstraint("pages_processed >= 0", name="ck_discovery_run_pages_nonnegative"),
+        CheckConstraint("items_processed >= 0", name="ck_discovery_run_items_nonnegative"),
+        CheckConstraint("items_skipped >= 0", name="ck_discovery_run_items_skipped_nonnegative"),
+        CheckConstraint(
+            "cursor IS NULL OR char_length(cursor) <= 4096",
+            name="ck_discovery_run_cursor_bounded",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    campaign_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_campaigns.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    query_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_search_queries.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    command_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[DiscoveryRunStatus] = mapped_column(
+        enum_type(DiscoveryRunStatus, "discovery_run_status"), nullable=False
+    )
+    cursor: Mapped[str | None] = mapped_column(Text)
+    profile_lookup_complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    pages_processed: Mapped[int] = mapped_column(Integer, nullable=False)
+    items_processed: Mapped[int] = mapped_column(Integer, nullable=False)
+    items_skipped: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DiscoveredAuthorRecord(Base):
+    __tablename__ = "discovered_authors"
+    __table_args__ = (
+        UniqueConstraint("remote_author_id", name="uq_discovered_authors_remote_id"),
+        Index("ix_discovered_authors_username", "username"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    remote_author_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(255))
+    biography: Mapped[str | None] = mapped_column(String(5000))
+    profile_picture_url: Mapped[str | None] = mapped_column(String(2048))
+    enrichment_status: Mapped[DiscoveryEnrichmentStatus] = mapped_column(
+        enum_type(DiscoveryEnrichmentStatus, "discovery_enrichment_status"), nullable=False
+    )
+    last_enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DiscoveredThreadRecord(Base):
+    __tablename__ = "discovered_threads"
+    __table_args__ = (
+        UniqueConstraint("remote_thread_id", name="uq_discovered_threads_remote_id"),
+        Index("ix_discovered_threads_author_created", "author_id", "remote_created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    remote_thread_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    author_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovered_authors.id", ondelete="RESTRICT")
+    )
+    username: Mapped[str | None] = mapped_column(String(255))
+    text: Mapped[str | None] = mapped_column(Text)
+    permalink: Mapped[str | None] = mapped_column(String(2048))
+    media_type: Mapped[str | None] = mapped_column(String(80))
+    remote_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_quote_post: Mapped[bool | None] = mapped_column(Boolean)
+    has_replies: Mapped[bool | None] = mapped_column(Boolean)
+    enrichment_status: Mapped[DiscoveryEnrichmentStatus] = mapped_column(
+        enum_type(DiscoveryEnrichmentStatus, "discovery_enrichment_status"), nullable=False
+    )
+    conversation_status: Mapped[DiscoveryEnrichmentStatus] = mapped_column(
+        enum_type(DiscoveryEnrichmentStatus, "discovery_enrichment_status"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DiscoverySourceEvidenceRecord(Base):
+    __tablename__ = "discovery_source_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "(thread_id IS NOT NULL) <> (author_id IS NOT NULL)",
+            name="ck_discovery_evidence_exactly_one_entity",
+        ),
+        UniqueConstraint(
+            "run_id", "source", "page_number", "thread_id", name="uq_discovery_evidence_thread"
+        ),
+        UniqueConstraint(
+            "run_id", "source", "page_number", "author_id", name="uq_discovery_evidence_author"
+        ),
+        Index("ix_discovery_evidence_run_page", "run_id", "page_number"),
+        Index("ix_discovery_evidence_thread_source", "thread_id", "source"),
+        Index("ix_discovery_evidence_author_source", "author_id", "source"),
+        CheckConstraint("page_number >= 0", name="ck_discovery_evidence_page_nonnegative"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    thread_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovered_threads.id", ondelete="RESTRICT")
+    )
+    author_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovered_authors.id", ondelete="RESTRICT")
+    )
+    source: Mapped[DiscoveryEvidenceSource] = mapped_column(
+        enum_type(DiscoveryEvidenceSource, "discovery_evidence_source"), nullable=False
+    )
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_class: Mapped[DiscoveryEvidenceClass] = mapped_column(
+        enum_type(DiscoveryEvidenceClass, "discovery_evidence_class"), nullable=False
+    )
+
+
+class DiscoveryRunCursorRecord(Base):
+    __tablename__ = "discovery_run_cursors"
+    __table_args__ = (
+        UniqueConstraint("run_id", "cursor_digest", name="uq_discovery_run_cursor_digest"),
+        UniqueConstraint("run_id", "page_number", name="uq_discovery_run_cursor_page"),
+        Index("ix_discovery_run_cursors_run_page", "run_id", "page_number"),
+        CheckConstraint("page_number > 0", name="ck_discovery_run_cursor_page_positive"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    cursor_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class LeadCandidateRecord(Base):
+    __tablename__ = "lead_candidates"
+    __table_args__ = (
+        UniqueConstraint("account_id", "author_id", name="uq_lead_candidate_account_author"),
+        Index("ix_lead_candidates_account_status", "account_id", "status", "updated_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    author_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovered_authors.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[LeadCandidateStatus] = mapped_column(
+        enum_type(LeadCandidateStatus, "lead_candidate_status"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class LeadCandidateEvidenceRecord(Base):
+    __tablename__ = "lead_candidate_evidence"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", "evidence_id", name="uq_lead_candidate_evidence"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    candidate_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("lead_candidates.id", ondelete="RESTRICT"), nullable=False
+    )
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_source_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+
+
+class LeadCandidateTransitionRecord(Base):
+    __tablename__ = "lead_candidate_transitions"
+    __table_args__ = (
+        UniqueConstraint("command_id", name="uq_lead_transition_command_id"),
+        Index("ix_lead_candidate_transitions_candidate", "candidate_id", "occurred_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    candidate_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("lead_candidates.id", ondelete="RESTRICT"), nullable=False
+    )
+    command_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    previous_status: Mapped[LeadCandidateStatus | None] = mapped_column(
+        enum_type(LeadCandidateStatus, "lead_candidate_status")
+    )
+    next_status: Mapped[LeadCandidateStatus] = mapped_column(
+        enum_type(LeadCandidateStatus, "lead_candidate_status"), nullable=False
+    )
+    reason_code: Mapped[str] = mapped_column(String(80), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ScheduleRecord(Base):

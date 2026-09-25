@@ -42,9 +42,10 @@ class ThreadPost:
 class ThreadReply:
     account_id: UUID
     threads_reply_id: str
-    root_post_id: UUID
+    root_post_id: UUID | None = None
     id: UUID = field(default_factory=uuid4)
     parent_reply_id: UUID | None = None
+    discovered_thread_id: UUID | None = None
     text: str | None = None
     replied_at: datetime | None = None
     created_at: datetime = field(default_factory=utc_now)
@@ -52,6 +53,8 @@ class ThreadReply:
     def __post_init__(self) -> None:
         if not self.threads_reply_id.strip():
             raise ValueError("threads_reply_id must not be empty")
+        if (self.root_post_id is None) == (self.discovered_thread_id is None):
+            raise ValueError("reply must reference exactly one post or discovered-thread root")
         self.replied_at = normalize_utc(self.replied_at) if self.replied_at else None
         self.created_at = normalize_utc(self.created_at)
 

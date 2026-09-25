@@ -114,6 +114,22 @@ A Worker Agent does not own authoritative business state.
 - enrichment
 - lead candidates
 
+C4 discovery is API-first and command-driven. A campaign owns durable search queries
+and runs for keyword/tag search, public-profile lookup and posts, mentions, and
+conversation enrichment. Canonical Threads and authors are deduplicated by stable
+remote IDs. Each observation is retained as source evidence, even when the same
+entity appears in later runs or through another source. Profile and post fields
+that are absent from API responses remain marked as needing enrichment.
+
+Each run commits the fetched page, its source evidence, cursor history, and updated
+run counters/status in one PostgreSQL transaction. API requests happen outside that
+transaction; bounded page execution and an explicit resume command continue from the
+last committed cursor. Repeated cursors fail closed. Cursor behavior is implemented
+against Meta's documented contract and remains subject to issue #3 live validation.
+LeadCandidate records are account-scoped, link to retained evidence, and use an
+audited, explicit status lifecycle. Discovery does not invoke a browser, scheduler,
+or worker runtime.
+
 ### activities
 - AccountActivityPlan
 - scheduled explicit activities
