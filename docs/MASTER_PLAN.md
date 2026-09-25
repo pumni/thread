@@ -1,448 +1,419 @@
-# Master Delivery Plan
+# Master Delivery Plan v2 — Distributed Hybrid Threads Tool
 
-## 1. Objective
+## 1. Product objective
 
-Build a new Threads Operations Platform that preserves the useful business outcomes of the legacy Facebook system while using Threads-native concepts and official APIs wherever available.
+Build a distributed Threads operations tool that preserves the useful business outcomes of the legacy Facebook automation system while replacing its fragile execution model with durable orchestration, typed protocols, PostgreSQL state, and explicit execution adapters.
 
-The target is not behavioral cloning of Facebook UI automation. The target is business capability parity plus Threads-native capabilities, implemented with a maintainable production architecture.
+The product is **not**:
+- a centralized Threads API SaaS only;
+- a literal port of the legacy Selenium bot;
+- an anti-detect or verification-bypass system.
 
-## 2. Delivery principles
+The product **is**:
+- a durable Control Plane;
+- multiple Windows-first Worker Agents;
+- per-account execution modes;
+- Official Threads API adapters where supported;
+- isolated Browser Worker adapters for capabilities that require user-authorized web UI interaction;
+- human-assisted intervention when session/login/challenge handling cannot be safely automated;
+- one capability model shared across API, browser, and human execution.
 
-- Greenfield implementation.
-- API-first integration.
-- Typed domain models.
-- Explicit dependency boundaries.
-- Durable state in PostgreSQL.
-- External commands are idempotent.
-- Network delivery uses inbox/outbox semantics.
-- Async workers use bounded concurrency.
-- Secrets are never committed.
-- Every phase has a measurable Definition of Done.
-- Browser automation is excluded unless a documented capability gap justifies a separate adapter.
+## 2. Product decisions locked on 2026-09-25
 
-## 3. Target stack
+These are architectural/product invariants unless superseded by a new ADR.
 
-- Python 3.14
-- uv for Python/runtime/dependency management
-- FastAPI for HTTP endpoints
-- Pydantic v2 and pydantic-settings
-- httpx AsyncClient
+1. Browser accounts use **persistent account -> worker/profile affinity**.
+2. Every account has its own execution mode:
+   - API_ONLY
+   - BROWSER_ONLY
+   - HYBRID
+   - MANUAL
+3. If the assigned worker is offline:
+   - fall back to API only when account policy and capability allow it;
+   - otherwise wait for the assigned worker;
+   - do not automatically migrate browser profiles between machines.
+4. Background/account-activity work is created by the Control Plane/Scheduler. Workers do not invent random business actions.
+5. One Worker Agent process may manage multiple browser profiles, with configurable max concurrency.
+6. Initial login is operator-assisted; persistent profile/session is reused afterward.
+7. Session expiry/challenge becomes an intervention state, not credential stuffing or automatic bypass.
+8. Network/proxy configuration is account-scoped through a NetworkProfile.
+9. Browser automation fails closed when its UI contract is no longer recognized.
+10. Product/UI may use the familiar term “account nurturing”, but domain code models explicit AccountActivityPlan and capability-specific jobs.
+11. Discovery scope is broad: public posts, public profiles, profile posts, mentions, conversations, and lead-oriented enrichment.
+12. CRM moves to the new typed protocol. The core does not preserve the legacy raw message format.
+13. Worker behavior is strict-online:
+    - no new jobs while the Control Plane is unavailable;
+    - an active job may continue only to a safe boundary;
+    - no new irreversible side effect without a valid durable lease/checkpoint.
+14. Browser Worker support is Windows-first. Control Plane remains Linux/Docker capable.
+15. PostgreSQL remains the authoritative source of truth.
+16. Redis/message broker remains deferred until a measured need exists.
+
+## 3. Current implementation status
+
+### Completed
+
+- Batch A — Foundation
+  - Python 3.14 + uv
+  - FastAPI foundation
+  - PostgreSQL / SQLAlchemy / Alembic
+  - typed command protocol
+  - idempotency
+  - inbox/outbox
+  - durable command attempts
+- TP-004A
+  - short claim transactions
+  - durable command execution leases
+  - heartbeat
+  - checkpoint persistence
+  - stale-worker fencing
+  - bounded unexpected-error retries
+- Batch B — Threads Core
+  - documentation-contract Threads API adapter
+  - text/image/video/carousel publishing
+  - quote-post support from documented contract
+  - crash-safe container checkpointing
+  - conservative ambiguous publish recovery
+  - reply-to-post / reply-to-reply
+  - conversation synchronization
+  - cursor compare-and-set
+  - reply moderation contracts
+  - quota contract support
+
+### Open gates
+
+- TP-000 / issue #1:
+  - owner confirmation of historical credential status remains open;
+  - this does not block engineering.
+- TP-002 / issue #3:
+  - live Threads OAuth/API verification remains open;
+  - this blocks production/release activation, not documentation-contract implementation.
+
+## 4. External Threads API baseline
+
+As of 2026-09-25, Meta's official Threads API workspace documents capabilities including:
+- OAuth authorization, long-lived token exchange and refresh;
+- profile retrieval;
+- public profile lookup;
+- public profile posts;
+- text/image/video/carousel publishing;
+- quote-post and repost surfaces;
+- replies and flattened conversation retrieval;
+- reply creation and reply management;
+- keyword/topic-tag search;
+- mentions;
+- insights;
+- publishing quota retrieval.
+
+Repository implementation must continue to verify current Meta developer documentation/changelog before changing a capability contract.
+
+Official Postman collection is useful evidence but explicitly warns it may lag the latest developer changelog.
+
+## 5. Target topology
+
+~~~text
+CRM / Operator UI
+       |
+       v
++-------------------------------+
+|         CONTROL PLANE         |
+| Command Runtime               |
+| PostgreSQL                    |
+| Scheduler                     |
+| Worker Registry               |
+| Capability Router             |
+| Account Registry              |
+| Outbox                        |
++---------------+---------------+
+                |
+      WSS notifications +
+      HTTPS durable protocol
+                |
+      +---------+---------+
+      |                   |
+      v                   v
+ Windows Worker S01   Windows Worker S08
+      |                   |
+ profiles A,B          profiles C,D,E
+      |                   |
+ API/Browser           API/Browser
+ execution             execution
+~~~
+
+Official API execution may remain inside the Control Plane/application runtime where appropriate. Browser execution is delegated to an assigned WorkerJob.
+
+## 6. Execution model
+
+### Command
+
+Represents the business intent.
+
+Examples:
+- threads.publish_image
+- threads.create_reply
+- threads.discovery.search
+- threads.activity.execute
+
+### WorkerJob
+
+Represents remote execution delegated to one Worker Agent.
+
+A Command and a WorkerJob are not the same lifecycle.
+
+Remote browser execution must use:
+- durable WorkerJob state;
+- its own lease/fencing token;
+- worker affinity;
+- checkpoints;
+- attempts;
+- bounded retry;
+- intervention state.
+
+## 7. Future delivery roadmap
+
+### C1 — Distributed Worker Foundation
+
+Purpose: prove safe multi-machine execution before any browser automation is introduced.
+
+Deliverables:
+- WorkerNode registry;
+- worker presence/heartbeat;
+- worker protocol versioning;
+- one-time enrollment + device identity;
+- AccountWorkerAssignment;
+- BrowserProfile metadata;
+- NetworkProfile metadata;
+- WorkerJob / WorkerJobAttempt;
+- remote execution lease and fencing;
+- checkpoint / reconnect / recovery;
+- intervention state;
+- test worker;
+- WSS notification + HTTPS durable control protocol.
+
+Exit gate:
+- wrong worker cannot claim an account-affine job;
+- concurrent workers cannot own one job;
+- stale lease cannot checkpoint/finalize;
+- disconnect/reconnect does not lose authoritative state;
+- DRAINING/OFFLINE/UPGRADE_REQUIRED workers receive no new jobs;
+- Control Plane restart does not lose queued/running recovery state.
+
+### C2 — Capability Router and Account Execution Policy
+
+Deliverables:
+- capability registry with name + version;
+- executor availability model;
+- per-account execution mode;
+- API/BROWSER/HUMAN routing policy;
+- persistent account affinity enforcement;
+- WAITING_EXECUTION / WAITING_INTERVENTION semantics;
+- API fallback policy when assigned worker is offline;
+- per-account operation classes and mutation coordination.
+
+Exit gate:
+- the same business Command can route to API or remote worker without transport/business duplication;
+- routing is deterministic and testable;
+- unsupported capabilities fail explicitly instead of silently falling back.
+
+### C3 — Windows Browser Worker Foundation
+
+Purpose: establish browser/session infrastructure without implementing the whole feature set.
+
+Deliverables:
+- Windows Worker Agent runtime;
+- logical profile_ref -> local profile path resolution;
+- local Worker identity/state directories;
+- session manager;
+- operator-assisted initial login;
+- authenticated/session-expired/challenge states;
+- configurable max browser sessions;
+- local recovery journal interface;
+- browser engine ADR/selection;
+- fail-closed browser contract abstraction;
+- account-scoped NetworkProfile integration.
+
+Exit gate:
+- multiple profiles can be managed by one agent;
+- only assigned account/profile can execute a job;
+- session/challenge transitions are durable and visible to Control Plane;
+- UI contract mismatch fails safely;
+- no plaintext account password/2FA is required by the core.
+
+### C4 — Discovery and Leads
+
+Deliverables:
+- keyword/topic discovery;
+- public profile lookup;
+- public profile posts;
+- mentions;
+- conversation enrichment;
+- deduplication;
+- DiscoveryCampaign;
+- DiscoveredThread / DiscoveredAuthor;
+- LeadCandidate and enrichment state;
+- CRM result integration;
+- browser enrichment only where API data is insufficient and an approved capability exists.
+
+Exit gate:
+- repeated discovery runs deduplicate;
+- pagination/resume is durable;
+- lead-oriented normalized output is queryable and traceable to source discovery.
+
+### C5 — Browser Capabilities and Account Activity Plans
+
+Deliverables are capability-based, not one random “warm account” loop.
+
+Candidate browser capabilities:
+- browse feed;
+- open thread;
+- open profile;
+- local-file publishing where required;
+- UI-only actions explicitly approved after capability review;
+- like/follow only if retained as product requirements and implemented without evasion logic.
+
+AccountActivityPlan:
+- created centrally;
+- scheduled centrally;
+- low-priority;
+- preemptible at safe boundaries;
+- decomposed into explicit jobs.
+
+Explicitly excluded:
+- anti-detect/fingerprint spoofing;
+- randomized behavior intended to bypass bot detection;
+- automated checkpoint/challenge bypass;
+- uncontrolled random engagement.
+
+### C6 — Scheduler, Operations and Production Hardening
+
+Deliverables:
+- durable scheduler;
+- worker/job priority and cancellation;
+- draining/update workflow;
+- observability;
+- structured logs;
+- metrics/tracing;
+- remote diagnostics;
+- Windows worker packaging/update procedure;
+- Linux/Docker Control Plane deployment;
+- health/readiness;
+- security hardening;
+- staged rollout runbook.
+
+### D — Live Validation and Release Certification
+
+Must include:
+- TP-002 live Meta validation;
+- worker/browser end-to-end tests;
+- production credential provider;
+- release security review;
+- parity/capability matrix review;
+- recovery tests across Control Plane + Worker;
+- staged rollout.
+
+No production activation while TP-002 remains incomplete.
+
+## 8. Capability execution vocabulary
+
+Every capability must use one of:
+
+- NATIVE_API
+- HYBRID
+- BROWSER_ASSISTED
+- HUMAN_ASSISTED
+- UNSUPPORTED
+- N/A
+
+And separately record:
+- implementation_status;
+- preferred_executor;
+- fallback_executor;
+- live_verified;
+- account/session requirements;
+- priority.
+
+## 9. Browser automation boundary
+
+Browser automation is now an approved future infrastructure direction for documented capability gaps and local browser/session workflows.
+
+It is still forbidden from:
+- entering the domain layer;
+- becoming the source of truth;
+- introducing DOM-specific concepts into business models;
+- bypassing authentication/challenges/platform controls;
+- implementing anti-detect/fingerprint evasion as a project requirement.
+
+Every browser capability must:
+- have an explicit business outcome;
+- be represented as a capability;
+- run through WorkerJob;
+- use account affinity;
+- use bounded retry/checkpoints;
+- fail closed on UI-contract mismatch.
+
+## 10. Technology baseline
+
+Control Plane:
+- Python >=3.14,<3.15
+- uv
+- FastAPI
+- Pydantic v2
 - SQLAlchemy 2
-- PostgreSQL
 - Alembic
-- asyncio / TaskGroup
-- pytest
-- pytest-asyncio
-- respx for HTTP client tests
-- Ruff
-- Pyright
+- PostgreSQL
+- httpx
+- asyncio
 - structured logging
 - OpenTelemetry-compatible tracing
 - Prometheus-compatible metrics
-- Docker/Linux for deployment
+- Linux/Docker capable
 
-Redis is intentionally deferred until a concrete distributed coordination or cache requirement exists.
+Worker:
+- same Python project/package where practical;
+- Windows-first;
+- asyncio;
+- persistent secure device identity;
+- browser engine added only in C3 after ADR;
+- local recovery journal may use SQLite only for worker recovery metadata, never as authoritative business storage.
 
-## 4. Target repository layout
+## 11. Quality gates
 
-~~~
-src/threads_platform/
-  bootstrap/
-  config/
-  domain/
-    accounts/
-    publishing/
-    conversations/
-    discovery/
-    analytics/
-    commands/
-  application/
-    commands/
-    queries/
-    services/
-    policies/
-  infrastructure/
-    threads_api/
-    crm/
-    persistence/
-    security/
-    messaging/
-  transport/
-    http/
-    websocket/
-  workers/
-  observability/
+Standard:
 
-tests/
-  unit/
-  integration/
-  contract/
-  e2e/
-
-migrations/
-docs/
-  architecture/
-  adr/
-  protocols/
-  operations/
-~~~
-
-Dependency direction:
-
-transport -> application -> domain
-
-Infrastructure implements ports/interfaces used by application/domain. Domain code must not import FastAPI, HTTPX, SQLAlchemy, WebSocket libraries, or Meta-specific response models.
-
-## 5. Phase 0 — Security and capability baseline
-
-### Deliverables
-
-- Remove active credentials from tracked documentation.
-- Rotate any credential that may have been exposed in the legacy public report.
-- Create .env.example with placeholders only when implementation starts.
-- Verify current official Threads API capabilities required by the parity matrix.
-- Record capability gaps as explicit decisions, not assumptions.
-- Confirm Meta app ownership, OAuth redirect strategy and required permissions.
-- Confirm target CRM protocol requirements.
-
-### Exit gate
-
-No active secret is present in the working tree. Required official API capabilities have evidence links or are marked GAP / VERIFY.
-
-## 6. Phase 1 — Project foundation
-
-### Deliverables
-
-- uv project initialized.
-- Python constraint set to >=3.14,<3.15.
-- src layout.
-- pyproject.toml and uv.lock.
-- Ruff, Pyright, pytest configuration.
-- Settings model with environment validation.
-- Structured logging foundation.
-- FastAPI health endpoint.
-- CI workflow for sync, lint, type-check and tests.
-- Docker development/runtime skeleton.
-
-### Mandatory local commands
-
-~~~
+~~~bash
 uv sync --locked
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
+uv run alembic check
 uv run pytest
 ~~~
 
-### Exit gate
-
-A fresh clone can execute all required commands without undocumented manual steps.
-
-## 7. Phase 2 — Threads API integration spike
-
-Purpose: validate external contracts before building the complete application.
-
-### Deliverables
-
-Using a dedicated development Threads account:
-
-- OAuth authorization flow.
-- Exchange authorization code for token.
-- Long-lived token handling and refresh.
-- Retrieve own Threads identity/profile.
-- Publish a text post.
-- Publish an image post.
-- Publish a video post if the environment is available.
-- Retrieve published media.
-- Reply to a post/reply.
-- Retrieve replies/conversation.
-- Query current publishing limits where supported.
-- Verify required scopes and error shapes.
-
-Spike code may be temporary but findings must be converted into contract tests and ADR updates.
-
-### Exit gate
-
-We have real request/response evidence for the minimum API workflows and know the exact token lifecycle.
-
-## 8. Phase 3 — Domain and persistence foundation
-
-### Domain models
-
-- ThreadsAccount
-- OAuthCredential
-- Command
-- CommandAttempt
-- ThreadPost
-- ThreadReply
-- Schedule
-- SyncState
-- SyncRun
-- InsightSnapshot
-- OutboxEvent
-- IntegrationDelivery
-
-### Persistence
-
-PostgreSQL becomes the sole durable source of truth.
-
-Required unique constraints:
-
-- commands.command_id
-- posts(account_id, threads_post_id)
-- replies(account_id, threads_reply_id)
-- outbox event id
-
-### Required behavior
-
-- Migrations are Alembic-based.
-- Repository interfaces live outside infrastructure implementation details.
-- Command lifecycle is durable.
-- Outbox insert occurs in the same database transaction as business state change.
-
-### Exit gate
-
-Crash/restart tests prove state can be recovered without duplicate durable records.
-
-## 9. Phase 4 — Command runtime and CRM protocol v1
-
-### Envelope
-
-Every inbound command must include:
-
-- protocol_version
-- command_id
-- correlation_id
-- command_type
-- account_id
-- created_at
-- deadline where applicable
-- payload
-
-### Command lifecycle
-
-RECEIVED -> VALIDATED -> PROCESSING -> SUCCEEDED
-
-Alternate terminal/intermediate states:
-
-- REJECTED
-- EXPIRED
-- FAILED_RETRYABLE
-- FAILED_FINAL
-
-### Reliability
-
-- Duplicate command_id returns prior outcome and never repeats the side effect.
-- Inbox pattern handles at-least-once inbound delivery.
-- Outbox pattern handles reliable outbound delivery.
-- Transport can be HTTP or WebSocket without changing handlers.
-
-### Exit gate
-
-A simulated reconnect/resend cannot create a duplicate publish/reply.
-
-## 10. Phase 5 — Publishing
-
-### Scope
-
-- text
-- image
-- video
-- carousel
-- quote post where supported
-- repost where supported
-- reply controls and supported Threads-native metadata
-- media/container status
-- permalink/media retrieval
-- publishing quota awareness
-
-### State machine
-
-RECEIVED
--> VALIDATED
--> CONTAINER_CREATED when applicable
--> READY
--> PUBLISHED
--> PERSISTED
--> RESULT_QUEUED
--> COMPLETED
-
-Persist recovery anchors such as container_id immediately after obtaining them.
-
-### Required failure tests
-
-- crash after container creation
-- crash after remote publish but before CRM result
-- Meta timeout
-- Meta 5xx
-- rate limit
-- invalid media
-- expired/invalid token
-- duplicate command
-
-### Exit gate
-
-The same command never produces two posts even across process crashes and retries.
-
-## 11. Phase 6 — Conversations and moderation
-
-### Scope
-
-- sync top-level replies
-- sync nested conversation
-- create reply
-- reply to reply
-- hide/unhide where supported
-- approve/ignore pending replies where supported
-- reply controls
-- pagination/cursors
-- incremental sync
-
-### Data rule
-
-Replies are stored relationally using parent_reply_id/root_post_id. Do not store a giant mutable nested JSON document as the source of truth.
-
-### Exit gate
-
-Repeated sync is deterministic and produces no duplicate replies. Parent-child mapping is stable.
-
-## 12. Phase 7 — Discovery, mentions and analytics
-
-### Discovery
-
-Where officially supported:
-
-- keyword search
-- topic/tag search
-- public profile/media retrieval
-- account mentions
-
-Every discovery feature must record its API constraints and pagination semantics.
-
-### Analytics
-
-Insight data is stored as snapshots, not overwritten counters:
-
-- entity
-- metric
-- value
-- captured_at
-
-### Exit gate
-
-Sync can resume after interruption and analytics history remains queryable over time.
-
-## 13. Phase 8 — Scheduling and workers
-
-No while-true + sleep business scheduler.
-
-Durable job fields:
-
-- job_id
-- job_type
-- account_id
-- scheduled_at
-- status
-- attempts
-- next_retry_at
-- deadline
-
-Worker responsibilities:
-
-- scheduled publishing
-- token refresh
-- conversation sync
-- insights sync
-- discovery jobs
-- outbox delivery
-
-### Exit gate
-
-Restarting the process does not lose or double-run a due job.
-
-## 14. Phase 9 — Observability and production hardening
-
-### Logs
-
-Every important log should carry:
-
-- request_id
-- command_id
-- correlation_id
-- account_id
-- operation
-- attempt
-- duration
-
-Tokens/secrets/Authorization headers must be redacted.
-
-### Metrics
-
-At minimum:
-
-- commands_received_total
-- commands_failed_total
-- command_duration_seconds
-- threads_api_requests_total
-- threads_api_errors_total
-- threads_api_latency_seconds
-- posts_published_total
-- replies_created_total
-- outbox_pending_total
-- accounts_reauth_required
-- quota_remaining where measurable
-
-### Deployment
-
-Start with:
-
-- one API service
-- one worker service
-- PostgreSQL
-- Linux/Docker
-
-Scale replicas only after account-level coordination semantics are proven.
-
-## 15. Rollout sequence
-
-1 development account
--> 3 accounts
--> 10 accounts
--> wider rollout
-
-At each stage verify:
-
-- duplicate rate = 0 for idempotent commands
-- queue backlog behavior
-- token refresh reliability
-- rate limit handling
-- DB connection pressure
-- external API latency/error distribution
-
-## 16. Definition of Done for any implementation issue
-
-An issue is not complete until:
-
-- acceptance criteria pass
-- tests are added or updated
-- lint/type-check pass
-- migrations are included when schema changes
-- logs do not contain secrets
-- external API assumptions are cited in PR notes
-- failure/retry behavior is tested where applicable
-- docs/ADR updated for architectural changes
-- no unrelated refactor is bundled
-- PR includes exact verification commands and results
-
-## 17. Explicit non-goals for the initial architecture
-
-- Selenium/Playwright as a core dependency.
-- Chrome profile farms.
-- storing usernames/passwords for login automation.
-- anti-detect behavior.
-- JSON files as databases.
-- per-account cloned Python entrypoints.
-- premature microservices.
-- Redis without a demonstrated need.
-
-Any future exception requires an ADR.
+Distributed-worker changes additionally require:
+- PostgreSQL integration tests;
+- lease/fencing concurrency tests;
+- reconnect/restart tests;
+- protocol/version tests;
+- wrong-worker/account-affinity tests;
+- security/redaction tests.
+
+Browser changes additionally require:
+- adapter contract tests;
+- fail-closed UI mismatch test;
+- session lifecycle tests;
+- no real credentials in fixtures;
+- safe-boundary/recovery tests for external side effects.
+
+## 12. Source-of-truth order
+
+1. README.md
+2. docs/PROJECT_STATE_HANDOFF.md
+3. docs/MASTER_PLAN.md
+4. docs/ARCHITECTURE.md
+5. docs/FEATURE_PARITY_MATRIX.md
+6. docs/WORK_BREAKDOWN.md
+7. docs/protocols/WORKER_PROTOCOL_V1.md
+8. docs/adr/
+9. active GitHub issues
+
+If an issue conflicts with an ADR or a higher source-of-truth document, stop and resolve the conflict before implementation.
