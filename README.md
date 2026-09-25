@@ -4,7 +4,7 @@ Greenfield Python platform for managing and automating supported Meta Threads wo
 
 ## Status
 
-Architecture and delivery planning. No production implementation should begin until the planning pull request is reviewed and merged.
+Foundation implementation is in progress. Threads API side effects are not implemented yet.
 
 ## Product direction
 
