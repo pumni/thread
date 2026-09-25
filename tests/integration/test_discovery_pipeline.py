@@ -23,7 +23,11 @@ from threads_platform.application.ports.threads import (
     ThreadsAPIError,
 )
 from threads_platform.domain.commands import CommandStatus
-from threads_platform.domain.discovery import DiscoveredThread, DiscoveryRunStatus
+from threads_platform.domain.discovery import (
+    DiscoveredThread,
+    DiscoveryRun,
+    DiscoveryRunStatus,
+)
 from threads_platform.infrastructure.persistence.models import (
     CommandRecord,
     DiscoveredAuthorRecord,
@@ -35,6 +39,9 @@ from threads_platform.infrastructure.persistence.models import (
     LeadCandidateRecord,
     LeadCandidateTransitionRecord,
     ReplyRecord,
+)
+from threads_platform.infrastructure.persistence.repositories import (
+    SQLAlchemyDiscoveryRepository,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
@@ -158,6 +165,118 @@ async def test_run_page_and_cursor_commit_atomically_and_resume_without_duplicat
     assert final_run.pages_processed == 2
     assert final_run.items_processed == 3
     assert final_run.cursor is None
+
+
+async def test_crash_mid_page_rolls_back_entities_and_cursor_before_resume(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_id, _ = await seed_account_and_post(unit_of_work_factory)
+    api = FakeThreadsAPI()
+    clock = FixedClock()
+    runtime = make_runtime(unit_of_work_factory, api, clock)
+    campaign_id = await create_campaign(runtime, account_id, clock)
+    interrupted_page = DiscoveryPage((remote_thread("replay-thread"),), "cursor-after-page", True)
+    api.discovery_pages = [
+        interrupted_page,
+        interrupted_page,
+        DiscoveryPage(
+            (
+                remote_thread("replay-thread", text="Overlapping replay row"),
+                remote_thread("after-crash-thread", username="another"),
+            ),
+            None,
+            False,
+        ),
+    ]
+    search = command_body(
+        account_id,
+        clock,
+        "threads.discovery.search",
+        {
+            "campaign_id": str(campaign_id),
+            "query": "crash recovery",
+            "search_mode": "KEYWORD",
+            "search_type": "RECENT",
+            "max_pages": 1,
+        },
+    )
+    receipt = await runtime.receive(search)
+    run_id = uuid5(NAMESPACE_URL, f"threads.discovery.run:{receipt.command_id}")
+    original_update_run = SQLAlchemyDiscoveryRepository.update_run
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    async def crash_after_page_writes(
+        repository: SQLAlchemyDiscoveryRepository, run: DiscoveryRun
+    ) -> None:
+        if run.pages_processed == 1:
+            monkeypatch.setattr(SQLAlchemyDiscoveryRepository, "update_run", original_update_run)
+            raise SimulatedProcessCrash
+        await original_update_run(repository, run)
+
+    monkeypatch.setattr(SQLAlchemyDiscoveryRepository, "update_run", crash_after_page_writes)
+    with pytest.raises(SimulatedProcessCrash):
+        await runtime.process(receipt.command_id)
+
+    interrupted_run = await db_session.scalar(
+        select(DiscoveryRunRecord)
+        .where(DiscoveryRunRecord.id == run_id)
+        .execution_options(populate_existing=True)
+    )
+    assert interrupted_run is not None
+    assert interrupted_run.status is DiscoveryRunStatus.RUNNING
+    assert interrupted_run.cursor is None
+    assert interrupted_run.pages_processed == 0
+    assert await db_session.scalar(select(func.count()).select_from(DiscoveryRunCursorRecord)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(DiscoveredThreadRecord)) == 0
+    assert (
+        await db_session.scalar(select(func.count()).select_from(DiscoverySourceEvidenceRecord))
+        == 0
+    )
+
+    resume = command_body(
+        account_id,
+        clock,
+        "threads.discovery.resume",
+        {"run_id": str(run_id), "max_pages": 1},
+    )
+    resume_receipt = await runtime.receive(resume)
+    resumed_result = await runtime.process(resume_receipt.command_id)
+    paused_run = await db_session.scalar(
+        select(DiscoveryRunRecord)
+        .where(DiscoveryRunRecord.id == run_id)
+        .execution_options(populate_existing=True)
+    )
+    assert resumed_result.status is CommandStatus.SUCCEEDED
+    assert paused_run is not None
+    assert paused_run.status is DiscoveryRunStatus.PAUSED
+    assert paused_run.cursor == "cursor-after-page"
+    assert paused_run.pages_processed == 1
+    assert await db_session.scalar(select(func.count()).select_from(DiscoveryRunCursorRecord)) == 1
+    assert await db_session.scalar(select(func.count()).select_from(DiscoveredThreadRecord)) == 1
+
+    final_resume = command_body(
+        account_id,
+        clock,
+        "threads.discovery.resume",
+        {"run_id": str(run_id), "max_pages": 1},
+    )
+    final_receipt = await runtime.receive(final_resume)
+    final_result = await runtime.process(final_receipt.command_id)
+    final_run = await db_session.scalar(
+        select(DiscoveryRunRecord)
+        .where(DiscoveryRunRecord.id == run_id)
+        .execution_options(populate_existing=True)
+    )
+    assert final_result.status is CommandStatus.SUCCEEDED
+    assert api.discovery_after_values == [None, None, "cursor-after-page"]
+    assert final_run is not None
+    assert final_run.status is DiscoveryRunStatus.SUCCEEDED
+    assert final_run.pages_processed == 2
+    assert await db_session.scalar(select(func.count()).select_from(DiscoveredThreadRecord)) == 2
 
 
 async def test_profile_enrichment_preserves_search_provenance_and_creates_auditable_lead(
