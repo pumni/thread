@@ -36,21 +36,20 @@ Core principles:
 - No anti-detect/fingerprint-evasion objective.
 - Python >=3.14,<3.15 managed with uv.
 
-## Source of truth
+## Agent context and source of truth
 
-Read in this order:
+Coding agents should start with `AGENTS.md`, then `docs/PROJECT_STATE_HANDOFF.md`, the authorized issue, and `docs/CONTEXT_MAP.md`. The context map points to the smallest relevant subset of detailed docs for the task.
 
-1. docs/PROJECT_STATE_HANDOFF.md — current state and next action for a new session.
-2. docs/MASTER_PLAN.md — product decisions and C1-C6 roadmap.
-3. docs/ARCHITECTURE.md — target runtime/data/execution architecture.
-4. docs/FEATURE_PARITY_MATRIX.md — capability/executor matrix.
-5. docs/WORK_BREAKDOWN.md — exact issue order/checkpoints.
-6. docs/protocols/WORKER_PROTOCOL_V1.md — C1 worker protocol.
-7. docs/CODEX_EXECUTION_GUIDE.md — implementation rules.
-8. docs/ACCEPTANCE_AND_REVIEW.md — reviewer gates.
-9. docs/adr/ — accepted architectural decisions.
+Detailed durable knowledge lives in `docs/`:
+- `MASTER_PLAN.md` — product decisions and C1-C6 roadmap.
+- `ARCHITECTURE.md` — target runtime/data/execution architecture.
+- `FEATURE_PARITY_MATRIX.md` — capability/executor matrix.
+- `WORK_BREAKDOWN.md` — exact issue order/checkpoints.
+- `protocols/` — versioned protocols.
+- `adr/` — accepted architectural decisions.
+- `ACCEPTANCE_AND_REVIEW.md` — reviewer gates.
 
-The legacy Facebook report is not part of the repository source of truth.
+Do not load every document by default. The legacy Facebook report is not part of the repository source of truth.
 
 ## Required quality gate
 
