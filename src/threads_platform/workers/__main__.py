@@ -1,7 +1,6 @@
 import asyncio
 import os
 import signal
-from pathlib import Path
 
 from threads_platform.infrastructure.worker_agent.identity import WorkerIdentityFileStore
 from threads_platform.infrastructure.worker_agent.local_state import (
@@ -17,6 +16,8 @@ from threads_platform.workers.runtime import WorkerAgent, WorkerAgentConfig
 async def _run() -> None:
     if os.name != "nt":
         raise RuntimeError("the persistent Worker Agent entrypoint requires Windows DPAPI")
+    from pathlib import Path
+
     configured_root = os.environ.get("THREADS_WORKER_DATA_ROOT")
     data_root = LocalDataRoot.from_environment(
         Path(configured_root) if configured_root is not None else None

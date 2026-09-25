@@ -1,7 +1,7 @@
 import ctypes
 import os
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 from cryptography.hazmat.primitives import serialization
@@ -27,9 +27,9 @@ class WorkerDataProtector(Protocol):
 
 class WindowsDPAPIDataProtector:
     def __init__(self, worker_id: UUID) -> None:
+        self._entropy = KEY_CONTEXT + worker_id.bytes
         if os.name != "nt":
             raise WorkerKeyStoreError("Windows DPAPI is available only on Windows")
-        self._entropy = KEY_CONTEXT + worker_id.bytes
 
     def protect(self, plaintext: bytes) -> bytes:
         return self._transform(plaintext, protect=True)
@@ -96,7 +96,10 @@ class WindowsDPAPIDataProtector:
                     ctypes.byref(output_blob),
                 )
             if not succeeded:
-                code = ctypes.get_last_error()
+                get_last_error = cast(
+                    Callable[[], int], getattr(ctypes, "get_last_error", lambda: 0)
+                )
+                code = get_last_error()
                 raise WorkerKeyStoreError(f"Windows DPAPI operation failed ({code})")
             return ctypes.string_at(output_blob.pb_data, output_blob.length)
         finally:
