@@ -1,306 +1,508 @@
-# Target Architecture
+# Target Architecture v2 — Distributed Hybrid Threads Tool
 
 ## 1. Architectural style
 
-Use a modular monolith with ports/adapters boundaries.
+Use a modular monolith for the Control Plane plus distributed Worker Agents.
 
-Why:
+The architectural objective is not microservices. It is **clear execution boundaries**:
+- centralized durable business state;
+- local or remote executors;
+- stable application ports;
+- explicit capability routing.
 
-- current team/project size does not justify microservice overhead;
-- business modules remain independently testable;
-- infrastructure can change without rewriting domain logic;
-- future extraction is possible if scale proves necessary.
+## 2. Dependency direction
 
-## 2. Logical layers
+~~~text
+transport -> application -> domain
 
-### Domain
+infrastructure implements application/domain ports
+worker adapters implement worker/application ports
+~~~
 
-Pure business concepts and invariants.
+Domain must not import:
+- FastAPI;
+- httpx;
+- SQLAlchemy;
+- WebSocket libraries;
+- browser automation libraries;
+- Meta DTOs;
+- Windows APIs;
+- filesystem/profile paths.
 
-Must not import:
+## 3. Runtime topology
 
-- FastAPI
-- httpx
-- SQLAlchemy
-- WebSocket libraries
-- Meta API response DTOs
-- environment/config objects
+### Control Plane
 
-### Application
+Responsibilities:
+- command ingress;
+- business validation;
+- PostgreSQL source of truth;
+- command runtime;
+- scheduler;
+- worker registry;
+- capability router;
+- account execution policy;
+- WorkerJob dispatch;
+- outbox/result delivery;
+- observability.
 
-Use cases and orchestration:
+### Worker Agent
 
-- command handlers
-- queries
-- policies
-- transaction boundaries
-- account coordination
+Responsibilities:
+- authenticate as a device;
+- register presence/capabilities;
+- manage local capacity;
+- claim assigned WorkerJobs;
+- execute local adapters;
+- maintain job lease;
+- persist allowed recovery journal metadata;
+- report checkpoints/results/intervention states;
+- manage browser sessions in C3+.
 
-### Infrastructure
+A Worker Agent does not own authoritative business state.
 
-Adapters:
-
-- Threads API
-- PostgreSQL
-- CRM
-- token encryption
-- messaging transport implementations
-
-### Transport
-
-Ingress/egress protocol adaptation:
-
-- FastAPI
-- WebSocket
-- CLI/admin endpoints where required
-
-Routes parse/authenticate/validate/dispatch only.
-
-## 3. Core modules
+## 4. Core domain/application modules
 
 ### accounts
-
-Responsibilities:
-
-- Threads account identity
-- authorization state
-- scopes
-- encrypted credential reference
-- reauthorization status
-- token lifecycle state
-
-### publishing
-
-Responsibilities:
-
-- publish state machine
-- container lifecycle
-- media metadata
-- quota policy
-- recovery after partial external success
-
-### conversations
-
-Responsibilities:
-
-- reply model
-- reply hierarchy
-- conversation sync
-- moderation actions
-- cursor state
-
-### discovery
-
-Responsibilities:
-
-- keyword/topic discovery where officially supported
-- mentions
-- public profile/media retrieval where supported
-- pagination
-
-### analytics
-
-Responsibilities:
-
-- metrics/insights retrieval
-- snapshot persistence
-- time-series query model
+- Threads identity
+- execution_mode
+- API authorization state
+- browser/session state summary
+- worker assignment
+- network-profile reference
+- operational status
 
 ### commands
-
-Responsibilities:
-
-- command schema
+- business command
 - idempotency
+- command attempts
 - deadlines
-- lifecycle
-- attempts
-- errors
+- business result
 
-## 4. Command execution model
+### worker_fleet
+- WorkerNode
+- WorkerCapability
+- AccountWorkerAssignment
+- WorkerJob
+- WorkerJobAttempt
+- WorkerIntervention
+- protocol compatibility
+- worker state
 
-Inbound transport writes/deduplicates command -> application worker claims command -> handler performs use case -> business state and outbox are committed together -> outbox worker delivers result.
+### capabilities
+- capability identifier/version
+- execution requirements
+- preferred/fallback executor
+- route decision
+- operation class
+- live verification flags
 
-Never let WebSocket connection state be the source of truth for business processing.
+### publishing
+- publish state machine
+- container/recovery anchors
+- post persistence
 
-## 5. Concurrency
+### conversations
+- reply hierarchy
+- sync/cursor state
+- moderation
 
-Most work is I/O-bound and should use asyncio.
+### discovery
+- campaigns
+- search queries
+- discovered Threads/authors
+- enrichment
+- lead candidates
 
-Use bounded concurrency. Do not create an unbounded task for every inbound event.
+### activities
+- AccountActivityPlan
+- scheduled explicit activities
+- priority/preemption policy
 
-Per-account serialization is required for operations that may conflict:
+## 5. Account execution mode
 
-- token refresh
-- certain publish sequences
-- cursor/sync updates
+Each account has one mode:
 
-Initial single-process lock can use asyncio.Lock, but multi-worker deployment must rely on a durable/shared coordination mechanism such as PostgreSQL advisory locks or a lease table.
+- API_ONLY
+- BROWSER_ONLY
+- HYBRID
+- MANUAL
 
-## 6. Persistence rules
+Execution mode is a policy input, not a transport detail.
 
-PostgreSQL is authoritative.
+HYBRID does not mean automatic fallback for every failure. Fallback is allowed only if:
+- capability policy allows it;
+- executor has sufficient evidence/authorization;
+- switching executor does not violate recovery/idempotency semantics.
 
-Do not persist mutable business state in JSON files.
+## 6. Persistent browser affinity
 
-Suggested tables:
+Browser identity is persistent:
 
-- threads_accounts
-- oauth_credentials
-- commands
-- command_attempts
-- posts
-- replies
-- schedules
-- sync_states
-- sync_runs
-- insight_snapshots
-- outbox_events
-- integration_deliveries
-- audit_events
+~~~text
+Account -> AccountWorkerAssignment -> WorkerNode -> BrowserProfile
+~~~
 
-Use UTC timestamps.
+Rules:
+- browser jobs for an account route only to its active assigned worker;
+- another worker cannot opportunistically claim the job;
+- profile migration is not automatic;
+- manual reassignment may be supported later through an explicit administrative workflow;
+- API execution may be available independently from browser affinity.
 
-Store external IDs as strings unless official constraints justify another representation.
+## 7. Command vs WorkerJob
 
-## 7. Idempotency
+### Command
 
-Side-effecting operations must have a stable idempotency key.
+Represents business intent and owns business-level idempotency.
 
-Primary mechanism: CRM command_id.
+### WorkerJob
 
-If a direct API use case does not originate from CRM, generate an operation_id before the first external side effect and persist it.
+Represents one durable remote execution assignment.
 
-A retry must resume/reconcile; it must not blindly restart remote work.
+A Command may:
+- execute locally through an API adapter;
+- produce one WorkerJob;
+- wait for intervention;
+- later be rerouted only under an explicit safe policy.
 
-## 8. Publishing recovery
+WorkerJob must not replace Command.
 
-Persist intermediate external references such as container_id.
+## 8. WorkerJob lifecycle
 
-On restart:
+Base states:
 
-- inspect durable command state;
-- query remote state when necessary;
-- reconcile;
-- continue from the last safe state.
+- QUEUED
+- RUNNING
+- WAITING_INTERVENTION
+- SUCCEEDED
+- FAILED_RETRYABLE
+- FAILED_FINAL
+- CANCELLED
+- EXPIRED
 
-Never assume a timeout means the remote operation failed.
+Attempt history belongs in WorkerJobAttempt.
 
-## 9. Inbox/outbox
-
-Inbox:
-
-- deduplicate inbound commands;
-- store receipt/lifecycle;
-- enable retry after process crash.
-
-Outbox:
-
-- store result/event in same transaction as business data;
-- deliver asynchronously to CRM;
-- retry independently;
-- record attempts/delivery status.
-
-## 10. API client rules
-
-Use one long-lived httpx.AsyncClient per process/application lifetime.
-
-Centralize:
-
-- base URL
-- API version
-- auth header generation
-- timeout
-- response decoding
-- error mapping
-- retry metadata
-- request correlation
-- secret redaction
-
-Do not expose raw Meta response objects to the domain layer.
-
-## 11. Error taxonomy
-
-Define typed errors, at minimum:
-
-- ThreadsRateLimited
-- ThreadsUnavailable
-- ThreadsAuthExpired
-- ThreadsPermissionDenied
-- ThreadsValidationError
-- ThreadsNotFound
-- CRMUnavailable
-- DatabaseUnavailable
-- DuplicateCommand
-- CommandExpired
-- InvalidCommand
-- ReauthorizationRequired
-
-Retry policy is based on error class, not a generic Exception catch.
-
-## 12. Retry
-
-For retryable network/service failures:
-
-- exponential backoff
-- jitter
-- max attempts
-- total deadline
-
-Honor server-provided retry hints where available.
-
-No infinite retries.
-
-## 13. OAuth/token security
-
-- encrypted at rest
-- never logged
-- never returned to normal clients
-- never stored in Git
-- redaction on exception/HTTP traces
-- explicit status for reauthorization required
-
-Separate account identity from credential material.
-
-## 14. Observability
-
-Every command/request should carry:
-
-- request_id
-- correlation_id
+Required WorkerJob fields include:
+- id
 - command_id
 - account_id
+- capability_name
+- capability_version
+- worker_id
+- status
+- priority
+- preemptible
+- scheduled_at
+- deadline_at
+- lease_token
+- lease_expires_at
+- checkpoint
+- result
+- error_code
+- created_at
+- updated_at
+- completed_at
 
-Logs are structured.
+## 9. Remote lease/fencing semantics
 
-Trace external calls and DB operations.
+WorkerJob has a lease separate from the existing local Command execution lease.
 
-Record audit events separately from operational logs for sensitive actions.
+Claim:
+- performed in a short PostgreSQL transaction;
+- worker must be eligible, online and assigned;
+- claim writes a unique lease token and expiry.
 
-## 15. Browser automation boundary
+Checkpoint/heartbeat/finalization:
+- require matching lease token;
+- require an unexpired eligible lease;
+- stale worker cannot update state.
 
-Core dependency graph contains no Selenium or Playwright.
+Reclaim:
+- expired RUNNING jobs may be reclaimed according to retry/recovery policy;
+- old lease token becomes invalid permanently.
 
-If future feature X has no official API:
+## 10. Worker presence vs Job lease
 
-1. document the business need;
-2. prove the official API gap;
-3. assess stability/security/platform constraints;
-4. create ADR;
-5. if approved, implement an isolated adapter/service.
+Worker presence and WorkerJob execution are separate.
 
-Browser implementation must not change core domain models merely to expose DOM details.
+Worker presence answers:
+- is S08 connected/recently healthy?
 
-## 16. Architecture fitness checks
+WorkerJob lease answers:
+- does S08 still own J1?
 
-PR review should reject:
+A worker may be ONLINE while one browser/session/job is unhealthy.
 
-- domain importing infrastructure;
-- large god-service classes;
-- route handlers containing business logic;
-- direct SQL in transport layer;
-- direct httpx calls in command handlers if a port exists;
-- global mutable runtime state;
-- hardcoded secrets/endpoints/quotas;
-- catch-all retry loops;
-- non-idempotent side effects without recovery design.
+## 11. Worker transport
+
+### WebSocket
+
+Used for low-latency signals only:
+- worker hello/presence;
+- heartbeat hints;
+- capacity change;
+- job.available;
+- cancel request;
+- drain;
+- upgrade required;
+- session/intervention notification.
+
+WebSocket state is never business truth.
+
+### HTTPS
+
+Used for durable mutations:
+- enroll/authenticate;
+- claim job;
+- renew job lease;
+- persist checkpoint;
+- complete job;
+- fail job;
+- request/resolve intervention;
+- reconcile jobs.
+
+A lost WebSocket notification must not lose work.
+
+## 12. Worker authentication
+
+Target model:
+- one-time enrollment;
+- worker generates a device keypair;
+- Control Plane stores public identity;
+- worker private material remains local and protected by OS facilities;
+- reconnect uses challenge/signature to obtain a short-lived worker access token;
+- WSS and HTTPS use the authenticated worker identity.
+
+Do not deploy one shared static secret to all machines.
+
+Exact cryptographic/storage implementation is a C1 issue-level design detail and must receive security review.
+
+## 13. Worker protocol/versioning
+
+Worker reports:
+- agent_version;
+- worker_protocol_version;
+- capability_name + capability_version.
+
+Protocol mismatch:
+- worker may remain visible;
+- worker becomes DEGRADED/UPGRADE_REQUIRED;
+- it cannot claim incompatible jobs.
+
+## 14. WorkerNode lifecycle
+
+- REGISTERING
+- ONLINE
+- DEGRADED
+- DRAINING
+- OFFLINE
+- DISABLED
+- UPGRADE_REQUIRED
+
+DRAINING:
+- receives no new jobs;
+- active jobs finish/cancel at safe boundaries;
+- worker becomes safe to update/shutdown.
+
+## 15. Strict-online semantics
+
+When Control Plane connectivity is lost:
+- do not claim new work;
+- do not initiate a new irreversible external side effect without a valid durable lease/checkpoint;
+- current work may continue only to a safe boundary;
+- if outcome is already ambiguous, journal local evidence and reconcile after reconnect.
+
+## 16. Local recovery journal
+
+Worker may use a local journal for recovery metadata only.
+
+Allowed examples:
+- job_id
+- lease token reference/identifier
+- account_id
+- profile_ref
+- local execution phase
+- timestamp
+- non-secret remote/recovery identifiers where required
+
+Not allowed:
+- authoritative CRM/business records;
+- plaintext account passwords;
+- access tokens;
+- full Threads data store.
+
+PostgreSQL remains authoritative.
+
+## 17. Browser profile and session model
+
+Control Plane stores logical references, not Windows paths.
+
+Example:
+- profile_ref = profile://<account_uuid>
+
+Worker resolves the logical ref under its own local data root.
+
+Target session states:
+- UNINITIALIZED
+- LOGIN_REQUIRED
+- STARTING
+- AUTHENTICATED
+- BUSY
+- SESSION_EXPIRED
+- CHALLENGE_REQUIRED
+- ERROR
+- STOPPED
+
+Login/challenge handling is human-assisted. No automatic challenge bypass.
+
+## 18. NetworkProfile
+
+Network configuration is account-scoped.
+
+NetworkProfile may contain references to:
+- direct connection;
+- approved proxy endpoint;
+- connectivity policy.
+
+The architecture goal is routing/availability, not detection evasion.
+
+Sensitive proxy credentials must be protected and never exposed in normal logs/business payloads.
+
+## 19. Browser automation boundary
+
+Browser support is an isolated infrastructure capability for:
+- user-authorized UI workflows;
+- local media workflows;
+- capabilities not exposed through a suitable official API.
+
+Browser code must:
+- stay outside domain;
+- not leak selectors/DOM models into application business types;
+- run through WorkerJob;
+- fail closed on contract mismatch;
+- use bounded recovery;
+- never become an anti-detect/fingerprint-evasion subsystem.
+
+## 20. Browser capability safety rule
+
+Each browser capability must declare:
+- business outcome;
+- required session state;
+- mutation/read classification;
+- recovery checkpoints;
+- ambiguous outcome behavior;
+- whether it is preemptible;
+- UI contract version.
+
+No generic random “human behavior” function is accepted.
+
+## 21. Concurrency
+
+### Worker capacity
+Worker config:
+- max_browser_sessions
+- current active sessions
+- resource health
+
+### Account coordination
+At most one mutating browser job for one account at a time.
+
+Control Plane must enforce account-level coordination durably.
+
+C2 may define operation classes:
+- READ
+- MUTATION
+- SESSION
+- BACKGROUND
+
+## 22. Activity/preemption
+
+Account activity is centrally planned.
+
+Low-priority activities:
+- preemptible=true
+
+High-priority CRM mutations:
+- preemptible=false
+
+Preemption is cooperative:
+- Control Plane requests cancellation;
+- Worker reaches a safe boundary;
+- Worker checkpoints/cancels;
+- high-priority work proceeds.
+
+No global stop flag.
+
+## 23. Persistence
+
+PostgreSQL remains authoritative.
+
+Expected future tables:
+- worker_nodes
+- worker_capabilities
+- account_worker_assignments
+- browser_profiles
+- network_profiles
+- worker_jobs
+- worker_job_attempts
+- worker_interventions
+- discovery_campaigns
+- discovered_threads
+- discovered_authors
+- lead_candidates
+- activity_plans
+
+Use:
+- UTC timestamps;
+- durable uniqueness constraints;
+- explicit indexes for claim/routing queries;
+- JSONB only for bounded execution metadata/checkpoints, not mutable business aggregate trees.
+
+## 24. Existing API execution
+
+The current TP-004A/Batch-B runtime remains valid.
+
+Official API adapter is not replaced by the worker design.
+
+C2 decides when a capability uses:
+- local official API execution;
+- remote browser execution;
+- human-assisted state.
+
+## 25. Reliability invariants
+
+- command_id remains the business idempotency key;
+- WorkerJob has its own durable identity and lease;
+- timeout never means remote failure;
+- stale lease cannot finalize;
+- WebSocket loss cannot lose work;
+- worker crash cannot erase authoritative state;
+- profile affinity is enforced server-side;
+- retries are bounded;
+- ambiguous side effects reconcile instead of blind replay.
+
+## 26. Security invariants
+
+Reject:
+- plaintext account credentials committed/stored in normal business tables;
+- shared static worker secret deployed to every machine;
+- tokens in logs;
+- disabled TLS without explicit dev-only rationale;
+- browser challenge bypass;
+- anti-detect/fingerprint spoofing requirements;
+- selector fallback that clicks unknown UI.
+
+## 27. Architectural fitness checks
+
+Review rejects:
+- Command and WorkerJob collapsed into one state model;
+- worker considered source of truth;
+- business payload stored only on WebSocket;
+- other worker claiming an account-affine browser job;
+- domain importing browser/Windows/SQLAlchemy/httpx;
+- raw DOM selectors in application commands;
+- automatic profile migration;
+- random background action loops;
+- unbounded local tasks;
+- new broker/cache without evidence and ADR.
