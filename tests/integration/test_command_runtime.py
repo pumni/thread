@@ -761,7 +761,7 @@ async def test_c5_without_reviewed_ui_evidence_rejects_before_worker_job_enqueue
 
     assert result.status is CommandStatus.REJECTED
     async with unit_of_work_factory() as unit_of_work:
-        route = await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+        route = await unit_of_work.command_route_decisions.get_latest_for_command(
             receipt.command_id
         )
         assert route is not None
