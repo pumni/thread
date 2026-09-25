@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from threads_platform.domain.worker_jobs import WorkerJobStatus
+from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
 from threads_platform.domain.workers import (
     BrowserSessionState,
     NetworkProfile,
@@ -37,8 +37,10 @@ class WorkerJobSnapshot:
     status: WorkerJobStatus
     account_id: UUID | None
     assigned_worker_id: UUID | None
+    lease_worker_id: UUID | None
     lease_token: UUID | None
     lease_expires_at: datetime | None
+    retry_safety: WorkerJobRetrySafety
     checkpoint: dict[str, object] | None
 
 
@@ -111,6 +113,8 @@ class WorkerLocalState(Protocol):
 
     def recovery_entries(self) -> list[LocalRecoveryEntry]: ...
 
+    def clear_recovery_entry(self, worker_job_id: UUID) -> None: ...
+
 
 class ManagedProfileDirectory(Protocol):
     def ensure_profile(self, worker_id: UUID, account_id: UUID, profile_ref: str) -> None: ...
@@ -172,6 +176,39 @@ class WorkerControlClient(Protocol):
     async def report_session_state(self, session: LocalSessionState) -> None: ...
 
     async def aclose(self) -> None: ...
+
+
+class WorkerJobControlClient(Protocol):
+    """Authenticated HTTPS WorkerJob operations used by executor foundations."""
+
+    async def renew_job(self, job_id: UUID, lease_token: UUID) -> WorkerJobSnapshot: ...
+
+    async def checkpoint_job(
+        self, job_id: UUID, lease_token: UUID, checkpoint: dict[str, object]
+    ) -> WorkerJobSnapshot: ...
+
+    async def complete_job(
+        self, job_id: UUID, lease_token: UUID, result: dict[str, object]
+    ) -> WorkerJobSnapshot: ...
+
+    async def fail_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        error_code: str,
+        retryable: bool,
+        outcome_ambiguous: bool = False,
+    ) -> WorkerJobSnapshot: ...
+
+    async def request_intervention(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        intervention_type: str,
+        detail_code: str,
+    ) -> WorkerJobSnapshot: ...
 
 
 WorkerJobHandler = Callable[[WorkerJobSnapshot], Awaitable[None]]

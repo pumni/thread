@@ -437,6 +437,13 @@ class WorkerLocalStateStore:
             for row in rows
         ]
 
+    def clear_recovery_entry(self, worker_job_id: UUID) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM worker_recovery_journal WHERE worker_job_id = ?",
+                (str(worker_job_id),),
+            )
+
 
 def _validate_profile_ref(profile_ref: str) -> None:
     if (
