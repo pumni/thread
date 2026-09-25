@@ -15,11 +15,12 @@ The project is greenfield. The deleted legacy Facebook report is not an architec
 Engineering completed:
 - Batch A — Foundation;
 - TP-004A — durable external-side-effect execution hardening;
-- Batch B — Threads API publishing/conversation core.
+- Batch B — Threads API publishing/conversation core;
+- C1 — Distributed Worker Foundation.
 
-The next implementation milestone is **C1 — Distributed Worker Foundation**.
+The next authorized implementation milestone is **C2-01 — Capability registry, per-account execution modes and deterministic router (#24)**.
 
-Do not start C2/C3/C4/C5/C6 until the coordinator explicitly authorizes the corresponding batch/checkpoint.
+Do not start C3/C4/C5/C6 until the coordinator explicitly authorizes the corresponding batch/checkpoint.
 
 ## 3. Important merged checkpoints
 
@@ -47,6 +48,12 @@ Batch B:
 Distributed-hybrid rebaseline:
 - PR #29 — v2 architecture, Worker Protocol v1, C1-C6 roadmap and fresh-session handoffs.
 - Merge commit: cb675e5109fb04d91ceaf7b81f83f34d5673a849.
+
+C1 — Distributed Worker Foundation:
+- PR #32 — Worker registry/affinity, enrollment/device auth/presence/protocol v1, durable WorkerJob leases/fencing/intervention/recovery.
+- Accepted head: ff2f0d731a254f25a4058dba4281f9f589cfca4c.
+- Merge commit: 8cbcd9e6c4fad73579148a826f3754e92e41e4f3.
+- Issues #21, #22 and #23 closed completed after coordinator acceptance.
 
 ## 4. Current open gates
 
@@ -133,9 +140,9 @@ uv run alembic check
 uv run pytest
 ~~~
 
-At the end of Batch B, CI and Secret scan were green.
+At the C1 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `ff2f0d731a254f25a4058dba4281f9f589cfca4c`.
 
-The v2 planning rebaseline PR #29 also passed CI and Secret scan before merge.
+Final reported C1 local gate: Ruff/format/Pyright/Alembic green, migration upgrade → downgrade → re-upgrade across revisions 0001–0006 green, and 83 tests passed.
 
 ## 8. Threads API baseline
 
@@ -156,13 +163,13 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 ## 9. Next action for a new coordinator
 
 1. Read root `AGENTS.md` and this handoff.
-2. Inspect the C1 GitHub issues listed in WORK_BREAKDOWN.md.
-3. Use `docs/CONTEXT_MAP.md` to load the C1-specific architecture/protocol/ADR context.
-4. Confirm main/CI state before handoff.
-5. Hand Codex only the authorized C1 batch.
-6. Review at the C1 checkpoint before Browser Runtime work begins.
+2. Confirm `main` includes C1 merge commit `8cbcd9e6c4fad73579148a826f3754e92e41e4f3`.
+3. Inspect issue #24 and the C2 sections of `docs/WORK_BREAKDOWN.md`, `docs/ARCHITECTURE.md`, ADR-0003 and ADR-0004.
+4. Authorize only C2-01: deterministic capability routing and per-account execution policy.
+5. Preserve C1's WorkerJob, affinity, auth, fencing and durable HTTPS/WSS boundaries.
+6. Stop at the C2 checkpoint for coordinator review before C3 browser-runtime work.
 
-Do not ask Codex to implement Playwright/Selenium in C1.
+Do not introduce Playwright/Selenium, browser DOM actions, scheduler/discovery scope, or anti-detect behavior in C2.
 
 ## 10. Coordinator acceptance vocabulary
 
