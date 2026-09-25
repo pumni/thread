@@ -17,11 +17,12 @@ Engineering completed:
 - TP-004A — durable external-side-effect execution hardening;
 - Batch B — Threads API publishing/conversation core;
 - C1 — Distributed Worker Foundation;
-- C2 — Capability Router and per-account execution policy.
+- C2 — Capability Router and per-account execution policy;
+- C3-01 — Windows Worker Agent, profile/session and NetworkProfile foundation.
 
-The next authorized implementation milestone is **C3-01 — Windows Worker Agent, profile/session and NetworkProfile foundation (#25)**.
+The next authorized implementation milestone is **C3-02 — Browser engine ADR and fail-closed browser adapter foundation (#26)**.
 
-Do not start C3-02/browser-engine work, C4, C5 or C6 until the coordinator explicitly authorizes the corresponding checkpoint.
+Do not start the Threads UI capability pack, C4 browser enrichment, C5 or C6 until the coordinator explicitly authorizes the corresponding checkpoint.
 
 ## 3. Important merged checkpoints
 
@@ -61,6 +62,12 @@ C2 — Capability Router:
 - Accepted head: c98b702099b8a2948dc4197de68af720a953a8c2.
 - Merge commit: 29895a987d12b7325671fb8ca7c30272f865cd73.
 - Issue #24 closed completed after coordinator acceptance.
+
+C3-01 — Windows Worker Agent foundation:
+- PR #34 — Windows process/runtime, DPAPI device identity, managed local data root, logical profile ownership, session/capacity recovery, durable session reporting and protocol v2 capacity extension.
+- Accepted head: 644aedc05b3305bf2e2b05373c863498db5c7873.
+- Merge commit: 6b9984fecf7167ce02389be9bd935983f8ab7f1d.
+- Issue #25 closed completed after coordinator acceptance.
 
 ## 4. Current open gates
 
@@ -147,9 +154,9 @@ uv run alembic check
 uv run pytest
 ~~~
 
-At the C2 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `c98b702099b8a2948dc4197de68af720a953a8c2`.
+At the C3-01 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `644aedc05b3305bf2e2b05373c863498db5c7873`.
 
-Final reported C2 local gate: Ruff/format/Pyright/Alembic green, migration downgrade/re-upgrade through revision 0007 green, and 90 tests passed.
+Final reported C3-01 local gate: Ruff/format/Pyright/Alembic green, migration downgrade/re-upgrade through revision 0008 green, 108 tests passed, and the native Windows DPAPI persistence/reload test passed locally.
 
 ## 8. Threads API baseline
 
@@ -170,13 +177,13 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 ## 9. Next action for a new coordinator
 
 1. Read root `AGENTS.md` and this handoff.
-2. Confirm `main` includes C2 merge commit `29895a987d12b7325671fb8ca7c30272f865cd73`.
-3. Inspect issue #25 and the C3 sections of `docs/WORK_BREAKDOWN.md`, `docs/ARCHITECTURE.md`, Worker Protocol v1 and ADR-0005.
-4. Authorize only C3-01: Windows-first Worker Agent runtime plus local profile/session/network foundations.
-5. Reuse C1 authentication/WorkerJob boundaries and C2 routing contracts rather than recreating them.
-6. Stop after #25 for coordinator review before #26 selects/boots a browser engine.
+2. Confirm `main` includes C3-01 merge commit `6b9984fecf7167ce02389be9bd935983f8ab7f1d`.
+3. Inspect issue #26, ADR-0005, Worker Protocol v1/v2, the C3-01 worker/session contracts, and the current WorkerJob lease/recovery code.
+4. Authorize only C3-02: browser-engine ADR plus isolated fail-closed browser lifecycle/navigation/contract adapter.
+5. Reuse C3-01 profile/session/network foundations and C1 WorkerJob fencing rather than creating a parallel execution model.
+6. Stop after #26 for coordinator review before any production Threads UI capability pack.
 
-Do not implement Threads DOM actions, publishing/engagement UI flows, anti-detect/fingerprint behavior, or challenge bypass in C3-01.
+Do not implement production Threads selectors/actions, like/follow, publishing through the UI, anti-detect/fingerprint behavior, or automated challenge bypass in C3-02.
 
 ## 10. Coordinator acceptance vocabulary
 
