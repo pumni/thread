@@ -1,0 +1,12 @@
+title = "Threads platform secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "embedded-service-uri-credentials"
+description = "URI with embedded username and password"
+regex = '''(?i)(?:mongodb(?:\+srv)?|https?|socks[45]?)://[^:@/\s]+:[^@/\s]+@[^/\s]+'''
+secretGroup = 0
+keywords = ["mongodb://", "mongodb+srv://", "http://", "https://", "socks4://", "socks5://"]
+tags = ["credentials", "uri"]
