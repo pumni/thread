@@ -1,6 +1,6 @@
 # ADR-0006: Playwright Browser Adapter Foundation
 
-- Status: Accepted for C3-02 implementation; checkpoint review remains open
+- Status: Accepted
 - Date: 2026-09-26
 
 ## Context
