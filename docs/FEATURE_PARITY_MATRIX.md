@@ -1,61 +1,110 @@
-# Feature Parity Matrix
+# Feature Capability Matrix v2
 
-## Status vocabulary
+## 1. Purpose
 
-- FULL: direct Threads-native equivalent can satisfy the legacy business outcome.
-- ADAPTED: the business outcome exists but Threads uses a different concept.
-- ENHANCED: official API enables a cleaner/stronger implementation than the legacy browser approach.
-- VERIFY: product capability exists or is suspected, but official automation/API support must be verified before implementation.
-- N/A: Facebook-specific behavior has no useful Threads equivalent.
-- DEFERRED: intentionally outside the initial production scope.
+This matrix maps useful business outcomes from the legacy Facebook tool to the new distributed Threads tool.
 
-## Matrix
+It does **not** require literal UI parity.
 
-| Legacy capability | Threads target | Status | Preferred implementation | Notes |
-|---|---|---:|---|---|
-| Multi-account management | Multiple Threads OAuth identities | ENHANCED | OAuth + DB | No cloned scripts or Chrome profiles |
-| Realtime CRM commands | Typed command protocol | FULL | HTTP/WebSocket transport -> command bus | Durable inbox/idempotency |
-| Post text | Publish text Thread | FULL | Official Threads API | P0 functional parity |
-| Post image | Publish image Thread | FULL | Official Threads API | Use remote media URL requirements |
-| Post video | Publish video Thread | FULL | Official Threads API | Verify processing/status behavior |
-| Multi-image/video post | Carousel | FULL | Official Threads API | Container workflow |
-| Share/re-share | Repost | VERIFY | Official Threads API | Endpoint is documented; outcome reconciliation is not, so mutation is deferred |
-| Quote content | Quote post | ENHANCED | Official Threads API | Documented with `quote_post_id`; live permission remains part of TP-002 |
-| Comment on post | Reply to Thread | FULL | Official Threads API | Domain term becomes reply |
-| Reply to comment | Reply to reply | FULL | Official Threads API | Use reply_to_id |
-| Nested reply hierarchy | Conversation tree | ENHANCED | Official Threads API + relational model | No DOM indentation parsing |
-| Crawl comments | Sync replies/conversations | ENHANCED | Official Threads API | Cursor/incremental sync |
-| CRM-triggered crawl | CRM-triggered conversation sync | FULL | Command runtime | Durable sync command |
-| Periodic crawl | Scheduled incremental sync | FULL | Durable scheduler | No sleep loop |
-| CSV export | Export synchronized data | FULL | Application query/export | Optional reporting feature |
-| Store post/comment tree locally | Persist posts/replies | ENHANCED | PostgreSQL | No post_structure.json |
-| Mongo/device account sync | Account registry/integration sync | ADAPTED | DB + CRM adapter | New data model |
-| Proxy per browser account | Usually unnecessary for official API | N/A initially | Normal API networking | Revisit only for documented infra need |
-| Cookie storage | OAuth token lifecycle | ENHANCED | Encrypted credential store | Never browser cookies as auth foundation |
-| Login via browser profile | OAuth authorization | ENHANCED | Official OAuth | Explicit reauth state |
-| Friend requests | Follow/social graph equivalent | VERIFY/ADAPTED | Official capability only | Do not assume Facebook friend semantics |
-| Recruitment group search | Threads discovery/community workflows | ADAPTED | Search/discovery API where supported | Product/domain mapping required |
-| Join Facebook group | Threads community membership equivalent | VERIFY | Official capability only | Capability gate |
-| Group moderation questions | No direct assumed equivalent | VERIFY/N/A | None until verified | Do not create browser workaround by default |
-| Messenger send message | Threads messaging automation | VERIFY | Official API only if exposed | Product feature does not imply public API support |
-| Feed browsing | Content discovery/feed workflow | ADAPTED | Discovery APIs | No human-like scrolling |
-| Random reaction automation | Engagement action | VERIFY/DEFERRED | Official API only | Not required for MVP |
-| Watch video automation | Threads content consumption | N/A | None | Facebook Watch-specific |
-| Human-like typing/scrolling | None | N/A | None | Explicitly excluded |
-| Anti-detect browser flags | None | N/A | None | Explicitly excluded |
-| Background process hiding | Service deployment | ENHANCED | Linux/Docker/service manager | Operational concern, not product feature |
-| WebSocket reconnect | Reliable transport reconnect | FULL | Typed WS client | Does not own business state |
-| Priority interruption | Command priority/scheduling | ENHANCED | Durable command scheduler | No global stop flag |
-| API result callback | CRM result event | FULL | Outbox delivery | Retry-safe |
-| Posting limit tracking | Threads publishing quota | ENHANCED | Official limit endpoint where available | No hardcoded limits |
-| Comment/reply moderation | Threads reply management | ENHANCED | Official API | Hide/unhide/pending approval documented; account permissions remain VERIFY |
-| Search public discussions | Threads discovery | ENHANCED | Official API where supported | Keyword/tag capabilities must be checked |
-| Performance tracking | Threads insights | NEW/ENHANCED | Official Insights API | Snapshot time series |
+The legacy report is treated only as a requirements inventory. The new project uses Threads-native concepts, official API capabilities, Browser Worker capabilities where justified, and human intervention where necessary.
 
-## Rules for Codex
+## 2. Execution classes
 
-1. A FULL/ENHANCED row still requires current official API verification before implementation.
-2. A VERIFY row cannot be implemented via browser automation without an ADR approved in review.
-3. If Meta removes or changes a capability, update this matrix before changing architecture.
-4. Product UI existence is not evidence of API availability.
-5. Every parity implementation must have a corresponding acceptance test or documented manual integration test.
+- NATIVE_API — official Threads API is the preferred executor.
+- HYBRID — API is preferred for some paths, Browser/Human may be valid fallback or complementary execution.
+- BROWSER_ASSISTED — capability depends primarily on an authenticated browser/session.
+- HUMAN_ASSISTED — tool coordinates/prepares work but operator action is required.
+- UNSUPPORTED — intentionally not implemented unless a later product decision changes.
+- N/A — Facebook-specific primitive with no useful direct Threads parity.
+
+## 3. Delivery status
+
+- DONE — implemented in current codebase.
+- PLANNED — approved future scope.
+- VERIFY — capability/permission/recovery semantics require verification before activation.
+- DEFERRED — intentionally postponed.
+- DROP — explicitly excluded as a project objective.
+
+## 4. Matrix
+
+| Legacy/business outcome | Threads target | Execution class | Preferred executor | Fallback | Status | Priority | Notes |
+|---|---|---|---|---|---|---:|---|
+| Multi-machine tool | Distributed Worker Fleet | HYBRID | Control Plane + WorkerJob | none | PLANNED | P0 | C1 |
+| Per-machine account ownership | Persistent account-worker affinity | BROWSER_ASSISTED | assigned Worker | API when policy allows | PLANNED | P0 | no auto profile migration |
+| Multiple account modes | API_ONLY/BROWSER_ONLY/HYBRID/MANUAL | HYBRID | Capability Router | explicit policy | PLANNED | P0 | C2 |
+| CRM realtime command | Typed durable Command | NATIVE_API | Control Plane | none | DONE | P0 | command_id idempotency |
+| WebSocket reconnect | Realtime worker/CRM notification | HYBRID | WSS notification | DB/HTTPS reconcile | DONE/PLANNED | P0 | socket never source of truth |
+| Priority interruption | Durable priority/preemption | HYBRID | Scheduler/WorkerJob | cancellation at safe boundary | PLANNED | P1 | replaces stop_browsing |
+| Text publish | Threads text post | HYBRID | Official API | Browser | DONE/API | P0 | Browser fallback C3/C5 |
+| Image publish by URL | Threads image post | HYBRID | Official API | Browser | DONE/API | P0 | API requires media contract |
+| Local image/file publish | Local browser upload | BROWSER_ASSISTED | Browser Worker | media service -> API later | PLANNED | P1 | no CDN requirement for browser path |
+| Video publish | Threads video post | HYBRID | Official API | Browser | DONE/API | P0 | live media behavior still TP-002 gate |
+| Multi-media post | Carousel | HYBRID | Official API | Browser | DONE/API | P0 | container workflow |
+| Quote content | Quote Thread | HYBRID | Official API | Browser | DONE/API | P1 | live permission still VERIFY |
+| Re-share | Repost | HYBRID | Official API | Browser/Human | VERIFY | P2 | lost-response reconciliation unresolved |
+| Comment | Reply | HYBRID | Official API | Browser | DONE/API | P0 | Threads-native terminology |
+| Reply to comment | Reply-to-reply | HYBRID | Official API | Browser | DONE/API | P0 | relational parent mapping |
+| Crawl own post replies | Conversation sync | NATIVE_API | Official API | Browser enrichment | DONE/API | P0 | deterministic relational sync |
+| Deep comment tree | Flattened conversation + relational tree | NATIVE_API | Official API | Browser enrichment | DONE/API | P0 | no DOM indentation guessing |
+| Periodic comment crawl | Scheduled conversation sync | NATIVE_API | Scheduler + API | Browser if required | PLANNED | P1 | C6 |
+| Search public posts | Keyword/topic search | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | Meta documents keyword_search |
+| Search topic/tag | Topic-tag discovery | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | search_mode TAG |
+| Public user lookup | Public profile lookup | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | exact username lookup documented |
+| Public profile post collection | profile_posts | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | live contract verification before production |
+| Mention monitoring | Mentions | NATIVE_API | Official API | none | PLANNED | P1 | time/cursor support documented |
+| Lead discovery | DiscoveryCampaign -> LeadCandidate | HYBRID | API-first pipeline | Browser enrichment | PLANNED | P1 | C4 |
+| Competitor/public-account monitoring | Public profile/posts + discovery | HYBRID | API | Browser enrichment | PLANNED | P1 | policy/retention required |
+| CSV/report export | Query/export | NATIVE_API | Application | none | DEFERRED | P2 | reporting concern |
+| Post/comment local JSON tree | PostgreSQL relational persistence | NATIVE_API | PostgreSQL | none | DONE | P0 | replaces post_structure.json |
+| Device/account registry | Worker + Account registry | HYBRID | Control Plane | none | PLANNED | P0 | C1 |
+| Chrome profile per account | BrowserProfile | BROWSER_ASSISTED | assigned Worker | none | PLANNED | P0 | logical profile_ref |
+| Login using persistent profile | Operator login + persisted session | HUMAN_ASSISTED | Worker + operator | none | PLANNED | P0 | no password-as-core model |
+| Session health | Browser session lifecycle | BROWSER_ASSISTED | Worker | Human intervention | PLANNED | P0 | challenge/session-expired states |
+| Per-account proxy | NetworkProfile | BROWSER_ASSISTED | assigned Worker | direct connection if policy allows | PLANNED | P1 | routing config, not evasion |
+| Feed browsing | Explicit BrowseFeed capability | BROWSER_ASSISTED | Browser Worker | none | PLANNED | P1 | no random warm-up loop |
+| Open/read thread | OpenThread/ReadThread | BROWSER_ASSISTED | Browser Worker | API when equivalent exists | PLANNED | P1 | explicit capability |
+| Open profile | OpenProfile | HYBRID | API when sufficient | Browser | PLANNED | P1 | UI enrichment only where needed |
+| Like | LikeThread | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | retain only if product requires |
+| Follow/unfollow | FollowUser | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | no Facebook friend semantics |
+| Random reactions | None | UNSUPPORTED | none | none | DROP | - | random engagement is not an architecture objective |
+| Add Facebook friend | Threads follow semantics | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | adapted outcome only |
+| Facebook group search | Recruitment/community discovery | HYBRID | API discovery | Browser enrichment | PLANNED | P1 | business outcome, not group primitive |
+| Join Facebook group | No direct parity | N/A | none | none | DROP | - | Threads-native community capability may be evaluated separately |
+| Auto-answer group join questions | No direct parity | N/A | none | none | DROP | - | Facebook-specific |
+| Messenger DM | Threads/private messaging workflow | HUMAN_ASSISTED | Human | Browser only after separate review | VERIFY | P2 | do not assume public API support |
+| Facebook Watch loop | Feed/media browsing | BROWSER_ASSISTED | Browser Worker | none | DROP direct parity | - | no dedicated Watch clone |
+| “Account nurturing” | AccountActivityPlan | HYBRID | Scheduler -> explicit jobs | Human | PLANNED | P1 | product term may remain in UI |
+| Human-like typing/scrolling for detection avoidance | None | UNSUPPORTED | none | none | DROP | - | not a project objective |
+| Anti-detect browser flags/fingerprint spoofing | None | UNSUPPORTED | none | none | DROP | - | explicitly excluded |
+| Process hiding | Service/worker management | NATIVE_API | OS service manager | none | DROP direct parity | - | operational packaging replaces hiding |
+| Worker process recovery | Worker health/restart | HYBRID | Worker Agent | Control Plane | PLANNED | P0 | C1/C6 |
+| Posting quota | API quota query | NATIVE_API | Official API | unknown-safe policy | DONE/API | P1 | no hardcoded quota |
+| Reply moderation | Reply management | NATIVE_API | Official API | Browser only if separately approved | DONE/API | P1 | live account permission still TP-002 gate |
+| Insights | Threads Insights | NATIVE_API | Official API | none | PLANNED | P2 | snapshots, not overwritten counters |
+| Worker software update | Drain/update workflow | HYBRID | Control Plane + Worker | manual | PLANNED | P1 | C6 |
+| Remote diagnostics | Worker health/diagnostics | HYBRID | Worker Agent | manual | PLANNED | P1 | no secrets in diagnostics |
+
+## 5. Official API evidence baseline
+
+Current official Meta Threads workspace (checked 2026-09-25) documents:
+- OAuth flows and token refresh;
+- public profile lookup;
+- public profile posts;
+- publishing;
+- reply/conversation management;
+- keyword/topic search;
+- mentions;
+- insights;
+- quota retrieval.
+
+Meta explicitly warns that the Postman collection may lag the latest developer changelog. Implementation must verify the current developer docs/changelog before changing a contract.
+
+## 6. Rules
+
+1. DONE/API means implemented against documentation contracts; it does not imply TP-002 live verification is complete.
+2. VERIFY cannot be silently promoted to production-ready.
+3. Browser execution requires the distributed-worker architecture and an explicit capability; no one-off Selenium/Playwright calls in application/domain code.
+4. Browser fallback is not an excuse to bypass account authorization, challenges, platform controls, or rate limits.
+5. Human-assisted is a valid first-class outcome.
+6. N/A/DROP rows do not need literal parity if the useful business outcome is covered elsewhere.
+7. Every future feature PR must update this matrix when its execution class or delivery status changes.

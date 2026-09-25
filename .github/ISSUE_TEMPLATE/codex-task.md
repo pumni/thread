@@ -1,7 +1,7 @@
 ---
 name: Codex implementation task
-about: A bounded implementation task designed for Codex handoff and acceptance review
-title: "[TP-XXX] "
+about: Bounded task for an authorized project checkpoint
+title: "[C?-??] "
 labels: ""
 assignees: ""
 ---
@@ -10,40 +10,51 @@ assignees: ""
 
 ## Objective
 
+## Source of truth / ADRs
+
+- docs/PROJECT_STATE_HANDOFF.md
+- docs/MASTER_PLAN.md
+- docs/ARCHITECTURE.md
+- applicable ADR/protocol:
+
 ## In scope
 
-- 
+-
 
 ## Out of scope
 
-- 
+-
 
-## Technical constraints
+## Invariants / technical constraints
 
-- Follow docs/ARCHITECTURE.md.
-- Follow applicable ADRs.
-- Verify current official Threads API behavior for external integration work.
+-
 
 ## Deliverables
 
-- 
+-
 
 ## Acceptance criteria
 
-- [ ] 
-- [ ] Tests added/updated.
+- [ ]
+- [ ] Failure/recovery tests added where relevant.
 - [ ] No secrets introduced.
+- [ ] Architecture docs updated if the accepted contract changes.
 
-## Verification commands
+## Verification
 
 ~~~
 uv sync --locked
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright
+uv run alembic check
 uv run pytest
 ~~~
 
+Additional DB/distributed/browser tests:
+
 ## Dependencies
+
+## Stop conditions
 
 ## Notes for reviewer
