@@ -55,7 +55,7 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
             return presence
 
         async def heartbeat(
-            self, requested_worker_id: object, *, healthy: bool = True
+            self, requested_worker_id: object, *, healthy: bool = True, **_: object
         ) -> WorkerPresence:
             assert requested_worker_id == worker_id
             assert healthy

@@ -49,6 +49,15 @@ async def test_worker_enrollment_authentication_protocol_and_presence(
     issued = await service.create_enrollment()
     identity = WorkerDeviceIdentity.generate()
     worker_id = uuid4()
+    with pytest.raises(WorkerControlError, match="INVALID_PUBLIC_KEY"):
+        await service.enroll(
+            issued.code,
+            worker_id=worker_id,
+            display_name="Invalid key length",
+            hostname="OPS-INVALID",
+            platform="windows",
+            public_key=b"short",
+        )
     enrolled = await service.enroll(
         issued.code,
         worker_id=worker_id,

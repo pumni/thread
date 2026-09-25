@@ -215,6 +215,8 @@ def create_worker_router(
             public_key = _decode_base64(request.public_key)
         except ValueError as error:
             raise HTTPException(status_code=422, detail={"code": "INVALID_PUBLIC_KEY"}) from error
+        if len(public_key) != 32:
+            raise HTTPException(status_code=422, detail={"code": "INVALID_PUBLIC_KEY"})
         try:
             enrolled = await require_service().enroll(
                 request.enrollment_code,
@@ -261,6 +263,7 @@ def create_worker_router(
         request: WorkerHelloRequest,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerPresenceResponse:
+        access_token = _bearer_token(authorization)
         worker_id = await authenticated_worker(authorization)
         control = require_service()
         try:
@@ -283,6 +286,7 @@ def create_worker_router(
                 platform=request.platform,
                 max_concurrent_jobs=request.max_concurrent_jobs,
                 healthy=request.healthy,
+                access_token=access_token,
             )
         except WorkerControlError as error:
             raise _http_error(error) from error
@@ -297,9 +301,14 @@ def create_worker_router(
         request: WorkerHeartbeatRequest,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerPresenceResponse:
+        access_token = _bearer_token(authorization)
         worker_id = await authenticated_worker(authorization)
         try:
-            presence = await require_service().heartbeat(worker_id, healthy=request.healthy)
+            presence = await require_service().heartbeat(
+                worker_id,
+                healthy=request.healthy,
+                access_token=access_token,
+            )
         except WorkerControlError as error:
             raise _http_error(error) from error
         notifications.publish(
@@ -460,7 +469,10 @@ def create_worker_router(
             return
         control = service
         token = _bearer_token(websocket.headers.get("authorization"))
-        worker_id = await control.authenticate(token) if token is not None else None
+        if token is None:
+            await websocket.close(code=4401)
+            return
+        worker_id = await control.authenticate(token)
         if worker_id is None:
             await websocket.close(code=4401)
             return
@@ -469,11 +481,18 @@ def create_worker_router(
 
             async def send_notifications() -> None:
                 while True:
-                    await websocket.send_json(await queue.get())
+                    message = await queue.get()
+                    if await control.authenticate(token) != worker_id:
+                        await websocket.close(code=4401)
+                        return
+                    await websocket.send_json(message)
 
             async def receive_messages() -> None:
                 while True:
                     raw_message: object = await websocket.receive_json()
+                    if await control.authenticate(token) != worker_id:
+                        await websocket.close(code=4401)
+                        return
                     if not isinstance(raw_message, dict):
                         await websocket.send_json({"type": "error", "code": "INVALID_MESSAGE"})
                         continue
@@ -502,6 +521,7 @@ def create_worker_router(
                                 platform=request.platform,
                                 max_concurrent_jobs=request.max_concurrent_jobs,
                                 healthy=request.healthy,
+                                access_token=token,
                             )
                             await websocket.send_json(
                                 {
@@ -512,7 +532,11 @@ def create_worker_router(
                             )
                         elif message_type == "worker.heartbeat":
                             request = WorkerHeartbeatRequest.model_validate(body)
-                            presence = await control.heartbeat(worker_id, healthy=request.healthy)
+                            presence = await control.heartbeat(
+                                worker_id,
+                                healthy=request.healthy,
+                                access_token=token,
+                            )
                             await websocket.send_json(
                                 {
                                     "type": "worker.heartbeat.accepted",
@@ -523,7 +547,12 @@ def create_worker_router(
                             await websocket.send_json(
                                 {"type": "error", "code": "UNSUPPORTED_MESSAGE"}
                             )
-                    except ValidationError, WorkerControlError:
+                    except WorkerControlError as error:
+                        if error.code == "WORKER_UNAUTHORIZED":
+                            await websocket.close(code=4401)
+                            return
+                        await websocket.send_json({"type": "error", "code": "INVALID_MESSAGE"})
+                    except ValidationError:
                         await websocket.send_json({"type": "error", "code": "INVALID_MESSAGE"})
 
             send_task = asyncio.create_task(send_notifications())
@@ -574,7 +603,12 @@ def _worker_job_response(job: WorkerJob) -> WorkerJobResponse:
 
 
 def _http_error(error: WorkerControlError) -> HTTPException:
-    status_code = 404 if error.code in {"WORKER_NOT_FOUND", "WORKER_NOT_AUTHENTICATABLE"} else 401
+    if error.code == "INVALID_PUBLIC_KEY":
+        status_code = 422
+    elif error.code in {"WORKER_NOT_FOUND", "WORKER_NOT_AUTHENTICATABLE"}:
+        status_code = 404
+    else:
+        status_code = 401
     return HTTPException(status_code=status_code, detail={"code": error.code})
 
 

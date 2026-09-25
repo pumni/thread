@@ -1,9 +1,13 @@
+import asyncio
 import base64
-from uuid import uuid4
+import json
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from pydantic import SecretStr
+from starlette.types import Message, Scope
 
 from threads_platform.app import create_app
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
@@ -15,6 +19,94 @@ from threads_platform.infrastructure.security.worker_auth import challenge_messa
 from threads_platform.workers.key_store import WorkerDeviceIdentity
 
 pytestmark = pytest.mark.integration
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.current = datetime(2026, 9, 25, 12, tzinfo=UTC)
+
+    def now(self) -> datetime:
+        return self.current
+
+    def advance(self, duration: timedelta) -> None:
+        self.current += duration
+
+
+class WebSocketHarness:
+    def __init__(self, app: object, token: str) -> None:
+        self._app = app
+        self._incoming: asyncio.Queue[Message] = asyncio.Queue()
+        self.outgoing: asyncio.Queue[Message] = asyncio.Queue()
+        self.scope: Scope = {
+            "type": "websocket",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "scheme": "wss",
+            "server": ("worker.test", 443),
+            "client": ("test", 1234),
+            "root_path": "",
+            "path": "/v1/workers/connect",
+            "raw_path": b"/v1/workers/connect",
+            "query_string": b"",
+            "headers": [
+                (b"authorization", f"Bearer {token}".encode("ascii")),
+                (b"host", b"worker.test"),
+            ],
+            "subprotocols": [],
+            "state": {},
+        }
+        self.task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        await self._app(self.scope, self._receive, self._send)  # type: ignore[operator]
+
+    async def _receive(self) -> Message:
+        return await self._incoming.get()
+
+    async def _send(self, message: Message) -> None:
+        await self.outgoing.put(message)
+
+    async def connect(self) -> None:
+        await self._incoming.put({"type": "websocket.connect"})
+        accepted = await asyncio.wait_for(self.outgoing.get(), timeout=2)
+        assert accepted["type"] == "websocket.accept"
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        await self._incoming.put({"type": "websocket.receive", "text": json.dumps(message)})
+
+    async def receive_close(self) -> Message:
+        while True:
+            message = await asyncio.wait_for(self.outgoing.get(), timeout=2)
+            if message["type"] == "websocket.close":
+                await asyncio.wait_for(self.task, timeout=2)
+                return message
+
+
+async def _authenticated_worker(
+    control: WorkerControlService,
+    identity: WorkerDeviceIdentity,
+) -> tuple[UUID, str]:
+    worker_id = uuid4()
+    enrollment = await control.create_enrollment()
+    await control.enroll(
+        enrollment.code,
+        worker_id=worker_id,
+        display_name="WSS expiry test worker",
+        hostname="TEST-HOST",
+        platform="windows",
+        public_key=identity.public_key_bytes,
+    )
+    challenge = await control.create_challenge(worker_id)
+    signature = identity.sign(challenge_message(challenge.challenge_id, challenge.nonce))
+    session = await control.exchange_challenge(challenge.challenge_id, signature)
+    await control.hello(
+        worker_id,
+        protocol_version=1,
+        agent_version="1.0.0",
+        capabilities_schema_version=1,
+        capabilities=[],
+        access_token=session.access_token,
+    )
+    return worker_id, session.access_token
 
 
 async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
@@ -50,6 +142,13 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
             "public_key": base64.b64encode(identity.public_key_bytes).decode("ascii"),
             "max_concurrent_jobs": 2,
         }
+        invalid_key_body = {
+            **enrollment_body,
+            "public_key": base64.b64encode(b"x" * 31).decode("ascii"),
+        }
+        invalid_key = await client.post("/v1/workers/enroll", json=invalid_key_body)
+        assert invalid_key.status_code == 422
+        assert invalid_key.json() == {"detail": {"code": "INVALID_PUBLIC_KEY"}}
         async with httpx.AsyncClient(
             transport=transport, base_url="http://worker.test"
         ) as plain_http:
@@ -194,3 +293,68 @@ async def test_durable_https_pull_recovers_job_without_wss_notification(
             json={"lease_token": lease_token, "result": {"synthetic": "stale"}},
         )
         assert stale.status_code == 409
+
+
+async def test_established_wss_sessions_expire_for_presence_and_notifications(
+    unit_of_work_factory: UnitOfWorkFactory,
+) -> None:
+    clock = MutableClock()
+    control = WorkerControlService(
+        unit_of_work_factory,
+        clock=clock,
+        session_ttl=timedelta(seconds=30),
+    )
+    notifications = WorkerNotificationHub()
+    app = create_app(
+        Settings(worker_tls_required=True),
+        worker_control_service=control,
+        worker_notifications=notifications,
+    )
+    heartbeat_worker, heartbeat_token = await _authenticated_worker(
+        control, WorkerDeviceIdentity.generate()
+    )
+    notification_worker, notification_token = await _authenticated_worker(
+        control, WorkerDeviceIdentity.generate()
+    )
+    hello_worker, hello_token = await _authenticated_worker(
+        control, WorkerDeviceIdentity.generate()
+    )
+    heartbeat_socket = WebSocketHarness(app, heartbeat_token)
+    notification_socket = WebSocketHarness(app, notification_token)
+    hello_socket = WebSocketHarness(app, hello_token)
+    await heartbeat_socket.connect()
+    await notification_socket.connect()
+    await hello_socket.connect()
+
+    clock.advance(timedelta(seconds=31))
+    await heartbeat_socket.send_json({"type": "worker.heartbeat", "healthy": True})
+    heartbeat_close = await heartbeat_socket.receive_close()
+    assert heartbeat_close.get("code") == 4401
+
+    await hello_socket.send_json(
+        {
+            "type": "worker.hello",
+            "protocol_version": 1,
+            "agent_version": "1.0.0",
+            "capabilities_schema_version": 1,
+            "capabilities": [],
+        }
+    )
+    hello_close = await hello_socket.receive_close()
+    assert hello_close.get("code") == 4401
+
+    notifications.publish(
+        notification_worker,
+        {"type": "job.available", "job_id": str(uuid4())},
+    )
+    notification_close = await notification_socket.receive_close()
+    assert notification_close.get("code") == 4401
+
+    async with unit_of_work_factory() as unit_of_work:
+        stored_heartbeat_worker = await unit_of_work.workers.get(heartbeat_worker)
+        stored_hello_worker = await unit_of_work.workers.get(hello_worker)
+    initial_presence_time = clock.current - timedelta(seconds=31)
+    assert stored_heartbeat_worker is not None
+    assert stored_heartbeat_worker.last_heartbeat_at == initial_presence_time
+    assert stored_hello_worker is not None
+    assert stored_hello_worker.last_heartbeat_at == initial_presence_time

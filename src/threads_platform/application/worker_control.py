@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 from threads_platform.application.clock import Clock, SystemClock
-from threads_platform.application.ports.repositories import UnitOfWorkFactory
+from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.domain.time import normalize_utc
 from threads_platform.domain.workers import (
     WorkerAuditEvent,
@@ -113,6 +113,8 @@ class WorkerControlService:
         public_key: bytes,
         max_concurrent_jobs: int = 1,
     ) -> EnrolledWorker:
+        if len(public_key) != 32:
+            raise WorkerControlError("INVALID_PUBLIC_KEY")
         now = normalize_utc(self._clock.now())
         enrollment: WorkerEnrollment | None = None
         valid = False
@@ -266,6 +268,7 @@ class WorkerControlService:
         platform: str | None = None,
         max_concurrent_jobs: int | None = None,
         healthy: bool = True,
+        access_token: str | None = None,
     ) -> WorkerPresence:
         now = normalize_utc(self._clock.now())
         compatible = (
@@ -273,6 +276,8 @@ class WorkerControlService:
             and capabilities_schema_version == SUPPORTED_CAPABILITY_SCHEMA_VERSION
         )
         async with self._unit_of_work_factory() as unit_of_work:
+            if access_token is not None:
+                await self._require_active_access_token(unit_of_work, worker_id, access_token, now)
             worker = await unit_of_work.workers.get_for_update(worker_id)
             if worker is None:
                 raise WorkerControlError("WORKER_NOT_FOUND")
@@ -313,9 +318,17 @@ class WorkerControlService:
             protocol_compatible=compatible,
         )
 
-    async def heartbeat(self, worker_id: UUID, *, healthy: bool = True) -> WorkerPresence:
+    async def heartbeat(
+        self,
+        worker_id: UUID,
+        *,
+        healthy: bool = True,
+        access_token: str | None = None,
+    ) -> WorkerPresence:
         now = normalize_utc(self._clock.now())
         async with self._unit_of_work_factory() as unit_of_work:
+            if access_token is not None:
+                await self._require_active_access_token(unit_of_work, worker_id, access_token, now)
             worker = await unit_of_work.workers.get_for_update(worker_id)
             if worker is None:
                 raise WorkerControlError("WORKER_NOT_FOUND")
@@ -380,3 +393,16 @@ class WorkerControlService:
     @staticmethod
     def _digest(value: str) -> str:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    async def _require_active_access_token(
+        self,
+        unit_of_work: UnitOfWork,
+        worker_id: UUID,
+        access_token: str,
+        now: datetime,
+    ) -> None:
+        session = await unit_of_work.worker_security.get_active_session(
+            self._digest(access_token), now
+        )
+        if session is None or session.worker_id != worker_id:
+            raise WorkerControlError("WORKER_UNAUTHORIZED")
