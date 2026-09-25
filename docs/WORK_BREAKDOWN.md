@@ -7,12 +7,11 @@ Completed:
 - Batch A PR #15.
 - TP-004A / partial TP-002 PR #18.
 - Batch B PR #20.
+- C1 PR #32 — issues #21, #22, #23 accepted and merged.
 
-Current next implementation checkpoint:
-- **C1 — Distributed Worker Foundation**
-  - #21 C1-01
-  - #22 C1-02
-  - #23 C1-03
+Current authorized implementation checkpoint:
+- **C2 — Capability Router**
+  - #24 C2-01
 
 Issue #3 remains a production/release gate.
 
@@ -44,6 +43,8 @@ Each batch:
 | D | #11 | E2E production certification | Requires issue #3 complete |
 
 ## 4. C1 — Distributed Worker Foundation
+
+Status: **ACCEPTED / MERGED** in PR #32, merge commit `8cbcd9e6c4fad73579148a826f3754e92e41e4f3`.
 
 ### Order
 
@@ -83,6 +84,8 @@ Recommended branch: batch/c1-distributed-worker-foundation
 ## 5. C2 — Capability Router
 
 Issue #24.
+
+Status: **CURRENT AUTHORIZED CHECKPOINT** after C1 acceptance.
 
 Must separate business capability from executor.
 
