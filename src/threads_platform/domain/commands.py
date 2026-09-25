@@ -53,8 +53,10 @@ class Command:
     id: UUID = field(default_factory=uuid4)
     protocol_version: int = 1
     status: CommandStatus = CommandStatus.RECEIVED
+    created_at: datetime = field(default_factory=utc_now)
     received_at: datetime = field(default_factory=utc_now)
     deadline_at: datetime | None = None
+    next_retry_at: datetime | None = None
     validated_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -66,8 +68,12 @@ class Command:
             raise ValueError("command_id and correlation_id must not be empty")
         if not self.command_type.strip() or self.protocol_version < 1:
             raise ValueError("command type and protocol version are invalid")
+        self.created_at = normalize_utc(self.created_at)
         self.received_at = normalize_utc(self.received_at)
         self.deadline_at = normalize_utc(self.deadline_at) if self.deadline_at is not None else None
+        self.next_retry_at = (
+            normalize_utc(self.next_retry_at) if self.next_retry_at is not None else None
+        )
         self.validated_at = (
             normalize_utc(self.validated_at) if self.validated_at is not None else None
         )
@@ -83,6 +89,7 @@ class Command:
         *,
         error_code: str | None = None,
         result: dict[str, object] | None = None,
+        next_retry_at: datetime | None = None,
     ) -> None:
         occurred_at = normalize_utc(at)
         if (self.status, target) not in _VALID_TRANSITIONS:
@@ -93,13 +100,21 @@ class Command:
             and occurred_at >= self.deadline_at
         ):
             raise ValueError("expired command cannot enter processing")
+        retry_at = normalize_utc(next_retry_at) if next_retry_at is not None else None
+        if target == CommandStatus.FAILED_RETRYABLE:
+            if retry_at is None or retry_at <= occurred_at:
+                raise ValueError("retryable failure requires a future retry time")
+            if self.deadline_at is not None and retry_at >= self.deadline_at:
+                raise ValueError("retry time must be before the command deadline")
 
         self.status = target
         self.error_code = error_code
+        self.next_retry_at = retry_at
         if target == CommandStatus.VALIDATED:
             self.validated_at = occurred_at
         elif target == CommandStatus.PROCESSING:
             self.started_at = occurred_at
+            self.next_retry_at = None
         elif target in {
             CommandStatus.SUCCEEDED,
             CommandStatus.REJECTED,

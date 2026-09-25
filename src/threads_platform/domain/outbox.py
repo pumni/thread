@@ -14,6 +14,7 @@ class OutboxStatus(StrEnum):
 
 class DeliveryStatus(StrEnum):
     PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
     DELIVERED = "DELIVERED"
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_FINAL = "FAILED_FINAL"
@@ -53,6 +54,9 @@ class IntegrationDelivery:
     status: DeliveryStatus = DeliveryStatus.PENDING
     attempt_count: int = 0
     next_attempt_at: datetime = field(default_factory=utc_now)
+    delivery_deadline_at: datetime | None = None
+    lease_token: UUID | None = None
+    lease_expires_at: datetime | None = None
     delivered_at: datetime | None = None
     remote_delivery_id: str | None = None
     error_code: str | None = None
@@ -63,6 +67,14 @@ class IntegrationDelivery:
         if not self.destination.strip() or self.attempt_count < 0:
             raise ValueError("delivery destination and attempt count are invalid")
         self.next_attempt_at = normalize_utc(self.next_attempt_at)
+        self.delivery_deadline_at = (
+            normalize_utc(self.delivery_deadline_at)
+            if self.delivery_deadline_at is not None
+            else None
+        )
+        self.lease_expires_at = (
+            normalize_utc(self.lease_expires_at) if self.lease_expires_at is not None else None
+        )
         self.delivered_at = normalize_utc(self.delivered_at) if self.delivered_at else None
         self.created_at = normalize_utc(self.created_at)
         self.updated_at = normalize_utc(self.updated_at)

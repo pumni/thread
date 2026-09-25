@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +13,7 @@ from threads_platform.infrastructure.persistence.database import (
     create_database_engine,
     create_session_factory,
 )
+from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
 
 def _test_database_url() -> str:
@@ -49,4 +51,20 @@ async def db_session() -> AsyncIterator[AsyncSession]:
             yield session
         finally:
             await transaction.rollback()
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def unit_of_work_factory() -> AsyncIterator[SQLAlchemyUnitOfWorkFactory]:
+    engine = create_database_engine(_test_database_url())
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "TRUNCATE TABLE integration_deliveries, outbox_events, "
+                "insight_snapshots, sync_runs, sync_states, schedules, replies, "
+                "posts, command_attempts, commands, oauth_credentials, "
+                "threads_accounts RESTART IDENTITY CASCADE"
+            )
+        )
+    yield SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
     await engine.dispose()

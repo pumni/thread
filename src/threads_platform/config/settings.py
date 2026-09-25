@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     log_level: LogLevel = "INFO"
     database_url: SecretStr | None = None
+    crm_ingress_token: SecretStr | None = None
 
 
 @lru_cache(maxsize=1)
