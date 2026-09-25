@@ -1,12 +1,13 @@
 import asyncio
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from threads_platform.application.capability_router import CapabilityEvidence, CapabilityRouter
 from threads_platform.application.clock import Clock, SystemClock
 from threads_platform.application.commands.handlers import (
     CommandCheckpoint,
@@ -31,6 +32,12 @@ from threads_platform.application.errors import (
 )
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.application.retry import RetryPolicy
+from threads_platform.application.worker_jobs import WorkerJobService
+from threads_platform.domain.account_execution import AccountExecutionOwnerType
+from threads_platform.domain.capabilities import (
+    CapabilityExecutor,
+    RouteTarget,
+)
 from threads_platform.domain.commands import (
     AttemptStatus,
     Command,
@@ -38,6 +45,7 @@ from threads_platform.domain.commands import (
     CommandStatus,
 )
 from threads_platform.domain.time import normalize_utc
+from threads_platform.domain.worker_jobs import WorkerJob, WorkerJobRetrySafety
 
 KNOWN_COMMAND_TYPES = frozenset(
     {
@@ -64,6 +72,16 @@ class _ExecutionClaim:
     command: Command
     lease_token: UUID
     attempt_number: int
+    attempt_id: UUID
+    account_coordination_generation: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerJobEnqueued:
+    result: CommandExecutionResult
+    job: WorkerJob
+    notification_worker_ids: tuple[UUID, ...]
+    occurred_at: datetime
 
 
 class _SyncCursorConflict(Exception):
@@ -83,6 +101,8 @@ class CommandRuntime:
         execution_lease_duration: timedelta = timedelta(minutes=2),
         crm_destination: str = "crm",
         event_id_factory: Callable[[], UUID] = uuid4,
+        capability_router: CapabilityRouter | None = None,
+        worker_job_service: WorkerJobService | None = None,
     ) -> None:
         if (
             max_command_lifetime <= timedelta(0)
@@ -99,6 +119,8 @@ class CommandRuntime:
         self._execution_lease_duration = execution_lease_duration
         self._crm_destination = crm_destination
         self._event_id_factory = event_id_factory
+        self._capability_router = capability_router or CapabilityRouter()
+        self._worker_job_service = worker_job_service
 
     async def receive(self, raw_command: dict[str, object]) -> CommandReceiptV1:
         try:
@@ -178,6 +200,14 @@ class CommandRuntime:
             claim_or_result = await self._claim_locked(
                 unit_of_work, command, normalize_utc(self._clock.now())
             )
+        if isinstance(claim_or_result, _WorkerJobEnqueued):
+            if self._worker_job_service is not None:
+                self._worker_job_service.publish_available(
+                    claim_or_result.job,
+                    claim_or_result.notification_worker_ids,
+                    now=claim_or_result.occurred_at,
+                )
+            return claim_or_result.result
         if isinstance(claim_or_result, CommandExecutionResult):
             return claim_or_result
         return await self._execute_claim(claim_or_result)
@@ -189,6 +219,14 @@ class CommandRuntime:
             if command is None:
                 return None
             claim_or_result = await self._claim_locked(unit_of_work, command, now)
+        if isinstance(claim_or_result, _WorkerJobEnqueued):
+            if self._worker_job_service is not None:
+                self._worker_job_service.publish_available(
+                    claim_or_result.job,
+                    claim_or_result.notification_worker_ids,
+                    now=claim_or_result.occurred_at,
+                )
+            return claim_or_result.result
         if isinstance(claim_or_result, CommandExecutionResult):
             return claim_or_result
         return await self._execute_claim(claim_or_result)
@@ -198,8 +236,10 @@ class CommandRuntime:
         unit_of_work: UnitOfWork,
         command: Command,
         now: datetime,
-    ) -> _ExecutionClaim | CommandExecutionResult:
+    ) -> _ExecutionClaim | _WorkerJobEnqueued | CommandExecutionResult:
         if command.status in self._terminal_statuses():
+            return CommandExecutionResult(command.command_id, command.status, executed=False)
+        if command.status is CommandStatus.WAITING_INTERVENTION:
             return CommandExecutionResult(command.command_id, command.status, executed=False)
 
         previous_attempt: CommandAttempt | None = None
@@ -261,36 +301,224 @@ class CommandRuntime:
 
         if command.status == CommandStatus.RECEIVED:
             command.transition(CommandStatus.VALIDATED, now)
+            await unit_of_work.commands.update(command)
+        return await self._route_and_claim(
+            unit_of_work,
+            command,
+            now,
+            attempt_count=attempt_count,
+            previous_attempt=previous_attempt,
+        )
 
-        handler = self._handlers.get(command.command_type)
-        if handler is None:
-            unavailable_status = (
-                CommandStatus.FAILED_FINAL
-                if command.status == CommandStatus.PROCESSING
-                else CommandStatus.REJECTED
+    async def _route_and_claim(
+        self,
+        unit_of_work: UnitOfWork,
+        command: Command,
+        now: datetime,
+        *,
+        attempt_count: int,
+        previous_attempt: CommandAttempt | None,
+    ) -> _ExecutionClaim | _WorkerJobEnqueued | CommandExecutionResult:
+        account = await unit_of_work.accounts.get_for_update(command.account_id)
+        if account is None:
+            raise CommandInputError("UNKNOWN_ACCOUNT")
+
+        policy = self._capability_router.policy_for(command.command_type)
+        assignment = await unit_of_work.assignments.get_active(command.account_id)
+        worker = (
+            await unit_of_work.workers.get(assignment.worker_id) if assignment is not None else None
+        )
+        advertises_capability = False
+        if (
+            policy is not None
+            and policy.worker_capability_name is not None
+            and assignment is not None
+        ):
+            advertises_capability = await unit_of_work.worker_capabilities.has(
+                assignment.worker_id,
+                policy.worker_capability_name,
+                policy.worker_capability_version or 1,
             )
+        existing_job = await unit_of_work.worker_jobs.get_by_command_id(command.command_id)
+        previous_route = (
+            await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+                command.command_id
+            )
+        )
+        previous_executor = (
+            previous_route.executor
+            if previous_route is not None
+            else CapabilityExecutor.API
+            if attempt_count > 0
+            else None
+        )
+        account_mutation_busy = False
+        if policy is not None and policy.operation_class.requires_exclusive_account_coordination:
+            account_mutation_busy = (
+                await unit_of_work.account_execution_leases.get_active(command.account_id, now)
+                is not None
+            )
+        decision = self._capability_router.decide(
+            command.command_id,
+            command.account_id,
+            command.command_type,
+            account.execution_mode,
+            CapabilityEvidence(
+                api_handler_available=command.command_type in self._handlers,
+                worker_assigned=assignment is not None,
+                worker_online=(
+                    worker is not None
+                    and worker.status.value == "ONLINE"
+                    and worker.presence_expires_at is not None
+                    and worker.presence_expires_at > now
+                    and worker.protocol_version == 1
+                    and worker.capabilities_schema_version == 1
+                ),
+                worker_advertises_capability=advertises_capability,
+                account_mutation_busy=account_mutation_busy,
+                account_status=account.status,
+                attempt_count=attempt_count,
+                previous_executor=previous_executor,
+                existing_worker_job=existing_job,
+            ),
+        )
+        decision = replace(decision, attempt_count=attempt_count, created_at=now)
+
+        if decision.target is RouteTarget.UNSUPPORTED:
+            await unit_of_work.command_route_decisions.add(decision)
             command.transition(
-                unavailable_status,
+                CommandStatus.REJECTED
+                if command.status is CommandStatus.VALIDATED
+                else CommandStatus.FAILED_FINAL,
                 now,
-                error_code="HANDLER_UNAVAILABLE",
+                error_code=decision.reason_code,
             )
             self._clear_execution_lease(command)
             await unit_of_work.commands.update(command)
             await self._enqueue_result(unit_of_work, command, now)
             return CommandExecutionResult(command.command_id, command.status, executed=False)
 
-        if previous_attempt is not None:
+        if decision.target is RouteTarget.WAITING_INTERVENTION:
+            await unit_of_work.command_route_decisions.add(decision)
+            command.transition(
+                CommandStatus.WAITING_INTERVENTION,
+                now,
+                error_code=decision.reason_code,
+            )
+            self._clear_execution_lease(command)
+            await unit_of_work.commands.update(command)
+            return CommandExecutionResult(command.command_id, command.status, executed=False)
+
+        if decision.target is RouteTarget.WAITING_EXECUTION:
+            await unit_of_work.command_route_decisions.add(decision)
+            if command.status is not CommandStatus.WAITING_EXECUTION:
+                command.transition(
+                    CommandStatus.WAITING_EXECUTION,
+                    now,
+                    error_code=decision.reason_code,
+                )
+            self._clear_execution_lease(command)
+            await unit_of_work.commands.update(command)
+            return CommandExecutionResult(command.command_id, command.status, executed=False)
+
+        if decision.target is RouteTarget.WORKER_JOB:
+            if self._worker_job_service is None or policy is None:
+                decision = replace(
+                    decision,
+                    target=RouteTarget.WAITING_EXECUTION,
+                    executor=None,
+                    reason_code="WORKER_JOB_SERVICE_UNAVAILABLE",
+                )
+                await unit_of_work.command_route_decisions.add(decision)
+                if command.status is not CommandStatus.WAITING_EXECUTION:
+                    command.transition(
+                        CommandStatus.WAITING_EXECUTION,
+                        now,
+                        error_code=decision.reason_code,
+                    )
+                self._clear_execution_lease(command)
+                await unit_of_work.commands.update(command)
+                return CommandExecutionResult(command.command_id, command.status, executed=False)
+            await unit_of_work.command_route_decisions.add(decision)
+            job, worker_ids = await self._worker_job_service.enqueue_in_transaction(
+                unit_of_work,
+                policy.worker_capability_name or policy.capability_name,
+                policy.worker_capability_version or policy.capability_version,
+                now=now,
+                command_id=command.command_id,
+                account_id=command.account_id,
+                assigned_worker_id=assignment.worker_id if assignment is not None else None,
+                account_affinity_required=True,
+                deadline_at=command.deadline_at,
+                retry_safety=(
+                    WorkerJobRetrySafety.RECONCILIATION_REQUIRED
+                    if decision.operation_class.requires_exclusive_account_coordination
+                    else WorkerJobRetrySafety.SAFE_TO_RETRY
+                ),
+                operation_class=decision.operation_class,
+            )
+            return _WorkerJobEnqueued(
+                CommandExecutionResult(
+                    command.command_id,
+                    CommandStatus.WAITING_EXECUTION,
+                    executed=False,
+                ),
+                job,
+                worker_ids,
+                now,
+            )
+
+        if decision.target is not RouteTarget.LOCAL_API:
+            raise RuntimeError(f"unhandled capability route: {decision.target}")
+
+        await unit_of_work.command_route_decisions.add(decision)
+        attempt_number = attempt_count + 1
+        attempt = CommandAttempt(command.command_id, attempt_number, started_at=now)
+        account_coordination_generation = None
+        if decision.operation_class.requires_exclusive_account_coordination:
+            lease = await unit_of_work.account_execution_leases.try_acquire(
+                command.account_id,
+                AccountExecutionOwnerType.COMMAND,
+                str(attempt.id),
+                decision.operation_class,
+                now,
+                now + self._execution_lease_duration,
+            )
+            if lease is None:
+                deferred = replace(
+                    decision,
+                    target=RouteTarget.WAITING_EXECUTION,
+                    executor=None,
+                    reason_code="ACCOUNT_EXECUTION_ALREADY_OWNED",
+                )
+                await unit_of_work.command_route_decisions.add(deferred)
+                if command.status is not CommandStatus.WAITING_EXECUTION:
+                    command.transition(
+                        CommandStatus.WAITING_EXECUTION,
+                        now,
+                        error_code=deferred.reason_code,
+                    )
+                self._clear_execution_lease(command)
+                await unit_of_work.commands.update(command)
+                return CommandExecutionResult(command.command_id, command.status, executed=False)
+            account_coordination_generation = lease.fencing_generation
+
+        lease_token = uuid4()
+        if command.status is CommandStatus.PROCESSING:
             command.reclaim(now)
         else:
             command.transition(CommandStatus.PROCESSING, now)
-        attempt_number = attempt_count + 1
-        lease_token = uuid4()
         command.execution_lease_token = lease_token
         command.execution_lease_expires_at = now + self._execution_lease_duration
-        attempt = CommandAttempt(command.command_id, attempt_number, started_at=now)
         await unit_of_work.attempts.add(attempt)
         await unit_of_work.commands.update(command)
-        return _ExecutionClaim(command, lease_token, attempt_number)
+        return _ExecutionClaim(
+            command,
+            lease_token,
+            attempt_number,
+            attempt.id,
+            account_coordination_generation,
+        )
 
     async def _execute_claim(self, claim: _ExecutionClaim) -> CommandExecutionResult:
         command = claim.command
@@ -299,6 +527,8 @@ class CommandRuntime:
         async def persist_checkpoint(data: dict[str, object]) -> bool:
             now = normalize_utc(self._clock.now())
             async with self._unit_of_work_factory() as unit_of_work:
+                if not await self._owns_account_execution(unit_of_work, claim, now):
+                    return False
                 return await unit_of_work.commands.save_checkpoint_if_leased(
                     command.command_id, claim.lease_token, now, data
                 )
@@ -360,8 +590,9 @@ class CommandRuntime:
                     now,
                     now + self._execution_lease_duration,
                 )
-            if not renewed:
-                raise ExecutionLeaseLost("command execution lease could not be renewed")
+                account_renewed = await self._renew_account_execution(unit_of_work, claim, now)
+                if not renewed or not account_renewed:
+                    raise ExecutionLeaseLost("command or account execution lease was lost")
 
     async def _finish_success(
         self, claim: _ExecutionClaim, output: CommandExecutionOutput
@@ -378,7 +609,9 @@ class CommandRuntime:
                 return CommandExecutionResult(
                     claim.command.command_id, CommandStatus.FAILED_FINAL, executed=False
                 )
-            if not self._owns_claim(command, attempt, claim, now):
+            if not self._owns_claim(
+                command, attempt, claim, now
+            ) or not await self._owns_account_execution(unit_of_work, claim, now):
                 return CommandExecutionResult(
                     claim.command.command_id,
                     command.status,
@@ -400,6 +633,7 @@ class CommandRuntime:
             await unit_of_work.attempts.update(attempt)
             await unit_of_work.commands.update(command)
             await self._enqueue_result(unit_of_work, command, now)
+            await self._release_account_execution(unit_of_work, claim, now)
             return CommandExecutionResult(command.command_id, command.status, executed=True)
 
     async def _finish_failure(
@@ -422,7 +656,9 @@ class CommandRuntime:
                 return CommandExecutionResult(
                     claim.command.command_id, CommandStatus.FAILED_FINAL, executed=False
                 )
-            if not self._owns_claim(command, attempt, claim, now):
+            if not self._owns_claim(
+                command, attempt, claim, now
+            ) or not await self._owns_account_execution(unit_of_work, claim, now):
                 return CommandExecutionResult(
                     claim.command.command_id,
                     command.status,
@@ -457,7 +693,50 @@ class CommandRuntime:
             await unit_of_work.commands.update(command)
             if command.status == CommandStatus.FAILED_FINAL:
                 await self._enqueue_result(unit_of_work, command, now)
+            await self._release_account_execution(unit_of_work, claim, now)
             return CommandExecutionResult(command.command_id, command.status, executed=True)
+
+    async def _owns_account_execution(
+        self, unit_of_work: UnitOfWork, claim: _ExecutionClaim, now: datetime
+    ) -> bool:
+        if claim.account_coordination_generation is None:
+            return True
+        return await unit_of_work.account_execution_leases.owns(
+            claim.command.account_id,
+            AccountExecutionOwnerType.COMMAND,
+            str(claim.attempt_id),
+            claim.account_coordination_generation,
+            now,
+        )
+
+    async def _renew_account_execution(
+        self, unit_of_work: UnitOfWork, claim: _ExecutionClaim, now: datetime
+    ) -> bool:
+        if claim.account_coordination_generation is None:
+            return True
+        return await unit_of_work.account_execution_leases.renew(
+            claim.command.account_id,
+            AccountExecutionOwnerType.COMMAND,
+            str(claim.attempt_id),
+            claim.account_coordination_generation,
+            now,
+            now + self._execution_lease_duration,
+        )
+
+    async def _release_account_execution(
+        self, unit_of_work: UnitOfWork, claim: _ExecutionClaim, now: datetime
+    ) -> None:
+        if claim.account_coordination_generation is None:
+            return
+        released = await unit_of_work.account_execution_leases.release(
+            claim.command.account_id,
+            AccountExecutionOwnerType.COMMAND,
+            str(claim.attempt_id),
+            claim.account_coordination_generation,
+            now,
+        )
+        if not released:
+            raise ExecutionLeaseLost("account execution fence was lost before finalization")
 
     async def _current_result(self, command_id: str) -> CommandExecutionResult:
         async with self._unit_of_work_factory() as unit_of_work:

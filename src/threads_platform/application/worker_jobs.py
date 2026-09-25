@@ -2,11 +2,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
+from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.clock import Clock, SystemClock
 from threads_platform.application.commands.results import enqueue_command_result
 from threads_platform.application.errors import CommandNotFound
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.application.worker_notifications import WorkerNotificationHub
+from threads_platform.domain.account_execution import AccountExecutionOwnerType
+from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.time import normalize_utc
 from threads_platform.domain.worker_jobs import (
@@ -43,6 +46,7 @@ class WorkerJobService:
         retry_delay: timedelta = timedelta(seconds=2),
         result_delivery_lifetime: timedelta = timedelta(hours=24),
         crm_destination: str = "crm",
+        capability_router: CapabilityRouter | None = None,
     ) -> None:
         if lease_duration <= timedelta(0) or retry_delay < timedelta(0):
             raise ValueError("WorkerJob lease and retry durations are invalid")
@@ -53,6 +57,7 @@ class WorkerJobService:
         self._retry_delay = retry_delay
         self._result_delivery_lifetime = result_delivery_lifetime
         self._crm_destination = crm_destination
+        self._capability_router = capability_router or CapabilityRouter()
 
     async def enqueue(
         self,
@@ -69,81 +74,131 @@ class WorkerJobService:
         deadline_at: datetime | None = None,
         max_attempts: int = 3,
         retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY,
+        operation_class: OperationClass = OperationClass.READ,
     ) -> WorkerJob:
         now = normalize_utc(self._clock.now())
         schedule = normalize_utc(scheduled_at) if scheduled_at else now
-        notification_worker_ids: list[UUID] = []
         async with self._unit_of_work_factory() as unit_of_work:
-            command = None
-            if command_id is not None:
-                command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
-                if command is None:
-                    raise CommandNotFound(command_id)
-                if command.status is not CommandStatus.VALIDATED:
-                    raise WorkerJobControlError("COMMAND_NOT_READY_FOR_REMOTE_EXECUTION")
-                if command.deadline_at is not None and now >= command.deadline_at:
-                    raise WorkerJobControlError("COMMAND_DEADLINE_EXPIRED")
-                if account_id is not None and account_id != command.account_id:
-                    raise WorkerJobControlError("COMMAND_ACCOUNT_MISMATCH")
-                account_id = command.account_id
-                if deadline_at is None:
-                    deadline_at = command.deadline_at
-
-            assignment = (
-                await unit_of_work.assignments.get_active(account_id)
-                if account_id is not None
-                else None
-            )
-            affinity_required = (
-                account_affinity_required
-                if account_affinity_required is not None
-                else assignment is not None
-            )
-            if affinity_required:
-                if assignment is None:
-                    raise WorkerJobControlError("ACTIVE_ACCOUNT_ASSIGNMENT_REQUIRED")
-                if assigned_worker_id is not None and assigned_worker_id != assignment.worker_id:
-                    raise WorkerJobControlError("ACCOUNT_WORKER_AFFINITY_MISMATCH")
-                assigned_worker_id = assignment.worker_id
-            elif (
-                assigned_worker_id is not None and account_id is not None and assignment is not None
-            ):
-                if assigned_worker_id != assignment.worker_id:
-                    raise WorkerJobControlError("ACCOUNT_WORKER_AFFINITY_MISMATCH")
-
-            job = WorkerJob(
+            job, notification_worker_ids = await self.enqueue_in_transaction(
+                unit_of_work,
+                capability_name,
+                capability_version,
+                now=now,
                 command_id=command_id,
                 account_id=account_id,
                 assigned_worker_id=assigned_worker_id,
-                account_affinity_required=affinity_required,
-                capability_name=capability_name,
-                capability_version=capability_version,
+                account_affinity_required=account_affinity_required,
                 priority=priority,
                 preemptible=preemptible,
                 scheduled_at=schedule,
                 deadline_at=deadline_at,
                 max_attempts=max_attempts,
                 retry_safety=retry_safety,
-                created_at=now,
-                updated_at=now,
+                operation_class=operation_class,
             )
-            if command is not None:
-                command.transition(CommandStatus.WAITING_EXECUTION, now)
-                await unit_of_work.commands.update(command)
-            await unit_of_work.worker_jobs.add(job)
-            if assigned_worker_id is not None:
-                notification_worker_ids = [assigned_worker_id]
-            else:
-                notification_worker_ids = await unit_of_work.worker_capabilities.list_worker_ids(
+        self.publish_available(job, notification_worker_ids, now=now)
+        return job
+
+    async def enqueue_in_transaction(
+        self,
+        unit_of_work: UnitOfWork,
+        capability_name: str,
+        capability_version: int,
+        *,
+        now: datetime,
+        command_id: str | None = None,
+        account_id: UUID | None = None,
+        assigned_worker_id: UUID | None = None,
+        account_affinity_required: bool | None = None,
+        priority: int = 0,
+        preemptible: bool = False,
+        scheduled_at: datetime | None = None,
+        deadline_at: datetime | None = None,
+        max_attempts: int = 3,
+        retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY,
+        operation_class: OperationClass = OperationClass.READ,
+    ) -> tuple[WorkerJob, tuple[UUID, ...]]:
+        occurred_at = normalize_utc(now)
+        schedule = normalize_utc(scheduled_at) if scheduled_at else occurred_at
+        command = None
+        if command_id is not None:
+            command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
+            if command is None:
+                raise CommandNotFound(command_id)
+            if command.status not in {
+                CommandStatus.VALIDATED,
+                CommandStatus.WAITING_EXECUTION,
+            }:
+                raise WorkerJobControlError("COMMAND_NOT_READY_FOR_REMOTE_EXECUTION")
+            if command.deadline_at is not None and occurred_at >= command.deadline_at:
+                raise WorkerJobControlError("COMMAND_DEADLINE_EXPIRED")
+            if account_id is not None and account_id != command.account_id:
+                raise WorkerJobControlError("COMMAND_ACCOUNT_MISMATCH")
+            account_id = command.account_id
+            if deadline_at is None:
+                deadline_at = command.deadline_at
+
+        assignment = (
+            await unit_of_work.assignments.get_active(account_id)
+            if account_id is not None
+            else None
+        )
+        affinity_required = (
+            account_affinity_required
+            if account_affinity_required is not None
+            else assignment is not None
+        )
+        if affinity_required:
+            if assignment is None:
+                raise WorkerJobControlError("ACTIVE_ACCOUNT_ASSIGNMENT_REQUIRED")
+            if assigned_worker_id is not None and assigned_worker_id != assignment.worker_id:
+                raise WorkerJobControlError("ACCOUNT_WORKER_AFFINITY_MISMATCH")
+            assigned_worker_id = assignment.worker_id
+        elif assigned_worker_id is not None and account_id is not None and assignment is not None:
+            if assigned_worker_id != assignment.worker_id:
+                raise WorkerJobControlError("ACCOUNT_WORKER_AFFINITY_MISMATCH")
+
+        job = WorkerJob(
+            command_id=command_id,
+            account_id=account_id,
+            assigned_worker_id=assigned_worker_id,
+            account_affinity_required=affinity_required,
+            capability_name=capability_name,
+            capability_version=capability_version,
+            operation_class=operation_class,
+            priority=priority,
+            preemptible=preemptible,
+            scheduled_at=schedule,
+            deadline_at=deadline_at,
+            max_attempts=max_attempts,
+            retry_safety=retry_safety,
+            created_at=occurred_at,
+            updated_at=occurred_at,
+        )
+        if command is not None and command.status is CommandStatus.VALIDATED:
+            command.transition(CommandStatus.WAITING_EXECUTION, occurred_at)
+            await unit_of_work.commands.update(command)
+        await unit_of_work.worker_jobs.add(job)
+        if assigned_worker_id is not None:
+            notification_worker_ids = (assigned_worker_id,)
+        else:
+            notification_worker_ids = tuple(
+                await unit_of_work.worker_capabilities.list_worker_ids(
                     capability_name, capability_version
                 )
-        if self._notifications is not None and schedule <= now:
-            for worker_id in notification_worker_ids:
-                self._notifications.publish(
-                    worker_id,
-                    {"type": "job.available", "job_id": str(job.id)},
-                )
-        return job
+            )
+        return job, notification_worker_ids
+
+    def publish_available(
+        self, job: WorkerJob, worker_ids: tuple[UUID, ...], *, now: datetime
+    ) -> None:
+        if self._notifications is None or job.scheduled_at > normalize_utc(now):
+            return
+        for worker_id in worker_ids:
+            self._notifications.publish(
+                worker_id,
+                {"type": "job.available", "job_id": str(job.id)},
+            )
 
     async def claim_next(self, worker_id: UUID) -> WorkerJob | None:
         now = normalize_utc(self._clock.now())
@@ -155,23 +210,54 @@ class WorkerJobService:
                 raise WorkerJobControlError("WORKER_NOT_FOUND")
             if not self._eligible(worker, now):
                 raise WorkerJobControlError("WORKER_NOT_ELIGIBLE")
-            job = await unit_of_work.worker_jobs.claim_next(
-                worker,
-                now,
-                lease_expires_at,
-                token,
-            )
-            if job is None:
-                return None
-            await unit_of_work.worker_job_attempts.add(
-                WorkerJobAttempt(
-                    worker_job_id=job.id,
-                    attempt_number=job.attempt_count,
-                    worker_id=worker_id,
-                    lease_token=token,
-                    started_at=now,
+            candidates = await unit_of_work.worker_jobs.list_claimable(worker, now)
+            job = None
+            for candidate in candidates:
+                if not await self._account_policy_allows_claim(unit_of_work, candidate, worker_id):
+                    continue
+                coordination_generation = None
+                if (
+                    candidate.account_id is not None
+                    and candidate.operation_class.requires_exclusive_account_coordination
+                ):
+                    account_lease = await unit_of_work.account_execution_leases.try_acquire(
+                        candidate.account_id,
+                        AccountExecutionOwnerType.WORKER_JOB,
+                        str(candidate.id),
+                        candidate.operation_class,
+                        now,
+                        lease_expires_at,
+                    )
+                    if account_lease is None:
+                        continue
+                    coordination_generation = account_lease.fencing_generation
+                job = await unit_of_work.worker_jobs.claim(
+                    candidate,
+                    worker_id,
+                    now,
+                    lease_expires_at,
+                    token,
+                    coordination_generation,
                 )
-            )
+                if job is not None:
+                    await unit_of_work.worker_job_attempts.add(
+                        WorkerJobAttempt(
+                            worker_job_id=job.id,
+                            attempt_number=job.attempt_count,
+                            worker_id=worker_id,
+                            lease_token=token,
+                            started_at=now,
+                        )
+                    )
+                    break
+                if coordination_generation is not None and candidate.account_id is not None:
+                    await unit_of_work.account_execution_leases.release(
+                        candidate.account_id,
+                        AccountExecutionOwnerType.WORKER_JOB,
+                        str(candidate.id),
+                        coordination_generation,
+                        now,
+                    )
         return job
 
     async def renew(self, job_id: UUID, worker_id: UUID, lease_token: UUID) -> WorkerJob:
@@ -180,6 +266,8 @@ class WorkerJobService:
             job = await self._locked_job(unit_of_work, job_id)
             if not job.renew(worker_id, lease_token, now, now + self._lease_duration):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            if not await self._renew_account_coordination(unit_of_work, job, now):
+                raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
             await unit_of_work.worker_jobs.update(job)
         return job
 
@@ -195,6 +283,8 @@ class WorkerJobService:
             job = await self._locked_job(unit_of_work, job_id)
             if not job.save_checkpoint(worker_id, lease_token, now, checkpoint):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            if not await self._owns_account_coordination(unit_of_work, job, now):
+                raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
             await unit_of_work.worker_jobs.update(job)
         return job
 
@@ -208,6 +298,9 @@ class WorkerJobService:
         now = normalize_utc(self._clock.now())
         async with self._unit_of_work_factory() as unit_of_work:
             job = await self._locked_job(unit_of_work, job_id)
+            if not await self._owns_account_coordination(unit_of_work, job, now):
+                raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
+            generation = job.account_coordination_generation
             if not job.complete(worker_id, lease_token, now, result):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
             attempt = await self._running_attempt(unit_of_work, job.id)
@@ -222,6 +315,7 @@ class WorkerJobService:
                 now,
                 result=result,
             )
+            await self._release_account_coordination(unit_of_work, job, generation, now)
         return job
 
     async def fail(
@@ -238,6 +332,9 @@ class WorkerJobService:
         retry_at = now + self._retry_delay
         async with self._unit_of_work_factory() as unit_of_work:
             job = await self._locked_job(unit_of_work, job_id)
+            if not await self._owns_account_coordination(unit_of_work, job, now):
+                raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
+            generation = job.account_coordination_generation
             if not job.fail(
                 worker_id,
                 lease_token,
@@ -276,6 +373,7 @@ class WorkerJobService:
                     now,
                     error_code=error_code,
                 )
+            await self._release_account_coordination(unit_of_work, job, generation, now)
         return job
 
     async def request_intervention(
@@ -300,6 +398,9 @@ class WorkerJobService:
         now = normalize_utc(self._clock.now())
         async with self._unit_of_work_factory() as unit_of_work:
             job = await self._locked_job(unit_of_work, job_id)
+            if not await self._owns_account_coordination(unit_of_work, job, now):
+                raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
+            generation = job.account_coordination_generation
             if not job.require_intervention(worker_id, lease_token, now):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
             if intervention_type == "AMBIGUOUS_OUTCOME":
@@ -319,6 +420,7 @@ class WorkerJobService:
             )
             await unit_of_work.worker_jobs.update(job)
             await self._set_command_waiting_intervention(unit_of_work, job, now)
+            await self._release_account_coordination(unit_of_work, job, generation, now)
         return job
 
     async def resolve_intervention(
@@ -393,6 +495,7 @@ class WorkerJobService:
         async with self._unit_of_work_factory() as unit_of_work:
             jobs = await unit_of_work.worker_jobs.list_expired_for_update(now, limit)
             for job in jobs:
+                generation = job.account_coordination_generation
                 attempt = await unit_of_work.worker_job_attempts.get_running_for_update(job.id)
                 if job.deadline_at is not None and job.deadline_at <= now:
                     if attempt is not None:
@@ -408,6 +511,7 @@ class WorkerJobService:
                         await unit_of_work.worker_interventions.update(intervention)
                     job.expire(now)
                     await unit_of_work.worker_jobs.update(job)
+                    await self._release_account_coordination(unit_of_work, job, generation, now)
                     await self._finalize_command(
                         unit_of_work,
                         job,
@@ -423,6 +527,7 @@ class WorkerJobService:
                         await unit_of_work.worker_job_attempts.update(attempt)
                     job.finalize_failure(now, "WORKER_JOB_ATTEMPTS_EXHAUSTED")
                     await unit_of_work.worker_jobs.update(job)
+                    await self._release_account_coordination(unit_of_work, job, generation, now)
                     await self._finalize_command(
                         unit_of_work,
                         job,
@@ -442,6 +547,7 @@ class WorkerJobService:
                         await unit_of_work.worker_job_attempts.update(attempt)
                     job.suspend_for_intervention(now, "AMBIGUOUS_OUTCOME")
                     await unit_of_work.worker_jobs.update(job)
+                    await self._release_account_coordination(unit_of_work, job, generation, now)
                     await self._add_intervention(
                         unit_of_work,
                         job,
@@ -485,6 +591,101 @@ class WorkerJobService:
         if job is None:
             raise WorkerJobControlError("WORKER_JOB_NOT_FOUND")
         return job
+
+    async def _owns_account_coordination(
+        self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime
+    ) -> bool:
+        if (
+            job.account_id is None
+            or not job.operation_class.requires_exclusive_account_coordination
+        ):
+            return True
+        if job.account_coordination_generation is None:
+            return False
+        return await unit_of_work.account_execution_leases.owns(
+            job.account_id,
+            AccountExecutionOwnerType.WORKER_JOB,
+            str(job.id),
+            job.account_coordination_generation,
+            now,
+        )
+
+    async def _account_policy_allows_claim(
+        self, unit_of_work: UnitOfWork, job: WorkerJob, worker_id: UUID
+    ) -> bool:
+        if job.account_id is None:
+            return True
+        account = await unit_of_work.accounts.get_for_update(job.account_id)
+        if account is None:
+            return False
+        if job.account_affinity_required:
+            assignment = await unit_of_work.assignments.get_active(job.account_id)
+            if assignment is None or assignment.worker_id != worker_id:
+                return False
+        if job.command_id is None:
+            return True
+        command = await unit_of_work.commands.get_by_command_id(job.command_id)
+        if (
+            command is None
+            or command.account_id != job.account_id
+            or command.status is not CommandStatus.WAITING_EXECUTION
+        ):
+            return False
+        route = await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+            job.command_id
+        )
+        if route is None:
+            return True
+        if route.executor is not CapabilityExecutor.WORKER:
+            return False
+        if account.status.value != "ACTIVE":
+            return False
+        policy = self._capability_router.policy_for(command.command_type)
+        return (
+            self._capability_router.worker_execution_allowed(
+                command.command_type,
+                account.execution_mode,
+            )
+            and policy is not None
+            and policy.worker_capability_name == job.capability_name
+            and policy.worker_capability_version == job.capability_version
+        )
+
+    async def _renew_account_coordination(
+        self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime
+    ) -> bool:
+        if (
+            job.account_id is None
+            or not job.operation_class.requires_exclusive_account_coordination
+        ):
+            return True
+        if job.account_coordination_generation is None:
+            return False
+        return await unit_of_work.account_execution_leases.renew(
+            job.account_id,
+            AccountExecutionOwnerType.WORKER_JOB,
+            str(job.id),
+            job.account_coordination_generation,
+            now,
+            job.lease_expires_at or now,
+        )
+
+    async def _release_account_coordination(
+        self,
+        unit_of_work: UnitOfWork,
+        job: WorkerJob,
+        generation: int | None,
+        now: datetime,
+    ) -> None:
+        if job.account_id is None or generation is None:
+            return
+        await unit_of_work.account_execution_leases.release(
+            job.account_id,
+            AccountExecutionOwnerType.WORKER_JOB,
+            str(job.id),
+            generation,
+            now,
+        )
 
     @staticmethod
     async def _running_attempt(unit_of_work: UnitOfWork, job_id: UUID) -> WorkerJobAttempt:

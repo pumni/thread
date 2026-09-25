@@ -4,7 +4,12 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from threads_platform.domain.account_execution import (
+    AccountExecutionLease,
+    AccountExecutionOwnerType,
+)
 from threads_platform.domain.accounts import ThreadsAccount
+from threads_platform.domain.capabilities import CapabilityRouteDecision, OperationClass
 from threads_platform.domain.commands import Command, CommandAttempt
 from threads_platform.domain.outbox import IntegrationDelivery, OutboxEvent
 from threads_platform.domain.publishing import ThreadPost, ThreadReply
@@ -31,6 +36,8 @@ class AccountRepository(Protocol):
     async def add(self, account: ThreadsAccount) -> None: ...
 
     async def get(self, account_id: UUID) -> ThreadsAccount | None: ...
+
+    async def get_for_update(self, account_id: UUID) -> ThreadsAccount | None: ...
 
     async def update(self, account: ThreadsAccount) -> None: ...
 
@@ -204,19 +211,82 @@ class WorkerJobRepository(Protocol):
 
     async def get_for_update(self, job_id: UUID) -> WorkerJob | None: ...
 
+    async def get_by_command_id(self, command_id: str) -> WorkerJob | None: ...
+
     async def update(self, job: WorkerJob) -> None: ...
 
-    async def claim_next(
+    async def list_claimable(
         self,
         worker: WorkerNode,
         now: datetime,
+        limit: int = 50,
+    ) -> list[WorkerJob]: ...
+
+    async def claim(
+        self,
+        job: WorkerJob,
+        worker_id: UUID,
+        now: datetime,
         lease_expires_at: datetime,
         lease_token: UUID,
+        account_coordination_generation: int | None,
     ) -> WorkerJob | None: ...
 
     async def list_expired_for_update(self, now: datetime, limit: int) -> list[WorkerJob]: ...
 
     async def list_for_reconcile(self, worker_id: UUID, now: datetime) -> list[WorkerJob]: ...
+
+
+class AccountExecutionLeaseRepository(Protocol):
+    async def try_acquire(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        operation_class: OperationClass,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> AccountExecutionLease | None: ...
+
+    async def get_active(self, account_id: UUID, now: datetime) -> AccountExecutionLease | None: ...
+
+    async def renew(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        fencing_generation: int,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> bool: ...
+
+    async def owns(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        fencing_generation: int,
+        now: datetime,
+    ) -> bool: ...
+
+    async def release(
+        self,
+        account_id: UUID,
+        owner_type: AccountExecutionOwnerType,
+        owner_id: str,
+        fencing_generation: int,
+        now: datetime,
+    ) -> bool: ...
+
+
+class CommandRouteDecisionRepository(Protocol):
+    async def add(self, decision: CapabilityRouteDecision) -> None: ...
+
+    async def get_latest_for_command(self, command_id: str) -> CapabilityRouteDecision | None: ...
+
+    async def get_latest_execution_for_command(
+        self, command_id: str
+    ) -> CapabilityRouteDecision | None: ...
 
 
 class WorkerJobAttemptRepository(Protocol):
@@ -259,6 +329,8 @@ class UnitOfWork(Protocol):
     worker_jobs: WorkerJobRepository
     worker_job_attempts: WorkerJobAttemptRepository
     worker_interventions: WorkerInterventionRepository
+    account_execution_leases: AccountExecutionLeaseRepository
+    command_route_decisions: CommandRouteDecisionRepository
 
     def savepoint(self) -> AbstractAsyncContextManager[object]: ...
 

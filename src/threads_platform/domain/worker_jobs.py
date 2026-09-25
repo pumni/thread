@@ -7,6 +7,7 @@ from typing import cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from threads_platform.domain.capabilities import OperationClass
 from threads_platform.domain.time import normalize_utc, utc_now
 
 MAX_WORKER_JOB_DOCUMENT_BYTES = 64 * 1024
@@ -47,6 +48,7 @@ class WorkerInterventionStatus(StrEnum):
 class WorkerJob:
     capability_name: str
     capability_version: int
+    operation_class: OperationClass = OperationClass.READ
     id: UUID = field(default_factory=uuid4)
     command_id: str | None = None
     account_id: UUID | None = None
@@ -64,6 +66,7 @@ class WorkerJob:
     lease_worker_id: UUID | None = None
     lease_token: UUID | None = None
     lease_expires_at: datetime | None = None
+    account_coordination_generation: int | None = None
     checkpoint: dict[str, object] | None = None
     result: dict[str, object] | None = None
     error_code: str | None = None
@@ -99,6 +102,23 @@ class WorkerJob:
             raise ValueError("WorkerJob lease owner, token, and expiry must be set together")
         if self.status is WorkerJobStatus.RUNNING and self.lease_token is None:
             raise ValueError("RUNNING WorkerJob requires a lease")
+        requires_coordination = (
+            self.account_id is not None
+            and self.operation_class.requires_exclusive_account_coordination
+        )
+        if (
+            self.status is WorkerJobStatus.RUNNING
+            and requires_coordination
+            and self.account_coordination_generation is None
+        ):
+            raise ValueError("running exclusive account job requires an account coordination fence")
+        if self.account_coordination_generation is not None and (
+            self.status is not WorkerJobStatus.RUNNING
+            or not requires_coordination
+            or self.account_id is None
+            or self.account_coordination_generation < 1
+        ):
+            raise ValueError("account coordination fence requires a running exclusive job")
         _validate_document(self.checkpoint)
         _validate_document(self.result)
 
@@ -108,6 +128,8 @@ class WorkerJob:
         now: datetime,
         lease_expires_at: datetime,
         lease_token: UUID,
+        *,
+        account_coordination_generation: int | None = None,
     ) -> None:
         occurred_at = normalize_utc(now)
         expires_at = normalize_utc(lease_expires_at)
@@ -136,10 +158,19 @@ class WorkerJob:
                 raise ValueError("WorkerJob requires side-effect reconciliation")
         if expires_at <= occurred_at:
             raise ValueError("WorkerJob lease expiry must be in the future")
+        if (
+            self.operation_class.requires_exclusive_account_coordination
+            and self.account_id is not None
+        ):
+            if account_coordination_generation is None or account_coordination_generation < 1:
+                raise ValueError("exclusive account job requires an account coordination fence")
+        elif account_coordination_generation is not None:
+            raise ValueError("account coordination fence is not valid for this job")
         self.status = WorkerJobStatus.RUNNING
         self.lease_worker_id = worker_id
         self.lease_token = lease_token
         self.lease_expires_at = expires_at
+        self.account_coordination_generation = account_coordination_generation
         self.attempt_count += 1
         self.retry_authorized_by_operator = False
         self.error_code = None
@@ -298,6 +329,7 @@ class WorkerJob:
         self.lease_worker_id = None
         self.lease_token = None
         self.lease_expires_at = None
+        self.account_coordination_generation = None
 
 
 @dataclass(slots=True)

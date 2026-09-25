@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -27,7 +28,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.accounts import AccountExecutionMode, AccountStatus, CredentialStatus
+from threads_platform.domain.capabilities import (
+    CapabilityExecutionClass,
+    CapabilityExecutor,
+    OperationClass,
+    RouteTarget,
+)
 from threads_platform.domain.commands import AttemptStatus, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxStatus
 from threads_platform.domain.publishing import ScheduleStatus
@@ -86,6 +94,33 @@ class AccountRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class AccountExecutionLeaseRecord(Base):
+    __tablename__ = "account_execution_leases"
+    __table_args__ = (
+        CheckConstraint("fencing_generation >= 0", name="ck_account_execution_lease_generation"),
+        CheckConstraint(
+            "operation_class <> 'READ'", name="ck_account_execution_lease_exclusive_operation"
+        ),
+        Index("ix_account_execution_lease_expiry", "lease_expires_at"),
+    )
+
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("threads_accounts.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    owner_type: Mapped[AccountExecutionOwnerType] = mapped_column(
+        enum_type(AccountExecutionOwnerType, "account_execution_owner_type"), nullable=False
+    )
+    owner_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation_class: Mapped[OperationClass] = mapped_column(
+        enum_type(OperationClass, "account_execution_operation_class"), nullable=False
+    )
+    fencing_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class OAuthCredentialRecord(Base):
@@ -150,6 +185,41 @@ class CommandRecord(Base):
     execution_lease_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     execution_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+
+
+class CommandRouteDecisionRecord(Base):
+    __tablename__ = "command_route_decisions"
+    __table_args__ = (
+        Index("ix_command_route_decisions_command", "command_id", "created_at"),
+        CheckConstraint("capability_version > 0", name="ck_command_route_capability_version"),
+        CheckConstraint("attempt_count >= 0", name="ck_command_route_attempt_count"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    command_id: Mapped[str] = mapped_column(
+        String(255), ForeignKey("commands.command_id", ondelete="RESTRICT"), nullable=False
+    )
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    capability_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    capability_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    execution_class: Mapped[CapabilityExecutionClass] = mapped_column(
+        enum_type(CapabilityExecutionClass, "capability_execution_class"), nullable=False
+    )
+    operation_class: Mapped[OperationClass] = mapped_column(
+        enum_type(OperationClass, "capability_operation_class"), nullable=False
+    )
+    account_mode: Mapped[AccountExecutionMode] = mapped_column(
+        enum_type(AccountExecutionMode, "route_account_execution_mode"), nullable=False
+    )
+    target: Mapped[RouteTarget] = mapped_column(enum_type(RouteTarget, "capability_route_target"))
+    executor: Mapped[CapabilityExecutor | None] = mapped_column(
+        enum_type(CapabilityExecutor, "capability_executor")
+    )
+    reason_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class CommandAttemptRecord(Base):
@@ -527,6 +597,13 @@ class WorkerJobRecord(Base):
             "(account_id IS NOT NULL AND assigned_worker_id IS NOT NULL)",
             name="ck_worker_jobs_affinity_assignment",
         ),
+        CheckConstraint(
+            "(account_coordination_generation IS NULL OR "
+            "(status = 'RUNNING' AND account_id IS NOT NULL AND operation_class <> 'READ')) "
+            "AND (status <> 'RUNNING' OR account_id IS NULL OR operation_class = 'READ' "
+            "OR account_coordination_generation IS NOT NULL)",
+            name="ck_worker_jobs_account_coordination_fence",
+        ),
         Index("ix_worker_jobs_claim", "status", "scheduled_at", "priority"),
         Index("ix_worker_jobs_lease_expiry", "status", "lease_expires_at"),
         Index("ix_worker_jobs_assigned_worker", "assigned_worker_id", "status"),
@@ -548,6 +625,11 @@ class WorkerJobRecord(Base):
     )
     capability_name: Mapped[str] = mapped_column(String(120), nullable=False)
     capability_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation_class: Mapped[OperationClass] = mapped_column(
+        enum_type(OperationClass, "worker_job_operation_class"),
+        nullable=False,
+        server_default=text("'READ'"),
+    )
     status: Mapped[WorkerJobStatus] = mapped_column(
         enum_type(WorkerJobStatus, "worker_job_status"), nullable=False
     )
@@ -568,6 +650,7 @@ class WorkerJobRecord(Base):
     )
     lease_token: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    account_coordination_generation: Mapped[int | None] = mapped_column(BigInteger)
     checkpoint: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
     error_code: Mapped[str | None] = mapped_column(String(120))
