@@ -10,10 +10,11 @@ Completed:
 - C1 PR #32 — issues #21, #22, #23 accepted and merged.
 - C2 PR #33 — issue #24 accepted and merged.
 - C3-01 PR #34 — issue #25 accepted and merged.
+- C3-02 PR #35 — issue #26 accepted and merged.
 
 Current authorized implementation checkpoint:
-- **C3-02 — Browser engine ADR + fail-closed adapter foundation**
-  - #26 only
+- **C4 — Discovery, public-profile enrichment and Leads pipeline**
+  - #8 only
 
 Issue #3 remains a production/release gate.
 
@@ -106,15 +107,17 @@ No browser business action is implemented here.
 
 Order:
 1. #25 Worker Agent/profile/session/network foundation — **ACCEPTED / MERGED** in PR #34, merge commit `6b9984fecf7167ce02389be9bd935983f8ab7f1d`.
-2. #26 browser engine ADR + fail-closed adapter — **CURRENT AUTHORIZED ITEM**.
+2. #26 browser engine ADR + fail-closed adapter — **ACCEPTED / MERGED** in PR #35, merge commit `0021517b55b1e7bcddc9f3fd9d2099feb3e0b6ab`.
 
-C3 establishes infrastructure only.
+C3 establishes infrastructure only and is complete.
 
 Do not expand C3 into the full Threads UI feature set.
 
 ## 7. C4 — Discovery and Leads
 
 Issue #8.
+
+Status: **CURRENT AUTHORIZED CHECKPOINT** after C3 acceptance.
 
 Scope:
 - keyword/topic;
