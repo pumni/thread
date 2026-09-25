@@ -54,6 +54,7 @@ from threads_platform.workers.browser import (
     WorkerJobExecution,
     WorkerJobLeaseLost,
     WorkerJobReconnectRecovery,
+    WorkerJobRetrySafetyViolation,
     classify_browser_surface,
 )
 from threads_platform.workers.sessions import (
@@ -417,6 +418,83 @@ def test_lease_loss_blocks_mutation_and_ambiguous_outcomes_do_not_retry(
     asyncio.run(scenario())
 
 
+def test_post_action_lease_loss_is_ambiguous_and_keeps_recovery_journal(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        worker_id, account_id = uuid4(), uuid4()
+        _, store, _ = _managed_storage(tmp_path, worker_id)
+        job = _running_job(worker_id, account_id)
+        client = _MemoryWorkerJobControl(worker_id, account_id, job)
+        client.lose_lease_on_checkpoint_phase = "MUTATION_CONFIRMED"
+        execution = WorkerJobExecution(
+            job,
+            worker_id,
+            client,
+            local_state=store,
+            profile_ref="safe-profile",
+        )
+        action_count = 0
+
+        async def increment() -> None:
+            nonlocal action_count
+            action_count += 1
+
+        with pytest.raises(ActionOutcomeAmbiguous) as ambiguous:
+            await execution.execute_irreversible_boundary(increment)
+
+        assert not ambiguous.value.intervention_recorded
+        assert action_count == 1
+        assert client.interventions == []
+        assert store.recovery_entries()[0].phase == "MUTATION_CONFIRMED"
+
+        recovery = WorkerJobReconnectRecovery(worker_id, client, store)
+        await recovery.reconcile((job,))
+        assert store.recovery_entries()[0].phase == "MUTATION_CONFIRMED"
+
+        client.lose_lease = False
+        await recovery.reconcile((job,))
+        assert client.interventions == [
+            ("AMBIGUOUS_OUTCOME", "RESTART_REQUIRES_OUTCOME_RECONCILIATION")
+        ]
+        assert store.recovery_entries() == []
+        assert action_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_safe_to_retry_job_cannot_enter_irreversible_boundary(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        worker_id, account_id = uuid4(), uuid4()
+        _, store, _ = _managed_storage(tmp_path, worker_id)
+        job = replace(
+            _running_job(worker_id, account_id),
+            retry_safety=WorkerJobRetrySafety.SAFE_TO_RETRY,
+        )
+        client = _MemoryWorkerJobControl(worker_id, account_id, job)
+        execution = WorkerJobExecution(
+            job,
+            worker_id,
+            client,
+            local_state=store,
+            profile_ref="safe-profile",
+        )
+        action_count = 0
+
+        async def increment() -> None:
+            nonlocal action_count
+            action_count += 1
+
+        with pytest.raises(WorkerJobRetrySafetyViolation):
+            await execution.execute_irreversible_boundary(increment)
+
+        assert action_count == 0
+        assert client.snapshot.checkpoint is None
+        assert store.recovery_entries() == []
+
+    asyncio.run(scenario())
+
+
 def test_reconnect_reconciliation_turns_local_uncertainty_into_intervention(
     tmp_path: Path,
 ) -> None:
@@ -691,18 +769,20 @@ class _MemoryWorkerJobControl:
     ) -> None:
         self.snapshot = snapshot or _running_job(worker_id, account_id)
         self.lose_lease = False
+        self.lose_lease_on_checkpoint_phase: str | None = None
         self.interventions: list[tuple[str, str]] = []
 
     async def renew_job(self, job_id: UUID, lease_token: UUID) -> WorkerJobSnapshot:
         self._verify(job_id, lease_token)
-        if self.lose_lease:
-            raise WorkerControlClientError("WORKER_JOB_LEASE_LOST")
         return self.snapshot
 
     async def checkpoint_job(
         self, job_id: UUID, lease_token: UUID, checkpoint: dict[str, object]
     ) -> WorkerJobSnapshot:
         self._verify(job_id, lease_token)
+        if checkpoint.get("phase") == self.lose_lease_on_checkpoint_phase:
+            self.lose_lease = True
+            raise WorkerControlClientError("WORKER_JOB_LEASE_LOST")
         self.snapshot = replace(self.snapshot, checkpoint=checkpoint)
         return self.snapshot
 
@@ -762,5 +842,9 @@ class _MemoryWorkerJobControl:
         return self.snapshot
 
     def _verify(self, job_id: UUID, lease_token: UUID) -> None:
-        if job_id != self.snapshot.job_id or lease_token != self.snapshot.lease_token:
+        if (
+            self.lose_lease
+            or job_id != self.snapshot.job_id
+            or lease_token != self.snapshot.lease_token
+        ):
             raise WorkerControlClientError("WORKER_JOB_LEASE_LOST")

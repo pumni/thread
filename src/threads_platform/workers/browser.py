@@ -21,7 +21,7 @@ from threads_platform.application.ports.worker_agent import (
     WorkerJobSnapshot,
     WorkerLocalState,
 )
-from threads_platform.domain.worker_jobs import WorkerJobStatus
+from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
 from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.workers.sessions import (
     BrowserSessionManager,
@@ -111,6 +111,11 @@ class BrowserAccountAffinityMismatch(BrowserAdapterError):
 class WorkerJobLeaseLost(BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("WORKER_JOB_LEASE_LOST")
+
+
+class WorkerJobRetrySafetyViolation(BrowserAdapterError):
+    def __init__(self) -> None:
+        super().__init__("WORKER_JOB_RETRY_SAFETY_MISMATCH")
 
 
 class BrowserSurfaceState(StrEnum):
@@ -362,6 +367,8 @@ class WorkerJobExecution:
         if self.mutation_may_have_started:
             recorded = await self._request_ambiguous_intervention()
             raise ActionOutcomeAmbiguous(intervention_recorded=recorded)
+        if self._snapshot.retry_safety is not WorkerJobRetrySafety.RECONCILIATION_REQUIRED:
+            raise WorkerJobRetrySafetyViolation()
         if self._local_state is not None:
             account_id = self._snapshot.account_id
             profile_ref = self._profile_ref
@@ -389,7 +396,7 @@ class WorkerJobExecution:
             self._save_recovery_entry(account_id, profile_ref, "MUTATION_CONFIRMED")
         try:
             await self.checkpoint({"phase": "MUTATION_CONFIRMED"})
-        except WorkerControlClientError:
+        except WorkerControlClientError, WorkerJobLeaseLost:
             recorded = await self._request_ambiguous_intervention()
             raise ActionOutcomeAmbiguous(intervention_recorded=recorded) from None
         return result
