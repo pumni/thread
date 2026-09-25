@@ -1,4 +1,6 @@
-# 📑 BÁO CÁO TOÀN DIỆN VỀ KIẾN TRÚC, TÍNH NĂNG VÀ LUỒNG XỬ LÝ DỰ ÁN CHROMIUM-TOOLFBPC
+# 📑 LEGACY REFERENCE — BÁO CÁO CHROMIUM-TOOLFBPC
+
+> ⚠️ **Legacy only:** Tài liệu này chỉ dùng để truy vết yêu cầu nghiệp vụ của hệ thống Facebook cũ. Không dùng làm blueprint cho dự án Threads mới. Mọi credential xuất hiện trong phiên bản lịch sử phải được coi là đã lộ và cần rotate/revoke nếu từng là credential thật.
 
 > **Dự án**: Chromium-ToolFbPC (Facebook Automation System)  
 > **Phiên bản phân tích**: 2.0.0+  
@@ -533,10 +535,10 @@ File này lưu vết toàn bộ bài viết, các bình luận và phản hồi 
     "roleWebSocket": "B22616984",
     "nameFb": "Hải Linh",
     "to": "22773024",
-    "proxy_ip": "42.118.161.103",
-    "proxy_port": "35270",
-    "proxy_user": "muaproxy689ef8202bc87",
-    "proxy_pass": "lyl1nqbxq4ghgpyu"
+    "proxy_ip": "<REDACTED>",
+    "proxy_port": "<REDACTED>",
+    "proxy_user": "<REDACTED>",
+    "proxy_pass": "<REDACTED>"
   }
 ]
 ```
@@ -572,7 +574,7 @@ CHROME_USER_DATA_DIR=r"C:\Nuoi_FB\chrome_profile\Hai_Linh_0936212850_timviec365@
 CHROME_USER_DATA_DIR_1=r"C:\Nuoi_FB\chrome_profile\Hoang_Maii_0966338017_Timviec365@"
 CHROME_USER_DATA_DIR_2=r"C:\Nuoi_FB\chrome_profile\My_Vu_Hoang_myv217704@gmail.com_Timviec365@@"
 CHROME_USER_DATA_DIR_3=r"C:\Nuoi_FB\chrome_profile\Hai_Linh_0936212850_timviec365@"
-MONGO_URI=mongodb://myuser_duc:Anhduc14062002%40%23%24@123.24.206.25:27017/?authSource=admin
+MONGO_URI=<REDACTED>
 MONGO_DB=Facebook
 MONGO_COLLECTION_DEVICES=devices
 ```
