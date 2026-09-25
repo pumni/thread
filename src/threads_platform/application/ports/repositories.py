@@ -13,8 +13,12 @@ from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
     NetworkProfile,
+    WorkerAuditEvent,
+    WorkerAuthChallenge,
     WorkerCapability,
+    WorkerEnrollment,
     WorkerNode,
+    WorkerSession,
 )
 
 
@@ -129,6 +133,8 @@ class WorkerRepository(Protocol):
 
     async def update(self, worker: WorkerNode) -> None: ...
 
+    async def list_expired_presence(self, now: datetime) -> list[WorkerNode]: ...
+
 
 class WorkerCapabilityRepository(Protocol):
     async def replace_for_worker(
@@ -158,6 +164,30 @@ class AccountWorkerAssignmentRepository(Protocol):
     async def update(self, assignment: AccountWorkerAssignment) -> None: ...
 
 
+class WorkerSecurityRepository(Protocol):
+    async def add_enrollment(self, enrollment: WorkerEnrollment) -> None: ...
+
+    async def get_enrollment_for_update(self, token_digest: str) -> WorkerEnrollment | None: ...
+
+    async def update_enrollment(self, enrollment: WorkerEnrollment) -> None: ...
+
+    async def add_challenge(self, challenge: WorkerAuthChallenge) -> None: ...
+
+    async def get_challenge_for_update(self, challenge_id: UUID) -> WorkerAuthChallenge | None: ...
+
+    async def update_challenge(self, challenge: WorkerAuthChallenge) -> None: ...
+
+    async def add_session(self, session: WorkerSession) -> None: ...
+
+    async def get_active_session(
+        self, token_digest: str, now: datetime
+    ) -> WorkerSession | None: ...
+
+    async def add_audit_event(self, event: WorkerAuditEvent) -> None: ...
+
+    async def list_audit_events(self, worker_id: UUID) -> list[WorkerAuditEvent]: ...
+
+
 class UnitOfWork(Protocol):
     accounts: AccountRepository
     commands: CommandRepository
@@ -172,6 +202,7 @@ class UnitOfWork(Protocol):
     browser_profiles: BrowserProfileRepository
     network_profiles: NetworkProfileRepository
     assignments: AccountWorkerAssignmentRepository
+    worker_security: WorkerSecurityRepository
 
     def savepoint(self) -> AbstractAsyncContextManager[object]: ...
 

@@ -35,6 +35,8 @@ class WorkerNode:
     platform: str = "unknown"
     agent_version: str | None = None
     protocol_version: int | None = None
+    capabilities_schema_version: int | None = None
+    public_key: bytes | None = None
     status: WorkerStatus = WorkerStatus.REGISTERING
     max_concurrent_jobs: int = 1
     last_heartbeat_at: datetime | None = None
@@ -49,6 +51,10 @@ class WorkerNode:
             raise ValueError("worker capacity must be positive")
         if self.protocol_version is not None and self.protocol_version < 1:
             raise ValueError("protocol_version must be positive")
+        if self.capabilities_schema_version is not None and self.capabilities_schema_version < 1:
+            raise ValueError("capabilities_schema_version must be positive")
+        if self.public_key is not None and len(self.public_key) != 32:
+            raise ValueError("Ed25519 public key must be 32 bytes")
         self.created_at = normalize_utc(self.created_at)
         self.updated_at = normalize_utc(self.updated_at)
         if self.last_heartbeat_at is not None:
@@ -164,3 +170,69 @@ class WorkerIntervention:
             raise ValueError("intervention_type must not be empty")
         self.created_at = normalize_utc(self.created_at)
         self.resolved_at = normalize_utc(self.resolved_at) if self.resolved_at else None
+
+
+@dataclass(slots=True)
+class WorkerEnrollment:
+    token_digest: str
+    expires_at: datetime
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=utc_now)
+    consumed_at: datetime | None = None
+    created_by: str | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.token_digest) != 64:
+            raise ValueError("enrollment token digest must be SHA-256 hex")
+        self.created_at = normalize_utc(self.created_at)
+        self.expires_at = normalize_utc(self.expires_at)
+        self.consumed_at = normalize_utc(self.consumed_at) if self.consumed_at else None
+
+
+@dataclass(slots=True)
+class WorkerAuthChallenge:
+    worker_id: UUID
+    nonce: str
+    expires_at: datetime
+    id: UUID = field(default_factory=uuid4)
+    issued_at: datetime = field(default_factory=utc_now)
+    used_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.nonce.strip():
+            raise ValueError("challenge nonce must not be empty")
+        self.issued_at = normalize_utc(self.issued_at)
+        self.expires_at = normalize_utc(self.expires_at)
+        self.used_at = normalize_utc(self.used_at) if self.used_at else None
+
+
+@dataclass(slots=True)
+class WorkerSession:
+    worker_id: UUID
+    token_digest: str
+    expires_at: datetime
+    id: UUID = field(default_factory=uuid4)
+    issued_at: datetime = field(default_factory=utc_now)
+    revoked_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.token_digest) != 64:
+            raise ValueError("worker session digest must be SHA-256 hex")
+        self.issued_at = normalize_utc(self.issued_at)
+        self.expires_at = normalize_utc(self.expires_at)
+        self.revoked_at = normalize_utc(self.revoked_at) if self.revoked_at else None
+
+
+@dataclass(slots=True)
+class WorkerAuditEvent:
+    event_type: str
+    id: UUID = field(default_factory=uuid4)
+    worker_id: UUID | None = None
+    enrollment_id: UUID | None = None
+    detail_code: str | None = None
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if not self.event_type.strip():
+            raise ValueError("event_type must not be empty")
+        self.created_at = normalize_utc(self.created_at)

@@ -56,6 +56,31 @@ Security requirements:
 
 Exact algorithms/key storage must be documented in the implementation PR and security-reviewed.
 
+### C1 implementation binding
+
+- Device identity uses Ed25519 (RFC 8032) through the `cryptography` Python package. The
+  worker generates the keypair locally and sends only the 32-byte raw public key during
+  enrollment. PostgreSQL stores that public key; it has no private-key column.
+- The signed challenge message is the UTF-8 bytes of
+  `threads-platform-worker-auth-v1\n{canonical-lowercase-worker-challenge-uuid}\n{nonce}`.
+  The nonce is 256 bits of random URL-safe text. Challenges expire after one minute and are
+  consumed under a row lock; a failed signature consumes the challenge too.
+- Enrollment codes and access tokens each contain 256 bits of random material. Enrollment
+  codes expire after ten minutes and are single-use. PostgreSQL stores SHA-256 digests of
+  enrollment codes and access tokens, never their raw values. Worker sessions expire after
+  fifteen minutes.
+- `WorkerKeyStore` is the worker-side secure-storage boundary. The later Windows adapter
+  will protect the generated private key with DPAPI and expose signing operations without
+  returning key bytes. C1 includes the interface and in-memory signer; it does not persist
+  private key material.
+- Worker HTTPS and WSS routes reject non-TLS ASGI schemes by default. TLS terminates at the
+  trusted deployment ingress. Workers must retain normal certificate verification. WSS
+  authenticates with the `Authorization: Bearer` header, never a query parameter.
+- C1 supports protocol version 1 and capability schema version 1. Unsupported versions put
+  the worker in `UPGRADE_REQUIRED`. Heartbeat presence expires after 90 seconds and the
+  Control Plane marks stale ONLINE/DEGRADED workers OFFLINE. WSS notifications are process
+  local and advisory; workers recover from PostgreSQL-backed HTTPS operations.
+
 ## 5. Worker states
 
 - REGISTERING

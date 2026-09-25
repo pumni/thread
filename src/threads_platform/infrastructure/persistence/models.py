@@ -15,6 +15,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -364,6 +365,14 @@ class WorkerNodeRecord(Base):
     __tablename__ = "worker_nodes"
     __table_args__ = (
         CheckConstraint("max_concurrent_jobs > 0", name="ck_worker_nodes_positive_capacity"),
+        CheckConstraint(
+            "capabilities_schema_version IS NULL OR capabilities_schema_version > 0",
+            name="ck_worker_nodes_capabilities_schema_version",
+        ),
+        CheckConstraint(
+            "public_key IS NULL OR octet_length(public_key) = 32",
+            name="ck_worker_nodes_public_key_length",
+        ),
         Index("ix_worker_nodes_status_presence", "status", "presence_expires_at"),
     )
 
@@ -373,6 +382,8 @@ class WorkerNodeRecord(Base):
     platform: Mapped[str] = mapped_column(String(80), nullable=False)
     agent_version: Mapped[str | None] = mapped_column(String(80))
     protocol_version: Mapped[int | None] = mapped_column(Integer)
+    capabilities_schema_version: Mapped[int | None] = mapped_column(Integer)
+    public_key: Mapped[bytes | None] = mapped_column(LargeBinary(32))
     status: Mapped[WorkerStatus] = mapped_column(
         enum_type(WorkerStatus, "worker_status"), nullable=False
     )
@@ -411,6 +422,72 @@ class WorkerCapabilityRecord(Base):
         "metadata", JSON_DOCUMENT, nullable=False, default=dict, server_default=JSON_OBJECT_DEFAULT
     )
     advertised_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkerEnrollmentRecord(Base):
+    __tablename__ = "worker_enrollments"
+    __table_args__ = (
+        Index("ix_worker_enrollments_expiry", "expires_at", "consumed_at"),
+        UniqueConstraint("token_digest", name="uq_worker_enrollments_token_digest"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str | None] = mapped_column(String(255))
+
+
+class WorkerAuthChallengeRecord(Base):
+    __tablename__ = "worker_auth_challenges"
+    __table_args__ = (Index("ix_worker_auth_challenges_expiry", "expires_at", "used_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    worker_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    nonce: Mapped[str] = mapped_column(String(100), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkerSessionRecord(Base):
+    __tablename__ = "worker_sessions"
+    __table_args__ = (
+        Index("ix_worker_sessions_worker_expiry", "worker_id", "expires_at"),
+        UniqueConstraint("token_digest", name="uq_worker_sessions_token_digest"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    worker_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkerAuditEventRecord(Base):
+    __tablename__ = "worker_audit_events"
+    __table_args__ = (Index("ix_worker_audit_events_created", "created_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    worker_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_nodes.worker_id", ondelete="RESTRICT")
+    )
+    enrollment_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_enrollments.id", ondelete="RESTRICT")
+    )
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    detail_code: Mapped[str | None] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class BrowserProfileRecord(Base):

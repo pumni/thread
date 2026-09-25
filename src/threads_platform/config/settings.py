@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     log_level: LogLevel = "INFO"
     database_url: SecretStr | None = None
     crm_ingress_token: SecretStr | None = None
+    worker_admin_token: SecretStr | None = None
+    worker_tls_required: bool = True
     threads_api_base_url: AnyHttpUrl = AnyHttpUrl("https://graph.threads.net/v1.0/")
 
 

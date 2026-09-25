@@ -19,6 +19,7 @@ from threads_platform.application.ports.repositories import (
     SyncStateRepository,
     WorkerCapabilityRepository,
     WorkerRepository,
+    WorkerSecurityRepository,
 )
 from threads_platform.domain.accounts import (
     AccountExecutionMode,
@@ -44,8 +45,12 @@ from threads_platform.domain.workers import (
     BrowserProfile,
     NetworkProfile,
     NetworkProtocol,
+    WorkerAuditEvent,
+    WorkerAuthChallenge,
     WorkerCapability,
+    WorkerEnrollment,
     WorkerNode,
+    WorkerSession,
     WorkerStatus,
 )
 from threads_platform.infrastructure.persistence.models import (
@@ -60,8 +65,12 @@ from threads_platform.infrastructure.persistence.models import (
     PostRecord,
     ReplyRecord,
     SyncStateRecord,
+    WorkerAuditEventRecord,
+    WorkerAuthChallengeRecord,
     WorkerCapabilityRecord,
+    WorkerEnrollmentRecord,
     WorkerNodeRecord,
+    WorkerSessionRecord,
 )
 
 
@@ -749,12 +758,23 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
         record.platform = worker.platform
         record.agent_version = worker.agent_version
         record.protocol_version = worker.protocol_version
+        record.capabilities_schema_version = worker.capabilities_schema_version
+        record.public_key = worker.public_key
         record.status = worker.status
         record.max_concurrent_jobs = worker.max_concurrent_jobs
         record.last_heartbeat_at = worker.last_heartbeat_at
         record.presence_expires_at = worker.presence_expires_at
         record.updated_at = worker.updated_at
         await self._session.flush()
+
+    async def list_expired_presence(self, now: datetime) -> list[WorkerNode]:
+        result = await self._session.scalars(
+            select(WorkerNodeRecord).where(
+                WorkerNodeRecord.status.in_([WorkerStatus.ONLINE, WorkerStatus.DEGRADED]),
+                WorkerNodeRecord.presence_expires_at <= now,
+            )
+        )
+        return [self._domain(record) for record in result]
 
     @staticmethod
     def _record(worker: WorkerNode) -> WorkerNodeRecord:
@@ -765,6 +785,8 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
             platform=worker.platform,
             agent_version=worker.agent_version,
             protocol_version=worker.protocol_version,
+            capabilities_schema_version=worker.capabilities_schema_version,
+            public_key=worker.public_key,
             status=worker.status,
             max_concurrent_jobs=worker.max_concurrent_jobs,
             last_heartbeat_at=worker.last_heartbeat_at,
@@ -782,6 +804,8 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
             platform=record.platform,
             agent_version=record.agent_version,
             protocol_version=record.protocol_version,
+            capabilities_schema_version=record.capabilities_schema_version,
+            public_key=record.public_key,
             status=WorkerStatus(record.status),
             max_concurrent_jobs=record.max_concurrent_jobs,
             last_heartbeat_at=record.last_heartbeat_at,
@@ -969,4 +993,153 @@ class SQLAlchemyAccountWorkerAssignmentRepository(AccountWorkerAssignmentReposit
             is_active=record.is_active,
             assigned_at=record.assigned_at,
             ended_at=record.ended_at,
+        )
+
+
+class SQLAlchemyWorkerSecurityRepository(WorkerSecurityRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_enrollment(self, enrollment: WorkerEnrollment) -> None:
+        self._session.add(
+            WorkerEnrollmentRecord(
+                id=enrollment.id,
+                token_digest=enrollment.token_digest,
+                created_at=enrollment.created_at,
+                expires_at=enrollment.expires_at,
+                consumed_at=enrollment.consumed_at,
+                created_by=enrollment.created_by,
+            )
+        )
+        await self._session.flush()
+
+    async def get_enrollment_for_update(self, token_digest: str) -> WorkerEnrollment | None:
+        record = await self._session.scalar(
+            select(WorkerEnrollmentRecord)
+            .where(WorkerEnrollmentRecord.token_digest == token_digest)
+            .with_for_update()
+        )
+        return self._enrollment_domain(record) if record is not None else None
+
+    async def update_enrollment(self, enrollment: WorkerEnrollment) -> None:
+        record = await self._session.get(WorkerEnrollmentRecord, enrollment.id)
+        if record is None:
+            raise LookupError(f"worker enrollment not found: {enrollment.id}")
+        record.consumed_at = enrollment.consumed_at
+        await self._session.flush()
+
+    async def add_challenge(self, challenge: WorkerAuthChallenge) -> None:
+        self._session.add(
+            WorkerAuthChallengeRecord(
+                id=challenge.id,
+                worker_id=challenge.worker_id,
+                nonce=challenge.nonce,
+                issued_at=challenge.issued_at,
+                expires_at=challenge.expires_at,
+                used_at=challenge.used_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_challenge_for_update(self, challenge_id: UUID) -> WorkerAuthChallenge | None:
+        record = await self._session.scalar(
+            select(WorkerAuthChallengeRecord)
+            .where(WorkerAuthChallengeRecord.id == challenge_id)
+            .with_for_update()
+        )
+        return self._challenge_domain(record) if record is not None else None
+
+    async def update_challenge(self, challenge: WorkerAuthChallenge) -> None:
+        record = await self._session.get(WorkerAuthChallengeRecord, challenge.id)
+        if record is None:
+            raise LookupError(f"worker auth challenge not found: {challenge.id}")
+        record.used_at = challenge.used_at
+        await self._session.flush()
+
+    async def add_session(self, session: WorkerSession) -> None:
+        self._session.add(
+            WorkerSessionRecord(
+                id=session.id,
+                worker_id=session.worker_id,
+                token_digest=session.token_digest,
+                issued_at=session.issued_at,
+                expires_at=session.expires_at,
+                revoked_at=session.revoked_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_active_session(self, token_digest: str, now: datetime) -> WorkerSession | None:
+        record = await self._session.scalar(
+            select(WorkerSessionRecord).where(
+                WorkerSessionRecord.token_digest == token_digest,
+                WorkerSessionRecord.expires_at > now,
+                WorkerSessionRecord.revoked_at.is_(None),
+            )
+        )
+        return self._session_domain(record) if record is not None else None
+
+    async def add_audit_event(self, event: WorkerAuditEvent) -> None:
+        self._session.add(
+            WorkerAuditEventRecord(
+                id=event.id,
+                worker_id=event.worker_id,
+                enrollment_id=event.enrollment_id,
+                event_type=event.event_type,
+                detail_code=event.detail_code,
+                created_at=event.created_at,
+            )
+        )
+        await self._session.flush()
+
+    async def list_audit_events(self, worker_id: UUID) -> list[WorkerAuditEvent]:
+        result = await self._session.scalars(
+            select(WorkerAuditEventRecord)
+            .where(WorkerAuditEventRecord.worker_id == worker_id)
+            .order_by(WorkerAuditEventRecord.created_at, WorkerAuditEventRecord.id)
+        )
+        return [self._audit_domain(record) for record in result]
+
+    @staticmethod
+    def _enrollment_domain(record: WorkerEnrollmentRecord) -> WorkerEnrollment:
+        return WorkerEnrollment(
+            id=record.id,
+            token_digest=record.token_digest,
+            created_at=record.created_at,
+            expires_at=record.expires_at,
+            consumed_at=record.consumed_at,
+            created_by=record.created_by,
+        )
+
+    @staticmethod
+    def _challenge_domain(record: WorkerAuthChallengeRecord) -> WorkerAuthChallenge:
+        return WorkerAuthChallenge(
+            id=record.id,
+            worker_id=record.worker_id,
+            nonce=record.nonce,
+            issued_at=record.issued_at,
+            expires_at=record.expires_at,
+            used_at=record.used_at,
+        )
+
+    @staticmethod
+    def _session_domain(record: WorkerSessionRecord) -> WorkerSession:
+        return WorkerSession(
+            id=record.id,
+            worker_id=record.worker_id,
+            token_digest=record.token_digest,
+            issued_at=record.issued_at,
+            expires_at=record.expires_at,
+            revoked_at=record.revoked_at,
+        )
+
+    @staticmethod
+    def _audit_domain(record: WorkerAuditEventRecord) -> WorkerAuditEvent:
+        return WorkerAuditEvent(
+            id=record.id,
+            worker_id=record.worker_id,
+            enrollment_id=record.enrollment_id,
+            event_type=record.event_type,
+            detail_code=record.detail_code,
+            created_at=record.created_at,
         )

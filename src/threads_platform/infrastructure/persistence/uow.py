@@ -19,6 +19,7 @@ from threads_platform.application.ports.repositories import (
     SyncStateRepository,
     WorkerCapabilityRepository,
     WorkerRepository,
+    WorkerSecurityRepository,
 )
 from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyAccountRepository,
@@ -34,6 +35,7 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemySyncStateRepository,
     SQLAlchemyWorkerCapabilityRepository,
     SQLAlchemyWorkerRepository,
+    SQLAlchemyWorkerSecurityRepository,
 )
 
 
@@ -62,6 +64,9 @@ class SQLAlchemyUnitOfWork:
         )
         self.assignments: AccountWorkerAssignmentRepository = (
             SQLAlchemyAccountWorkerAssignmentRepository(self._session)
+        )
+        self.worker_security: WorkerSecurityRepository = SQLAlchemyWorkerSecurityRepository(
+            self._session
         )
 
     async def __aenter__(self) -> SQLAlchemyUnitOfWork:
