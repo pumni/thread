@@ -73,20 +73,24 @@ No production Threads side effects should be implemented before Batch A passes r
 
 Execution order:
 
-1. #3 TP-002 — validate real Threads OAuth/API capabilities.
+1. #3 TP-002 — document current official Threads API contracts and complete live verification when a development app/account is available.
 2. #16 TP-004A — harden durable command execution for external side effects.
-3. #6 TP-005 — publishing pipeline.
-4. #7 TP-006 — replies/conversation/moderation.
+3. #6 TP-005 — publishing pipeline implementation against official documented contracts.
+4. #7 TP-006 — replies/conversation/moderation implementation against official documented contracts.
 
 Continuation rule:
-- If the API spike confirms the expected contracts, Codex may continue into TP-004A without waiting for review.
-- TP-004A must complete before any live Meta side-effect handler is wired into the command runtime.
-- After TP-004A passes local gates, Codex may continue directly into publishing and conversations.
-- If official API behavior materially differs from FEATURE_PARITY_MATRIX.md, required permissions are unavailable, product UI capability is not exposed through the official API, or OAuth/token lifecycle assumptions are wrong, **stop after TP-002** and report the mismatch before implementing workarounds.
+- Documentation-backed implementation may proceed without a live Meta development account when the official contract is sufficiently specified.
+- TP-004A must complete before publishing/reply handlers are integrated with the command runtime.
+- #6/#7 must isolate Meta HTTP behavior behind ports/adapters and use mocked contract fixtures derived from official documentation, clearly marked as non-live evidence.
+- Missing live OAuth/account access blocks production acceptance, not implementation. Issue #3 remains open until live OAuth/token/scopes/error/quota/media/reply behavior is verified.
+- No production rollout or final release certification may occur while #3 remains incomplete.
+- If official documentation is ambiguous on behavior that affects correctness, implement a conservative interface/state machine and mark that path VERIFY; do not fabricate behavior.
+- If official API behavior later materially differs from FEATURE_PARITY_MATRIX.md or the implemented contract, stop the affected feature and reconcile the adapter/ADR before workarounds.
 
-Checkpoint B reviewer validates:
-- real API evidence and current permissions;
-- token lifecycle;
+Checkpoint B implementation reviewer validates:
+- documented API contracts are isolated behind adapters and contract tests;
+- any live evidence obtained is recorded separately and scrubbed;
+- unresolved live permissions/token/error behavior remains explicitly tracked in #3;
 - command execution does not hold DB transactions/row locks across Meta network I/O;
 - durable claim/lease, checkpoint and crash-reconciliation behavior;
 - crash-safe publishing;
@@ -94,6 +98,15 @@ Checkpoint B reviewer validates:
 - timeout/reconciliation behavior;
 - deterministic conversation synchronization;
 - no browser automation was introduced without an approved ADR.
+
+### Production gate after Batch B implementation
+
+Before staging/production activation of Threads side effects and before final release certification:
+- #3 TP-002 must be completed with a dedicated development app/account;
+- effective scopes and token refresh behavior must be verified;
+- representative text/image/video publishing and reply/conversation calls must be exercised live;
+- quota and representative error responses must be captured in scrubbed form;
+- contract tests must be updated if live responses differ from documentation examples.
 
 ## Batch C — Expansion & Operations
 
