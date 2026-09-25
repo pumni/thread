@@ -77,6 +77,7 @@ class WorkerJobService:
         retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY,
         operation_class: OperationClass = OperationClass.READ,
     ) -> WorkerJob:
+        self._ensure_capability_not_blocked(capability_name)
         now = normalize_utc(self._clock.now())
         schedule = normalize_utc(scheduled_at) if scheduled_at else now
         async with self._unit_of_work_factory() as unit_of_work:
@@ -119,6 +120,7 @@ class WorkerJobService:
         retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY,
         operation_class: OperationClass = OperationClass.READ,
     ) -> tuple[WorkerJob, tuple[UUID, ...]]:
+        self._ensure_capability_not_blocked(capability_name)
         occurred_at = normalize_utc(now)
         schedule = normalize_utc(scheduled_at) if scheduled_at else occurred_at
         command = None
@@ -615,6 +617,9 @@ class WorkerJobService:
     async def _account_policy_allows_claim(
         self, unit_of_work: UnitOfWork, job: WorkerJob, worker_id: UUID
     ) -> bool:
+        policy = self._capability_router.policy_for(job.capability_name)
+        if policy is not None and policy.blocked_reason_code is not None:
+            return False
         if job.account_id is None:
             return True
         account = await unit_of_work.accounts.get_for_update(job.account_id)
@@ -652,6 +657,11 @@ class WorkerJobService:
             and policy.worker_capability_name == job.capability_name
             and policy.worker_capability_version == job.capability_version
         )
+
+    def _ensure_capability_not_blocked(self, capability_name: str) -> None:
+        policy = self._capability_router.policy_for(capability_name)
+        if policy is not None and policy.blocked_reason_code is not None:
+            raise WorkerJobControlError(policy.blocked_reason_code)
 
     async def _renew_account_coordination(
         self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime

@@ -25,7 +25,7 @@ class SessionCapacityError(LocalWorkerStateError):
 
 
 class LocalDataRoot:
-    _directories = ("worker", "profiles", "journal", "cache", "logs", "updates")
+    _directories = ("worker", "profiles", "media", "journal", "cache", "logs", "updates")
 
     def __init__(self, root: Path) -> None:
         self._configured_root = root.expanduser()

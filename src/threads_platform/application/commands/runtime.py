@@ -65,6 +65,10 @@ KNOWN_COMMAND_TYPES = frozenset(
         "threads.discovery.resume",
         "threads.discovery.lead_status",
         "threads.moderate_reply",
+        "threads.browser.feed.browse",
+        "threads.browser.thread.open",
+        "threads.browser.profile.open",
+        "threads.browser.media.local_upload",
     }
 )
 

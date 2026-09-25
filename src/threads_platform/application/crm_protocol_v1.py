@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -5,6 +6,12 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from threads_platform.domain.commands import CommandStatus
+
+_WINDOWS_DEVICE_NAME_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
 
 
 class CommandEnvelopeHeader(BaseModel):
@@ -353,6 +360,71 @@ class ModerateReplyCommandV1(CRMCommandV1):
     payload: ModerateReplyPayload
 
 
+class BrowserFeedBrowsePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_items: int = Field(default=10, ge=1, le=20)
+
+
+class BrowserThreadOpenPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    thread_ref: str = Field(min_length=1, max_length=255)
+
+    @field_validator("thread_ref")
+    @classmethod
+    def thread_ref_must_be_an_opaque_identifier(cls, value: str) -> str:
+        return _validate_browser_identifier(value)
+
+
+class BrowserProfileOpenPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_ref: str = Field(min_length=1, max_length=255)
+
+    @field_validator("profile_ref")
+    @classmethod
+    def profile_ref_must_be_an_opaque_identifier(cls, value: str) -> str:
+        return _validate_browser_identifier(value)
+
+
+class BrowserLocalUploadPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    media_ref: str = Field(min_length=1, max_length=120)
+
+    @field_validator("media_ref")
+    @classmethod
+    def media_ref_must_be_a_logical_file_reference(cls, value: str) -> str:
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", value) is None
+            or value in {".", ".."}
+            or value.split(".", 1)[0].casefold() in _WINDOWS_DEVICE_NAME_STEMS
+        ):
+            raise ValueError("media_ref must be a simple worker-local file name")
+        return value
+
+
+class BrowserFeedBrowseCommandV1(CRMCommandV1):
+    command_type: Literal["threads.browser.feed.browse"]
+    payload: BrowserFeedBrowsePayload
+
+
+class BrowserThreadOpenCommandV1(CRMCommandV1):
+    command_type: Literal["threads.browser.thread.open"]
+    payload: BrowserThreadOpenPayload
+
+
+class BrowserProfileOpenCommandV1(CRMCommandV1):
+    command_type: Literal["threads.browser.profile.open"]
+    payload: BrowserProfileOpenPayload
+
+
+class BrowserLocalUploadCommandV1(CRMCommandV1):
+    command_type: Literal["threads.browser.media.local_upload"]
+    payload: BrowserLocalUploadPayload
+
+
 type CommandEnvelopeV1 = Annotated[
     PublishTextPostCommandV1
     | CreateReplyCommandV1
@@ -368,7 +440,11 @@ type CommandEnvelopeV1 = Annotated[
     | DiscoveryConversationCommandV1
     | DiscoveryResumeCommandV1
     | LeadCandidateStatusCommandV1
-    | ModerateReplyCommandV1,
+    | ModerateReplyCommandV1
+    | BrowserFeedBrowseCommandV1
+    | BrowserThreadOpenCommandV1
+    | BrowserProfileOpenCommandV1
+    | BrowserLocalUploadCommandV1,
     Field(discriminator="command_type"),
 ]
 COMMAND_ENVELOPE_ADAPTER: TypeAdapter[CommandEnvelopeV1] = TypeAdapter(CommandEnvelopeV1)
@@ -383,6 +459,12 @@ def _validate_media_url(value: str) -> None:
         or parsed.password is not None
     ):
         raise ValueError("media URL must be an HTTP(S) URL without embedded credentials")
+
+
+def _validate_browser_identifier(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", value) is None:
+        raise ValueError("browser target must be a bounded opaque identifier")
+    return value
 
 
 class CommandReceiptV1(BaseModel):
