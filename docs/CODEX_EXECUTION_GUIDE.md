@@ -1,20 +1,18 @@
 # Codex Execution Guide v2
 
-## 1. First rule for a fresh Codex session
+## 1. Context loading for a fresh Codex session
 
-Before coding, read in order:
+Codex should use the repository context layer rather than preload every document.
 
-1. README.md
-2. docs/PROJECT_STATE_HANDOFF.md
-3. docs/MASTER_PLAN.md
-4. docs/ARCHITECTURE.md
-5. docs/FEATURE_PARITY_MATRIX.md
-6. docs/WORK_BREAKDOWN.md
-7. docs/CODEX_EXECUTION_GUIDE.md
-8. docs/ACCEPTANCE_AND_REVIEW.md
-9. applicable docs/adr/*
-10. applicable docs/protocols/*
-11. every authorized GitHub issue and coordinator comment
+Before coding:
+
+1. follow root `AGENTS.md`;
+2. read `docs/PROJECT_STATE_HANDOFF.md`;
+3. read the authorized GitHub issue/batch and coordinator comments;
+4. use `docs/CONTEXT_MAP.md` to select only the architecture/ADR/protocol docs relevant to that task;
+5. inspect the current code and tests before proposing new abstractions.
+
+Read broader project documentation only when the task genuinely crosses those boundaries.
 
 Do not use the deleted legacy Facebook report as implementation architecture.
 
