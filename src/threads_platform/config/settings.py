@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
     )
 
     log_level: LogLevel = "INFO"
+    database_url: SecretStr | None = None
 
 
 @lru_cache(maxsize=1)

@@ -1,0 +1,33 @@
+services:
+  api:
+    build: .
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && uvicorn threads_platform.app:app --host 0.0.0.0 --port 8000
+    environment:
+      THREADS_PLATFORM_DATABASE_URL: postgresql+asyncpg://threads_platform@postgres:5432/threads_platform
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:8000:8000
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: threads_platform
+      POSTGRES_DB: threads_platform
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U threads_platform -d threads_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - 127.0.0.1:5432:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
