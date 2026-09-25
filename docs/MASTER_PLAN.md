@@ -404,16 +404,24 @@ Browser changes additionally require:
 - no real credentials in fixtures;
 - safe-boundary/recovery tests for external side effects.
 
-## 12. Source-of-truth order
+## 12. Agent context and source-of-truth policy
 
-1. README.md
-2. docs/PROJECT_STATE_HANDOFF.md
-3. docs/MASTER_PLAN.md
-4. docs/ARCHITECTURE.md
-5. docs/FEATURE_PARITY_MATRIX.md
-6. docs/WORK_BREAKDOWN.md
-7. docs/protocols/WORKER_PROTOCOL_V1.md
-8. docs/adr/
-9. active GitHub issues
+`AGENTS.md` and `docs/CONTEXT_MAP.md` are **navigation/instruction layers**, not architecture encyclopedias. They tell agents what to load; they do not replace the detailed sources below.
 
-If an issue conflicts with an ADR or a higher source-of-truth document, stop and resolve the conflict before implementation.
+For current state, use:
+1. `docs/PROJECT_STATE_HANDOFF.md`;
+2. active authorized GitHub issue/batch.
+
+For durable design, use:
+1. accepted ADRs;
+2. `docs/ARCHITECTURE.md`;
+3. versioned protocol docs;
+4. `docs/MASTER_PLAN.md`;
+5. `docs/FEATURE_PARITY_MATRIX.md`;
+6. `docs/WORK_BREAKDOWN.md`.
+
+README is human-facing orientation.
+
+Agents should use `docs/CONTEXT_MAP.md` to select the smallest sufficient subset instead of loading every source above for every task.
+
+If an active issue conflicts with an accepted ADR or higher durable design source, stop and resolve the conflict before implementation.

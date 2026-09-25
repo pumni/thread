@@ -12,21 +12,22 @@ A coordinator should verify current main/issue state, then explicitly tell Codex
 
 Recommended branch: batch/c1-distributed-worker-foundation
 
-## Mandatory reading
+## Context for C1
 
-- README.md
-- docs/PROJECT_STATE_HANDOFF.md
-- docs/MASTER_PLAN.md
-- docs/ARCHITECTURE.md
-- docs/FEATURE_PARITY_MATRIX.md
-- docs/WORK_BREAKDOWN.md
-- docs/CODEX_EXECUTION_GUIDE.md
-- docs/ACCEPTANCE_AND_REVIEW.md
-- docs/protocols/WORKER_PROTOCOL_V1.md
-- ADR-0003
-- ADR-0004
-- ADR-0005
-- issues #21/#22/#23 including coordinator comments
+Start with:
+- root `AGENTS.md`;
+- `docs/PROJECT_STATE_HANDOFF.md`;
+- issues #21/#22/#23 including coordinator comments;
+- the C1 row in `docs/CONTEXT_MAP.md`.
+
+C1-specific deeper context:
+- Worker sections in `docs/ARCHITECTURE.md`;
+- `docs/protocols/WORKER_PROTOCOL_V1.md`;
+- ADR-0003;
+- ADR-0004;
+- WorkerJob/auth/data sections in `docs/ACCEPTANCE_AND_REVIEW.md`.
+
+ADR-0005/browser details are not required for C1 implementation because browser engine work starts in C3.
 
 ## Execution order
 

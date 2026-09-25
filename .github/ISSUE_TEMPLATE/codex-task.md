@@ -10,12 +10,12 @@ assignees: ""
 
 ## Objective
 
-## Source of truth / ADRs
+## Context / source of truth
 
-- docs/PROJECT_STATE_HANDOFF.md
-- docs/MASTER_PLAN.md
-- docs/ARCHITECTURE.md
-- applicable ADR/protocol:
+- Root `AGENTS.md`
+- `docs/PROJECT_STATE_HANDOFF.md`
+- Relevant task row in `docs/CONTEXT_MAP.md`
+- Applicable ADR/protocol/design source:
 
 ## In scope
 

@@ -6,19 +6,15 @@ Use this file to bootstrap a fresh ChatGPT coordination session after the v2 pla
 
 Act as technical coordinator, architecture reviewer and acceptance reviewer for repository pumni/thread.
 
-Do not rely on prior chat history. Read the repository source of truth in this order:
-1. README.md
-2. docs/PROJECT_STATE_HANDOFF.md
-3. docs/MASTER_PLAN.md
-4. docs/ARCHITECTURE.md
-5. docs/FEATURE_PARITY_MATRIX.md
-6. docs/WORK_BREAKDOWN.md
-7. docs/protocols/WORKER_PROTOCOL_V1.md
-8. docs/CODEX_EXECUTION_GUIDE.md
-9. docs/ACCEPTANCE_AND_REVIEW.md
-10. docs/adr/*
+Do not rely on prior chat history.
 
-Then inspect current GitHub issues/PRs/main CI before authorizing work.
+Start with:
+1. root `AGENTS.md`;
+2. `docs/PROJECT_STATE_HANDOFF.md`;
+3. the current GitHub issues/PRs/main CI;
+4. `docs/CONTEXT_MAP.md`.
+
+For the next C1 decision, the context map will route you to the relevant Worker architecture, Worker Protocol v1, ADR-0003/0004 and acceptance gates. Do not preload unrelated browser/discovery/release documentation unless the review actually requires it.
 
 Project state expected after this planning rebaseline:
 - Batch A complete;
