@@ -4,12 +4,11 @@ This document defines how implementation work is handed to Codex running on the 
 
 ## 1. Unit of work
 
-Codex receives ONE GitHub issue at a time unless the issue explicitly declares a dependency bundle.
+The default unit of implementation is a GitHub issue. The reviewer/coordinator may authorize a **dependency batch** containing multiple issues so Codex can continue through safe, linear work without waiting for review after every issue.
 
-Do not ask Codex to "implement the entire project".
+Do not interpret a batch as permission to implement the entire project.
 
-Each issue must contain:
-
+Every issue still retains its own:
 - Context
 - Objective
 - In scope
@@ -17,35 +16,60 @@ Each issue must contain:
 - Technical constraints
 - Deliverables
 - Acceptance criteria
-- Verification commands
+- Verification requirements
 - Dependencies
-- Relevant docs/ADR links
+
+When a batch is authorized, Codex must preserve traceability between each issue and its commits/tests.
 
 ## 2. Branch convention
 
-Use:
+Single-issue work:
 
-feature/<issue-number>-short-name
-fix/<issue-number>-short-name
-chore/<issue-number>-short-name
+- feature/<issue-number>-short-name
+- fix/<issue-number>-short-name
+- chore/<issue-number>-short-name
 
-One issue should normally produce one PR.
+Authorized batch work:
+
+- batch/<batch-name>
+
+For a batch PR, keep each issue as a clearly identifiable commit or commit group and map them in the PR description.
+
+Do not self-merge.
 
 ## 3. Before coding
 
 Codex must:
 
 1. read README.md;
-2. read MASTER_PLAN.md;
-3. read ARCHITECTURE.md;
-4. read the relevant ADRs;
-5. read the complete issue;
-6. inspect current code before proposing new abstractions;
-7. verify any external Threads API behavior required by the issue against current official documentation.
+2. read docs/MASTER_PLAN.md;
+3. read docs/ARCHITECTURE.md;
+4. read docs/WORK_BREAKDOWN.md;
+5. read applicable ADRs;
+6. read every issue authorized for the current batch;
+7. inspect current code before proposing new abstractions;
+8. verify current official Threads API behavior for any external integration work.
 
-If an issue conflicts with an ADR, stop and report the conflict in the PR rather than silently rewriting architecture.
+If implementation conflicts with an ADR or a stop condition in WORK_BREAKDOWN.md, stop and report the conflict instead of silently rewriting architecture.
 
-## 4. Implementation rules
+## 4. Continuing inside a batch
+
+Codex does not need reviewer approval between issue boundaries when:
+- the next issue is explicitly part of the authorized batch;
+- its declared dependencies have been implemented in the same branch;
+- tests/quality gates are green;
+- no stop condition has occurred.
+
+After completing one issue inside the batch:
+
+1. run relevant verification;
+2. commit with a message referencing that issue;
+3. record any important decision/failure case in the batch PR notes;
+4. continue to the next authorized issue.
+
+Do not expand beyond the authorized batch.
+
+## 5. Implementation rules
 
 - Prefer the smallest design that satisfies current requirements and architecture boundaries.
 - No speculative framework.
@@ -53,13 +77,15 @@ If an issue conflicts with an ADR, stop and report the conflict in the PR rather
 - No secret or real access token in tests/fixtures.
 - No network calls in unit tests.
 - Do not weaken typing/test gates to make CI pass.
-- Do not skip migration for schema changes.
-- Avoid broad formatting/refactor unrelated to the issue.
-- Preserve backward compatibility of an established internal protocol unless the issue explicitly changes it.
+- Do not skip migrations for schema changes.
+- Avoid broad formatting/refactors unrelated to the authorized issues.
+- Preserve established protocol compatibility unless an issue explicitly changes it.
+- Keep domain logic independent of FastAPI, httpx, SQLAlchemy and Meta DTOs.
+- Side-effecting commands require explicit idempotency/recovery design.
 
-## 5. Test requirements
+## 6. Test requirements
 
-At minimum, Codex runs:
+At minimum, after project bootstrap Codex runs:
 
 ~~~
 uv sync --locked
@@ -69,94 +95,105 @@ uv run pyright
 uv run pytest
 ~~~
 
-For DB changes, run relevant integration tests/migrations.
+For DB changes, run relevant integration tests and migration checks.
 
-For external Threads API integrations, unit tests must mock HTTP behavior and an integration test/manual evidence must be documented separately when real credentials are required.
+For external Threads API integrations:
+- unit/contract tests mock HTTP behavior;
+- real-account verification is recorded separately;
+- real credentials must never enter Git, fixtures, logs or PR text.
 
-## 6. Failure-path requirement
+For a batch, run the complete gate before presenting the checkpoint PR even if individual issue boundaries also ran narrower tests.
 
-Any issue that performs an external side effect must test failure behavior.
+## 7. Failure-path requirement
+
+Any issue that performs an external or durable side effect must test failure behavior.
 
 Examples:
+- timeout;
+- duplicate command;
+- retryable server error;
+- authorization failure;
+- validation error;
+- partial success;
+- restart/recovery state;
+- concurrent claim/refresh behavior where relevant.
 
-- timeout
-- duplicate command
-- retryable server error
-- authorization failure
-- validation error
-- partial success
-- restart/recovery state
+Happy-path-only work is not accepted for publishing, CRM delivery, token handling, migrations or scheduling.
 
-Happy-path-only work is not accepted for publishing, CRM delivery, token handling or scheduling.
+## 8. PR description expected from Codex
 
-## 7. PR description expected from Codex
-
-PR must include:
+For a batch PR include:
 
 ### Summary
 
-What changed and why.
+What the batch establishes.
 
-### Scope
+### Issue/commit map
 
-Files/modules changed.
+For every issue:
+- issue number;
+- commit SHA(s);
+- files/modules;
+- acceptance criteria status.
 
-### Design
+### Architecture
 
-Important choices and how they respect existing ADRs.
+Important decisions and applicable ADRs.
 
 ### Verification
 
-Exact commands run and their outcomes.
+Exact commands and outcomes.
+
+### Migrations
+
+Revision/order and how they were tested.
 
 ### Failure cases tested
 
-List them.
+List by issue.
 
 ### External assumptions
 
-Current API documentation/capability assumptions.
+Current API documentation/capability evidence where applicable.
 
 ### Risks / follow-ups
 
 Anything intentionally deferred.
 
-## 8. Handoff to acceptance reviewer
+## 9. Handoff to acceptance reviewer
 
-Once Codex opens a PR, do not self-merge.
+At the designated checkpoint, stop and do not start the next batch.
 
-The reviewer/coordinator will evaluate:
-
-- scope compliance
-- architecture boundaries
-- data model/migrations
-- error semantics
-- idempotency/recovery
-- tests
-- security
-- observability
-- documentation
-- regressions
+The reviewer/coordinator evaluates:
+- scope compliance;
+- architecture boundaries;
+- data model/migrations;
+- error semantics;
+- idempotency/recovery;
+- tests;
+- security;
+- observability;
+- documentation;
+- regressions;
+- cross-issue integration.
 
 Review outcomes:
-
 - ACCEPTED
 - ACCEPTED WITH FOLLOW-UP
 - CHANGES REQUIRED
 - BLOCKED BY PRODUCT/API DECISION
 
-## 9. What Codex must not decide alone
+## 10. What Codex must not decide alone
 
 Requires explicit architectural/product decision:
+- adding browser automation;
+- switching primary database;
+- adding Redis/message broker;
+- splitting into microservices;
+- changing established command protocol semantics outside issue scope;
+- removing idempotency guarantees;
+- changing OAuth/security model;
+- introducing account credential/password storage;
+- bypassing official API due to convenience.
 
-- adding browser automation
-- switching primary database
-- adding Redis/message broker
-- splitting into microservices
-- changing command protocol semantics
-- removing idempotency guarantees
-- changing OAuth/security model
-- introducing account credential/password storage
-- bypassing official API due to convenience
-
-Create/propose an ADR instead.
+Propose an ADR or stop at the checkpoint instead.
