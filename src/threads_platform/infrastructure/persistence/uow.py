@@ -19,6 +19,7 @@ from threads_platform.application.ports.repositories import (
     PostRepository,
     ReplyRepository,
     SyncStateRepository,
+    WorkerAccountSessionRepository,
     WorkerCapabilityRepository,
     WorkerInterventionRepository,
     WorkerJobAttemptRepository,
@@ -40,6 +41,7 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyPostRepository,
     SQLAlchemyReplyRepository,
     SQLAlchemySyncStateRepository,
+    SQLAlchemyWorkerAccountSessionRepository,
     SQLAlchemyWorkerCapabilityRepository,
     SQLAlchemyWorkerInterventionRepository,
     SQLAlchemyWorkerJobAttemptRepository,
@@ -74,6 +76,9 @@ class SQLAlchemyUnitOfWork:
         )
         self.browser_profiles: BrowserProfileRepository = SQLAlchemyBrowserProfileRepository(
             self._session
+        )
+        self.worker_account_sessions: WorkerAccountSessionRepository = (
+            SQLAlchemyWorkerAccountSessionRepository(self._session)
         )
         self.network_profiles: NetworkProfileRepository = SQLAlchemyNetworkProfileRepository(
             self._session

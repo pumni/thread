@@ -406,18 +406,33 @@ async def test_active_execution_heartbeat_extends_the_durable_lease(
         clock=clock,
         execution_lease_duration=timedelta(milliseconds=300),
     )
-    await runtime.receive(command_body(account_id, clock))
+    receipt = await runtime.receive(command_body(account_id, clock))
 
     first_worker = asyncio.create_task(runtime.process_next())
     await handler.started.wait()
+    async with unit_of_work_factory() as unit_of_work:
+        claimed = await unit_of_work.commands.get_by_command_id(receipt.command_id)
+    assert claimed is not None
+    original_expiry = claimed.execution_lease_expires_at
+    assert original_expiry is not None
     clock.advance(timedelta(milliseconds=150))
-    await asyncio.sleep(0.12)
+    for _ in range(100):
+        async with unit_of_work_factory() as unit_of_work:
+            renewed = await unit_of_work.commands.get_by_command_id(receipt.command_id)
+        if (
+            renewed is not None
+            and renewed.execution_lease_expires_at is not None
+            and renewed.execution_lease_expires_at > original_expiry
+        ):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("the active command lease was not renewed")
     clock.advance(timedelta(milliseconds=200))
     second_worker = asyncio.create_task(runtime.process_next())
-    await asyncio.sleep(0.02)
+    second_result = await second_worker
     handler.release.set()
     first_result = await first_worker
-    second_result = await second_worker
 
     assert first_result is not None
     assert first_result.status is CommandStatus.SUCCEEDED
@@ -634,7 +649,7 @@ async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
         hostname="test-host",
         platform="windows",
         agent_version="1.0.0",
-        protocol_version=1,
+        protocol_version=2,
         capabilities_schema_version=1,
         status=WorkerStatus.ONLINE,
         last_heartbeat_at=clock.now(),

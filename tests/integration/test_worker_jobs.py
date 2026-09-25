@@ -49,6 +49,7 @@ async def add_worker(
     *,
     now: datetime,
     max_concurrent_jobs: int = 4,
+    protocol_version: int = 1,
 ) -> UUID:
     identity = worker_id or uuid4()
     worker = WorkerNode(
@@ -57,7 +58,7 @@ async def add_worker(
         hostname=f"host-{identity}",
         platform="windows",
         agent_version="1.0.0",
-        protocol_version=1,
+        protocol_version=protocol_version,
         capabilities_schema_version=1,
         status=WorkerStatus.ONLINE,
         max_concurrent_jobs=max_concurrent_jobs,
@@ -133,6 +134,24 @@ async def test_concurrent_claim_has_one_owner(
     attempts = await jobs.attempts(queued.id)
     assert len(attempts) == 1
     assert attempts[0].status is WorkerJobAttemptStatus.RUNNING
+
+
+async def test_protocol_v2_worker_can_claim_eligible_jobs(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = MutableClock()
+    worker_id = await add_worker(
+        unit_of_work_factory,
+        now=clock.now(),
+        protocol_version=2,
+    )
+    jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    queued = await jobs.enqueue("synthetic.echo", 1)
+
+    claimed = await jobs.claim_next(worker_id)
+
+    assert claimed is not None
+    assert claimed.id == queued.id
 
 
 async def test_account_affinity_and_worker_eligibility_are_enforced(

@@ -191,6 +191,20 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
         assert hello.status_code == 200
         assert hello.json()["worker_id"] == str(worker_id)
         assert hello.json()["status"] == "ONLINE"
+        assert set(hello.json()) == {
+            "worker_id",
+            "status",
+            "last_heartbeat_at",
+            "presence_expires_at",
+            "protocol_compatible",
+        }
+        heartbeat = await client.post(
+            "/v1/workers/heartbeat",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={},
+        )
+        assert heartbeat.status_code == 200
+        assert set(heartbeat.json()) == set(hello.json())
 
 
 async def test_durable_https_pull_recovers_job_without_wss_notification(

@@ -23,6 +23,7 @@ from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
     NetworkProfile,
+    WorkerAccountSession,
     WorkerAuditEvent,
     WorkerAuthChallenge,
     WorkerCapability,
@@ -164,6 +165,16 @@ class BrowserProfileRepository(Protocol):
     async def add(self, profile: BrowserProfile) -> None: ...
 
     async def get(self, worker_id: UUID, profile_ref: str) -> BrowserProfile | None: ...
+
+
+class WorkerAccountSessionRepository(Protocol):
+    async def add(self, session: WorkerAccountSession) -> None: ...
+
+    async def get_for_update(self, account_id: UUID) -> WorkerAccountSession | None: ...
+
+    async def get(self, account_id: UUID) -> WorkerAccountSession | None: ...
+
+    async def update(self, session: WorkerAccountSession) -> None: ...
 
 
 class NetworkProfileRepository(Protocol):
@@ -323,6 +334,7 @@ class UnitOfWork(Protocol):
     workers: WorkerRepository
     worker_capabilities: WorkerCapabilityRepository
     browser_profiles: BrowserProfileRepository
+    worker_account_sessions: WorkerAccountSessionRepository
     network_profiles: NetworkProfileRepository
     assignments: AccountWorkerAssignmentRepository
     worker_security: WorkerSecurityRepository

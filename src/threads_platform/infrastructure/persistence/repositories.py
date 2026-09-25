@@ -19,6 +19,7 @@ from threads_platform.application.ports.repositories import (
     PostRepository,
     ReplyRepository,
     SyncStateRepository,
+    WorkerAccountSessionRepository,
     WorkerCapabilityRepository,
     WorkerInterventionRepository,
     WorkerJobAttemptRepository,
@@ -69,8 +70,10 @@ from threads_platform.domain.worker_jobs import (
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
+    BrowserSessionState,
     NetworkProfile,
     NetworkProtocol,
+    WorkerAccountSession,
     WorkerAuditEvent,
     WorkerAuthChallenge,
     WorkerCapability,
@@ -93,6 +96,7 @@ from threads_platform.infrastructure.persistence.models import (
     PostRecord,
     ReplyRecord,
     SyncStateRecord,
+    WorkerAccountSessionRecord,
     WorkerAuditEventRecord,
     WorkerAuthChallengeRecord,
     WorkerCapabilityRecord,
@@ -1047,6 +1051,8 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
         record.public_key = worker.public_key
         record.status = worker.status
         record.max_concurrent_jobs = worker.max_concurrent_jobs
+        record.max_browser_sessions = worker.max_browser_sessions
+        record.active_browser_sessions = worker.active_browser_sessions
         record.last_heartbeat_at = worker.last_heartbeat_at
         record.presence_expires_at = worker.presence_expires_at
         record.updated_at = worker.updated_at
@@ -1074,6 +1080,8 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
             public_key=worker.public_key,
             status=worker.status,
             max_concurrent_jobs=worker.max_concurrent_jobs,
+            max_browser_sessions=worker.max_browser_sessions,
+            active_browser_sessions=worker.active_browser_sessions,
             last_heartbeat_at=worker.last_heartbeat_at,
             presence_expires_at=worker.presence_expires_at,
             created_at=worker.created_at,
@@ -1093,6 +1101,8 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
             public_key=record.public_key,
             status=WorkerStatus(record.status),
             max_concurrent_jobs=record.max_concurrent_jobs,
+            max_browser_sessions=record.max_browser_sessions,
+            active_browser_sessions=record.active_browser_sessions,
             last_heartbeat_at=record.last_heartbeat_at,
             presence_expires_at=record.presence_expires_at,
             created_at=record.created_at,
@@ -1204,6 +1214,63 @@ class SQLAlchemyBrowserProfileRepository(BrowserProfileRepository):
             display_name=record.display_name,
             metadata=record.metadata_json,
             created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyWorkerAccountSessionRepository(WorkerAccountSessionRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, session: WorkerAccountSession) -> None:
+        self._session.add(
+            WorkerAccountSessionRecord(
+                account_id=session.account_id,
+                worker_id=session.worker_id,
+                profile_ref=session.profile_ref,
+                session_id=session.session_id,
+                state=session.state,
+                intervention_required=session.requires_intervention,
+                revision=session.revision,
+                updated_at=session.updated_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get(self, account_id: UUID) -> WorkerAccountSession | None:
+        record = await self._session.get(WorkerAccountSessionRecord, account_id)
+        return self._domain(record) if record is not None else None
+
+    async def get_for_update(self, account_id: UUID) -> WorkerAccountSession | None:
+        record = await self._session.scalar(
+            select(WorkerAccountSessionRecord)
+            .where(WorkerAccountSessionRecord.account_id == account_id)
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def update(self, session: WorkerAccountSession) -> None:
+        record = await self._session.get(WorkerAccountSessionRecord, session.account_id)
+        if record is None:
+            raise LookupError(f"worker account session not found: {session.account_id}")
+        record.worker_id = session.worker_id
+        record.profile_ref = session.profile_ref
+        record.session_id = session.session_id
+        record.state = session.state
+        record.intervention_required = session.requires_intervention
+        record.revision = session.revision
+        record.updated_at = session.updated_at
+        await self._session.flush()
+
+    @staticmethod
+    def _domain(record: WorkerAccountSessionRecord) -> WorkerAccountSession:
+        return WorkerAccountSession(
+            account_id=record.account_id,
+            worker_id=record.worker_id,
+            profile_ref=record.profile_ref,
+            session_id=record.session_id,
+            state=BrowserSessionState(record.state),
+            revision=record.revision,
             updated_at=record.updated_at,
         )
 
@@ -1499,8 +1566,6 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
             raise ValueError("WorkerJob claim limit must be positive")
         if (
             worker.status is not WorkerStatus.ONLINE
-            or worker.protocol_version != 1
-            or worker.capabilities_schema_version != 1
             or worker.presence_expires_at is None
             or worker.presence_expires_at <= occurred_at
         ):

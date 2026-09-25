@@ -4,7 +4,9 @@
 
 Define the Control Plane <-> Worker Agent contract for C1.
 
-This protocol intentionally excludes browser-specific commands and DOM selectors.
+This protocol intentionally excludes browser-specific commands and DOM selectors. Protocol
+version 1 remains supported; the additive C3-01 session/capacity extension uses protocol
+version 2 with capability schema version 1.
 
 ## 2. Principles
 
@@ -54,6 +56,16 @@ Security requirements:
 - enrollment token is one-time and expiring;
 - replayed challenge response must fail.
 
+### C3-01 device storage binding
+
+The persistent Windows Worker Agent stores the locally generated Ed25519 PKCS#8 private key
+only after protecting it with Windows DPAPI `CryptProtectData` for the current user. The
+worker-specific UUID is included as optional entropy. The on-disk envelope has a fixed
+version marker; DPAPI or key-decoding failure is closed as an identity-store error. It never
+creates a replacement key over unreadable existing material. Linux contract tests inject a
+fake protector. Only the raw public key is enrolled; runtime code receives signing and public
+key operations through `WorkerDeviceIdentity`.
+
 Exact algorithms/key storage must be documented in the implementation PR and security-reviewed.
 
 ### C1 implementation binding
@@ -76,8 +88,9 @@ Exact algorithms/key storage must be documented in the implementation PR and sec
 - Worker HTTPS and WSS routes reject non-TLS ASGI schemes by default. TLS terminates at the
   trusted deployment ingress. Workers must retain normal certificate verification. WSS
   authenticates with the `Authorization: Bearer` header, never a query parameter.
-- C1 supports protocol version 1 and capability schema version 1. Unsupported versions put
-  the worker in `UPGRADE_REQUIRED`. Heartbeat presence expires after 90 seconds and the
+- C1 supports protocol version 1, and C3-01 adds protocol version 2 while retaining capability
+  schema version 1. Unsupported versions put the worker in `UPGRADE_REQUIRED`. Heartbeat
+  presence expires after 90 seconds and the
   Control Plane marks stale ONLINE/DEGRADED workers OFFLINE. WSS notifications are process
   local and advisory; workers recover from PostgreSQL-backed HTTPS operations.
 
@@ -174,6 +187,8 @@ Logical operations, independent of exact route naming:
 - request intervention
 - resolve/requeue intervention
 - reconcile active jobs after reconnect
+- fetch the active account assignment and logical profile/network routing context
+- report account browser-session state and revision
 
 All state-mutating job requests require:
 - authenticated worker_id;
@@ -303,6 +318,25 @@ Incompatible worker:
 - status -> UPGRADE_REQUIRED/DEGRADED;
 - receives no incompatible job.
 
+### Protocol v2 additive extension (C3-01)
+
+- Version 1 remains accepted with its original hello and heartbeat fields.
+- Version 2 keeps capability schema version 1 and adds `max_browser_sessions` and
+  `active_browser_sessions` to hello; heartbeat carries the current active count.
+- Presence responses include capacity fields for protocol v2; protocol v1 keeps its original
+  response shape.
+- The Control Plane stores aggregate capacity on `WorkerNode`. Values contain no account
+  identifiers, paths, or secrets, and active sessions cannot exceed the advertised maximum.
+- `GET /v1/workers/accounts/{account_id}/context` returns only the authenticated worker's
+  active account assignment, logical `profile_ref`, and account-scoped routing metadata.
+- `PUT /v1/workers/accounts/{account_id}/session` persists session UUID, state, and a
+  monotonic revision after checking current worker/account/profile affinity. Login, expired
+  session, and challenge states are explicitly marked as requiring operator intervention.
+  Repeating an identical report revision is idempotent so reconnect can finish an ambiguous
+  response; a conflicting or older revision is rejected.
+- Both endpoints use the short-lived bearer session over HTTPS. WSS remains advisory and is
+  not the source of durable session or capacity state.
+
 ## 17. Test matrix
 
 C1 must test:
@@ -323,3 +357,4 @@ C1 must test:
 - Control Plane restart;
 - worker reconnect/reconcile;
 - WebSocket notification loss with successful HTTPS/pull recovery.
+- protocol v1 compatibility and protocol v2 capacity/session reporting.

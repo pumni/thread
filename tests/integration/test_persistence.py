@@ -45,6 +45,7 @@ async def test_initial_migration_creates_all_persistence_tables(db_session: Asyn
         "worker_enrollments",
         "worker_auth_challenges",
         "worker_sessions",
+        "worker_account_sessions",
         "worker_audit_events",
         "browser_profiles",
         "network_profiles",

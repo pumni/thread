@@ -12,6 +12,7 @@ from threads_platform.application.ports.threads import ThreadsAccessTokenProvide
 from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.application.worker_notifications import WorkerNotificationHub
+from threads_platform.application.worker_sessions import WorkerSessionService
 from threads_platform.config.settings import Settings, get_settings
 from threads_platform.infrastructure.persistence.database import (
     create_database_engine,
@@ -39,6 +40,7 @@ def create_app(
     threads_api_gateway: ThreadsAPI | None = None,
     worker_control_service: WorkerControlService | None = None,
     worker_job_service: WorkerJobService | None = None,
+    worker_session_service: WorkerSessionService | None = None,
     worker_notifications: WorkerNotificationHub | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
@@ -47,9 +49,13 @@ def create_app(
     http_client = None
     resolved_worker_service = worker_control_service
     resolved_job_service = worker_job_service
+    resolved_session_service = worker_session_service
     notifications = worker_notifications or WorkerNotificationHub()
     if resolved_settings.database_url is not None and (
-        command_runtime is None or resolved_worker_service is None or resolved_job_service is None
+        command_runtime is None
+        or resolved_worker_service is None
+        or resolved_job_service is None
+        or resolved_session_service is None
     ):
         engine = create_database_engine(resolved_settings.database_url)
         session_factory = create_session_factory(engine)
@@ -80,6 +86,8 @@ def create_app(
             )
         if resolved_worker_service is None:
             resolved_worker_service = WorkerControlService(unit_of_work_factory)
+        if resolved_session_service is None:
+            resolved_session_service = WorkerSessionService(unit_of_work_factory)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
@@ -128,6 +136,7 @@ def create_app(
             BearerTokenAuthenticator(resolved_settings.worker_admin_token),
             notifications,
             resolved_job_service,
+            resolved_session_service,
         )
     )
 

@@ -111,8 +111,8 @@ async def test_worker_enrollment_authentication_protocol_and_presence(
 
     incompatible = await service.hello(
         worker_id,
-        protocol_version=2,
-        agent_version="2.0.0",
+        protocol_version=3,
+        agent_version="3.0.0",
         capabilities_schema_version=1,
         capabilities=[WorkerCapability(worker_id, "synthetic.echo", 1)],
     )
@@ -127,12 +127,29 @@ async def test_worker_enrollment_authentication_protocol_and_presence(
         capabilities=[WorkerCapability(worker_id, "synthetic.echo", 1)],
     )
     assert compatible.status is WorkerStatus.ONLINE
-    degraded = await service.heartbeat(worker_id, healthy=False)
+
+    protocol_v2 = await service.hello(
+        worker_id,
+        protocol_version=2,
+        agent_version="2.0.0",
+        capabilities_schema_version=1,
+        capabilities=[WorkerCapability(worker_id, "synthetic.echo", 1)],
+        max_browser_sessions=4,
+        active_browser_sessions=2,
+    )
+    assert protocol_v2.status is WorkerStatus.ONLINE
+    assert protocol_v2.protocol_compatible
+    assert protocol_v2.max_browser_sessions == 4
+    assert protocol_v2.active_browser_sessions == 2
+    with pytest.raises(WorkerControlError, match="BROWSER_CAPACITY_SUMMARY_REQUIRED"):
+        await service.heartbeat(worker_id)
+
+    degraded = await service.heartbeat(worker_id, healthy=False, active_browser_sessions=2)
     assert degraded.status is WorkerStatus.DEGRADED
 
     clock.advance(timedelta(seconds=11))
     assert await service.expire_presence() == 1
-    recovered = await service.heartbeat(worker_id)
+    recovered = await service.heartbeat(worker_id, active_browser_sessions=2)
     assert recovered.status is WorkerStatus.ONLINE
     clock.advance(timedelta(seconds=9))
     assert await service.authenticate(session.access_token) is None

@@ -6,6 +6,10 @@ from uuid import UUID
 
 from threads_platform.application.clock import Clock, SystemClock
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
+from threads_platform.application.worker_protocol import (
+    SUPPORTED_CAPABILITY_SCHEMA_VERSION,
+    is_worker_protocol_supported,
+)
 from threads_platform.domain.time import normalize_utc
 from threads_platform.domain.workers import (
     WorkerAuditEvent,
@@ -20,9 +24,6 @@ from threads_platform.infrastructure.security.worker_auth import (
     challenge_message,
     verify_worker_signature,
 )
-
-SUPPORTED_WORKER_PROTOCOL_VERSION = 1
-SUPPORTED_CAPABILITY_SCHEMA_VERSION = 1
 
 
 class WorkerControlError(ValueError):
@@ -68,6 +69,8 @@ class WorkerPresence:
     last_heartbeat_at: datetime
     presence_expires_at: datetime
     protocol_compatible: bool
+    max_browser_sessions: int | None = None
+    active_browser_sessions: int | None = None
 
 
 class WorkerControlService:
@@ -118,6 +121,7 @@ class WorkerControlService:
         platform: str,
         public_key: bytes,
         max_concurrent_jobs: int = 1,
+        max_browser_sessions: int = 1,
     ) -> EnrolledWorker:
         if len(public_key) != 32:
             raise WorkerControlError("INVALID_PUBLIC_KEY")
@@ -140,6 +144,7 @@ class WorkerControlService:
                     platform=platform,
                     public_key=public_key,
                     max_concurrent_jobs=max_concurrent_jobs,
+                    max_browser_sessions=max_browser_sessions,
                     status=WorkerStatus.REGISTERING,
                     created_at=now,
                     updated_at=now,
@@ -283,20 +288,31 @@ class WorkerControlService:
         hostname: str | None = None,
         platform: str | None = None,
         max_concurrent_jobs: int | None = None,
+        max_browser_sessions: int | None = None,
+        active_browser_sessions: int | None = None,
         healthy: bool = True,
         access_token: str | None = None,
     ) -> WorkerPresence:
         now = normalize_utc(self._clock.now())
-        compatible = (
-            protocol_version == SUPPORTED_WORKER_PROTOCOL_VERSION
-            and capabilities_schema_version == SUPPORTED_CAPABILITY_SCHEMA_VERSION
-        )
+        if protocol_version == 2 and (
+            max_browser_sessions is None or active_browser_sessions is None
+        ):
+            raise WorkerControlError("BROWSER_CAPACITY_SUMMARY_REQUIRED")
+        compatible = is_worker_protocol_supported(protocol_version, capabilities_schema_version)
         async with self._unit_of_work_factory() as unit_of_work:
             if access_token is not None:
                 await self._require_active_access_token(unit_of_work, worker_id, access_token, now)
             worker = await unit_of_work.workers.get_for_update(worker_id)
             if worker is None:
                 raise WorkerControlError("WORKER_NOT_FOUND")
+            reported_max = max_browser_sessions or worker.max_browser_sessions
+            reported_active = (
+                active_browser_sessions
+                if active_browser_sessions is not None
+                else worker.active_browser_sessions
+            )
+            if reported_active > reported_max:
+                raise WorkerControlError("BROWSER_SESSION_CAPACITY_EXCEEDED")
             if display_name is not None:
                 worker.display_name = display_name
             if hostname is not None:
@@ -305,6 +321,16 @@ class WorkerControlService:
                 worker.platform = platform
             if max_concurrent_jobs is not None:
                 worker.max_concurrent_jobs = max_concurrent_jobs
+            if max_browser_sessions is not None:
+                if max_browser_sessions < 1:
+                    raise WorkerControlError("INVALID_BROWSER_SESSION_CAPACITY")
+                worker.max_browser_sessions = max_browser_sessions
+            if active_browser_sessions is not None:
+                if active_browser_sessions < 0:
+                    raise WorkerControlError("INVALID_ACTIVE_BROWSER_SESSIONS")
+                if active_browser_sessions > worker.max_browser_sessions:
+                    raise WorkerControlError("BROWSER_SESSION_CAPACITY_EXCEEDED")
+                worker.active_browser_sessions = active_browser_sessions
             worker.protocol_version = protocol_version
             worker.agent_version = agent_version
             worker.capabilities_schema_version = capabilities_schema_version
@@ -332,6 +358,10 @@ class WorkerControlService:
             last_heartbeat_at=now,
             presence_expires_at=worker.presence_expires_at,
             protocol_compatible=compatible,
+            max_browser_sessions=worker.max_browser_sessions if protocol_version == 2 else None,
+            active_browser_sessions=worker.active_browser_sessions
+            if protocol_version == 2
+            else None,
         )
 
     async def heartbeat(
@@ -339,6 +369,7 @@ class WorkerControlService:
         worker_id: UUID,
         *,
         healthy: bool = True,
+        active_browser_sessions: int | None = None,
         access_token: str | None = None,
     ) -> WorkerPresence:
         now = normalize_utc(self._clock.now())
@@ -348,11 +379,18 @@ class WorkerControlService:
             worker = await unit_of_work.workers.get_for_update(worker_id)
             if worker is None:
                 raise WorkerControlError("WORKER_NOT_FOUND")
+            if worker.protocol_version == 2 and active_browser_sessions is None:
+                raise WorkerControlError("BROWSER_CAPACITY_SUMMARY_REQUIRED")
             worker.last_heartbeat_at = now
             worker.presence_expires_at = now + self._presence_ttl
-            compatible = (
-                worker.protocol_version == SUPPORTED_WORKER_PROTOCOL_VERSION
-                and worker.capabilities_schema_version == SUPPORTED_CAPABILITY_SCHEMA_VERSION
+            if active_browser_sessions is not None:
+                if active_browser_sessions < 0:
+                    raise WorkerControlError("INVALID_ACTIVE_BROWSER_SESSIONS")
+                if active_browser_sessions > worker.max_browser_sessions:
+                    raise WorkerControlError("BROWSER_SESSION_CAPACITY_EXCEEDED")
+                worker.active_browser_sessions = active_browser_sessions
+            compatible = is_worker_protocol_supported(
+                worker.protocol_version, worker.capabilities_schema_version
             )
             if not compatible:
                 worker.status = WorkerStatus.UPGRADE_REQUIRED
@@ -374,6 +412,12 @@ class WorkerControlService:
             last_heartbeat_at=now,
             presence_expires_at=worker.presence_expires_at,
             protocol_compatible=compatible,
+            max_browser_sessions=(
+                worker.max_browser_sessions if worker.protocol_version == 2 else None
+            ),
+            active_browser_sessions=(
+                worker.active_browser_sessions if worker.protocol_version == 2 else None
+            ),
         )
 
     async def expire_presence(self) -> int:

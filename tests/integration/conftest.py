@@ -62,7 +62,8 @@ async def unit_of_work_factory() -> AsyncIterator[SQLAlchemyUnitOfWorkFactory]:
             text(
                 "TRUNCATE TABLE worker_interventions, worker_job_attempts, worker_jobs, "
                 "command_route_decisions, account_execution_leases, "
-                "worker_audit_events, worker_sessions, worker_auth_challenges, "
+                "worker_audit_events, worker_account_sessions, worker_sessions, "
+                "worker_auth_challenges, "
                 "worker_enrollments, worker_capabilities, browser_profiles, "
                 "account_worker_assignments, network_profiles, worker_nodes, "
                 "integration_deliveries, outbox_events, "

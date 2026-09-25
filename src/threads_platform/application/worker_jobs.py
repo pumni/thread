@@ -8,6 +8,7 @@ from threads_platform.application.commands.results import enqueue_command_result
 from threads_platform.application.errors import CommandNotFound
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.application.worker_notifications import WorkerNotificationHub
+from threads_platform.application.worker_protocol import is_worker_protocol_supported
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
 from threads_platform.domain.commands import Command, CommandStatus
@@ -579,8 +580,9 @@ class WorkerJobService:
     def _eligible(worker: WorkerNode, now: datetime) -> bool:
         return (
             worker.status is WorkerStatus.ONLINE
-            and worker.protocol_version == 1
-            and worker.capabilities_schema_version == 1
+            and is_worker_protocol_supported(
+                worker.protocol_version, worker.capabilities_schema_version
+            )
             and worker.presence_expires_at is not None
             and worker.presence_expires_at > now
         )
