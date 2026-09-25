@@ -1,6 +1,6 @@
 # Project State Handoff — 2026-09-25
 
-This is the first document a new coordinator or Codex session should read.
+After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
 ## 1. Repository
 
@@ -155,11 +155,12 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 
 ## 9. Next action for a new coordinator
 
-1. Read all source-of-truth docs.
+1. Read root `AGENTS.md` and this handoff.
 2. Inspect the C1 GitHub issues listed in WORK_BREAKDOWN.md.
-3. Confirm main/CI state before handoff.
-4. Hand Codex only the authorized C1 batch.
-5. Review at the C1 checkpoint before Browser Runtime work begins.
+3. Use `docs/CONTEXT_MAP.md` to load the C1-specific architecture/protocol/ADR context.
+4. Confirm main/CI state before handoff.
+5. Hand Codex only the authorized C1 batch.
+6. Review at the C1 checkpoint before Browser Runtime work begins.
 
 Do not ask Codex to implement Playwright/Selenium in C1.
 
