@@ -1,4 +1,4 @@
-# Project State Handoff — 2026-09-25
+# Project State Handoff — 2026-09-26
 
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
@@ -21,9 +21,15 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-The next authorized implementation milestone is **C5-01 — Browser capability pack v1 (#27)**.
+The current checkpoint is **C5-01 — Browser capability pack v1 (#27)** on
+`batch/c5-01-browser-capability-pack`. The four approved capability contracts are
+declared, but all remain blocked pending reviewed production Threads UI evidence;
+no production selectors or browser workflows were added. See
+`docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` and its checkpoint PR for evidence.
 
-Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or production release work until the coordinator explicitly authorizes the corresponding checkpoint.
+Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
+production release work until the coordinator explicitly authorizes the
+corresponding checkpoint.
 
 ## 3. Important merged checkpoints
 
@@ -193,7 +199,9 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Authorize only C5-01: explicit browser capability contracts and the first reviewed capability pack.
+4. Review the C5-01 checkpoint PR. All four capabilities currently report
+   `BROWSER_UI_EVIDENCE_REQUIRED`; review or provide scrubbed observed evidence
+   before any production capability is enabled.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Stop after #27 for coordinator review before #28 AccountActivityPlan/preemption.
 

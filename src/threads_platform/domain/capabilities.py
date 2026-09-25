@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -56,6 +57,7 @@ class BusinessCapabilityPolicy:
     fallback_safety: FallbackSafety = FallbackSafety.NEVER
     worker_capability_name: str | None = None
     worker_capability_version: int | None = None
+    blocked_reason_code: str | None = None
 
     def __post_init__(self) -> None:
         if not self.command_type.strip() or not self.capability_name.strip():
@@ -66,6 +68,11 @@ class BusinessCapabilityPolicy:
             raise ValueError("worker capability name and version must be set together")
         if self.worker_capability_version is not None and self.worker_capability_version < 1:
             raise ValueError("worker capability version must be positive")
+        if (
+            self.blocked_reason_code is not None
+            and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", self.blocked_reason_code) is None
+        ):
+            raise ValueError("blocked capability reason must be a bounded code")
         if self.fallback_executor is self.preferred_executor:
             raise ValueError("fallback executor must differ from the preferred executor")
         if self.fallback_executor is not None and self.fallback_safety is FallbackSafety.NEVER:

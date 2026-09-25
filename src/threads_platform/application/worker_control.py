@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
+from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.clock import Clock, SystemClock
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.application.worker_protocol import (
@@ -83,6 +84,7 @@ class WorkerControlService:
         challenge_ttl: timedelta = timedelta(minutes=1),
         session_ttl: timedelta = timedelta(minutes=15),
         presence_ttl: timedelta = timedelta(seconds=90),
+        capability_router: CapabilityRouter | None = None,
     ) -> None:
         self._unit_of_work_factory = unit_of_work_factory
         self._clock = clock or SystemClock()
@@ -90,6 +92,7 @@ class WorkerControlService:
         self._challenge_ttl = challenge_ttl
         self._session_ttl = session_ttl
         self._presence_ttl = presence_ttl
+        self._capability_router = capability_router or CapabilityRouter()
 
     async def create_enrollment(self, created_by: str = "operator") -> EnrollmentIssued:
         now = normalize_utc(self._clock.now())
@@ -298,6 +301,11 @@ class WorkerControlService:
             max_browser_sessions is None or active_browser_sessions is None
         ):
             raise WorkerControlError("BROWSER_CAPACITY_SUMMARY_REQUIRED")
+        if any(
+            not self._capability_router.worker_capability_advertisement_allowed(capability.name)
+            for capability in capabilities
+        ):
+            raise WorkerControlError("WORKER_ADVERTISED_BLOCKED_CAPABILITY")
         compatible = is_worker_protocol_supported(protocol_version, capabilities_schema_version)
         async with self._unit_of_work_factory() as unit_of_work:
             if access_token is not None:
