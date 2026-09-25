@@ -44,6 +44,10 @@ Coordination:
 Batch B:
 - PR #20 — Threads publishing + conversation sync.
 
+Distributed-hybrid rebaseline:
+- PR #29 — v2 architecture, Worker Protocol v1, C1-C6 roadmap and fresh-session handoffs.
+- Merge commit: cb675e5109fb04d91ceaf7b81f83f34d5673a849.
+
 ## 4. Current open gates
 
 ### Issue #1 — historical credential status
@@ -130,6 +134,8 @@ uv run pytest
 ~~~
 
 At the end of Batch B, CI and Secret scan were green.
+
+The v2 planning rebaseline PR #29 also passed CI and Secret scan before merge.
 
 ## 8. Threads API baseline
 
