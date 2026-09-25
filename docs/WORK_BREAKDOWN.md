@@ -9,10 +9,11 @@ Completed:
 - Batch B PR #20.
 - C1 PR #32 — issues #21, #22, #23 accepted and merged.
 - C2 PR #33 — issue #24 accepted and merged.
+- C3-01 PR #34 — issue #25 accepted and merged.
 
 Current authorized implementation checkpoint:
-- **C3-01 — Windows Worker Agent / profile-session foundation**
-  - #25 only
+- **C3-02 — Browser engine ADR + fail-closed adapter foundation**
+  - #26 only
 
 Issue #3 remains a production/release gate.
 
@@ -104,8 +105,8 @@ No browser business action is implemented here.
 ## 6. C3 — Windows Browser Worker Foundation
 
 Order:
-1. #25 Worker Agent/profile/session/network foundation — **CURRENT AUTHORIZED ITEM**.
-2. #26 browser engine ADR + fail-closed adapter — not authorized until #25 is reviewed.
+1. #25 Worker Agent/profile/session/network foundation — **ACCEPTED / MERGED** in PR #34, merge commit `6b9984fecf7167ce02389be9bd935983f8ab7f1d`.
+2. #26 browser engine ADR + fail-closed adapter — **CURRENT AUTHORIZED ITEM**.
 
 C3 establishes infrastructure only.
 
