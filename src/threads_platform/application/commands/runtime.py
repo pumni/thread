@@ -56,6 +56,14 @@ KNOWN_COMMAND_TYPES = frozenset(
         "threads.publish_carousel",
         "threads.create_reply",
         "threads.sync_conversation",
+        "threads.discovery.create_campaign",
+        "threads.discovery.complete_campaign",
+        "threads.discovery.search",
+        "threads.discovery.profile",
+        "threads.discovery.mentions",
+        "threads.discovery.conversation",
+        "threads.discovery.resume",
+        "threads.discovery.lead_status",
         "threads.moderate_reply",
     }
 )

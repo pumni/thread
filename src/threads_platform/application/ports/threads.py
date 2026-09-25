@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import SecretStr
+
+from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 
 MediaType = Literal["TEXT", "IMAGE", "VIDEO", "CAROUSEL"]
 
@@ -63,6 +65,35 @@ class ReplyPage:
     has_more: bool
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteDiscoveryThread:
+    remote_thread_id: str
+    author_remote_id: str | None
+    username: str | None
+    text: str | None
+    permalink: str | None
+    media_type: str | None
+    timestamp: datetime | None
+    is_quote_post: bool | None
+    has_replies: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class RemotePublicProfile:
+    remote_author_id: str
+    username: str
+    display_name: str | None
+    biography: str | None
+    profile_picture_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryPage:
+    threads: tuple[RemoteDiscoveryThread, ...]
+    next_cursor: str | None
+    has_more: bool
+
+
 class ThreadsAPIError(Exception):
     """A sanitized Threads API failure. Response bodies are never attached."""
 
@@ -102,6 +133,35 @@ class ThreadsAPI(Protocol):
     async def get_conversation(
         self, token: SecretStr, thread_id: str, after: str | None
     ) -> ReplyPage: ...
+
+    async def search_threads(
+        self,
+        token: SecretStr,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage: ...
+
+    async def get_public_profile(self, token: SecretStr, username: str) -> RemotePublicProfile: ...
+
+    async def get_profile_posts(
+        self, token: SecretStr, username: str, *, after: str | None, limit: int
+    ) -> DiscoveryPage: ...
+
+    async def get_mentions(
+        self,
+        token: SecretStr,
+        *,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage: ...
 
     async def manage_reply(self, token: SecretStr, reply_id: str, *, hide: bool) -> None: ...
 

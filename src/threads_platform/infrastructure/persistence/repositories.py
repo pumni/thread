@@ -1,7 +1,8 @@
+import hashlib
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, delete, exists, func, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +14,7 @@ from threads_platform.application.ports.repositories import (
     CommandAttemptRepository,
     CommandRepository,
     CommandRouteDecisionRepository,
+    DiscoveryRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
     OutboxEventRepository,
@@ -48,6 +50,20 @@ from threads_platform.domain.commands import (
     Command,
     CommandAttempt,
     CommandStatus,
+)
+from threads_platform.domain.discovery import (
+    DiscoveredAuthor,
+    DiscoveredThread,
+    DiscoveryCampaign,
+    DiscoveryEnrichmentStatus,
+    DiscoveryEvidenceSource,
+    DiscoveryRun,
+    DiscoveryRunCursor,
+    DiscoverySourceEvidence,
+    LeadCandidate,
+    LeadCandidateEvidence,
+    LeadCandidateTransition,
+    SearchQuery,
 )
 from threads_platform.domain.outbox import (
     DeliveryStatus,
@@ -90,11 +106,21 @@ from threads_platform.infrastructure.persistence.models import (
     CommandAttemptRecord,
     CommandRecord,
     CommandRouteDecisionRecord,
+    DiscoveredAuthorRecord,
+    DiscoveredThreadRecord,
+    DiscoveryCampaignRecord,
+    DiscoveryRunCursorRecord,
+    DiscoveryRunRecord,
+    DiscoverySourceEvidenceRecord,
     IntegrationDeliveryRecord,
+    LeadCandidateEvidenceRecord,
+    LeadCandidateRecord,
+    LeadCandidateTransitionRecord,
     NetworkProfileRecord,
     OutboxEventRecord,
     PostRecord,
     ReplyRecord,
+    SearchQueryRecord,
     SyncStateRecord,
     WorkerAccountSessionRecord,
     WorkerAuditEventRecord,
@@ -698,6 +724,17 @@ class SQLAlchemyReplyRepository(ReplyRepository):
         )
         return [self._domain(record) for record in records]
 
+    async def list_for_discovered_thread(
+        self, account_id: UUID, discovered_thread_id: UUID
+    ) -> list[ThreadReply]:
+        records = await self._session.scalars(
+            select(ReplyRecord).where(
+                ReplyRecord.account_id == account_id,
+                ReplyRecord.discovered_thread_id == discovered_thread_id,
+            )
+        )
+        return [self._domain(record) for record in records]
+
     @staticmethod
     def _values(reply: ThreadReply) -> dict[str, object]:
         return {
@@ -705,6 +742,7 @@ class SQLAlchemyReplyRepository(ReplyRepository):
             "account_id": reply.account_id,
             "threads_reply_id": reply.threads_reply_id,
             "root_post_id": reply.root_post_id,
+            "discovered_thread_id": reply.discovered_thread_id,
             "parent_reply_id": reply.parent_reply_id,
             "text": reply.text,
             "replied_at": reply.replied_at,
@@ -719,9 +757,575 @@ class SQLAlchemyReplyRepository(ReplyRepository):
             threads_reply_id=record.threads_reply_id,
             root_post_id=record.root_post_id,
             parent_reply_id=record.parent_reply_id,
+            discovered_thread_id=record.discovered_thread_id,
             text=record.text,
             replied_at=record.replied_at,
             created_at=record.created_at,
+        )
+
+
+class SQLAlchemyDiscoveryRepository(DiscoveryRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_campaign(self, campaign: DiscoveryCampaign) -> None:
+        self._session.add(
+            DiscoveryCampaignRecord(
+                id=campaign.id,
+                account_id=campaign.account_id,
+                name=campaign.name,
+                status=campaign.status,
+                created_at=campaign.created_at,
+                updated_at=campaign.updated_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_campaign(self, campaign_id: UUID) -> DiscoveryCampaign | None:
+        record = await self._session.get(DiscoveryCampaignRecord, campaign_id)
+        return self._campaign_domain(record) if record is not None else None
+
+    async def get_campaign_for_update(self, campaign_id: UUID) -> DiscoveryCampaign | None:
+        record = await self._session.scalar(
+            select(DiscoveryCampaignRecord)
+            .where(DiscoveryCampaignRecord.id == campaign_id)
+            .with_for_update()
+        )
+        return self._campaign_domain(record) if record is not None else None
+
+    async def update_campaign(self, campaign: DiscoveryCampaign) -> None:
+        record = await self._session.get(DiscoveryCampaignRecord, campaign.id)
+        if record is None:
+            raise LookupError("discovery campaign not found")
+        record.name = campaign.name
+        record.status = campaign.status
+        record.updated_at = campaign.updated_at
+        await self._session.flush()
+
+    async def get_or_create_query(self, query: SearchQuery) -> SearchQuery:
+        fingerprint = hashlib.sha256(query.identity_key().encode("utf-8")).hexdigest()
+        statement = (
+            postgres_insert(SearchQueryRecord)
+            .values(
+                id=query.id,
+                campaign_id=query.campaign_id,
+                kind=query.kind,
+                query_text=query.query_text,
+                search_mode=query.search_mode,
+                search_type=query.search_type,
+                username=query.username,
+                thread_remote_id=query.thread_remote_id,
+                since=query.since,
+                until=query.until,
+                query_fingerprint=fingerprint,
+                created_at=query.created_at,
+            )
+            .on_conflict_do_nothing(constraint="uq_discovery_query_identity")
+            .returning(SearchQueryRecord.id)
+        )
+        query_id = await self._session.scalar(statement)
+        record = await self._session.get(SearchQueryRecord, query_id) if query_id else None
+        if record is None:
+            record = await self._session.scalar(
+                select(SearchQueryRecord).where(
+                    SearchQueryRecord.campaign_id == query.campaign_id,
+                    SearchQueryRecord.query_fingerprint == fingerprint,
+                )
+            )
+        if record is None:
+            raise RuntimeError("discovery query disappeared after upsert")
+        return self._query_domain(record)
+
+    async def get_query(self, query_id: UUID) -> SearchQuery | None:
+        record = await self._session.get(SearchQueryRecord, query_id)
+        return self._query_domain(record) if record is not None else None
+
+    async def add_run_if_absent(self, run: DiscoveryRun) -> bool:
+        statement = (
+            postgres_insert(DiscoveryRunRecord)
+            .values(**self._run_values(run))
+            .on_conflict_do_nothing(constraint="uq_discovery_runs_command_id")
+            .returning(DiscoveryRunRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
+
+    async def get_run(self, run_id: UUID) -> DiscoveryRun | None:
+        record = await self._session.get(DiscoveryRunRecord, run_id)
+        return self._run_domain(record) if record is not None else None
+
+    async def get_run_for_update(self, run_id: UUID) -> DiscoveryRun | None:
+        record = await self._session.scalar(
+            select(DiscoveryRunRecord).where(DiscoveryRunRecord.id == run_id).with_for_update()
+        )
+        return self._run_domain(record) if record is not None else None
+
+    async def get_run_by_command_id(self, command_id: str) -> DiscoveryRun | None:
+        record = await self._session.scalar(
+            select(DiscoveryRunRecord).where(DiscoveryRunRecord.command_id == command_id)
+        )
+        return self._run_domain(record) if record is not None else None
+
+    async def update_run(self, run: DiscoveryRun) -> None:
+        record = await self._session.get(DiscoveryRunRecord, run.id)
+        if record is None:
+            raise LookupError("discovery run not found")
+        record.status = run.status
+        record.cursor = run.cursor
+        record.profile_lookup_complete = run.profile_lookup_complete
+        record.pages_processed = run.pages_processed
+        record.items_processed = run.items_processed
+        record.items_skipped = run.items_skipped
+        record.error_code = run.error_code
+        record.updated_at = run.updated_at
+        record.finished_at = run.finished_at
+        await self._session.flush()
+
+    async def add_run_cursor(self, cursor: DiscoveryRunCursor) -> bool:
+        statement = (
+            postgres_insert(DiscoveryRunCursorRecord)
+            .values(
+                id=cursor.id,
+                run_id=cursor.run_id,
+                cursor_digest=cursor.cursor_digest,
+                page_number=cursor.page_number,
+            )
+            .on_conflict_do_nothing(constraint="uq_discovery_run_cursor_digest")
+            .returning(DiscoveryRunCursorRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
+
+    async def upsert_author(self, author: DiscoveredAuthor) -> DiscoveredAuthor:
+        statement = postgres_insert(DiscoveredAuthorRecord).values(**self._author_values(author))
+        excluded = statement.excluded
+        statement = statement.on_conflict_do_update(
+            constraint="uq_discovered_authors_remote_id",
+            set_={
+                "username": excluded.username,
+                "display_name": func.coalesce(
+                    excluded.display_name, DiscoveredAuthorRecord.display_name
+                ),
+                "biography": func.coalesce(excluded.biography, DiscoveredAuthorRecord.biography),
+                "profile_picture_url": func.coalesce(
+                    excluded.profile_picture_url, DiscoveredAuthorRecord.profile_picture_url
+                ),
+                "enrichment_status": case(
+                    (
+                        excluded.enrichment_status == DiscoveryEnrichmentStatus.ENRICHED,
+                        DiscoveryEnrichmentStatus.ENRICHED,
+                    ),
+                    else_=DiscoveredAuthorRecord.enrichment_status,
+                ),
+                "last_enriched_at": func.coalesce(
+                    excluded.last_enriched_at, DiscoveredAuthorRecord.last_enriched_at
+                ),
+                "updated_at": excluded.updated_at,
+            },
+        )
+        await self._session.execute(statement)
+        record = await self._session.scalar(
+            select(DiscoveredAuthorRecord).where(
+                DiscoveredAuthorRecord.remote_author_id == author.remote_author_id
+            )
+        )
+        if record is None:
+            raise RuntimeError("discovered author disappeared after upsert")
+        return self._author_domain(record)
+
+    async def get_author_by_remote_id(self, remote_author_id: str) -> DiscoveredAuthor | None:
+        record = await self._session.scalar(
+            select(DiscoveredAuthorRecord).where(
+                DiscoveredAuthorRecord.remote_author_id == remote_author_id
+            )
+        )
+        return self._author_domain(record) if record is not None else None
+
+    async def get_author_by_username(self, username: str) -> DiscoveredAuthor | None:
+        record = await self._session.scalar(
+            select(DiscoveredAuthorRecord)
+            .where(DiscoveredAuthorRecord.username == username)
+            .order_by(DiscoveredAuthorRecord.created_at, DiscoveredAuthorRecord.id)
+            .limit(1)
+        )
+        return self._author_domain(record) if record is not None else None
+
+    async def get_profile_author_for_run(self, run_id: UUID) -> DiscoveredAuthor | None:
+        record = await self._session.scalar(
+            select(DiscoveredAuthorRecord)
+            .join(
+                DiscoverySourceEvidenceRecord,
+                DiscoverySourceEvidenceRecord.author_id == DiscoveredAuthorRecord.id,
+            )
+            .where(
+                DiscoverySourceEvidenceRecord.run_id == run_id,
+                DiscoverySourceEvidenceRecord.source
+                == DiscoveryEvidenceSource.PUBLIC_PROFILE_LOOKUP,
+            )
+            .limit(1)
+        )
+        return self._author_domain(record) if record is not None else None
+
+    async def attach_author_to_threads_by_username(self, username: str, author_id: UUID) -> None:
+        await self._session.execute(
+            update(DiscoveredThreadRecord)
+            .where(
+                DiscoveredThreadRecord.username == username,
+                DiscoveredThreadRecord.author_id.is_(None),
+            )
+            .values(author_id=author_id, updated_at=func.now())
+        )
+        await self._session.flush()
+
+    async def list_evidence_for_author(self, account_id: UUID, author_id: UUID) -> list[UUID]:
+        records = await self._session.scalars(
+            select(DiscoverySourceEvidenceRecord.id)
+            .join(
+                DiscoveryRunRecord,
+                DiscoverySourceEvidenceRecord.run_id == DiscoveryRunRecord.id,
+            )
+            .outerjoin(
+                DiscoveredThreadRecord,
+                DiscoverySourceEvidenceRecord.thread_id == DiscoveredThreadRecord.id,
+            )
+            .where(
+                DiscoveryRunRecord.account_id == account_id,
+                or_(
+                    DiscoverySourceEvidenceRecord.author_id == author_id,
+                    DiscoveredThreadRecord.author_id == author_id,
+                ),
+            )
+            .distinct()
+        )
+        return list(records)
+
+    async def upsert_thread(self, thread: DiscoveredThread) -> DiscoveredThread:
+        statement = postgres_insert(DiscoveredThreadRecord).values(**self._thread_values(thread))
+        excluded = statement.excluded
+        statement = statement.on_conflict_do_update(
+            constraint="uq_discovered_threads_remote_id",
+            set_={
+                "author_id": func.coalesce(excluded.author_id, DiscoveredThreadRecord.author_id),
+                "username": func.coalesce(excluded.username, DiscoveredThreadRecord.username),
+                "text": func.coalesce(excluded.text, DiscoveredThreadRecord.text),
+                "permalink": func.coalesce(excluded.permalink, DiscoveredThreadRecord.permalink),
+                "media_type": func.coalesce(excluded.media_type, DiscoveredThreadRecord.media_type),
+                "remote_created_at": func.coalesce(
+                    excluded.remote_created_at, DiscoveredThreadRecord.remote_created_at
+                ),
+                "is_quote_post": func.coalesce(
+                    excluded.is_quote_post, DiscoveredThreadRecord.is_quote_post
+                ),
+                "has_replies": func.coalesce(
+                    excluded.has_replies, DiscoveredThreadRecord.has_replies
+                ),
+                "enrichment_status": case(
+                    (
+                        excluded.enrichment_status == DiscoveryEnrichmentStatus.ENRICHED,
+                        DiscoveryEnrichmentStatus.ENRICHED,
+                    ),
+                    else_=DiscoveredThreadRecord.enrichment_status,
+                ),
+                "updated_at": excluded.updated_at,
+            },
+        )
+        await self._session.execute(statement)
+        record = await self._session.scalar(
+            select(DiscoveredThreadRecord).where(
+                DiscoveredThreadRecord.remote_thread_id == thread.remote_thread_id
+            )
+        )
+        if record is None:
+            raise RuntimeError("discovered thread disappeared after upsert")
+        return self._thread_domain(record)
+
+    async def get_thread_by_remote_id(self, remote_thread_id: str) -> DiscoveredThread | None:
+        record = await self._session.scalar(
+            select(DiscoveredThreadRecord).where(
+                DiscoveredThreadRecord.remote_thread_id == remote_thread_id
+            )
+        )
+        return self._thread_domain(record) if record is not None else None
+
+    async def update_thread(self, thread: DiscoveredThread) -> None:
+        record = await self._session.get(DiscoveredThreadRecord, thread.id)
+        if record is None:
+            raise LookupError("discovered thread not found")
+        record.author_id = thread.author_id
+        record.username = thread.username
+        record.text = thread.text
+        record.permalink = thread.permalink
+        record.media_type = thread.media_type
+        record.remote_created_at = thread.remote_created_at
+        record.is_quote_post = thread.is_quote_post
+        record.has_replies = thread.has_replies
+        record.enrichment_status = thread.enrichment_status
+        record.conversation_status = thread.conversation_status
+        record.updated_at = thread.updated_at
+        await self._session.flush()
+
+    async def add_evidence(self, evidence: DiscoverySourceEvidence) -> bool:
+        values = self._evidence_values(evidence)
+        statement = postgres_insert(DiscoverySourceEvidenceRecord).values(**values)
+        constraint = (
+            "uq_discovery_evidence_thread"
+            if evidence.thread_id is not None
+            else "uq_discovery_evidence_author"
+        )
+        result = await self._session.scalar(
+            statement.on_conflict_do_nothing(constraint=constraint).returning(
+                DiscoverySourceEvidenceRecord.id
+            )
+        )
+        if result is not None:
+            return True
+        record = await self._session.scalar(
+            select(DiscoverySourceEvidenceRecord).where(
+                DiscoverySourceEvidenceRecord.run_id == evidence.run_id,
+                DiscoverySourceEvidenceRecord.source == evidence.source,
+                DiscoverySourceEvidenceRecord.page_number == evidence.page_number,
+                DiscoverySourceEvidenceRecord.thread_id == evidence.thread_id,
+                DiscoverySourceEvidenceRecord.author_id == evidence.author_id,
+            )
+        )
+        if record is not None:
+            evidence.id = record.id
+        return False
+
+    async def add_candidate_if_absent(self, candidate: LeadCandidate) -> bool:
+        statement = (
+            postgres_insert(LeadCandidateRecord)
+            .values(**self._candidate_values(candidate))
+            .on_conflict_do_nothing(constraint="uq_lead_candidate_account_author")
+            .returning(LeadCandidateRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
+
+    async def get_candidate_for_update(self, candidate_id: UUID) -> LeadCandidate | None:
+        record = await self._session.scalar(
+            select(LeadCandidateRecord)
+            .where(LeadCandidateRecord.id == candidate_id)
+            .with_for_update()
+        )
+        return self._candidate_domain(record) if record is not None else None
+
+    async def get_candidate_by_author(
+        self, account_id: UUID, author_id: UUID
+    ) -> LeadCandidate | None:
+        record = await self._session.scalar(
+            select(LeadCandidateRecord).where(
+                LeadCandidateRecord.account_id == account_id,
+                LeadCandidateRecord.author_id == author_id,
+            )
+        )
+        return self._candidate_domain(record) if record is not None else None
+
+    async def update_candidate(self, candidate: LeadCandidate) -> None:
+        record = await self._session.get(LeadCandidateRecord, candidate.id)
+        if record is None:
+            raise LookupError("lead candidate not found")
+        record.status = candidate.status
+        record.updated_at = candidate.updated_at
+        await self._session.flush()
+
+    async def add_candidate_evidence(self, link: LeadCandidateEvidence) -> bool:
+        statement = (
+            postgres_insert(LeadCandidateEvidenceRecord)
+            .values(id=link.id, candidate_id=link.candidate_id, evidence_id=link.evidence_id)
+            .on_conflict_do_nothing(constraint="uq_lead_candidate_evidence")
+            .returning(LeadCandidateEvidenceRecord.id)
+        )
+        return (await self._session.scalar(statement)) is not None
+
+    async def add_candidate_transition(self, transition: LeadCandidateTransition) -> None:
+        self._session.add(
+            LeadCandidateTransitionRecord(
+                id=uuid4(),
+                candidate_id=transition.candidate_id,
+                command_id=transition.command_id,
+                previous_status=transition.previous_status,
+                next_status=transition.next_status,
+                reason_code=transition.reason_code,
+                occurred_at=transition.occurred_at,
+            )
+        )
+        await self._session.flush()
+
+    async def has_candidate_transition(self, command_id: str) -> bool:
+        return (
+            await self._session.scalar(
+                select(LeadCandidateTransitionRecord.id).where(
+                    LeadCandidateTransitionRecord.command_id == command_id
+                )
+            )
+        ) is not None
+
+    @staticmethod
+    def _campaign_domain(record: DiscoveryCampaignRecord) -> DiscoveryCampaign:
+        return DiscoveryCampaign(
+            id=record.id,
+            account_id=record.account_id,
+            name=record.name,
+            status=record.status,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+    @staticmethod
+    def _query_domain(record: SearchQueryRecord) -> SearchQuery:
+        return SearchQuery(
+            id=record.id,
+            campaign_id=record.campaign_id,
+            kind=record.kind,
+            query_text=record.query_text,
+            search_mode=record.search_mode,
+            search_type=record.search_type,
+            username=record.username,
+            thread_remote_id=record.thread_remote_id,
+            since=record.since,
+            until=record.until,
+            created_at=record.created_at,
+        )
+
+    @staticmethod
+    def _run_values(run: DiscoveryRun) -> dict[str, object]:
+        return {
+            "id": run.id,
+            "account_id": run.account_id,
+            "campaign_id": run.campaign_id,
+            "query_id": run.query_id,
+            "command_id": run.command_id,
+            "status": run.status,
+            "cursor": run.cursor,
+            "profile_lookup_complete": run.profile_lookup_complete,
+            "pages_processed": run.pages_processed,
+            "items_processed": run.items_processed,
+            "items_skipped": run.items_skipped,
+            "error_code": run.error_code,
+            "started_at": run.started_at,
+            "updated_at": run.updated_at,
+            "finished_at": run.finished_at,
+        }
+
+    @classmethod
+    def _run_domain(cls, record: DiscoveryRunRecord) -> DiscoveryRun:
+        return DiscoveryRun(
+            id=record.id,
+            account_id=record.account_id,
+            campaign_id=record.campaign_id,
+            query_id=record.query_id,
+            command_id=record.command_id,
+            status=record.status,
+            cursor=record.cursor,
+            profile_lookup_complete=record.profile_lookup_complete,
+            pages_processed=record.pages_processed,
+            items_processed=record.items_processed,
+            items_skipped=record.items_skipped,
+            error_code=record.error_code,
+            started_at=record.started_at,
+            updated_at=record.updated_at,
+            finished_at=record.finished_at,
+        )
+
+    @staticmethod
+    def _author_values(author: DiscoveredAuthor) -> dict[str, object]:
+        return {
+            "id": author.id,
+            "remote_author_id": author.remote_author_id,
+            "username": author.username,
+            "display_name": author.display_name,
+            "biography": author.biography,
+            "profile_picture_url": author.profile_picture_url,
+            "enrichment_status": author.enrichment_status,
+            "last_enriched_at": author.last_enriched_at,
+            "created_at": author.created_at,
+            "updated_at": author.updated_at,
+        }
+
+    @staticmethod
+    def _author_domain(record: DiscoveredAuthorRecord) -> DiscoveredAuthor:
+        return DiscoveredAuthor(
+            id=record.id,
+            remote_author_id=record.remote_author_id,
+            username=record.username,
+            display_name=record.display_name,
+            biography=record.biography,
+            profile_picture_url=record.profile_picture_url,
+            enrichment_status=record.enrichment_status,
+            last_enriched_at=record.last_enriched_at,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+    @staticmethod
+    def _thread_values(thread: DiscoveredThread) -> dict[str, object]:
+        return {
+            "id": thread.id,
+            "remote_thread_id": thread.remote_thread_id,
+            "author_id": thread.author_id,
+            "username": thread.username,
+            "text": thread.text,
+            "permalink": thread.permalink,
+            "media_type": thread.media_type,
+            "remote_created_at": thread.remote_created_at,
+            "is_quote_post": thread.is_quote_post,
+            "has_replies": thread.has_replies,
+            "enrichment_status": thread.enrichment_status,
+            "conversation_status": thread.conversation_status,
+            "created_at": thread.created_at,
+            "updated_at": thread.updated_at,
+        }
+
+    @staticmethod
+    def _thread_domain(record: DiscoveredThreadRecord) -> DiscoveredThread:
+        return DiscoveredThread(
+            id=record.id,
+            remote_thread_id=record.remote_thread_id,
+            author_id=record.author_id,
+            username=record.username,
+            text=record.text,
+            permalink=record.permalink,
+            media_type=record.media_type,
+            remote_created_at=record.remote_created_at,
+            is_quote_post=record.is_quote_post,
+            has_replies=record.has_replies,
+            enrichment_status=record.enrichment_status,
+            conversation_status=record.conversation_status,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+    @staticmethod
+    def _evidence_values(evidence: DiscoverySourceEvidence) -> dict[str, object]:
+        return {
+            "id": evidence.id,
+            "run_id": evidence.run_id,
+            "thread_id": evidence.thread_id,
+            "author_id": evidence.author_id,
+            "source": evidence.source,
+            "page_number": evidence.page_number,
+            "observed_at": evidence.observed_at,
+            "evidence_class": evidence.evidence_class,
+        }
+
+    @staticmethod
+    def _candidate_values(candidate: LeadCandidate) -> dict[str, object]:
+        return {
+            "id": candidate.id,
+            "account_id": candidate.account_id,
+            "author_id": candidate.author_id,
+            "status": candidate.status,
+            "created_at": candidate.created_at,
+            "updated_at": candidate.updated_at,
+        }
+
+    @staticmethod
+    def _candidate_domain(record: LeadCandidateRecord) -> LeadCandidate:
+        return LeadCandidate(
+            id=record.id,
+            account_id=record.account_id,
+            author_id=record.author_id,
+            status=record.status,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
         )
 
 

@@ -103,7 +103,7 @@ class ThreadsConversationHandler:
                 raise PermanentCommandError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
 
         existing_by_external_id = {reply.threads_reply_id: reply for reply in known_replies}
-        new_replies, skipped_missing_parent = self._map_replies(
+        new_replies, skipped_missing_parent = self.map_replies(
             command.account_id,
             root_post,
             remote_replies,
@@ -163,12 +163,18 @@ class ThreadsConversationHandler:
         )
 
     @staticmethod
-    def _map_replies(
+    def map_replies(
         account_id: UUID,
-        root_post: ThreadPost,
+        root_post: ThreadPost | None,
         remote_replies: dict[str, RemoteReply],
         existing: dict[str, ThreadReply],
+        *,
+        root_remote_id: str | None = None,
+        discovered_thread_id: UUID | None = None,
     ) -> tuple[list[ThreadReply], int]:
+        root_id = root_post.threads_post_id if root_post is not None else root_remote_id
+        if root_id is None or (root_post is None) != (discovered_thread_id is not None):
+            raise ValueError("conversation mapping requires exactly one local root")
         internal_by_external_id = {key: value.id for key, value in existing.items()}
         pending = dict(remote_replies)
         new_replies: list[ThreadReply] = []
@@ -176,12 +182,12 @@ class ThreadsConversationHandler:
         while pending:
             progressed = False
             for external_id, remote in tuple(pending.items()):
-                if remote.root_post_id != root_post.threads_post_id or remote.replied_to_id is None:
+                if remote.root_post_id != root_id or remote.replied_to_id is None:
                     pending.pop(external_id)
                     skipped_missing_parent += 1
                     progressed = True
                     continue
-                if remote.replied_to_id == root_post.threads_post_id:
+                if remote.replied_to_id == root_id:
                     parent_id = None
                 else:
                     parent_id = internal_by_external_id.get(remote.replied_to_id)
@@ -191,7 +197,8 @@ class ThreadsConversationHandler:
                     reply = ThreadReply(
                         account_id=account_id,
                         threads_reply_id=external_id,
-                        root_post_id=root_post.id,
+                        root_post_id=root_post.id if root_post is not None else None,
+                        discovered_thread_id=discovered_thread_id,
                         parent_reply_id=parent_id,
                         text=remote.text,
                         replied_at=ThreadsConversationHandler._parse_timestamp(remote.timestamp),

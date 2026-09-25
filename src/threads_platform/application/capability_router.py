@@ -84,6 +84,46 @@ _POLICIES = (
         OperationClass.READ,
     ),
     _policy(
+        "threads.discovery.create_campaign",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.MUTATION,
+    ),
+    _policy(
+        "threads.discovery.complete_campaign",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.MUTATION,
+    ),
+    _policy(
+        "threads.discovery.search",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.READ,
+    ),
+    _policy(
+        "threads.discovery.profile",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.READ,
+    ),
+    _policy(
+        "threads.discovery.mentions",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.READ,
+    ),
+    _policy(
+        "threads.discovery.conversation",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.READ,
+    ),
+    _policy(
+        "threads.discovery.resume",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.READ,
+    ),
+    _policy(
+        "threads.discovery.lead_status",
+        CapabilityExecutionClass.NATIVE_API,
+        OperationClass.MUTATION,
+    ),
+    _policy(
         "threads.moderate_reply",
         CapabilityExecutionClass.NATIVE_API,
         OperationClass.MUTATION,

@@ -29,6 +29,24 @@ No live account responses are represented by repository documentation-contract f
 | Permissions | threads_basic, threads_content_publish, threads_read_replies, threads_manage_replies, threads_manage_insights listed in official workspace | OPEN effective per-account grants |
 | Error payloads/headers | examples are not sufficient for full runtime error contract | OPEN |
 
+### C4 documentation-contract implementation
+
+C4 now has API adapter and persistence paths for keyword/tag search, public profile
+lookup/posts, mentions, and conversation enrichment. Synthetic fixtures exercise
+the documented request parameters and conservative response mapping; they are not
+live account evidence, and the table above remains OPEN for production validation.
+
+The discovery adapter currently reads `paging.cursors.after` as the continuation
+cursor. A present cursor is treated as another page; cursor repetition is rejected
+and each committed cursor is recorded per run. This interpretation and the use of
+the `after` request parameter for profile posts and mentions still require live
+validation. The public profile lookup request is documented, but the reviewed
+workspace has no response example; the implementation therefore treats `id` and
+`username` as required and `name`, `threads_biography`, and
+`threads_profile_picture_url` as optional fields based on the documented profile
+shape. Profile-post and discovery response field combinations also require live
+verification. No implementation state here sets `live_verified=true`.
+
 ## Implementation vs production gate
 
 Documentation-backed implementation is allowed when behavior can be modeled conservatively.

@@ -14,16 +14,19 @@ from threads_platform.application.commands.threads_handlers import (
 )
 from threads_platform.application.crm_protocol_v1 import CommandEnvelopeV1
 from threads_platform.application.ports.threads import (
+    DiscoveryPage,
     MediaContainer,
     MediaContainerRequest,
     PublishingQuota,
     RemoteMedia,
+    RemotePublicProfile,
     RemoteReply,
     ReplyPage,
     ThreadsAPIError,
 )
 from threads_platform.application.retry import RetryPolicy
 from threads_platform.domain.accounts import ThreadsAccount
+from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 from threads_platform.domain.publishing import ThreadPost
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
@@ -71,6 +74,13 @@ class FakeThreadsAPI:
         self.moderation_calls: list[tuple[str, str, bool]] = []
         self.moderation_attempts = 0
         self.media_id = "published-media-doc-example"
+        self.discovery_pages: list[DiscoveryPage] = []
+        self.profile_post_pages: list[DiscoveryPage] = []
+        self.mention_pages: list[DiscoveryPage] = []
+        self.profile = RemotePublicProfile("author-doc-example", "example", "Example", None, None)
+        self.discovery_after_values: list[str | None] = []
+        self.discovery_error: ThreadsAPIError | None = None
+        self.profile_error: ThreadsAPIError | None = None
 
     async def create_container(
         self, token: SecretStr, request: MediaContainerRequest
@@ -139,6 +149,60 @@ class FakeThreadsAPI:
         if not self.page_responses:
             return ReplyPage((), after, has_more=False)
         return self.page_responses.pop(0)
+
+    async def search_threads(
+        self,
+        token: SecretStr,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage:
+        assert token.get_secret_value() == "test-placeholder"
+        self.discovery_after_values.append(after)
+        if self.discovery_error is not None:
+            raise self.discovery_error
+        if not self.discovery_pages:
+            return DiscoveryPage((), None, False)
+        return self.discovery_pages.pop(0)
+
+    async def get_public_profile(self, token: SecretStr, username: str) -> RemotePublicProfile:
+        assert token.get_secret_value() == "test-placeholder"
+        if self.profile_error is not None:
+            raise self.profile_error
+        return self.profile
+
+    async def get_profile_posts(
+        self, token: SecretStr, username: str, *, after: str | None, limit: int
+    ) -> DiscoveryPage:
+        assert token.get_secret_value() == "test-placeholder"
+        self.discovery_after_values.append(after)
+        if self.discovery_error is not None:
+            raise self.discovery_error
+        if not self.profile_post_pages:
+            return DiscoveryPage((), None, False)
+        return self.profile_post_pages.pop(0)
+
+    async def get_mentions(
+        self,
+        token: SecretStr,
+        *,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage:
+        assert token.get_secret_value() == "test-placeholder"
+        self.discovery_after_values.append(after)
+        if self.discovery_error is not None:
+            raise self.discovery_error
+        if not self.mention_pages:
+            return DiscoveryPage((), None, False)
+        return self.mention_pages.pop(0)
 
     async def manage_reply(self, token: SecretStr, reply_id: str, *, hide: bool) -> None:
         self.moderation_attempts += 1

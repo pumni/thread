@@ -47,12 +47,12 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Crawl own post replies | Conversation sync | NATIVE_API | Official API | Browser enrichment | DONE/API | P0 | deterministic relational sync |
 | Deep comment tree | Flattened conversation + relational tree | NATIVE_API | Official API | Browser enrichment | DONE/API | P0 | no DOM indentation guessing |
 | Periodic comment crawl | Scheduled conversation sync | NATIVE_API | Scheduler + API | Browser if required | PLANNED | P1 | C6 |
-| Search public posts | Keyword/topic search | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | Meta documents keyword_search |
-| Search topic/tag | Topic-tag discovery | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | search_mode TAG |
-| Public user lookup | Public profile lookup | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | exact username lookup documented |
-| Public profile post collection | profile_posts | NATIVE_API | Official API | Browser enrichment | PLANNED | P1 | live contract verification before production |
-| Mention monitoring | Mentions | NATIVE_API | Official API | none | PLANNED | P1 | time/cursor support documented |
-| Lead discovery | DiscoveryCampaign -> LeadCandidate | HYBRID | API-first pipeline | Browser enrichment | PLANNED | P1 | C4 |
+| Search public posts | Keyword/topic search | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | issue #3 live verification remains open |
+| Search topic/tag | Topic-tag discovery | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | search_mode TAG; issue #3 live verification remains open |
+| Public user lookup | Public profile lookup | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | response fields require issue #3 live verification |
+| Public profile post collection | profile_posts | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | response fields require issue #3 live verification |
+| Mention monitoring | Mentions | NATIVE_API | Official API | none | DONE/API (docs contract) | P1 | time/cursor support requires issue #3 live verification |
+| Lead discovery | DiscoveryCampaign -> LeadCandidate | NATIVE_API | API-first pipeline | none in C4 | DONE/API (docs contract) | P1 | no browser enrichment or scheduler |
 | Competitor/public-account monitoring | Public profile/posts + discovery | HYBRID | API | Browser enrichment | PLANNED | P1 | policy/retention required |
 | CSV/report export | Query/export | NATIVE_API | Application | none | DEFERRED | P2 | reporting concern |
 | Post/comment local JSON tree | PostgreSQL relational persistence | NATIVE_API | PostgreSQL | none | DONE | P0 | replaces post_structure.json |

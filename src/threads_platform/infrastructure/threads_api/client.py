@@ -1,20 +1,25 @@
-from datetime import timedelta
-from urllib.parse import quote
+from datetime import UTC, datetime, timedelta
+from typing import cast
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
 from threads_platform.application.ports.threads import (
+    DiscoveryPage,
     MediaContainer,
     MediaContainerRequest,
     PublishingQuota,
+    RemoteDiscoveryThread,
     RemoteMedia,
+    RemotePublicProfile,
     RemoteReply,
     ReplyPage,
     ThreadsAPIError,
     ThreadsContractError,
     ThreadsTransportError,
 )
+from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 
 _OBJECT_ADAPTER = TypeAdapter(dict[str, object])
 _OBJECT_LIST_ADAPTER = TypeAdapter(list[object])
@@ -106,7 +111,7 @@ class HttpThreadsAPI:
         data = payload.get("data")
         if not isinstance(data, list):
             raise ThreadsContractError()
-        quota_items = _OBJECT_LIST_ADAPTER.validate_python(data)
+        quota_items = self._object_list(cast(object, data))
         if not quota_items:
             raise ThreadsContractError()
         quota = self._mapping(quota_items[0])
@@ -138,6 +143,89 @@ class HttpThreadsAPI:
         self, token: SecretStr, thread_id: str, after: str | None
     ) -> ReplyPage:
         return await self._reply_page(token, thread_id, "conversation", after)
+
+    async def search_threads(
+        self,
+        token: SecretStr,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage:
+        params = self._discovery_params(after, limit)
+        params.update(
+            {
+                "q": query,
+                "search_mode": search_mode.value,
+                "search_type": search_type.value,
+                "fields": self._discovery_fields(),
+            }
+        )
+        if since is not None:
+            params["since"] = since.isoformat()
+        if until is not None:
+            params["until"] = until.isoformat()
+        response = await self._request("GET", "keyword_search", token, params=params)
+        return self._discovery_page(response)
+
+    async def get_public_profile(self, token: SecretStr, username: str) -> RemotePublicProfile:
+        response = await self._request(
+            "GET", "profile_lookup", token, params={"username": username}
+        )
+        payload = self._object(response)
+        author_id = payload.get("id")
+        response_username = payload.get("username")
+        if (
+            not isinstance(author_id, str)
+            or not author_id
+            or not isinstance(response_username, str)
+            or not response_username
+        ):
+            raise ThreadsContractError()
+        return RemotePublicProfile(
+            remote_author_id=self._bounded_string(author_id, 255),
+            username=self._bounded_string(response_username, 255),
+            display_name=self._bounded_optional_string(payload.get("name"), 255),
+            biography=self._bounded_optional_string(payload.get("threads_biography"), 5000),
+            profile_picture_url=self._optional_https_url(
+                payload.get("threads_profile_picture_url")
+            ),
+        )
+
+    async def get_profile_posts(
+        self, token: SecretStr, username: str, *, after: str | None, limit: int
+    ) -> DiscoveryPage:
+        params = self._discovery_params(after, limit)
+        params.update(
+            {
+                "username": username,
+                "fields": self._discovery_fields(),
+            }
+        )
+        response = await self._request("GET", "profile_posts", token, params=params)
+        return self._discovery_page(response)
+
+    async def get_mentions(
+        self,
+        token: SecretStr,
+        *,
+        after: str | None,
+        since: datetime | None,
+        until: datetime | None,
+        limit: int,
+    ) -> DiscoveryPage:
+        params = self._discovery_params(after, limit)
+        params["fields"] = self._discovery_fields()
+        if since is not None:
+            params["since"] = since.isoformat()
+        if until is not None:
+            params["until"] = until.isoformat()
+        response = await self._request("GET", "me/mentions", token, params=params)
+        return self._discovery_page(response)
 
     async def manage_reply(self, token: SecretStr, reply_id: str, *, hide: bool) -> None:
         response = await self._request(
@@ -179,7 +267,7 @@ class HttpThreadsAPI:
         paging = payload.get("paging")
         if not isinstance(values, list):
             raise ThreadsContractError()
-        value_items = _OBJECT_LIST_ADAPTER.validate_python(values)
+        value_items = self._object_list(cast(object, values))
         paging_object = self._optional_mapping(paging)
         if paging is not None and paging_object is None:
             raise ThreadsContractError()
@@ -188,13 +276,84 @@ class HttpThreadsAPI:
         if cursor_value is not None and cursors is None:
             raise ThreadsContractError()
         after_cursor = cursors.get("after") if cursors is not None else None
-        if after_cursor is not None and not isinstance(after_cursor, str):
+        if after_cursor is not None and (
+            not isinstance(after_cursor, str)
+            or not after_cursor.strip()
+            or len(after_cursor) > 4096
+        ):
             raise ThreadsContractError()
         next_page = paging_object.get("next") if paging_object is not None else None
         if next_page is not None and not isinstance(next_page, str):
             raise ThreadsContractError()
         replies = tuple(self._remote_reply(item) for item in value_items)
-        return ReplyPage(replies, after_cursor, has_more=bool(next_page))
+        return ReplyPage(
+            replies, after_cursor, has_more=bool(next_page) or after_cursor is not None
+        )
+
+    @classmethod
+    def _discovery_page(cls, response: httpx.Response) -> DiscoveryPage:
+        payload = cls._object(response)
+        values = payload.get("data")
+        paging_value = payload.get("paging")
+        paging = cls._optional_mapping(paging_value)
+        if not isinstance(values, list) or (paging_value is not None and paging is None):
+            raise ThreadsContractError()
+        cursors_value = paging.get("cursors") if paging is not None else None
+        cursors = cls._optional_mapping(cursors_value)
+        if cursors_value is not None and cursors is None:
+            raise ThreadsContractError()
+        next_cursor = cls._optional_string(cursors.get("after") if cursors else None)
+        if next_cursor is not None and (not next_cursor.strip() or len(next_cursor) > 4096):
+            raise ThreadsContractError()
+        items = cls._object_list(cast(object, values))
+        if len(items) > 50:
+            raise ThreadsContractError()
+        threads = tuple(cls._remote_discovery_thread(item) for item in items)
+        return DiscoveryPage(threads, next_cursor, has_more=next_cursor is not None)
+
+    @classmethod
+    def _remote_discovery_thread(cls, value: object) -> RemoteDiscoveryThread:
+        item = cls._mapping(value)
+        if item is None:
+            raise ThreadsContractError()
+        thread_id = item.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ThreadsContractError()
+        thread_id = cls._bounded_string(thread_id, 255)
+        author_id = cls._nested_id(item.get("owner"))
+        timestamp = cls._optional_timestamp(item.get("timestamp"))
+        is_quote_post = item.get("is_quote_post")
+        has_replies = item.get("has_replies")
+        if is_quote_post is not None and not isinstance(is_quote_post, bool):
+            raise ThreadsContractError()
+        if has_replies is not None and not isinstance(has_replies, bool):
+            raise ThreadsContractError()
+        return RemoteDiscoveryThread(
+            remote_thread_id=thread_id,
+            author_remote_id=author_id,
+            username=cls._bounded_optional_string(item.get("username"), 255),
+            text=cls._bounded_optional_string(item.get("text"), 10_000, allow_empty=True),
+            permalink=cls._optional_https_url(item.get("permalink")),
+            media_type=cls._bounded_optional_string(item.get("media_type"), 80),
+            timestamp=timestamp,
+            is_quote_post=is_quote_post,
+            has_replies=has_replies,
+        )
+
+    @staticmethod
+    def _discovery_fields() -> str:
+        return "id,media_type,permalink,username,text,timestamp,is_quote_post,has_replies"
+
+    @staticmethod
+    def _discovery_params(after: str | None, limit: int) -> dict[str, str]:
+        if not 1 <= limit <= 50:
+            raise ValueError("Threads discovery page limit must be between 1 and 50")
+        params = {"limit": str(limit)}
+        if after is not None:
+            if not after.strip():
+                raise ValueError("Threads discovery cursor must not be empty")
+            params["after"] = after
+        return params
 
     @classmethod
     def _remote_reply(cls, item: object) -> RemoteReply:
@@ -224,7 +383,7 @@ class HttpThreadsAPI:
         nested_id = nested.get("id")
         if nested_id is not None and not isinstance(nested_id, str):
             raise ThreadsContractError()
-        return nested_id
+        return cls._bounded_string(nested_id, 255) if nested_id is not None else None
 
     async def _request(
         self,
@@ -266,9 +425,16 @@ class HttpThreadsAPI:
     def _object(response: httpx.Response) -> dict[str, object]:
         try:
             payload = _OBJECT_ADAPTER.validate_python(response.json())
-        except (ValidationError, ValueError) as error:
-            raise ThreadsContractError() from error
+        except ValidationError, ValueError:
+            raise ThreadsContractError() from None
         return payload
+
+    @staticmethod
+    def _object_list(value: object) -> list[object]:
+        try:
+            return _OBJECT_LIST_ADAPTER.validate_python(value)
+        except ValidationError:
+            raise ThreadsContractError() from None
 
     @staticmethod
     def _mapping(value: object) -> dict[str, object] | None:
@@ -276,8 +442,8 @@ class HttpThreadsAPI:
             return None
         try:
             return _OBJECT_ADAPTER.validate_python(value)
-        except ValidationError as error:
-            raise ThreadsContractError() from error
+        except ValidationError:
+            raise ThreadsContractError() from None
 
     @classmethod
     def _optional_mapping(cls, value: object) -> dict[str, object] | None:
@@ -296,6 +462,56 @@ class HttpThreadsAPI:
         if value is not None and not isinstance(value, str):
             raise ThreadsContractError()
         return value
+
+    @classmethod
+    def _bounded_optional_string(
+        cls, value: object, maximum: int, *, allow_empty: bool = False
+    ) -> str | None:
+        result = cls._optional_string(value)
+        if result is None:
+            return None
+        if len(result) > maximum or (not allow_empty and not result.strip()):
+            raise ThreadsContractError()
+        return result
+
+    @staticmethod
+    def _bounded_string(value: str, maximum: int) -> str:
+        if not value.strip() or len(value) > maximum:
+            raise ThreadsContractError()
+        return value
+
+    @classmethod
+    def _optional_https_url(cls, value: object) -> str | None:
+        result = cls._bounded_optional_string(value, 2048)
+        if result is None:
+            return None
+        try:
+            parsed = urlsplit(result)
+            hostname = parsed.hostname
+        except ValueError:
+            raise ThreadsContractError() from None
+        if (
+            parsed.scheme != "https"
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ThreadsContractError()
+        return result
+
+    @staticmethod
+    def _optional_timestamp(value: object) -> datetime | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ThreadsContractError()
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ThreadsContractError() from None
+        if parsed.tzinfo is None:
+            raise ThreadsContractError()
+        return parsed.astimezone(UTC)
 
     @staticmethod
     def _retry_after(value: str | None) -> timedelta | None:

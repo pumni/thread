@@ -175,6 +175,91 @@ class SyncConversationPayload(BaseModel):
     sync_kind: Literal["replies", "conversation"] = "conversation"
 
 
+class CreateDiscoveryCampaignPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def name_must_not_be_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("campaign name must not be empty")
+        return value
+
+
+class CompleteDiscoveryCampaignPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: UUID
+
+
+class DiscoverySearchPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: UUID
+    query: str = Field(min_length=1, max_length=255)
+    search_mode: Literal["KEYWORD", "TAG"]
+    search_type: Literal["TOP", "RECENT"]
+    since: AwareDatetime | None = None
+    until: AwareDatetime | None = None
+    max_pages: int = Field(default=3, ge=1, le=5)
+
+    @field_validator("query")
+    @classmethod
+    def query_must_not_be_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("discovery query must not be empty")
+        return value
+
+
+class DiscoveryProfilePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: UUID
+    username: str = Field(min_length=1, max_length=255)
+    max_pages: int = Field(default=3, ge=1, le=5)
+
+    @field_validator("username")
+    @classmethod
+    def username_must_not_be_whitespace(cls, value: str) -> str:
+        if not value.strip() or value.startswith("@"):
+            raise ValueError("username must be an exact handle without @")
+        return value
+
+
+class DiscoveryMentionsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: UUID
+    since: AwareDatetime | None = None
+    until: AwareDatetime | None = None
+    max_pages: int = Field(default=3, ge=1, le=5)
+
+
+class DiscoveryConversationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: UUID
+    thread_remote_id: str = Field(min_length=1, max_length=255)
+    max_pages: int = Field(default=3, ge=1, le=5)
+
+
+class DiscoveryResumePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    max_pages: int = Field(default=3, ge=1, le=5)
+
+
+class LeadCandidateStatusPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: UUID
+    target_status: Literal["CANDIDATE", "READY", "DISMISSED"]
+    reason_code: str = Field(min_length=1, max_length=80, pattern=r"^[A-Z][A-Z0-9_]*$")
+
+
 class ModerateReplyPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -223,6 +308,46 @@ class SyncConversationCommandV1(CRMCommandV1):
     payload: SyncConversationPayload
 
 
+class CreateDiscoveryCampaignCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.create_campaign"]
+    payload: CreateDiscoveryCampaignPayload
+
+
+class CompleteDiscoveryCampaignCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.complete_campaign"]
+    payload: CompleteDiscoveryCampaignPayload
+
+
+class DiscoverySearchCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.search"]
+    payload: DiscoverySearchPayload
+
+
+class DiscoveryProfileCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.profile"]
+    payload: DiscoveryProfilePayload
+
+
+class DiscoveryMentionsCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.mentions"]
+    payload: DiscoveryMentionsPayload
+
+
+class DiscoveryConversationCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.conversation"]
+    payload: DiscoveryConversationPayload
+
+
+class DiscoveryResumeCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.resume"]
+    payload: DiscoveryResumePayload
+
+
+class LeadCandidateStatusCommandV1(CRMCommandV1):
+    command_type: Literal["threads.discovery.lead_status"]
+    payload: LeadCandidateStatusPayload
+
+
 class ModerateReplyCommandV1(CRMCommandV1):
     command_type: Literal["threads.moderate_reply"]
     payload: ModerateReplyPayload
@@ -235,6 +360,14 @@ type CommandEnvelopeV1 = Annotated[
     | PublishVideoCommandV1
     | PublishCarouselCommandV1
     | SyncConversationCommandV1
+    | CreateDiscoveryCampaignCommandV1
+    | CompleteDiscoveryCampaignCommandV1
+    | DiscoverySearchCommandV1
+    | DiscoveryProfileCommandV1
+    | DiscoveryMentionsCommandV1
+    | DiscoveryConversationCommandV1
+    | DiscoveryResumeCommandV1
+    | LeadCandidateStatusCommandV1
     | ModerateReplyCommandV1,
     Field(discriminator="command_type"),
 ]
