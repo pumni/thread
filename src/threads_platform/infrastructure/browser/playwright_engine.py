@@ -158,7 +158,8 @@ class _PlaywrightBrowserSession:
         self._navigation_guard_installed = False
         self._navigation_guard_lock = asyncio.Lock()
         self._blocked_navigation = False
-        self._remote_redirect = False
+        self._approved_document_loaded = False
+        self._remote_state_uncertain = False
         self._navigation_timed_out = False
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
@@ -209,7 +210,10 @@ class _PlaywrightBrowserSession:
             return
         async with self._navigation_guard_lock:
             if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
-                self._blocked_navigation = True
+                if self._approved_document_loaded:
+                    self._remote_state_uncertain = True
+                else:
+                    self._blocked_navigation = True
                 await route.abort("blockedbyclient")
                 return
             try:
@@ -231,9 +235,10 @@ class _PlaywrightBrowserSession:
                     pass
                 return
             if 300 <= response.status < 400:
-                self._remote_redirect = True
+                self._remote_state_uncertain = True
                 await route.abort("blockedbyclient")
                 return
+            self._approved_document_loaded = True
             await route.fulfill(response=response)
 
     async def _raise_navigation_policy_error(self) -> None:
@@ -250,7 +255,7 @@ class _PlaywrightBrowserSession:
         async with self._navigation_guard_lock:
             if self._blocked_navigation:
                 raise UnsupportedUIState()
-            if self._remote_redirect:
+            if self._remote_state_uncertain:
                 raise RemoteSessionStateUncertain()
             if self._navigation_timed_out:
                 raise NavigationTimeout()

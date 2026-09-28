@@ -217,37 +217,52 @@ def test_playwright_redirect_requests_intervention_without_following_target(
     asyncio.run(scenario())
 
 
-def test_playwright_keeps_origin_guard_after_document_load(
+def test_page_initiated_off_origin_navigation_after_load_requests_intervention(
     tmp_path: Path,
     synthetic_origin: str,
     synthetic_redirect_target_requests: list[str],
 ) -> None:
     async def scenario() -> None:
-        profile_directory = tmp_path / "delayed-redirect-profile"
-        profile_directory.mkdir()
-        account_id = uuid4()
-        session = await PlaywrightBrowserEngine(navigation_timeout_ms=5_000).open(
-            BrowserLaunchRequest(
-                worker_id=uuid4(),
-                account_id=account_id,
-                profile_ref="delayed-redirect-profile",
-                profile_directory=profile_directory,
-                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
-                headless=True,
-            )
+        worker_id, account_id = uuid4(), uuid4()
+        context, manager, _, resolver, _ = await _managed_session(
+            tmp_path,
+            worker_id,
+            account_id,
+            "delayed-redirect-profile",
+            open_session=False,
+        )
+        reserved = await manager.open(context)
+        await manager.transition(account_id, BrowserSessionState.STARTING)
+        authenticated = await manager.transition(account_id, BrowserSessionState.AUTHENTICATED)
+        opened = replace(reserved, state=authenticated)
+        job = _running_job(worker_id, account_id)
+        client = _MemoryWorkerJobControl(worker_id, account_id, job)
+        execution = WorkerJobExecution(job, worker_id, client)
+        adapter = PlaywrightBrowserAdapter(
+            worker_id,
+            resolver,
+            PlaywrightBrowserEngine(navigation_timeout_ms=5_000),
+        )
+        session = await adapter.open_reserved_session(
+            context,
+            opened,
+            transition=manager.transition,
+            close_session=manager.close,
+            job_execution=execution,
+            headless=True,
         )
         try:
             await session.navigate(
                 f"{synthetic_origin}/delayed-redirect",
-                allowed_origins=frozenset({synthetic_origin}),
+                _local_policy(synthetic_origin),
             )
             await asyncio.sleep(0.3)
-            with pytest.raises(UnsupportedUIState):
-                await cast(BrowserFeedEngineSession, session).collect_feed_candidates(
-                    ancestor_bound=8
-                )
+            with pytest.raises(RemoteSessionStateUncertain):
+                await session.collect_feed_candidates(ancestor_bound=8)
         finally:
             await session.close()
+        assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
+        assert client.interventions == [("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")]
         assert synthetic_redirect_target_requests == []
 
     asyncio.run(scenario())
