@@ -382,12 +382,14 @@ class BrowserThreadOpenPayload(BaseModel):
 class BrowserProfileOpenPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    profile_ref: str = Field(min_length=1, max_length=255)
+    profile_ref: str = Field(min_length=1, max_length=33)
 
     @field_validator("profile_ref")
     @classmethod
-    def profile_ref_must_be_an_opaque_identifier(cls, value: str) -> str:
-        return _validate_browser_identifier(value)
+    def profile_ref_must_be_a_bounded_relative_profile_path(cls, value: str) -> str:
+        if re.fullmatch(r"/@[A-Za-z0-9._]{1,30}/?", value) is None:
+            raise ValueError("profile_ref must be a bounded relative Threads profile path")
+        return value[:-1] if value.endswith("/") else value
 
 
 class BrowserLocalUploadPayload(BaseModel):
@@ -461,12 +463,6 @@ def _validate_media_url(value: str) -> None:
         or parsed.password is not None
     ):
         raise ValueError("media URL must be an HTTP(S) URL without embedded credentials")
-
-
-def _validate_browser_identifier(value: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", value) is None:
-        raise ValueError("browser target must be a bounded opaque identifier")
-    return value
 
 
 class CommandReceiptV1(BaseModel):

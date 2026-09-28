@@ -18,6 +18,7 @@ from threads_platform.application.capability_router import CapabilityEvidence, C
 from threads_platform.application.commands.runtime import KNOWN_COMMAND_TYPES
 from threads_platform.application.crm_protocol_v1 import (
     COMMAND_ENVELOPE_ADAPTER,
+    BrowserProfileOpenCommandV1,
     BrowserThreadOpenCommandV1,
 )
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
@@ -53,7 +54,12 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
         assert contract.result_schema_version == 1
         expected_status = (
             BrowserCapabilityStatus.AVAILABLE
-            if contract.name in {"threads.browser.feed.browse", "threads.browser.thread.open"}
+            if contract.name
+            in {
+                "threads.browser.feed.browse",
+                "threads.browser.thread.open",
+                "threads.browser.profile.open",
+            }
             else BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE
         )
         expected_block = (
@@ -68,11 +74,18 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
         if contract.name in {
             "threads.browser.feed.browse",
             "threads.browser.thread.open",
+            "threads.browser.profile.open",
         }:
             assert "REMOTE_STATE_UNCERTAIN" in contract.intervention_types
         if contract.name == "threads.browser.thread.open":
             assert contract.safe_checkpoints == ("BEFORE_NAVIGATION", "THREAD_READY")
             assert contract.max_duration_seconds == 30
+        if contract.name == "threads.browser.profile.open":
+            assert contract.safe_checkpoints == (
+                "BEFORE_NAVIGATION",
+                "BEFORE_PROFILE_INSPECTION",
+                "PROFILE_READY",
+            )
         assert contract.name in KNOWN_COMMAND_TYPES
         policy = router.policy_for(contract.name)
         assert policy is not None
@@ -102,7 +115,16 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
                 assert decision.target is RouteTarget.UNSUPPORTED
 
     contracts = {contract.name: contract for contract in BROWSER_CAPABILITY_CONTRACTS}
-    assert contracts["threads.browser.profile.open"].allowed_failure_codes == COMMON_FAILURES
+    assert contracts["threads.browser.profile.open"].allowed_failure_codes == (
+        COMMON_FAILURES
+        | {
+            "BROWSER_SESSION_UNAVAILABLE",
+            "BROWSER_NETWORK_ROUTE_UNSUPPORTED",
+            "UNSUPPORTED_BROWSER_CAPABILITY",
+            "WORKER_JOB_INPUT_INVALID",
+            "WORKER_JOB_RETRY_SAFETY_MISMATCH",
+        }
+    )
     assert contracts["threads.browser.media.local_upload"].allowed_failure_codes == (
         COMMON_FAILURES | {"MEDIA_FILE_REJECTED", "MEDIA_UPLOAD_FAILED"}
     )
@@ -113,7 +135,7 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
     [
         ("threads.browser.feed.browse", {"max_items": 20}),
         ("threads.browser.thread.open", {"thread_ref": "/@alice/post/remote_thread-1"}),
-        ("threads.browser.profile.open", {"profile_ref": "public.profile_1"}),
+        ("threads.browser.profile.open", {"profile_ref": "/@alice/"}),
         ("threads.browser.media.local_upload", {"media_ref": "asset-1.jpg"}),
     ],
 )
@@ -133,7 +155,10 @@ def test_c5_command_payloads_are_strict_and_bounded(
     )
 
     assert command.command_type == command_type
-    assert command.payload.model_dump(mode="python") == payload
+    expected_payload = (
+        {"profile_ref": "/@alice"} if command_type == "threads.browser.profile.open" else payload
+    )
+    assert command.payload.model_dump(mode="python") == expected_payload
 
 
 def test_c5_commands_reject_arbitrary_urls_unbounded_feed_and_local_paths() -> None:
@@ -152,6 +177,9 @@ def test_c5_commands_reject_arbitrary_urls_unbounded_feed_and_local_paths() -> N
         ("threads.browser.thread.open", {"thread_ref": "/@alice/post/post-1#reply"}),
         ("threads.browser.thread.open", {"thread_ref": "/@alice/post/../post-1"}),
         ("threads.browser.profile.open", {"profile_ref": "https://threads.net/@user"}),
+        ("threads.browser.profile.open", {"profile_ref": "/@alice?source=profile"}),
+        ("threads.browser.profile.open", {"profile_ref": "/@alice#posts"}),
+        ("threads.browser.profile.open", {"profile_ref": "/@alice/post/post-1"}),
         ("threads.browser.media.local_upload", {"media_ref": "..\\secret.jpg"}),
         ("threads.browser.media.local_upload", {"media_ref": "CON.txt"}),
         ("threads.browser.media.local_upload", {"media_ref": "asset.jpg", "path": "C:\\x"}),
@@ -172,6 +200,16 @@ def test_c5_commands_reject_arbitrary_urls_unbounded_feed_and_local_paths() -> N
     assert isinstance(trailing_slash, BrowserThreadOpenCommandV1)
     assert trailing_slash.payload.thread_ref == "/@alice/post/post-1"
 
+    trailing_profile_slash = COMMAND_ENVELOPE_ADAPTER.validate_python(
+        {
+            **header,
+            "command_type": "threads.browser.profile.open",
+            "payload": {"profile_ref": "/@alice/"},
+        }
+    )
+    assert isinstance(trailing_profile_slash, BrowserProfileOpenCommandV1)
+    assert trailing_profile_slash.payload.profile_ref == "/@alice"
+
 
 def test_c5_result_schemas_exclude_dom_and_worker_local_paths() -> None:
     feed = BrowserFeedResultV1.model_validate(
@@ -184,11 +222,24 @@ def test_c5_result_schemas_exclude_dom_and_worker_local_paths() -> None:
             "recognized": True,
         }
     )
+    profile_target = BrowserTargetOpenResultV1.model_validate(
+        {
+            "target_kind": "PROFILE",
+            "target_ref": "/@alice",
+            "recognized": True,
+        }
+    )
     upload = BrowserMediaStageResultV1.model_validate(
         {"media_kind": BrowserMediaKind.IMAGE, "byte_size": 1024, "staged": True}
     )
-    assert feed.result_version == target.result_version == upload.result_version == 1
-    assert target.recognized is True
+    assert (
+        feed.result_version
+        == target.result_version
+        == profile_target.result_version
+        == upload.result_version
+        == 1
+    )
+    assert target.recognized is profile_target.recognized is True
     with pytest.raises(ValidationError):
         BrowserTargetOpenResultV1.model_validate(
             {"target_kind": "THREAD", "target_ref": "thread-1", "recognized": False}

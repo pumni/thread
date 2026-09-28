@@ -471,12 +471,18 @@ class CommandRuntime:
                 ),
                 operation_class=decision.operation_class,
                 preemptible=command.command_type
-                in {"threads.browser.feed.browse", "threads.browser.thread.open"},
+                in {
+                    "threads.browser.feed.browse",
+                    "threads.browser.thread.open",
+                    "threads.browser.profile.open",
+                },
                 input_data=(
                     {"max_items": command.payload.get("max_items", 10)}
                     if command.command_type == "threads.browser.feed.browse"
                     else {"thread_ref": command.payload["thread_ref"]}
                     if command.command_type == "threads.browser.thread.open"
+                    else {"profile_ref": command.payload["profile_ref"]}
+                    if command.command_type == "threads.browser.profile.open"
                     else None
                 ),
             )

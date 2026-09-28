@@ -65,7 +65,6 @@ def test_worker_job_claim_and_fencing_reject_old_lease() -> None:
 @pytest.mark.parametrize(
     "capability_name",
     [
-        "threads.browser.profile.open",
         "threads.browser.media.local_upload",
     ],
 )
