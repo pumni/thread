@@ -65,6 +65,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | bounded read contract; reviewed production feed UI evidence required |
 | Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit Thread; reviewed production UI evidence required |
 | Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit profile; reviewed production UI evidence required |
+| Stage local media | `threads.browser.media.local_upload` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | worker-local staging only; no publish/submit; reviewed production UI evidence required |
 | Like | LikeThread | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | retain only if product requires |
 | Follow/unfollow | FollowUser | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | no Facebook friend semantics |
 | Random reactions | None | UNSUPPORTED | none | none | DROP | - | random engagement is not an architecture objective |

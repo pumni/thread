@@ -21,13 +21,21 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-The audit reconciliation in PR #38 is awaiting acceptance and merge. Until then,
-**C5-01 (#27) is PAUSED** and PR [#37](https://github.com/pumni/thread/pull/37)
-must remain open/unmerged and must not advance. If PR #38 is accepted and merged,
-the prior authorization resumes for #27 only. Its four approved capability
-contracts remain blocked pending reviewed production Threads UI evidence; no
-production selectors or browser workflows are treated as verified without that
-evidence. #28 remains unauthorized, and LIKE/FOLLOW remain VERIFY.
+### Canonical state once this reconciliation is on `main`
+
+PR #38's audit reconciliation is accepted and merged. The prior C5-01
+authorization resumes for #27 only. PR [#37](https://github.com/pumni/thread/pull/37)
+remains OPEN/unmerged and its implementation may advance only within these four
+approved contracts:
+`threads.browser.feed.browse`, `threads.browser.thread.open`,
+`threads.browser.profile.open`, and `threads.browser.media.local_upload` (local
+staging only; no publish/submit). All four remain BLOCKED until reviewed
+production Threads UI evidence is available; synthetic fixtures do not qualify,
+and selectors or workflows must not be guessed. #28 remains unauthorized, and
+LIKE/FOLLOW remain VERIFY.
+
+While PR #38 is still under review and absent from `main` (the current review
+state), #27 remains PAUSED and PR #37 must not advance.
 
 Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
 production release work until the coordinator explicitly authorizes the
@@ -214,9 +222,10 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Keep #27 PAUSED and PR #37 open/unmerged without advancing it until PR #38 is
-   accepted and merged. After that, resume only the prior #27 authorization; all
-   four capabilities still require reviewed, scrubbed production UI evidence.
+4. If PR #38 is not yet on `main`, keep #27 PAUSED and do not advance PR #37.
+   Once PR #38 is on `main`, resume only the prior #27 authorization; PR #37 may
+   advance only within the four approved contracts, all still BLOCKED pending
+   reviewed, scrubbed production UI evidence.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
@@ -233,9 +242,14 @@ CI green is necessary but not sufficient.
 
 ## 11. Audit reconciliation snapshot — 2026-09-28
 
-PR #37 remains open and unmerged at head
-`0f55550ad06b6545a3a4d056607052aef02fab75`. Its Python 3.14 quality gate
-(`36196015832`) and Secret scan (`36196015819`) pass. The four C5 capabilities
-remain blocked pending reviewed production UI evidence. The audit-reconciliation
-PR changes documents and migration regression coverage only; it does not change
-C5 implementation or authorize #28.
+The post-merge canonical state is described above: PR #38 is accepted/merged,
+the prior #27-only authorization resumes, and PR #37 remains OPEN/unmerged with
+scope limited to the four approved capability contracts. All four remain
+BLOCKED pending reviewed production Threads UI evidence; #28 is unauthorized
+and LIKE/FOLLOW remain VERIFY.
+
+At this review snapshot, PR #38 is still unmerged, so #27 remains PAUSED and
+PR #37 must not advance. PR #37 is at head
+`0f55550ad06b6545a3a4d056607052aef02fab75`; its Python 3.14 quality gate
+(`36196015832`) and Secret scan (`36196015819`) pass. PR #38 changes documents
+and migration regression coverage only; it does not change C5 implementation.
