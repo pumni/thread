@@ -13,17 +13,19 @@ Completed:
 - C3-02 PR #35 — issue #26 accepted and merged.
 - C4 PR #36 — issue #8 accepted and merged.
 
-### Canonical C5-01 state after the thread.open checkpoint is merged
+### Canonical C5-01 state after the profile.open checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
 `threads.browser.thread.open` v1 checkpoints are accepted and merged. Both are
 DONE for their checkpoints and available only through reviewed, bounded,
-account-affine WorkerJob paths with explicit worker opt-in. Thread open is the
-bounded READ workflow implemented from
-`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`.
-Issue #27 remains **OPEN** because `profile.open` and `media.local_upload`
-remain `BLOCKED_UI_EVIDENCE`, unadvertised and unrouted. Local media remains
+account-affine WorkerJob paths with explicit worker opt-in. The accepted
+profile.open evidence (2026-09-28, two authenticated public profiles) authorizes
+its bounded READ implementation from `main@cd3190d7ea8c2f80ef316f64fb364e8edf69cb98`.
+After this checkpoint merges, profile.open is DONE for its checkpoint and
+available only through the same account-affine WorkerJob path with explicit
+worker opt-in. Issue #27 remains **OPEN** because `media.local_upload` remains
+`BLOCKED_UI_EVIDENCE`, unadvertised and unrouted. Local media remains
 staging-only, with no publish/submit. Synthetic fixtures are not production
 evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No browser
 mutation or publish/submit scope is authorized.
@@ -151,9 +153,12 @@ Issues:
 - #27 `threads.browser.thread.open` v1 — PR #40 accepted and merged, DONE,
   available only through the reviewed bounded account-affine WorkerJob path
   with explicit worker opt-in;
-- `threads.browser.profile.open` and `threads.browser.media.local_upload`
-  remain `BLOCKED_UI_EVIDENCE`, unadvertised, and unrouted; local media remains
-  staging-only, with no publish/submit;
+- `threads.browser.profile.open` has accepted UI evidence and is DONE after its
+  authorized implementation checkpoint merges; it is READ-only and available
+  through the bounded account-affine WorkerJob path with explicit opt-in;
+- `threads.browser.media.local_upload` remains `BLOCKED_UI_EVIDENCE`,
+  unadvertised, and unrouted; local media remains staging-only, with no
+  publish/submit;
 - #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
   coordinator decision after the #27 checkpoint review.
 

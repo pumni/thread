@@ -25,6 +25,11 @@ from threads_platform.workers.feed_browse import (
     FEED_CAPABILITY_VERSION,
     BrowserFeedBrowseWorker,
 )
+from threads_platform.workers.profile_open import (
+    PROFILE_OPEN_CAPABILITY_NAME,
+    PROFILE_OPEN_CAPABILITY_VERSION,
+    BrowserProfileOpenWorker,
+)
 from threads_platform.workers.runtime import WorkerAgent, WorkerAgentConfig
 from threads_platform.workers.sessions import LocalBrowserSessionManager
 from threads_platform.workers.thread_open import (
@@ -44,16 +49,7 @@ async def _run() -> None:
     data_root.prepare()
     identity_store = WorkerIdentityFileStore(data_root)
     worker_id = identity_store.load_or_create()
-    feed_browse_enabled = _boolean_environment("THREADS_WORKER_FEED_BROWSE_ENABLED", False)
-    thread_open_enabled = _boolean_environment("THREADS_WORKER_THREAD_OPEN_ENABLED", False)
-    enabled_capabilities = tuple(
-        capability
-        for enabled, capability in (
-            (feed_browse_enabled, (FEED_CAPABILITY_NAME, FEED_CAPABILITY_VERSION)),
-            (thread_open_enabled, (THREAD_OPEN_CAPABILITY_NAME, THREAD_OPEN_CAPABILITY_VERSION)),
-        )
-        if enabled
-    )
+    enabled_capabilities = enabled_browser_capabilities()
     config = WorkerAgentConfig(
         control_plane_url=_required_environment("THREADS_WORKER_CONTROL_PLANE_URL"),
         display_name=os.environ.get("THREADS_WORKER_DISPLAY_NAME", "Windows Worker"),
@@ -84,12 +80,16 @@ async def _run() -> None:
             browser_adapter,
         )
         handlers: dict[str, BrowserCapabilityHandler] = {}
-        if feed_browse_enabled:
+        if (FEED_CAPABILITY_NAME, FEED_CAPABILITY_VERSION) in enabled_capabilities:
             handlers[FEED_CAPABILITY_NAME] = BrowserFeedBrowseWorker(
                 worker_id, client, browser_sessions
             )
-        if thread_open_enabled:
+        if (THREAD_OPEN_CAPABILITY_NAME, THREAD_OPEN_CAPABILITY_VERSION) in enabled_capabilities:
             handlers[THREAD_OPEN_CAPABILITY_NAME] = BrowserThreadOpenWorker(
+                worker_id, client, browser_sessions
+            )
+        if (PROFILE_OPEN_CAPABILITY_NAME, PROFILE_OPEN_CAPABILITY_VERSION) in enabled_capabilities:
+            handlers[PROFILE_OPEN_CAPABILITY_NAME] = BrowserProfileOpenWorker(
                 worker_id, client, browser_sessions
             )
         job_handler = BrowserCapabilityJobDispatcher(worker_id, client, handlers)
@@ -139,6 +139,27 @@ def _boolean_environment(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no"}:
         return False
     raise RuntimeError(f"{name} must be a boolean value")
+
+
+def enabled_browser_capabilities() -> tuple[tuple[str, int], ...]:
+    return tuple(
+        capability
+        for enabled, capability in (
+            (
+                _boolean_environment("THREADS_WORKER_FEED_BROWSE_ENABLED", False),
+                (FEED_CAPABILITY_NAME, FEED_CAPABILITY_VERSION),
+            ),
+            (
+                _boolean_environment("THREADS_WORKER_THREAD_OPEN_ENABLED", False),
+                (THREAD_OPEN_CAPABILITY_NAME, THREAD_OPEN_CAPABILITY_VERSION),
+            ),
+            (
+                _boolean_environment("THREADS_WORKER_PROFILE_OPEN_ENABLED", False),
+                (PROFILE_OPEN_CAPABILITY_NAME, PROFILE_OPEN_CAPABILITY_VERSION),
+            ),
+        )
+        if enabled
+    )
 
 
 def main() -> None:

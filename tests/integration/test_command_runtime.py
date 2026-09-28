@@ -743,6 +743,11 @@ async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
             "threads.browser.thread.open",
             {"thread_ref": "/@alice/post/post-7/"},
         ),
+        (
+            "threads.browser.profile.open",
+            "threads.browser.profile.open",
+            {"profile_ref": "/@alice/"},
+        ),
     ],
 )
 async def test_browser_read_capability_routes_to_affine_worker_with_bounded_input(
@@ -819,6 +824,8 @@ async def test_browser_read_capability_routes_to_affine_worker_with_bounded_inpu
         {"max_items": 7}
         if command_type == "threads.browser.feed.browse"
         else {"thread_ref": "/@alice/post/post-7"}
+        if command_type == "threads.browser.thread.open"
+        else {"profile_ref": "/@alice"}
     )
     assert job.input_data == expected_input
     claimed = await worker_jobs.claim_next(worker_id)
@@ -830,7 +837,6 @@ async def test_browser_read_capability_routes_to_affine_worker_with_bounded_inpu
 @pytest.mark.parametrize(
     ("command_type", "payload"),
     [
-        ("threads.browser.profile.open", {"profile_ref": "profile-1"}),
         ("threads.browser.media.local_upload", {"media_ref": "image-1.jpg"}),
     ],
 )

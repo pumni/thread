@@ -464,13 +464,17 @@ Each browser capability must declare:
 No generic random “human behavior” function is accepted.
 
 C5-01 declares versioned feed browse, Thread open, profile open, and local media
-staging contracts. They remain blocked from routing until each real Threads UI
-surface has reviewed observed evidence. A blocked capability is rejected with
-`BROWSER_UI_EVIDENCE_REQUIRED`; it is not advertised or enqueued as a WorkerJob.
-Synthetic contracts verify adapter behavior only. Local media references resolve
-under the Worker Agent's managed `media` directory, and staging never submits or
-publishes content. See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the
-per-capability bounds and schemas.
+staging contracts. Feed browse and Thread open have accepted evidence and use
+bounded account-affine WorkerJobs with explicit worker opt-in. Profile-open UI
+evidence is accepted; its authorized v1 implementation uses the same bounded
+READ path and explicit opt-in. Local media staging remains blocked until its
+real Threads UI surface has reviewed evidence. A blocked capability is rejected
+with `BROWSER_UI_EVIDENCE_REQUIRED`; it is not advertised or enqueued as a
+WorkerJob. Synthetic contracts verify adapter behavior only. Local media
+references resolve under the Worker Agent's managed `media` directory, and
+staging never submits or publishes content. See
+`docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the per-capability bounds and
+schemas.
 
 ## 21. Concurrency
 

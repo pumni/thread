@@ -42,6 +42,7 @@ from threads_platform.workers.browser import (
     BrowserNavigationPolicy,
     BrowserNetworkRouteUnsupported,
     BrowserProcessCrashed,
+    BrowserProfileOpenEngineSession,
     BrowserSurface,
     BrowserSurfaceState,
     BrowserThreadOpenEngineSession,
@@ -438,6 +439,97 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
             "/@alice/post/post-prefix-anchor",
             error=RemoteSessionStateUncertain,
         )
+
+    asyncio.run(scenario())
+
+
+def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
+    tmp_path: Path,
+    synthetic_origin: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def verify(
+        path: str,
+        target_ref: str,
+        *,
+        error: type[Exception] | None = None,
+        ancestor_bound: int = 8,
+    ) -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        account_id = uuid4()
+        profile_directory = tmp_path / f"profile-open-{uuid4()}"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine(navigation_timeout_ms=1_000).open(
+            BrowserLaunchRequest(
+                worker_id=uuid4(),
+                account_id=account_id,
+                profile_ref="profile-open-test",
+                profile_directory=profile_directory,
+                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            await session.navigate(
+                f"{synthetic_origin}{path}", allowed_origins=frozenset({synthetic_origin})
+            )
+            engine_session = cast(BrowserProfileOpenEngineSession, session)
+            if error is None:
+                assert (
+                    await engine_session.verify_profile_target(
+                        target_ref=target_ref,
+                        ancestor_bound=ancestor_bound,
+                    )
+                    is None
+                )
+            else:
+                with pytest.raises(error):
+                    await engine_session.verify_profile_target(
+                        target_ref=target_ref,
+                        ancestor_bound=ancestor_bound,
+                    )
+        finally:
+            await session.close()
+
+    async def scenario() -> None:
+        target = "/@alice"
+        await verify(target, target)
+        await verify(
+            "/@duph1",
+            "/@duph1",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@missingh1",
+            "/@missingh1",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@contaminated",
+            "/@contaminated",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@postonly",
+            "/@postonly",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@noevidence",
+            "/@noevidence",
+            error=RemoteSessionStateUncertain,
+        )
+        await verify(
+            "/@queryhref",
+            "/@queryhref",
+            error=RemoteSessionStateUncertain,
+        )
+        await verify(
+            "/@overbound",
+            "/@overbound",
+            error=BrowserContractError,
+        )
+        await verify("/@alice/extended", target, error=RemoteSessionStateUncertain)
 
     asyncio.run(scenario())
 
@@ -1023,6 +1115,10 @@ def _thread_document(body: bytes) -> bytes:
     )
 
 
+def _profile_document(body: bytes) -> bytes:
+    return b"<!doctype html><html><body>" + body + b"</body></html>"
+
+
 _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/authenticated": _document("AUTHENTICATED"),
     "/login": _document("LOGIN_REQUIRED"),
@@ -1083,6 +1179,41 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/@alice/post/post-prefix-anchor": _thread_document(
         b'<section><a href="/@alice/post/post-prefix-anchor-extra">similar permalink</a>'
         b'<a href="/@alice/">author</a><span dir="auto">Root text</span></section>'
+    ),
+    "/@alice": _profile_document(
+        b"<header><div><h1>Public profile</h1>"
+        + b"".join(b'<a href="/@alice/">profile identity</a>' for _ in range(9))
+        + b'</div></header><section><a href="/@alice/post/post-1">post</a></section>'
+    ),
+    "/@duph1": _profile_document(
+        b"<header><div><h1>First profile</h1><h1>Second profile</h1>"
+        b'<a href="/@duph1">profile identity</a></div></header>'
+    ),
+    "/@missingh1": _profile_document(
+        b'<header><div><a href="/@missingh1">profile identity</a></div></header>'
+    ),
+    "/@contaminated": _profile_document(
+        b'<header><div><h1>Public profile</h1><a href="/@contaminated">profile identity</a>'
+        b'<a href="/@alice/post/post-1">post permalink</a></div></header>'
+    ),
+    "/@postonly": _profile_document(
+        b"<header><h1>Public profile</h1></header><section>"
+        b'<a href="/@postonly">post content profile link</a>'
+        b'<a href="/@alice/post/post-1">post permalink</a></section>'
+    ),
+    "/@noevidence": _profile_document(
+        b'<header><h1>Public profile</h1><a href="/@someoneelse">other profile</a></header>'
+    ),
+    "/@queryhref": _profile_document(
+        b"<header><h1>Public profile</h1>"
+        b'<a href="/@queryhref?source=profile">profile identity</a></header>'
+    ),
+    "/@overbound": _profile_document(
+        b'<section><a href="/@overbound">profile identity</a>'
+        + b"<div>" * 8
+        + b"<h1>Public profile</h1>"
+        + b"</div>" * 8
+        + b"</section>"
     ),
 }
 

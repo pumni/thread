@@ -155,6 +155,62 @@ _THREAD_OPEN_SCRIPT = r"""
 }
 """
 
+_PROFILE_OPEN_SCRIPT = r"""
+({allowedOrigin, targetRef, ancestorBound}) => {
+  const normalizePath = (path) => path.endsWith('/') ? path.slice(0, -1) : path;
+  const anchorPath = (href) => {
+    if (typeof href !== 'string' || !href.startsWith('/') || href.startsWith('//') ||
+        href.includes('?') || href.includes('#')) {
+      return null;
+    }
+    return normalizePath(href);
+  };
+  const isPostPermalink = (href) => {
+    if (typeof href !== 'string' || !href.startsWith('/') || href.startsWith('//')) {
+      return false;
+    }
+    const pathname = href.split(/[?#]/, 1)[0];
+    return /^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(pathname);
+  };
+  if (window.location.origin !== allowedOrigin) return {outcome: 'uncertain'};
+  if (normalizePath(window.location.pathname) !== targetRef) return {outcome: 'uncertain'};
+
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  if (anchors.length > 1000) return {outcome: 'invalid'};
+  const headings = Array.from(document.querySelectorAll('h1'));
+  if (headings.length !== 1 || !(headings[0].textContent || '').replace(/\s+/g, ' ').trim()) {
+    return {outcome: 'invalid'};
+  }
+  const exactTargetAnchors = anchors.filter(
+    (anchor) => anchorPath(anchor.getAttribute('href')) === targetRef
+  );
+  if (exactTargetAnchors.length === 0) return {outcome: 'uncertain'};
+
+  let node = headings[0].parentElement;
+  for (let depth = 1; node && depth <= ancestorBound; depth += 1) {
+    const links = Array.from(node.querySelectorAll('a[href]'));
+    const hasExactTargetProfile = links.some(
+      (link) => anchorPath(link.getAttribute('href')) === targetRef
+    );
+    if (hasExactTargetProfile) {
+      if (links.some((link) => isPostPermalink(link.getAttribute('href')))) {
+        return {outcome: 'invalid'};
+      }
+      return {outcome: 'recognized'};
+    }
+    node = node.parentElement;
+  }
+
+  if (node) {
+    const overflowLinks = Array.from(node.querySelectorAll('a[href]'));
+    if (overflowLinks.some((link) => anchorPath(link.getAttribute('href')) === targetRef)) {
+      return {outcome: 'invalid'};
+    }
+  }
+  return {outcome: 'uncertain'};
+}
+"""
+
 
 class PlaywrightBrowserEngine:
     """Pinned Playwright/Chromium lifecycle implementation for worker profiles."""
@@ -400,6 +456,28 @@ class _PlaywrightBrowserSession:
             raise BrowserRuntimeUnavailable("BROWSER_THREAD_INSPECTION_FAILED") from None
         _verify_thread_target_result(payload)
 
+    async def verify_profile_target(self, *, target_ref: str, ancestor_bound: int) -> None:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        if (
+            not 1 <= ancestor_bound <= 8
+            or re.fullmatch(r"/@[A-Za-z0-9._]{1,30}", target_ref) is None
+        ):
+            raise BrowserContractError()
+        try:
+            payload = await self._page.evaluate(
+                _PROFILE_OPEN_SCRIPT,
+                {
+                    "allowedOrigin": BROWSER_FEED_ORIGIN,
+                    "targetRef": target_ref,
+                    "ancestorBound": ancestor_bound,
+                },
+            )
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_PROFILE_INSPECTION_FAILED") from None
+        _verify_profile_target_result(payload)
+
     async def scroll_feed(self) -> None:
         self._ensure_alive()
         await self._raise_navigation_policy_error()
@@ -520,6 +598,19 @@ def _feed_candidate_observations(payload: object) -> tuple[FeedCandidateObservat
 
 
 def _verify_thread_target_result(payload: object) -> None:
+    if not isinstance(payload, dict):
+        raise BrowserContractError()
+    data = cast(dict[str, object], payload)
+    if set(data) != {"outcome"}:
+        raise BrowserContractError()
+    outcome = data.get("outcome")
+    if outcome == "uncertain":
+        raise RemoteSessionStateUncertain()
+    if outcome != "recognized":
+        raise BrowserContractError()
+
+
+def _verify_profile_target_result(payload: object) -> None:
     if not isinstance(payload, dict):
         raise BrowserContractError()
     data = cast(dict[str, object], payload)
