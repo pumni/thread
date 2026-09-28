@@ -38,7 +38,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Priority interruption | Durable priority/preemption | HYBRID | Scheduler/WorkerJob | cancellation at safe boundary | PLANNED | P1 | replaces stop_browsing |
 | Text publish | Threads text post | HYBRID | Official API | Browser | DONE/API | P0 | Browser fallback C3/C5 |
 | Image publish by URL | Threads image post | HYBRID | Official API | Browser | DONE/API | P0 | API requires media contract |
-| Local image/file stage | `threads.browser.media.local_upload` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | C5 stages local media only; `BROWSER_UI_EVIDENCE_REQUIRED` pending reviewed production UI evidence; publish/submit excluded |
+| Local image/file stage | Local browser media staging | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | C5 only stages local media; production composer UI evidence required; publish/submit excluded |
 | Video publish | Threads video post | HYBRID | Official API | Browser | DONE/API | P0 | live media behavior still TP-002 gate |
 | Multi-media post | Carousel | HYBRID | Official API | Browser | DONE/API | P0 | container workflow |
 | Quote content | Quote Thread | HYBRID | Official API | Browser | DONE/API | P1 | live permission still VERIFY |
@@ -62,9 +62,9 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Login using persistent profile | Operator login + persisted session | HUMAN_ASSISTED | Worker + operator | none | PLANNED | P0 | no password-as-core model |
 | Session health | Browser session lifecycle | BROWSER_ASSISTED | Worker | Human intervention | DONE | P0 | C3 session-state reporting; login/challenges remain operator-assisted |
 | Per-account proxy | NetworkProfile | BROWSER_ASSISTED | assigned Worker | direct connection if policy allows | DONE | P1 | account-scoped routing config; credential references only, not evasion |
-| Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | C5-01 contract; `BROWSER_UI_EVIDENCE_REQUIRED`; synthetic fixtures are not production evidence |
-| Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit Thread; `BROWSER_UI_EVIDENCE_REQUIRED`; synthetic fixtures are not production evidence |
-| Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit profile; `BROWSER_UI_EVIDENCE_REQUIRED`; synthetic fixtures are not production evidence |
+| Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | bounded read contract; reviewed production feed UI evidence required |
+| Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit Thread; reviewed production UI evidence required |
+| Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit profile; reviewed production UI evidence required |
 | Like | LikeThread | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | retain only if product requires |
 | Follow/unfollow | FollowUser | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | no Facebook friend semantics |
 | Random reactions | None | UNSUPPORTED | none | none | DROP | - | random engagement is not an architecture objective |

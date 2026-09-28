@@ -1,4 +1,4 @@
-# Project State Handoff — 2026-09-28
+# Project State Handoff — 2026-09-26
 
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
@@ -21,19 +21,15 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-The current authorized checkpoint is **C5-01 — Browser capability pack v1 (#27)**.
-Its implementation is under review in open, unmerged PR #37 on
-`batch/c5-01-browser-capability-pack`, head
-`0f55550ad06b6545a3a4d056607052aef02fab75`. The Python 3.14 quality gate
-(run `36196015832`) and Secret scan (run `36196015819`) pass on that head. The four
-approved capability contracts are declared, but each remains blocked pending
-reviewed production Threads UI evidence; no production selectors or workflows are
-enabled. See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` and PR #37 for evidence.
+The current checkpoint is **C5-01 — Browser capability pack v1 (#27)** on
+`batch/c5-01-browser-capability-pack`. The four approved capability contracts are
+declared, but all remain blocked pending reviewed production Threads UI evidence;
+no production selectors or browser workflows were added. See
+`docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` and its checkpoint PR for evidence.
 
 Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
 production release work until the coordinator explicitly authorizes the
-corresponding checkpoint. The audit-reconciliation change is limited to documents
-and migration regression coverage; it does not advance C5 implementation.
+corresponding checkpoint.
 
 ## 3. Important merged checkpoints
 
@@ -213,11 +209,9 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Review open PR #37 at head `0f55550ad06b6545a3a4d056607052aef02fab75`.
-   All four capabilities currently report `BROWSER_UI_EVIDENCE_REQUIRED`; review
-   or provide scrubbed observed evidence before any production capability is
-   enabled. Both GitHub checks are green, but the PR remains unmerged pending
-   coordinator review.
+4. Review the C5-01 checkpoint PR. All four capabilities currently report
+   `BROWSER_UI_EVIDENCE_REQUIRED`; review or provide scrubbed observed evidence
+   before any production capability is enabled.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Stop after #27 for coordinator review before #28 AccountActivityPlan/preemption.
 
@@ -231,3 +225,12 @@ Do not guess production Threads selectors from synthetic fixtures. Any productio
 - BLOCKED BY PRODUCT/API DECISION
 
 CI green is necessary but not sufficient.
+
+## 11. Audit reconciliation snapshot — 2026-09-28
+
+PR #37 remains open and unmerged at head
+`0f55550ad06b6545a3a4d056607052aef02fab75`. Its Python 3.14 quality gate
+(`36196015832`) and Secret scan (`36196015819`) pass. The four C5 capabilities
+remain blocked pending reviewed production UI evidence. The audit-reconciliation
+PR changes documents and migration regression coverage only; it does not change
+C5 implementation or authorize #28.
