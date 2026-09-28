@@ -45,10 +45,12 @@ The four versioned command envelopes use strict, bounded payloads:
 
 The normalized result models are independent of Playwright and DOM types. Feed
 observations contain only an optional Thread reference, optional author username,
-a text excerpt capped at 500 characters, and an observation position. Target open
-returns the target kind/reference and whether its expected contract was recognized.
-Local media staging returns media kind, byte size, and staged status only. Schemas
-reject extra fields such as HTML, screenshots, browser storage, or filesystem paths.
+a text excerpt capped at 500 characters, and an observation position. A successful
+target-open result contains a recognized target kind/reference with
+`recognized: true`; an unknown or mismatched UI produces a typed failure rather
+than a successful result. Local media staging returns media kind, byte size, and
+staged status only. Schemas reject extra fields such as HTML, screenshots, browser
+storage, or filesystem paths.
 
 ## Local media source policy
 

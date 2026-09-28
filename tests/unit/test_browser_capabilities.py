@@ -134,6 +134,11 @@ def test_c5_result_schemas_exclude_dom_and_worker_local_paths() -> None:
         {"media_kind": BrowserMediaKind.IMAGE, "byte_size": 1024, "staged": True}
     )
     assert feed.result_version == target.result_version == upload.result_version == 1
+    assert target.recognized is True
+    with pytest.raises(ValidationError):
+        BrowserTargetOpenResultV1.model_validate(
+            {"target_kind": "THREAD", "target_ref": "thread-1", "recognized": False}
+        )
     with pytest.raises(ValidationError):
         BrowserFeedResultV1.model_validate(
             {"observations": [], "truncated": False, "html": "<body>"}

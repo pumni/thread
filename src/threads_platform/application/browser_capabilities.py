@@ -45,7 +45,7 @@ class BrowserTargetOpenResultV1(BaseModel):
     result_version: Literal[1] = 1
     target_kind: Literal["THREAD", "PROFILE"]
     target_ref: str = Field(min_length=1, max_length=255)
-    recognized: bool
+    recognized: Literal[True] = True
 
 
 class BrowserMediaStageResultV1(BaseModel):
