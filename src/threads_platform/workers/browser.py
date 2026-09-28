@@ -185,6 +185,12 @@ class BrowserFeedEngineSession(BrowserEngineSession, Protocol):
     async def scroll_feed(self) -> None: ...
 
 
+class BrowserThreadOpenEngineSession(BrowserEngineSession, Protocol):
+    async def verify_thread_target(
+        self, *, target_ref: str, author_username: str, ancestor_bound: int
+    ) -> None: ...
+
+
 class BrowserEngine(Protocol):
     async def open(self, request: BrowserLaunchRequest) -> BrowserEngineSession: ...
 
@@ -653,6 +659,39 @@ class WorkerBrowserSession:
         engine_session = cast(BrowserFeedEngineSession, self._engine_session)
         try:
             await engine_session.scroll_feed()
+        except SessionExpired:
+            await self._report_state_and_intervention(
+                BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
+            )
+            raise
+        except ChallengeDetected:
+            await self._report_state_and_intervention(
+                BrowserSessionState.CHALLENGE_REQUIRED,
+                "CHALLENGE_REQUIRED",
+                "CHALLENGE_REQUIRED",
+            )
+            raise
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise
+
+    async def verify_thread_target(
+        self, *, target_ref: str, author_username: str, ancestor_bound: int
+    ) -> None:
+        if self._closed:
+            raise BrowserProcessCrashed()
+        if self._session_state is not BrowserSessionState.AUTHENTICATED:
+            raise UnsupportedUIState()
+        if self._job_execution is None or self._job_execution.account_id != self._account_id:
+            raise BrowserAccountAffinityMismatch()
+        await self._job_execution.renew()
+        engine_session = cast(BrowserThreadOpenEngineSession, self._engine_session)
+        try:
+            await engine_session.verify_thread_target(
+                target_ref=target_ref,
+                author_username=author_username,
+                ancestor_bound=ancestor_bound,
+            )
         except SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"

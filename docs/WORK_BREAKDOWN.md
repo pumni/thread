@@ -19,11 +19,15 @@ PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 checkpoint is
 accepted and merged. Feed browse is available only through the reviewed,
 bounded, account-affine WorkerJob path, and workers must opt in to the
-capability. Issue #27 remains **OPEN** because thread.open, profile.open, and
-media.local_upload remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unadvertised
-and unrouted. Local media remains staging-only, with no publish/submit. #28
-remains unauthorized; LIKE/FOLLOW remain VERIFY. No browser mutation or
-publish/submit scope is authorized.
+capability. On 2026-09-28, production UI evidence for `thread.open` was accepted
+and implementation of `threads.browser.thread.open` v1 was authorized from
+`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`. This checkpoint adds only that
+bounded READ workflow through the same account-affine WorkerJob path. Issue #27
+remains **OPEN** because `profile.open` and `media.local_upload` remain
+`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unadvertised and unrouted. Local media
+remains staging-only, with no publish/submit. #28 remains unauthorized;
+LIKE/FOLLOW remain VERIFY. No browser mutation or publish/submit scope is
+authorized.
 
 Issue #3 remains a production/release gate.
 

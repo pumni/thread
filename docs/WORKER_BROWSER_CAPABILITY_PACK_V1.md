@@ -2,25 +2,28 @@
 
 ## Activation status
 
-The C5-01 catalog contains four v1 names. On 2026-09-28, the coordinator
-accepted scrubbed production UI evidence for `threads.browser.feed.browse` and
-authorized implementation of that capability only. PR #39's feed.browse v1
-checkpoint is accepted and merged. Feed browse is available only through the
-reviewed bounded, account-affine WorkerJob path, with worker opt-in required.
-The other three capabilities remain `BLOCKED_UI_EVIDENCE`, unavailable to
-routing and worker advertisement. C3's `worker.synthetic` contract remains a
-local fixture, not production UI evidence.
+The C5-01 catalog contains four v1 names. The coordinator accepted scrubbed
+production UI evidence for `threads.browser.feed.browse` and
+`threads.browser.thread.open`; feed.browse is accepted and merged, and thread
+open v1 is authorized for its own bounded implementation checkpoint from
+`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`. Both use the reviewed,
+account-affine WorkerJob path and require worker opt-in via
+`THREADS_WORKER_FEED_BROWSE_ENABLED` and `THREADS_WORKER_THREAD_OPEN_ENABLED`
+(both default false). `profile.open` and `media.local_upload` remain
+`BLOCKED_UI_EVIDENCE`, unavailable to routing and worker advertisement. C3's
+`worker.synthetic` contract remains a local fixture, not production UI evidence.
 
-The `ui_contract_id` values below are application contract names. The feed's
-version 1 is mapped to the accepted semantic evidence below; it is not a version
-reported by Threads. The other three contract names remain planned and blocked.
+The `ui_contract_id` values below are application contract names. The feed and
+thread-open version 1 contracts are mapped to their accepted semantic evidence;
+they are not versions reported by Threads. The other two contract names remain
+blocked pending evidence.
 
 ## Declared contracts
 
 | Capability | Class / operation | Session | Safe checkpoints | Bounded outcome | Preemptible | Irreversible boundary | Status |
 |---|---|---|---|---|---:|---:|---|
 | `threads.browser.feed.browse` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, FEED_READY, ITEM_BATCH | `BrowserFeedResultV1`; up to 20 observations, 5 feed iterations, 30 seconds | yes | no | AVAILABLE |
-| `threads.browser.thread.open` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, THREAD_READY | `BrowserTargetOpenResultV1`; one opaque Thread reference | yes | no | BLOCKED_UI_EVIDENCE |
+| `threads.browser.thread.open` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, THREAD_READY | `BrowserTargetOpenResultV1`; one normalized relative Thread permalink, 30 seconds | yes | no | AVAILABLE |
 | `threads.browser.profile.open` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, PROFILE_READY | `BrowserTargetOpenResultV1`; one opaque profile reference | yes | no | BLOCKED_UI_EVIDENCE |
 | `threads.browser.media.local_upload` v1 | BROWSER_ASSISTED / MUTATION | AUTHENTICATED | BEFORE_LOCAL_STAGE, LOCAL_STAGE_COMPLETE | `BrowserMediaStageResultV1`; image/video kind, bounded byte size, staged flag | yes | no external boundary | BLOCKED_UI_EVIDENCE |
 
@@ -33,7 +36,7 @@ requires a separate reviewed capability and recovery contract.
 The four versioned command envelopes use strict, bounded payloads:
 
 - feed browse accepts only `max_items` from 1 through 20;
-- Thread and profile open accept an opaque identifier, not a URL or arbitrary path;
+- Thread open accepts a relative `/@<username>/post/<id>` path only; one trailing slash is normalized. Profile open remains a blocked opaque identifier contract;
 - local upload accepts a simple worker-local `media_ref`, never an absolute path;
 - unknown payload fields are rejected.
 
@@ -45,6 +48,32 @@ target-open result contains a recognized target kind/reference with
 than a successful result. Local media staging returns media kind, byte size, and
 staged status only. Schemas reject extra fields such as HTML, screenshots, browser
 storage, or filesystem paths.
+
+## Thread open v1 reviewed contract
+
+Input is one bounded relative `/@<username>/post/<id>` path. The Worker Agent
+navigates only to the approved Threads Web origin plus that path. The current
+`window.location.pathname` must equal the normalized input exactly; normalization
+removes at most one trailing slash. A path prefix or extended path is not a
+match.
+
+Recognition uses exact relative href paths. The target permalink href must
+equal the input after the same trailing-slash normalization; the author profile
+href must equal `/@<username>` for the exact target author. The same bounded
+ancestor must also contain non-empty text from the observed `span[dir="auto"]`
+marker. Ancestor traversal is limited to eight levels. Multiple exact target
+anchors are allowed only if every anchor resolves to the same root association.
+Competing roots, a reply permalink/author in the candidate association, missing
+author or text evidence, and evidence beyond the bound fail closed.
+
+Redirects, page-initiated off-origin navigation, an exact pathname mismatch, or
+a loaded target without the reviewed target href create durable
+`REMOTE_STATE_UNCERTAIN` intervention. Known persisted login, expired-session,
+and challenge states use their existing durable interventions. No new login or
+challenge selector is inferred. Canonical metadata, `main`, `article`, generated
+CSS classes, and localized Back controls are not recognition inputs. A
+successful result contains only version, `THREAD`, the normalized relative
+target path, and `recognized: true`.
 
 ## Local media source policy
 
@@ -64,31 +93,33 @@ reviewed production evidence.
 
 All capabilities require the existing C3 managed account session to be
 `AUTHENTICATED`. The declared session interventions are `LOGIN_REQUIRED`,
-`SESSION_EXPIRED`, and `CHALLENGE_REQUIRED`. Feed browse and local upload also
-permit `REMOTE_STATE_UNCERTAIN`. If an authenticated feed navigation receives a
+`SESSION_EXPIRED`, and `CHALLENGE_REQUIRED`. Feed browse, thread open, and local
+upload permit `REMOTE_STATE_UNCERTAIN`. If an authenticated feed navigation receives a
 redirect, it is blocked before following and requests durable
 `REMOTE_STATE_UNCERTAIN` intervention. A bounded read with no reviewed permalink
 candidates does the same, including when the feed may simply be exhausted; the
 available production evidence cannot distinguish that from a remote session
 transition. This path does not guess a login or challenge selector. Malformed,
 ambiguous, or over-bound feed association evidence remains a fail-closed
-contract failure. Existing C3 session reporting and WorkerJob fencing are the
-required implementation paths; these contracts add no alternate session or job
-journal.
+contract failure. Thread open applies its target path, anchor, author, and text
+checks under the same durable WorkerJob intervention and lease fencing. Existing
+C3 session reporting and WorkerJob fencing are the required implementation
+paths; these contracts add no alternate session or job journal.
 
 Declared bounded failure codes are `BROWSER_CONTRACT_MISMATCH`,
 `BROWSER_REQUIRED_MARKER_NOT_FOUND`, `UNSUPPORTED_UI_STATE`,
 `BROWSER_NAVIGATION_TIMEOUT`, `BROWSER_PROCESS_CRASHED`, and
-`WORKER_JOB_LEASE_LOST`. Feed browsing also allows
+`WORKER_JOB_LEASE_LOST`. Feed browsing and thread open also allow
 `BROWSER_SESSION_UNAVAILABLE`, `BROWSER_NETWORK_ROUTE_UNSUPPORTED`,
 `UNSUPPORTED_BROWSER_CAPABILITY`, `WORKER_JOB_INPUT_INVALID`, and
 `WORKER_JOB_RETRY_SAFETY_MISMATCH`. Local media staging also declares
 `MEDIA_FILE_REJECTED` and `MEDIA_UPLOAD_FAILED`.
 
 The feed workflow renews the WorkerJob lease before navigation, feed collection,
-and scrolling, and checkpoints only bounded phase codes. Lease loss stops all
-subsequent browser work. Browser timeout or crash does not prove that a target is
-absent. The other capabilities have no executable workflow in this checkpoint.
+and scrolling. Thread open renews before navigation and target inspection. Both
+checkpoint only bounded phase codes, and lease loss stops all subsequent browser
+work. Browser timeout or crash does not prove that a target is absent. The two
+evidence-blocked capabilities have no executable workflow in this checkpoint.
 
 ## Accepted feed evidence record
 
@@ -145,12 +176,12 @@ request the existing intervention; unknown feed structure fails closed. The
 workflow has a 30-second wall-clock limit and does not checkpoint feed text or
 raw page data.
 
-Synthetic fixtures exercise the accepted semantic contract and its failure
-cases. They are not production evidence for the other three capabilities.
+Synthetic fixtures exercise the accepted semantic contracts and their failure
+cases; they are not production evidence for profile.open or media.local_upload.
 
-`threads.browser.thread.open`, `threads.browser.profile.open`, and
-`threads.browser.media.local_upload` remain blocked. LIKE/FOLLOW, browser
+`threads.browser.profile.open` and `threads.browser.media.local_upload` remain
+blocked. LIKE/FOLLOW, browser
 Reply/Repost/Share/Create/Post, publish/submit, scheduler, AccountActivityPlan,
 and durable priority preemption are outside this checkpoint. Issue #27 remains
-open because the three other browser capabilities are blocked; this checkpoint
-does not authorize another capability.
+open because two browser capabilities remain blocked; this checkpoint does not
+authorize `profile.open`, `media.local_upload`, #28, or any additional capability.

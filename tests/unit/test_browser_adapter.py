@@ -44,6 +44,7 @@ from threads_platform.workers.browser import (
     BrowserProcessCrashed,
     BrowserSurface,
     BrowserSurfaceState,
+    BrowserThreadOpenEngineSession,
     ChallengeDetected,
     FeedCandidateObservation,
     LocatorNotFound,
@@ -101,7 +102,7 @@ def synthetic_origin(synthetic_redirect_target_requests: list[str]) -> Iterator[
             else:
                 body = _SYNTHETIC_DOCUMENTS.get(
                     path,
-                    _document("AUTHENTICATED"),
+                    _SYNTHETIC_DOCUMENTS.get(path.rstrip("/"), _document("AUTHENTICATED")),
                 )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -217,7 +218,7 @@ def test_playwright_redirect_requests_intervention_without_following_target(
     asyncio.run(scenario())
 
 
-def test_page_initiated_off_origin_navigation_after_load_requests_intervention(
+def test_page_initiated_off_origin_navigation_blocks_thread_inspection_after_load(
     tmp_path: Path,
     synthetic_origin: str,
     synthetic_redirect_target_requests: list[str],
@@ -258,7 +259,11 @@ def test_page_initiated_off_origin_navigation_after_load_requests_intervention(
             )
             await asyncio.sleep(0.3)
             with pytest.raises(RemoteSessionStateUncertain):
-                await session.collect_feed_candidates(ancestor_bound=8)
+                await session.verify_thread_target(
+                    target_ref="/@alice/post/post-1",
+                    author_username="alice",
+                    ancestor_bound=8,
+                )
         finally:
             await session.close()
         assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
@@ -336,6 +341,98 @@ def test_playwright_feed_scan_uses_reviewed_semantic_markers_only(
         assert normalized[0].thread_ref == "https://www.threads.com/@alice/post/post-1"
         assert normalized[0].text_excerpt == "Synthetic public text"
         assert candidates[0].ancestors[0].text_regions == ("Synthetic public text",)
+
+    asyncio.run(scenario())
+
+
+def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
+    tmp_path: Path,
+    synthetic_origin: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def verify(
+        path: str,
+        target_ref: str,
+        *,
+        error: type[Exception] | None = None,
+    ) -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        account_id = uuid4()
+        profile_directory = tmp_path / f"thread-{uuid4()}"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine(navigation_timeout_ms=1_000).open(
+            BrowserLaunchRequest(
+                worker_id=uuid4(),
+                account_id=account_id,
+                profile_ref="thread-profile",
+                profile_directory=profile_directory,
+                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            await session.navigate(
+                f"{synthetic_origin}{path}", allowed_origins=frozenset({synthetic_origin})
+            )
+            engine_session = cast(BrowserThreadOpenEngineSession, session)
+            if error is None:
+                assert (
+                    await engine_session.verify_thread_target(
+                        target_ref=target_ref,
+                        author_username="alice",
+                        ancestor_bound=8,
+                    )
+                    is None
+                )
+            else:
+                with pytest.raises(error):
+                    await engine_session.verify_thread_target(
+                        target_ref=target_ref,
+                        author_username="alice",
+                        ancestor_bound=8,
+                    )
+        finally:
+            await session.close()
+
+    async def scenario() -> None:
+        target = "/@alice/post/post-1"
+        await verify(target, target)
+        await verify("/@alice/post/post-duplicate/", "/@alice/post/post-duplicate")
+        await verify(
+            "/@alice/post/post-competing",
+            "/@alice/post/post-competing",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@alice/post/post-reply-cross",
+            "/@alice/post/post-reply-cross",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@alice/post/post-over-bound",
+            "/@alice/post/post-over-bound",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@alice/post/post-author-mismatch",
+            "/@alice/post/post-author-mismatch",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@alice/post/post-no-anchor",
+            "/@alice/post/post-no-anchor",
+            error=RemoteSessionStateUncertain,
+        )
+        await verify(
+            "/@alice/post/post-prefix-extra",
+            "/@alice/post/post-prefix",
+            error=RemoteSessionStateUncertain,
+        )
+        await verify(
+            "/@alice/post/post-prefix-anchor",
+            "/@alice/post/post-prefix-anchor",
+            error=RemoteSessionStateUncertain,
+        )
 
     asyncio.run(scenario())
 
@@ -914,6 +1011,13 @@ def _surface(
     )
 
 
+def _thread_document(body: bytes) -> bytes:
+    return (
+        b'<!doctype html><html><head><link rel="canonical" '
+        b'href="/@canonical/post/unrelated"></head><body>' + body + b"</body></html>"
+    )
+
+
 _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/authenticated": _document("AUTHENTICATED"),
     "/login": _document("LOGIN_REQUIRED"),
@@ -928,6 +1032,47 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
         b'<a href="/@alice/">author</a>'
         b'<div dir="auto">Synthetic   public text</div>'
         b"</div></section></body></html>"
+    ),
+    "/@alice/post/post-1": _thread_document(
+        b'<section class="css-hash-919"><a href="/@alice/post/post-1">open</a>'
+        b'<a href="/@alice/">author</a><span dir="auto">Root text</span>'
+        b"</section><button>Open</button>"
+    ),
+    "/@alice/post/post-duplicate": _thread_document(
+        b'<section class="generated-42"><a href="/@alice/post/post-duplicate">one</a>'
+        b'<a href="/@alice/post/post-duplicate/">two</a><a href="/@alice/">author</a>'
+        b'<span dir="auto">Root text</span></section>'
+    ),
+    "/@alice/post/post-competing": _thread_document(
+        b'<section><div><a href="/@alice/post/post-competing">first</a>'
+        b'<a href="/@alice/">author</a><span dir="auto">First root</span></div></section>'
+        b'<section><div><a href="/@alice/post/post-competing">second</a>'
+        b'<a href="/@alice/">author</a><span dir="auto">Second root</span></div></section>'
+    ),
+    "/@alice/post/post-reply-cross": _thread_document(
+        b'<section><div><a href="/@alice/post/post-reply-cross">target</a>'
+        b'<a href="/@alice/">target author</a><span dir="auto">Target text</span>'
+        b'<div><a href="/@bob/post/reply-1">reply</a><a href="/@bob/">reply author</a>'
+        b'<span dir="auto">Reply text</span></div></div></section>'
+    ),
+    "/@alice/post/post-over-bound": _thread_document(
+        b'<div><a href="/@alice/">author</a><span dir="auto">Root text</span>'
+        + b"<div>" * 9
+        + b'<a href="/@alice/post/post-over-bound">target</a>'
+        + b"</div>" * 9
+        + b"</div>"
+    ),
+    "/@alice/post/post-author-mismatch": _thread_document(
+        b'<section><a href="/@alice/post/post-author-mismatch">target</a>'
+        b'<a href="/@Alice/">wrong case</a><span dir="auto">Root text</span></section>'
+    ),
+    "/@alice/post/post-no-anchor": _thread_document(
+        b'<section><a href="/@alice/post/post-no-anchor-extra">similar permalink</a>'
+        b'<a href="/@alice/">author</a><span dir="auto">Root text</span></section>'
+    ),
+    "/@alice/post/post-prefix-anchor": _thread_document(
+        b'<section><a href="/@alice/post/post-prefix-anchor-extra">similar permalink</a>'
+        b'<a href="/@alice/">author</a><span dir="auto">Root text</span></section>'
     ),
 }
 

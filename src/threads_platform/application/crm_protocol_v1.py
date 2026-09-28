@@ -369,12 +369,14 @@ class BrowserFeedBrowsePayload(BaseModel):
 class BrowserThreadOpenPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    thread_ref: str = Field(min_length=1, max_length=255)
+    thread_ref: str = Field(min_length=1, max_length=170)
 
     @field_validator("thread_ref")
     @classmethod
-    def thread_ref_must_be_an_opaque_identifier(cls, value: str) -> str:
-        return _validate_browser_identifier(value)
+    def thread_ref_must_be_a_bounded_relative_permalink(cls, value: str) -> str:
+        if re.fullmatch(r"/@[A-Za-z0-9._]{1,30}/post/[A-Za-z0-9_-]{1,120}/?", value) is None:
+            raise ValueError("thread_ref must be a bounded relative Thread permalink")
+        return value[:-1] if value.endswith("/") else value
 
 
 class BrowserProfileOpenPayload(BaseModel):
