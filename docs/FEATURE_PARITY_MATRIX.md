@@ -64,7 +64,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Session health | Browser session lifecycle | BROWSER_ASSISTED | Worker | Human intervention | DONE | P0 | C3 session-state reporting; login/challenges remain operator-assisted |
 | Per-account proxy | NetworkProfile | BROWSER_ASSISTED | assigned Worker | DIRECT only when no NetworkProfile is configured | DONE | P1 | configured unsupported routes fail closed; no proxy-to-DIRECT fallback; account-scoped routing config and credential references only, not evasion |
 | Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | DONE | P1 | evidence-backed v1 permalink-pivot workflow bounded to 20 items, 5 feed iterations, and 30 seconds; account-affine WorkerJob only; worker opt-in required |
-| Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit Thread; reviewed production UI evidence required |
+| Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | DONE | P1 | PR #40 accepted and merged; exact-path, exact-permalink v1; reviewed bounded account-affine WorkerJob path only; worker opt-in required |
 | Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit profile; reviewed production UI evidence required |
 | Stage local media | `threads.browser.media.local_upload` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | worker-local staging only; no publish/submit; reviewed production UI evidence required |
 | Like | LikeThread | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | retain only if product requires |

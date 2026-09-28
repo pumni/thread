@@ -730,8 +730,26 @@ async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
         assert api_route.executor is CapabilityExecutor.API
 
 
-async def test_feed_browse_routes_to_affine_worker_with_bounded_input(
+@pytest.mark.parametrize(
+    ("command_type", "capability_name", "payload"),
+    [
+        (
+            "threads.browser.feed.browse",
+            "threads.browser.feed.browse",
+            {"max_items": 7},
+        ),
+        (
+            "threads.browser.thread.open",
+            "threads.browser.thread.open",
+            {"thread_ref": "/@alice/post/post-7/"},
+        ),
+    ],
+)
+async def test_browser_read_capability_routes_to_affine_worker_with_bounded_input(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    command_type: str,
+    capability_name: str,
+    payload: dict[str, object],
 ) -> None:
     clock = FixedClock(datetime.now(UTC))
     account = ThreadsAccount(
@@ -767,7 +785,7 @@ async def test_feed_browse_routes_to_affine_worker_with_bounded_input(
             [
                 WorkerCapability(
                     worker_id,
-                    "threads.browser.feed.browse",
+                    capability_name,
                     1,
                     advertised_at=clock.now(),
                 )
@@ -784,9 +802,9 @@ async def test_feed_browse_routes_to_affine_worker_with_bounded_input(
     body = command_body(
         account.id,
         clock,
-        command_type="threads.browser.feed.browse",
+        command_type=command_type,
     )
-    body["payload"] = {"max_items": 7}
+    body["payload"] = payload
     receipt = await runtime.receive(body)
     result = await runtime.process(receipt.command_id)
 
@@ -796,16 +814,22 @@ async def test_feed_browse_routes_to_affine_worker_with_bounded_input(
     assert job is not None
     assert job.assigned_worker_id == worker_id
     assert job.account_affinity_required is True
-    assert job.input_data == {"max_items": 7}
+    assert job.preemptible is True
+    expected_input = (
+        {"max_items": 7}
+        if command_type == "threads.browser.feed.browse"
+        else {"thread_ref": "/@alice/post/post-7"}
+    )
+    assert job.input_data == expected_input
     claimed = await worker_jobs.claim_next(worker_id)
     assert claimed is not None
-    assert claimed.input_data == {"max_items": 7}
+    assert claimed.preemptible is True
+    assert claimed.input_data == expected_input
 
 
 @pytest.mark.parametrize(
     ("command_type", "payload"),
     [
-        ("threads.browser.thread.open", {"thread_ref": "thread-1"}),
         ("threads.browser.profile.open", {"profile_ref": "profile-1"}),
         ("threads.browser.media.local_upload", {"media_ref": "image-1.jpg"}),
     ],

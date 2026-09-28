@@ -15,6 +15,10 @@ from threads_platform.workers.browser import (
     ManagedPlaywrightBrowserSessionManager,
     PlaywrightBrowserAdapter,
 )
+from threads_platform.workers.browser_capability_dispatch import (
+    BrowserCapabilityHandler,
+    BrowserCapabilityJobDispatcher,
+)
 from threads_platform.workers.control_client import HttpWorkerControlClient
 from threads_platform.workers.feed_browse import (
     FEED_CAPABILITY_NAME,
@@ -23,6 +27,11 @@ from threads_platform.workers.feed_browse import (
 )
 from threads_platform.workers.runtime import WorkerAgent, WorkerAgentConfig
 from threads_platform.workers.sessions import LocalBrowserSessionManager
+from threads_platform.workers.thread_open import (
+    THREAD_OPEN_CAPABILITY_NAME,
+    THREAD_OPEN_CAPABILITY_VERSION,
+    BrowserThreadOpenWorker,
+)
 
 
 async def _run() -> None:
@@ -36,6 +45,15 @@ async def _run() -> None:
     identity_store = WorkerIdentityFileStore(data_root)
     worker_id = identity_store.load_or_create()
     feed_browse_enabled = _boolean_environment("THREADS_WORKER_FEED_BROWSE_ENABLED", False)
+    thread_open_enabled = _boolean_environment("THREADS_WORKER_THREAD_OPEN_ENABLED", False)
+    enabled_capabilities = tuple(
+        capability
+        for enabled, capability in (
+            (feed_browse_enabled, (FEED_CAPABILITY_NAME, FEED_CAPABILITY_VERSION)),
+            (thread_open_enabled, (THREAD_OPEN_CAPABILITY_NAME, THREAD_OPEN_CAPABILITY_VERSION)),
+        )
+        if enabled
+    )
     config = WorkerAgentConfig(
         control_plane_url=_required_environment("THREADS_WORKER_CONTROL_PLANE_URL"),
         display_name=os.environ.get("THREADS_WORKER_DISPLAY_NAME", "Windows Worker"),
@@ -43,14 +61,12 @@ async def _run() -> None:
         enrollment_code=os.environ.get("THREADS_WORKER_ENROLLMENT_CODE"),
         max_concurrent_jobs=_integer_environment("THREADS_WORKER_MAX_CONCURRENT_JOBS", 1),
         max_browser_sessions=_integer_environment("THREADS_WORKER_MAX_BROWSER_SESSIONS", 1),
-        capabilities=(
-            ((FEED_CAPABILITY_NAME, FEED_CAPABILITY_VERSION),) if feed_browse_enabled else ()
-        ),
+        capabilities=enabled_capabilities,
     )
     state_store = WorkerLocalStateStore(data_root, worker_id)
     client = HttpWorkerControlClient(config.control_plane_url)
     job_handler = None
-    if feed_browse_enabled:
+    if enabled_capabilities:
         profile_resolver = LocalProfileDirectoryResolver(data_root, state_store)
         local_sessions = LocalBrowserSessionManager(
             worker_id,
@@ -67,7 +83,16 @@ async def _run() -> None:
             local_sessions,
             browser_adapter,
         )
-        job_handler = BrowserFeedBrowseWorker(worker_id, client, browser_sessions)
+        handlers: dict[str, BrowserCapabilityHandler] = {}
+        if feed_browse_enabled:
+            handlers[FEED_CAPABILITY_NAME] = BrowserFeedBrowseWorker(
+                worker_id, client, browser_sessions
+            )
+        if thread_open_enabled:
+            handlers[THREAD_OPEN_CAPABILITY_NAME] = BrowserThreadOpenWorker(
+                worker_id, client, browser_sessions
+            )
+        job_handler = BrowserCapabilityJobDispatcher(worker_id, client, handlers)
     agent = WorkerAgent(
         config,
         identity_store,

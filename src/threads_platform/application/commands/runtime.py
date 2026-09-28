@@ -470,10 +470,13 @@ class CommandRuntime:
                     else WorkerJobRetrySafety.SAFE_TO_RETRY
                 ),
                 operation_class=decision.operation_class,
-                preemptible=command.command_type == "threads.browser.feed.browse",
+                preemptible=command.command_type
+                in {"threads.browser.feed.browse", "threads.browser.thread.open"},
                 input_data=(
                     {"max_items": command.payload.get("max_items", 10)}
                     if command.command_type == "threads.browser.feed.browse"
+                    else {"thread_ref": command.payload["thread_ref"]}
+                    if command.command_type == "threads.browser.thread.open"
                     else None
                 ),
             )
