@@ -1,3 +1,5 @@
+import asyncio
+import os
 from datetime import UTC, datetime
 from hashlib import sha256
 from uuid import uuid4
@@ -6,7 +8,6 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.integration.threads_test_support import seed_account_and_post
 from threads_platform.domain.discovery import (
@@ -29,6 +30,7 @@ from threads_platform.domain.discovery import (
     SearchQuery,
 )
 from threads_platform.domain.publishing import ThreadReply
+from threads_platform.infrastructure.persistence.database import create_database_engine
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
 pytestmark = pytest.mark.integration
@@ -36,7 +38,6 @@ pytestmark = pytest.mark.integration
 
 async def test_c4_migration_downgrade_deletes_seeded_discovery_data_and_discovered_replies(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
-    db_session: AsyncSession,
 ) -> None:
     account_id, post = await seed_account_and_post(unit_of_work_factory)
     now = datetime.now(UTC)
@@ -136,35 +137,48 @@ async def test_c4_migration_downgrade_deletes_seeded_discovery_data_and_discover
         assert await unit_of_work.replies.add_if_absent(discovered_child_reply)
 
     config = Config("alembic.ini")
-    command.downgrade(config, "20260925_0008")
+    engine = create_database_engine(os.environ["THREADS_PLATFORM_TEST_DATABASE_URL"])
+    try:
+        await asyncio.to_thread(command.downgrade, config, "20260925_0008")
+        try:
+            async with engine.connect() as connection:
+                assert (
+                    await connection.scalar(
+                        text("SELECT to_regclass('public.discovery_campaigns')")
+                    )
+                    is None
+                )
+                surviving_replies = set(
+                    await connection.scalars(text("SELECT threads_reply_id FROM replies"))
+                )
+                assert surviving_replies == {post_reply.threads_reply_id}
+        finally:
+            await asyncio.to_thread(command.upgrade, config, "head")
 
-    assert await db_session.scalar(text("SELECT to_regclass('public.discovery_campaigns')")) is None
-    surviving_replies = set(await db_session.scalars(text("SELECT threads_reply_id FROM replies")))
-    assert surviving_replies == {post_reply.threads_reply_id}
-
-    command.upgrade(config, "head")
-
-    discovery_tables = (
-        "discovery_campaigns",
-        "discovery_search_queries",
-        "discovered_authors",
-        "discovered_threads",
-        "discovery_runs",
-        "discovery_run_cursors",
-        "discovery_source_evidence",
-        "lead_candidates",
-        "lead_candidate_evidence",
-        "lead_candidate_transitions",
-    )
-    for table_name in discovery_tables:
-        assert await db_session.scalar(text(f"SELECT count(*) FROM {table_name}")) == 0
-    preserved_post_reply = await db_session.execute(
-        text(
-            "SELECT root_post_id, discovered_thread_id FROM replies "
-            "WHERE threads_reply_id = :reply_id"
-        ),
-        {"reply_id": post_reply.threads_reply_id},
-    )
-    row = preserved_post_reply.one()
-    assert row.root_post_id == post.id
-    assert row.discovered_thread_id is None
+        discovery_tables = (
+            "discovery_campaigns",
+            "discovery_search_queries",
+            "discovered_authors",
+            "discovered_threads",
+            "discovery_runs",
+            "discovery_run_cursors",
+            "discovery_source_evidence",
+            "lead_candidates",
+            "lead_candidate_evidence",
+            "lead_candidate_transitions",
+        )
+        async with engine.connect() as connection:
+            for table_name in discovery_tables:
+                assert await connection.scalar(text(f"SELECT count(*) FROM {table_name}")) == 0
+            preserved_post_reply = await connection.execute(
+                text(
+                    "SELECT root_post_id, discovered_thread_id FROM replies "
+                    "WHERE threads_reply_id = :reply_id"
+                ),
+                {"reply_id": post_reply.threads_reply_id},
+            )
+            row = preserved_post_reply.one()
+            assert row.root_post_id == post.id
+            assert row.discovered_thread_id is None
+    finally:
+        await engine.dispose()
