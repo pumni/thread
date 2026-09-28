@@ -27,11 +27,10 @@ PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
 `threads.browser.thread.open` v1 checkpoints are accepted and merged. Both are
 DONE for their checkpoints and available only through the reviewed, bounded,
-account-affine WorkerJob path, with explicit worker opt-in required. Production
-UI evidence for `threads.browser.profile.open` was accepted on 2026-09-28. The
-authorized profile.open v1 implementation checkpoint adds it to the same
-bounded account-affine path, also with explicit worker opt-in. After that
-checkpoint is merged, the three read capabilities are DONE for their
+account-affine WorkerJob path, with explicit worker opt-in required. PR #41's
+`threads.browser.profile.open` v1 is accepted and merged, DONE for its
+checkpoint, and available only through the same bounded account-affine path
+with explicit worker opt-in. All three read capabilities are DONE for their
 checkpoints. Issue #27 remains OPEN because local media is still blocked.
 
 The coordinator accepted production UI evidence for
@@ -58,13 +57,14 @@ WorkerJob path with worker opt-in.
 The accepted profile.open evidence consists of two authenticated public
 profile observations dated 2026-09-28. Recognition requires exact normalized
 `/@<username>` pathname equality, exactly one non-empty `<h1>`, and the nearest
-bounded ancestor association containing at least one exact target-profile href
-and no semantic post permalink. Duplicate exact profile hrefs are allowed.
-Missing exact target/header evidence uses durable `REMOTE_STATE_UNCERTAIN`;
-missing/duplicate `<h1>`, post contamination, ambiguity, and over-bound
-association fail closed. The implementation does not use canonical metadata,
-`main`, `article`, generated CSS classes, localized labels, or generic profile
-links outside that association.
+bounded `<div>` ancestor of that heading containing at least one exact
+target-profile href and no semantic post permalink. Duplicate exact profile
+hrefs inside that association are allowed. No exact target href anywhere after
+the target loads uses durable `REMOTE_STATE_UNCERTAIN`; exact hrefs only outside
+the `<div>` association, missing/duplicate `<h1>`, post contamination,
+ambiguity, and over-bound association fail closed. The implementation does not
+use canonical metadata, `main`, `article`, generated CSS classes, localized
+labels, or generic profile links outside that association.
 
 `threads.browser.media.local_upload` remains `BLOCKED_UI_EVIDENCE`, unadvertised
 and unrouted. Local media remains worker-local staging only; publish/submit is
@@ -258,10 +258,9 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
 4. Keep #27 OPEN because `threads.browser.media.local_upload` remains blocked,
-   unadvertised, and unrouted. Feed browse and thread open are DONE; profile.open
-   becomes DONE when its authorized implementation checkpoint is merged. Each
-   available capability uses the bounded account-affine WorkerJob path with
-   explicit worker opt-in.
+   unadvertised, and unrouted. Feed browse, thread open, and profile.open are
+   DONE for their checkpoints. Each available capability uses the bounded
+   account-affine WorkerJob path with explicit worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
@@ -281,16 +280,16 @@ CI green is necessary but not sufficient.
 PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, PR #37's
 C5-01 contract/evidence-gate foundation is accepted, PR #39's
 `threads.browser.feed.browse` v1 and PR #40's `threads.browser.thread.open` v1
-are accepted and merged. The authorized profile.open checkpoint follows the
-accepted 2026-09-28 production evidence from two authenticated public profiles.
-After that implementation is merged, all three read capabilities are DONE for
-their checkpoints and available only through reviewed bounded, account-affine
+are accepted and merged. PR #41's `threads.browser.profile.open` v1 is also
+accepted and merged. All three read capabilities are DONE for their
+checkpoints and available only through reviewed bounded, account-affine
 WorkerJob paths with explicit worker opt-in. Profile recognition uses exact
 normalized pathname equality, one non-empty `<h1>`, and the nearest bounded
-ancestor containing exact target-profile href(s) and no post permalink;
-duplicate exact profile hrefs are valid. Missing target/header evidence uses
-`REMOTE_STATE_UNCERTAIN`; malformed, contaminated, ambiguous, or over-bound
-associations fail closed. Issue #27 remains OPEN because
+`<div>` ancestor containing exact target-profile href(s) and no post permalink;
+duplicate exact profile hrefs inside that association are valid. No exact
+target href anywhere after load uses `REMOTE_STATE_UNCERTAIN`; exact hrefs only
+outside the `<div>` association, malformed, contaminated, ambiguous, or
+over-bound associations fail closed. Issue #27 remains OPEN because
 `threads.browser.media.local_upload` is still `BLOCKED_UI_EVIDENCE`, unrouted,
 and unadvertised; local media remains staging-only. Synthetic fixtures are not
 production evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No

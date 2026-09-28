@@ -520,6 +520,11 @@ def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
             error=RemoteSessionStateUncertain,
         )
         await verify(
+            "/@outsideheader",
+            "/@outsideheader",
+            error=BrowserContractError,
+        )
+        await verify(
             "/@queryhref",
             "/@queryhref",
             error=RemoteSessionStateUncertain,
@@ -1203,6 +1208,10 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     ),
     "/@noevidence": _profile_document(
         b'<header><h1>Public profile</h1><a href="/@someoneelse">other profile</a></header>'
+    ),
+    "/@outsideheader": _profile_document(
+        b"<div><header><div><h1>Public profile</h1></div></header>"
+        b'<footer><a href="/@outsideheader">profile elsewhere</a></footer></div>'
     ),
     "/@queryhref": _profile_document(
         b"<header><h1>Public profile</h1>"

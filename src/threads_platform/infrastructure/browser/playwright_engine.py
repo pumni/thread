@@ -187,27 +187,24 @@ _PROFILE_OPEN_SCRIPT = r"""
   if (exactTargetAnchors.length === 0) return {outcome: 'uncertain'};
 
   let node = headings[0].parentElement;
+  let profileHeader = null;
   for (let depth = 1; node && depth <= ancestorBound; depth += 1) {
-    const links = Array.from(node.querySelectorAll('a[href]'));
-    const hasExactTargetProfile = links.some(
-      (link) => anchorPath(link.getAttribute('href')) === targetRef
-    );
-    if (hasExactTargetProfile) {
-      if (links.some((link) => isPostPermalink(link.getAttribute('href')))) {
-        return {outcome: 'invalid'};
-      }
-      return {outcome: 'recognized'};
+    if (node.tagName === 'DIV') {
+      profileHeader = node;
+      break;
     }
     node = node.parentElement;
   }
+  if (profileHeader === null) return {outcome: 'invalid'};
 
-  if (node) {
-    const overflowLinks = Array.from(node.querySelectorAll('a[href]'));
-    if (overflowLinks.some((link) => anchorPath(link.getAttribute('href')) === targetRef)) {
-      return {outcome: 'invalid'};
-    }
+  const headerLinks = Array.from(profileHeader.querySelectorAll('a[href]'));
+  if (headerLinks.some((link) => isPostPermalink(link.getAttribute('href')))) {
+    return {outcome: 'invalid'};
   }
-  return {outcome: 'uncertain'};
+  if (!headerLinks.some((link) => anchorPath(link.getAttribute('href')) === targetRef)) {
+    return {outcome: 'invalid'};
+  }
+  return {outcome: 'recognized'};
 }
 """
 

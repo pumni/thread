@@ -19,16 +19,14 @@ PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
 `threads.browser.thread.open` v1 checkpoints are accepted and merged. Both are
 DONE for their checkpoints and available only through reviewed, bounded,
-account-affine WorkerJob paths with explicit worker opt-in. The accepted
-profile.open evidence (2026-09-28, two authenticated public profiles) authorizes
-its bounded READ implementation from `main@cd3190d7ea8c2f80ef316f64fb364e8edf69cb98`.
-After this checkpoint merges, profile.open is DONE for its checkpoint and
-available only through the same account-affine WorkerJob path with explicit
-worker opt-in. Issue #27 remains **OPEN** because `media.local_upload` remains
-`BLOCKED_UI_EVIDENCE`, unadvertised and unrouted. Local media remains
-staging-only, with no publish/submit. Synthetic fixtures are not production
-evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No browser
-mutation or publish/submit scope is authorized.
+account-affine WorkerJob paths with explicit worker opt-in. PR #41's
+`threads.browser.profile.open` v1 is accepted and merged, DONE for its
+checkpoint, and available only through the same bounded account-affine
+WorkerJob path with explicit worker opt-in. Issue #27 remains **OPEN** because
+`media.local_upload` remains `BLOCKED_UI_EVIDENCE`, unadvertised and unrouted.
+Local media remains staging-only, with no publish/submit. Synthetic fixtures
+are not production evidence. #28 remains unauthorized; LIKE/FOLLOW remain
+VERIFY. No browser mutation or publish/submit scope is authorized.
 
 Issue #3 remains a production/release gate.
 
@@ -153,9 +151,9 @@ Issues:
 - #27 `threads.browser.thread.open` v1 — PR #40 accepted and merged, DONE,
   available only through the reviewed bounded account-affine WorkerJob path
   with explicit worker opt-in;
-- `threads.browser.profile.open` has accepted UI evidence and is DONE after its
-  authorized implementation checkpoint merges; it is READ-only and available
-  through the bounded account-affine WorkerJob path with explicit opt-in;
+- PR #41 `threads.browser.profile.open` v1 is accepted and merged, DONE for its
+  checkpoint, READ-only, and available through the bounded account-affine
+  WorkerJob path with explicit opt-in;
 - `threads.browser.media.local_upload` remains `BLOCKED_UI_EVIDENCE`,
   unadvertised, and unrouted; local media remains staging-only, with no
   publish/submit;
