@@ -178,6 +178,7 @@ class WorkerJobResponse(BaseModel):
     attempt_count: int
     max_attempts: int
     retry_safety: WorkerJobRetrySafety
+    input_data: dict[str, object]
     lease_worker_id: UUID | None
     lease_token: UUID | None
     lease_expires_at: AwareDatetime | None
@@ -766,6 +767,7 @@ def _worker_job_response(job: WorkerJob) -> WorkerJobResponse:
         attempt_count=job.attempt_count,
         max_attempts=job.max_attempts,
         retry_safety=job.retry_safety,
+        input_data=job.input_data,
         lease_worker_id=job.lease_worker_id,
         lease_token=job.lease_token,
         lease_expires_at=job.lease_expires_at,

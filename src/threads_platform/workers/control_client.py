@@ -419,6 +419,7 @@ def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
             lease_expires_at=_optional_datetime_field(payload, "lease_expires_at"),
             retry_safety=WorkerJobRetrySafety(_text_field(payload, "retry_safety")),
             checkpoint=_optional_object_field(payload, "checkpoint"),
+            input_data=_optional_object_field(payload, "input_data") or {},
         )
     except (ValueError, TypeError) as error:
         raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error

@@ -65,13 +65,12 @@ def test_worker_job_claim_and_fencing_reject_old_lease() -> None:
 @pytest.mark.parametrize(
     "capability_name",
     [
-        "threads.browser.feed.browse",
         "threads.browser.thread.open",
         "threads.browser.profile.open",
         "threads.browser.media.local_upload",
     ],
 )
-async def test_ui_evidence_blocked_browser_capabilities_cannot_enqueue_or_claim(
+async def test_ui_evidence_blocked_browser_capabilities_cannot_enqueue(
     capability_name: str,
 ) -> None:
     service = WorkerJobService(cast(UnitOfWorkFactory, lambda: None))

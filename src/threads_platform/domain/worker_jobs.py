@@ -49,6 +49,7 @@ class WorkerJob:
     capability_name: str
     capability_version: int
     operation_class: OperationClass = OperationClass.READ
+    input_data: dict[str, object] = field(default_factory=lambda: dict[str, object]())
     id: UUID = field(default_factory=uuid4)
     command_id: str | None = None
     account_id: UUID | None = None
@@ -119,6 +120,7 @@ class WorkerJob:
             or self.account_coordination_generation < 1
         ):
             raise ValueError("account coordination fence requires a running exclusive job")
+        _validate_document(self.input_data)
         _validate_document(self.checkpoint)
         _validate_document(self.result)
 

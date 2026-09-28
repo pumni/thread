@@ -470,6 +470,12 @@ class CommandRuntime:
                     else WorkerJobRetrySafety.SAFE_TO_RETRY
                 ),
                 operation_class=decision.operation_class,
+                preemptible=command.command_type == "threads.browser.feed.browse",
+                input_data=(
+                    {"max_items": command.payload.get("max_items", 10)}
+                    if command.command_type == "threads.browser.feed.browse"
+                    else None
+                ),
             )
             return _WorkerJobEnqueued(
                 CommandExecutionResult(

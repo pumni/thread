@@ -1,8 +1,9 @@
 import asyncio
 import socket
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID
 
 from threads_platform.application.ports.worker_agent import (
@@ -261,14 +262,22 @@ class WorkerAgent:
             await self._control_client.aclose()
 
     async def _close_sessions(self) -> None:
-        for account_id, manager in tuple(self._session_managers.items()):
-            await manager.close(account_id)
-            self._session_managers.pop(account_id, None)
-            if self._connected:
-                try:
-                    await self.flush_session_reports()
-                except WorkerControlClientError:
-                    break
+        try:
+            for account_id, manager in tuple(self._session_managers.items()):
+                await manager.close(account_id)
+                self._session_managers.pop(account_id, None)
+                if self._connected:
+                    try:
+                        await self.flush_session_reports()
+                    except WorkerControlClientError:
+                        break
+        finally:
+            close_handler = cast(
+                Callable[[], Awaitable[None]] | None,
+                getattr(self._job_handler, "aclose", None),
+            )
+            if close_handler is not None:
+                await close_handler()
 
     async def _initialize(self) -> None:
         if self._initialized:

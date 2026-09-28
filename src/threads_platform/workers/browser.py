@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -33,6 +33,8 @@ from threads_platform.workers.sessions import (
 
 SUPPORTED_UI_CONTRACT_ID = "worker.synthetic"
 SUPPORTED_UI_CONTRACT_VERSION = 1
+BROWSER_FEED_ORIGIN = "https://www.threads.com"
+BROWSER_FEED_CANDIDATE_BOUND = 100
 _SAFE_CHECKPOINT_FIELDS = frozenset({"phase", "contract_id", "contract_version", "reason_code"})
 _RECOVERY_AMBIGUOUS_PHASES = frozenset({"MUTATION_STARTED", "MUTATION_CONFIRMED"})
 _CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -65,6 +67,11 @@ class SessionExpired(BrowserAdapterError):
 class ChallengeDetected(BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("CHALLENGE_REQUIRED")
+
+
+class RemoteSessionStateUncertain(BrowserAdapterError):
+    def __init__(self) -> None:
+        super().__init__("REMOTE_STATE_UNCERTAIN")
 
 
 class NavigationTimeout(BrowserAdapterError):
@@ -134,6 +141,24 @@ class BrowserSurface:
 
 
 @dataclass(frozen=True, slots=True)
+class FeedAncestorObservation:
+    """Bounded semantic evidence extracted from one permalink ancestor."""
+
+    hrefs: tuple[str, ...]
+    text_regions: tuple[str, ...]
+    links_truncated: bool = False
+    text_regions_truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FeedCandidateObservation:
+    """A post permalink and its nearest-first bounded ancestor evidence."""
+
+    permalink_href: str
+    ancestors: tuple[FeedAncestorObservation, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BrowserLaunchRequest:
     worker_id: UUID
     account_id: UUID
@@ -145,11 +170,19 @@ class BrowserLaunchRequest:
 
 
 class BrowserEngineSession(Protocol):
-    async def navigate(self, url: str) -> None: ...
+    async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None: ...
 
     async def inspect_surface(self) -> BrowserSurface: ...
 
     async def close(self) -> None: ...
+
+
+class BrowserFeedEngineSession(BrowserEngineSession, Protocol):
+    async def collect_feed_candidates(
+        self, *, ancestor_bound: int
+    ) -> tuple[FeedCandidateObservation, ...]: ...
+
+    async def scroll_feed(self) -> None: ...
 
 
 class BrowserEngine(Protocol):
@@ -173,13 +206,18 @@ class BrowserNavigationPolicy:
         parsed = urlsplit(url)
         hostname = parsed.hostname
         if (
-            parsed.scheme != "http"
+            parsed.scheme not in {"http", "https"}
             or hostname is None
             or parsed.username is not None
             or parsed.password is not None
             or parsed.fragment
         ):
             raise UnsupportedUIState()
+        origin = f"{parsed.scheme}://{parsed.netloc}".lower()
+        if parsed.scheme == "https":
+            if origin not in self.allowed_origins:
+                raise UnsupportedUIState()
+            return
         try:
             is_loopback = ipaddress.ip_address(hostname).is_loopback
         except ValueError:
@@ -546,12 +584,21 @@ class WorkerBrowserSession:
     def session_id(self) -> UUID:
         return self._session_id
 
+    @property
+    def session_state(self) -> BrowserSessionState:
+        return self._session_state
+
     async def navigate(self, url: str, policy: BrowserNavigationPolicy) -> None:
         if self._closed:
             raise BrowserProcessCrashed()
         policy.validate(url)
+        if self._job_execution is not None:
+            await self._job_execution.renew()
         try:
-            await self._engine_session.navigate(url)
+            await self._engine_session.navigate(url, allowed_origins=policy.allowed_origins)
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise
         except BrowserProcessCrashed:
             await self._set_state(BrowserSessionState.ERROR)
             if self._job_execution is not None:
@@ -564,6 +611,62 @@ class WorkerBrowserSession:
                     error_code="BROWSER_PROCESS_CRASHED",
                     retryable=True,
                 )
+            raise
+
+    async def collect_feed_candidates(
+        self, *, ancestor_bound: int
+    ) -> tuple[FeedCandidateObservation, ...]:
+        if self._closed:
+            raise BrowserProcessCrashed()
+        if self._session_state is not BrowserSessionState.AUTHENTICATED:
+            raise UnsupportedUIState()
+        if self._job_execution is None or self._job_execution.account_id != self._account_id:
+            raise BrowserAccountAffinityMismatch()
+        await self._job_execution.renew()
+        engine_session = cast(BrowserFeedEngineSession, self._engine_session)
+        try:
+            return await engine_session.collect_feed_candidates(ancestor_bound=ancestor_bound)
+        except SessionExpired:
+            await self._report_state_and_intervention(
+                BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
+            )
+            raise
+        except ChallengeDetected:
+            await self._report_state_and_intervention(
+                BrowserSessionState.CHALLENGE_REQUIRED,
+                "CHALLENGE_REQUIRED",
+                "CHALLENGE_REQUIRED",
+            )
+            raise
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise
+
+    async def scroll_feed(self) -> None:
+        if self._closed:
+            raise BrowserProcessCrashed()
+        if self._session_state is not BrowserSessionState.AUTHENTICATED:
+            raise UnsupportedUIState()
+        if self._job_execution is None or self._job_execution.account_id != self._account_id:
+            raise BrowserAccountAffinityMismatch()
+        await self._job_execution.renew()
+        engine_session = cast(BrowserFeedEngineSession, self._engine_session)
+        try:
+            await engine_session.scroll_feed()
+        except SessionExpired:
+            await self._report_state_and_intervention(
+                BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
+            )
+            raise
+        except ChallengeDetected:
+            await self._report_state_and_intervention(
+                BrowserSessionState.CHALLENGE_REQUIRED,
+                "CHALLENGE_REQUIRED",
+                "CHALLENGE_REQUIRED",
+            )
+            raise
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
     async def inspect_contract(self) -> BrowserSurfaceState:

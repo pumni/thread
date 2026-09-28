@@ -730,10 +730,81 @@ async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
         assert api_route.executor is CapabilityExecutor.API
 
 
+async def test_feed_browse_routes_to_affine_worker_with_bounded_input(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account = ThreadsAccount(
+        threads_user_id=f"feed-user-{uuid4()}",
+        username="feed-test",
+        execution_mode=AccountExecutionMode.BROWSER_ONLY,
+    )
+    worker_id = uuid4()
+    worker = WorkerNode(
+        worker_id=worker_id,
+        display_name="Feed test worker",
+        hostname="test-host",
+        platform="windows",
+        agent_version="1.0.0",
+        protocol_version=2,
+        capabilities_schema_version=1,
+        status=WorkerStatus.ONLINE,
+        last_heartbeat_at=clock.now(),
+        presence_expires_at=clock.now() + timedelta(hours=1),
+        created_at=clock.now(),
+        updated_at=clock.now(),
+    )
+    profile = BrowserProfile(worker_id, f"feed-profile-{uuid4()}")
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(account)
+        await unit_of_work.workers.add(worker)
+        await unit_of_work.browser_profiles.add(profile)
+        await unit_of_work.assignments.add(
+            AccountWorkerAssignment(account.id, worker_id, profile.profile_ref)
+        )
+        await unit_of_work.worker_capabilities.replace_for_worker(
+            worker_id,
+            [
+                WorkerCapability(
+                    worker_id,
+                    "threads.browser.feed.browse",
+                    1,
+                    advertised_at=clock.now(),
+                )
+            ],
+        )
+
+    worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=clock,
+        worker_job_service=worker_jobs,
+    )
+    body = command_body(
+        account.id,
+        clock,
+        command_type="threads.browser.feed.browse",
+    )
+    body["payload"] = {"max_items": 7}
+    receipt = await runtime.receive(body)
+    result = await runtime.process(receipt.command_id)
+
+    assert result.status is CommandStatus.WAITING_EXECUTION
+    async with unit_of_work_factory() as unit_of_work:
+        job = await unit_of_work.worker_jobs.get_by_command_id(receipt.command_id)
+    assert job is not None
+    assert job.assigned_worker_id == worker_id
+    assert job.account_affinity_required is True
+    assert job.input_data == {"max_items": 7}
+    claimed = await worker_jobs.claim_next(worker_id)
+    assert claimed is not None
+    assert claimed.input_data == {"max_items": 7}
+
+
 @pytest.mark.parametrize(
     ("command_type", "payload"),
     [
-        ("threads.browser.feed.browse", {"max_items": 10}),
         ("threads.browser.thread.open", {"thread_ref": "thread-1"}),
         ("threads.browser.profile.open", {"profile_ref": "profile-1"}),
         ("threads.browser.media.local_upload", {"media_ref": "image-1.jpg"}),
