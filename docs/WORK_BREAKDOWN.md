@@ -13,9 +13,20 @@ Completed:
 - C3-02 PR #35 — issue #26 accepted and merged.
 - C4 PR #36 — issue #8 accepted and merged.
 
-Current authorized implementation checkpoint:
-- **C5-01 — Browser capability pack v1**
-  - #27 only
+Canonical state once PR #38 is on `main`:
+- The audit reconciliation is accepted/merged and the prior **#27-only** C5-01
+  authorization resumes.
+- PR [#37](https://github.com/pumni/thread/pull/37) remains OPEN/unmerged; its
+  implementation may advance only within the four approved contracts:
+  `threads.browser.feed.browse`,
+  `threads.browser.thread.open`, `threads.browser.profile.open`, and
+  `threads.browser.media.local_upload` (local staging only; no publish/submit).
+- All four capabilities remain **BLOCKED** pending reviewed production Threads UI
+  evidence; no guessed selectors or workflows. #28 remains unauthorized and
+  LIKE/FOLLOW remain VERIFY.
+
+Current review hold while PR #38 is absent from `main`: #27 is PAUSED and PR #37
+must not advance.
 
 Issue #3 remains a production/release gate.
 
@@ -135,8 +146,13 @@ Browser enrichment waits for C3 and must route through C2.
 ## 8. C5 — Browser Capabilities and Account Activity
 
 Issues:
-- #27 capability pack v1 — **CURRENT AUTHORIZED ITEM**;
-- #28 AccountActivityPlan/priority/preemption — not authorized until #27 checkpoint review.
+- #27 capability pack v1 — once PR #38 is on `main` (accepted/merged), the prior
+  #27-only authorization is active. PR #37 remains OPEN/unmerged; its
+  implementation may advance only within the four approved contracts listed
+  above. All four remain BLOCKED pending reviewed production Threads UI
+  evidence;
+- #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
+  coordinator decision after the #27 checkpoint review.
 
 Browser capabilities must be explicit and independently reviewable.
 
