@@ -16,6 +16,9 @@ Completed:
 Current authorized implementation checkpoint:
 - **C5-01 — Browser capability pack v1**
   - #27 only
+- PR #37 is open and unmerged on `batch/c5-01-browser-capability-pack` at
+  `0f55550ad06b6545a3a4d056607052aef02fab75`; its two GitHub checks pass.
+- The four C5-01 contracts remain blocked pending reviewed production UI evidence.
 
 Issue #3 remains a production/release gate.
 
@@ -135,7 +138,7 @@ Browser enrichment waits for C3 and must route through C2.
 ## 8. C5 — Browser Capabilities and Account Activity
 
 Issues:
-- #27 capability pack v1 — **CURRENT AUTHORIZED ITEM**;
+- #27 capability pack v1 — **CURRENT AUTHORIZED ITEM**, under review in PR #37;
 - #28 AccountActivityPlan/priority/preemption — not authorized until #27 checkpoint review.
 
 Browser capabilities must be explicit and independently reviewable.
@@ -182,7 +185,7 @@ Codex stops and reports instead of improvising when:
 - anti-detect/fingerprint-evasion behavior appears in scope;
 - a side effect cannot be reconciled safely;
 - quality gates would need weakening;
-- destructive migration assumptions are required;
+- a migration downgrade's data loss cannot be documented and covered by a seeded regression;
 - current official API behavior materially contradicts the documented capability contract.
 
 ## 13. Parallelism

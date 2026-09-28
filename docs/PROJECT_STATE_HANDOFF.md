@@ -1,4 +1,4 @@
-# Project State Handoff — 2026-09-25
+# Project State Handoff — 2026-09-28
 
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
@@ -21,9 +21,19 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-The next authorized implementation milestone is **C5-01 — Browser capability pack v1 (#27)**.
+The current authorized checkpoint is **C5-01 — Browser capability pack v1 (#27)**.
+Its implementation is under review in open, unmerged PR #37 on
+`batch/c5-01-browser-capability-pack`, head
+`0f55550ad06b6545a3a4d056607052aef02fab75`. The Python 3.14 quality gate
+(run `36196015832`) and Secret scan (run `36196015819`) pass on that head. The four
+approved capability contracts are declared, but each remains blocked pending
+reviewed production Threads UI evidence; no production selectors or workflows are
+enabled. See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` and PR #37 for evidence.
 
-Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or production release work until the coordinator explicitly authorizes the corresponding checkpoint.
+Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
+production release work until the coordinator explicitly authorizes the
+corresponding checkpoint. The audit-reconciliation change is limited to documents
+and migration regression coverage; it does not advance C5 implementation.
 
 ## 3. Important merged checkpoints
 
@@ -146,6 +156,8 @@ Read:
 Critical invariants:
 - Command != WorkerJob;
 - WorkerJob has its own lease/fencing token;
+- fresh Worker presence gates new claims; it does not revoke or reclaim a running
+  WorkerJob, whose PostgreSQL lease/fencing token remains authoritative;
 - PostgreSQL is authoritative;
 - WebSocket is notification/presence only;
 - durable worker mutations use authenticated HTTPS;
@@ -170,7 +182,15 @@ uv run pytest
 
 At the C4 acceptance checkpoint, Python 3.14 quality gate and Secret scan were green on accepted head `9119bbcd754abd969c99ff7388b7ab221857dca1`.
 
-Final reported C4 evidence: 142 local tests passed, C4 PostgreSQL/migration suite 10 passed, migration 0009 downgrade/re-upgrade passed, crash rollback/replay and monotonic canonical enrichment regressions passed.
+Final reported C4 evidence: 142 local tests passed, C4 PostgreSQL/migration suite 10 passed, migration 0009 downgrade/re-upgrade passed, crash rollback/replay and monotonic canonical enrichment regressions passed. The earlier migration check did not seed persisted C4 data before downgrading.
+
+Migration `20260926_0009` has a destructive downgrade to `20260925_0008`: it drops
+all C4 discovery, provenance, cursor, and lead tables and their rows. It also
+deletes replies rooted in discovered Threads (clearing parent links among those
+rows first), while retaining replies rooted in published posts. Re-upgrading
+recreates empty C4 tables and cannot restore the deleted data. The seeded
+downgrade regression in `tests/integration/test_c4_migration.py` covers this
+behavior.
 
 ## 8. Threads API baseline
 
@@ -193,7 +213,11 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Authorize only C5-01: explicit browser capability contracts and the first reviewed capability pack.
+4. Review open PR #37 at head `0f55550ad06b6545a3a4d056607052aef02fab75`.
+   All four capabilities currently report `BROWSER_UI_EVIDENCE_REQUIRED`; review
+   or provide scrubbed observed evidence before any production capability is
+   enabled. Both GitHub checks are green, but the PR remains unmerged pending
+   coordinator review.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Stop after #27 for coordinator review before #28 AccountActivityPlan/preemption.
 

@@ -268,15 +268,29 @@ Reclaim:
 
 ## 10. Worker presence vs Job lease
 
-Worker presence and WorkerJob execution are separate.
+Presence controls whether a worker can receive new work. The default presence TTL
+is 90 seconds. `hello` and `heartbeat` update `last_heartbeat_at` and
+`presence_expires_at`; `expire_presence()` changes an expired ONLINE or DEGRADED
+worker to OFFLINE. A claim requires status ONLINE, a supported protocol/capability
+schema, and `presence_expires_at > now` (as well as assignment and account policy).
+DEGRADED, DRAINING, OFFLINE, DISABLED, and UPGRADE_REQUIRED workers cannot claim.
 
-Worker presence answers:
-- is S08 connected/recently healthy?
+Presence does not own a running WorkerJob. Its PostgreSQL lease is authoritative:
+the job remains RUNNING with its current `lease_worker_id`, `lease_token`, and
+`lease_expires_at` when presence expires or a WSS connection drops. Presence expiry
+does not clear the token, cancel the job, or make it reclaimable. An authenticated
+worker may renew, checkpoint, or finalize that job while the lease is unexpired,
+the worker/token match, and any exclusive account-coordination fence is still
+valid. Those operations check the WorkerJob and account fence; they do not require
+the worker to have fresh presence.
 
-WorkerJob lease answers:
-- does S08 still own J1?
-
-A worker may be ONLINE while one browser/session/job is unhealthy.
+Expired-job recovery is driven by `lease_expires_at <= now`, deadlines, attempt
+bounds, and retry-safety policy, not by presence expiry or disconnect. Reclaim
+issues a new fencing token, permanently invalidating the old token. A worker that
+cannot reach authenticated HTTPS cannot renew; its job remains authoritative until
+the lease expires and recovery processes it. Reconnect reconciliation reads the
+durable WorkerJob state from PostgreSQL. A worker may therefore be OFFLINE for new
+claims while still holding an unexpired lease for already claimed work.
 
 ## 11. Worker transport
 
