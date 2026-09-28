@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
@@ -152,6 +153,7 @@ class _PlaywrightBrowserSession:
         self._closed = False
         self._allowed_navigation_origins: frozenset[str] = frozenset()
         self._navigation_guard_installed = False
+        self._navigation_guard_lock = asyncio.Lock()
         self._blocked_navigation = False
         self._blocked_redirect = False
         self._navigation_timed_out = False
@@ -182,13 +184,13 @@ class _PlaywrightBrowserSession:
                 wait_until="domcontentloaded",
                 timeout=self._navigation_timeout_ms,
             )
-            self._raise_navigation_policy_error()
+            await self._raise_navigation_policy_error()
         except PlaywrightTimeoutError:
-            self._raise_guard_rejection()
+            await self._raise_guard_rejection()
             raise NavigationTimeout() from None
         except PlaywrightError:
             self._ensure_alive()
-            self._raise_guard_rejection()
+            await self._raise_guard_rejection()
             raise BrowserRuntimeUnavailable("BROWSER_NAVIGATION_FAILED") from None
 
     async def _guard_navigation(self, route: Route) -> None:
@@ -202,47 +204,51 @@ class _PlaywrightBrowserSession:
         if not is_main_navigation:
             await route.continue_()
             return
-        if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
-            self._blocked_navigation = True
-            await route.abort("blockedbyclient")
-            return
-        try:
-            response = await route.fetch(
-                max_redirects=0,
-                timeout=max(1, int(self._navigation_timeout_ms * 0.9)),
-            )
-        except PlaywrightTimeoutError:
-            self._navigation_timed_out = True
+        async with self._navigation_guard_lock:
+            if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
+                self._blocked_navigation = True
+                await route.abort("blockedbyclient")
+                return
             try:
-                await route.abort()
+                response = await route.fetch(
+                    max_redirects=0,
+                    timeout=max(1, int(self._navigation_timeout_ms * 0.9)),
+                )
+            except PlaywrightTimeoutError:
+                self._navigation_timed_out = True
+                try:
+                    await route.abort()
+                except PlaywrightError:
+                    pass
+                return
             except PlaywrightError:
-                pass
-            return
-        except PlaywrightError:
-            try:
-                await route.abort()
-            except PlaywrightError:
-                pass
-            return
-        if 300 <= response.status < 400:
-            self._blocked_redirect = True
-            await route.abort("blockedbyclient")
-            return
-        await route.fulfill(response=response)
+                try:
+                    await route.abort()
+                except PlaywrightError:
+                    pass
+                return
+            if 300 <= response.status < 400:
+                self._blocked_redirect = True
+                await route.abort("blockedbyclient")
+                return
+            await route.fulfill(response=response)
 
-    def _raise_navigation_policy_error(self) -> None:
-        self._raise_guard_rejection()
-        if (
-            self._allowed_navigation_origins
-            and _normalized_browser_origin(self._page.url) not in self._allowed_navigation_origins
-        ):
-            raise UnsupportedUIState()
+    async def _raise_navigation_policy_error(self) -> None:
+        await self._raise_guard_rejection()
+        async with self._navigation_guard_lock:
+            if (
+                self._allowed_navigation_origins
+                and _normalized_browser_origin(self._page.url)
+                not in self._allowed_navigation_origins
+            ):
+                raise UnsupportedUIState()
 
-    def _raise_guard_rejection(self) -> None:
-        if self._blocked_navigation or self._blocked_redirect:
-            raise UnsupportedUIState()
-        if self._navigation_timed_out:
-            raise NavigationTimeout()
+    async def _raise_guard_rejection(self) -> None:
+        async with self._navigation_guard_lock:
+            if self._blocked_navigation or self._blocked_redirect:
+                raise UnsupportedUIState()
+            if self._navigation_timed_out:
+                raise NavigationTimeout()
 
     async def inspect_surface(self) -> BrowserSurface:
         self._ensure_alive()
@@ -272,7 +278,7 @@ class _PlaywrightBrowserSession:
         self, *, ancestor_bound: int
     ) -> tuple[FeedCandidateObservation, ...]:
         self._ensure_alive()
-        self._raise_navigation_policy_error()
+        await self._raise_navigation_policy_error()
         if not 1 <= ancestor_bound <= 12:
             raise BrowserContractError()
         try:
@@ -291,7 +297,7 @@ class _PlaywrightBrowserSession:
 
     async def scroll_feed(self) -> None:
         self._ensure_alive()
-        self._raise_navigation_policy_error()
+        await self._raise_navigation_policy_error()
         try:
             await self._page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight, 1))")
         except PlaywrightError:

@@ -26,8 +26,6 @@ from threads_platform.workers.sessions import LocalBrowserSessionManager
 
 
 async def _run() -> None:
-    if os.name != "nt":
-        raise RuntimeError("the persistent Worker Agent entrypoint requires Windows DPAPI")
     from pathlib import Path
 
     configured_root = os.environ.get("THREADS_WORKER_DATA_ROOT")
@@ -119,6 +117,8 @@ def _boolean_environment(name: str, default: bool) -> bool:
 
 
 def main() -> None:
+    if os.name != "nt":
+        raise RuntimeError("the persistent Worker Agent entrypoint requires Windows DPAPI")
     asyncio.run(_run())
 
 
