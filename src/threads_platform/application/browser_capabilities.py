@@ -172,7 +172,14 @@ BROWSER_CAPABILITY_CONTRACTS: tuple[BrowserCapabilityContract, ...] = (
         safe_checkpoints=("BEFORE_NAVIGATION", "THREAD_READY"),
         result_schema="BrowserTargetOpenResultV1",
         result_schema_version=1,
-        allowed_failure_codes=COMMON_FAILURES,
+        allowed_failure_codes=COMMON_FAILURES
+        | {
+            "BROWSER_SESSION_UNAVAILABLE",
+            "BROWSER_NETWORK_ROUTE_UNSUPPORTED",
+            "UNSUPPORTED_BROWSER_CAPABILITY",
+            "WORKER_JOB_INPUT_INVALID",
+            "WORKER_JOB_RETRY_SAFETY_MISMATCH",
+        },
         intervention_types=SESSION_INTERVENTIONS | {"REMOTE_STATE_UNCERTAIN"},
         irreversible_boundary=False,
         status=BrowserCapabilityStatus.AVAILABLE,

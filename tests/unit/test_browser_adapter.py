@@ -399,6 +399,11 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
         await verify(target, target)
         await verify("/@alice/post/post-duplicate/", "/@alice/post/post-duplicate")
         await verify(
+            "/@alice/post/post-duplicate-author",
+            "/@alice/post/post-duplicate-author",
+            error=BrowserContractError,
+        )
+        await verify(
             "/@alice/post/post-competing",
             "/@alice/post/post-competing",
             error=BrowserContractError,
@@ -1041,6 +1046,11 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/@alice/post/post-duplicate": _thread_document(
         b'<section class="generated-42"><a href="/@alice/post/post-duplicate">one</a>'
         b'<a href="/@alice/post/post-duplicate/">two</a><a href="/@alice/">author</a>'
+        b'<span dir="auto">Root text</span></section>'
+    ),
+    "/@alice/post/post-duplicate-author": _thread_document(
+        b'<section><a href="/@alice/post/post-duplicate-author">target</a>'
+        b'<a href="/@alice/">author one</a><a href="/@alice/">author two</a>'
         b'<span dir="auto">Root text</span></section>'
     ),
     "/@alice/post/post-competing": _thread_document(

@@ -13,21 +13,20 @@ Completed:
 - C3-02 PR #35 — issue #26 accepted and merged.
 - C4 PR #36 — issue #8 accepted and merged.
 
-### Canonical C5-01 state after the feed.browse checkpoint is merged
+### Canonical C5-01 state after the thread.open checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
-is accepted and merged. PR #39's `threads.browser.feed.browse` v1 checkpoint is
-accepted and merged. Feed browse is available only through the reviewed,
-bounded, account-affine WorkerJob path, and workers must opt in to the
-capability. On 2026-09-28, production UI evidence for `thread.open` was accepted
-and implementation of `threads.browser.thread.open` v1 was authorized from
-`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`. This checkpoint adds only that
-bounded READ workflow through the same account-affine WorkerJob path. Issue #27
-remains **OPEN** because `profile.open` and `media.local_upload` remain
-`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unadvertised and unrouted. Local media
-remains staging-only, with no publish/submit. #28 remains unauthorized;
-LIKE/FOLLOW remain VERIFY. No browser mutation or publish/submit scope is
-authorized.
+is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
+`threads.browser.thread.open` v1 checkpoints are accepted and merged. Both are
+DONE for their checkpoints and available only through reviewed, bounded,
+account-affine WorkerJob paths with explicit worker opt-in. Thread open is the
+bounded READ workflow implemented from
+`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`.
+Issue #27 remains **OPEN** because `profile.open` and `media.local_upload`
+remain `BLOCKED_UI_EVIDENCE`, unadvertised and unrouted. Local media remains
+staging-only, with no publish/submit. Synthetic fixtures are not production
+evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No browser
+mutation or publish/submit scope is authorized.
 
 Issue #3 remains a production/release gate.
 
@@ -148,10 +147,12 @@ Browser enrichment waits for C3 and must route through C2.
 
 Issues:
 - PR #37 C5-01 contract/evidence-gate foundation — accepted and merged;
-- #27 feed.browse continuation — PR #39's `threads.browser.feed.browse` v1 is
-  accepted and merged, available only through the bounded account-affine
-  WorkerJob path with worker opt-in. Thread open, profile open, and local media
-  staging remain blocked, unadvertised, and unrouted; local media remains
+- #27 `threads.browser.feed.browse` v1 — PR #39 accepted and merged, DONE;
+- #27 `threads.browser.thread.open` v1 — PR #40 accepted and merged, DONE,
+  available only through the reviewed bounded account-affine WorkerJob path
+  with explicit worker opt-in;
+- `threads.browser.profile.open` and `threads.browser.media.local_upload`
+  remain `BLOCKED_UI_EVIDENCE`, unadvertised, and unrouted; local media remains
   staging-only, with no publish/submit;
 - #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
   coordinator decision after the #27 checkpoint review.

@@ -1,4 +1,4 @@
-# Project State Handoff — 2026-09-26
+# Project State Handoff — 2026-09-28
 
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
@@ -21,17 +21,18 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-### Canonical C5-01 state after the feed.browse checkpoint is merged
+### Canonical C5-01 state after the thread.open checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
-is accepted and merged. PR #39's `threads.browser.feed.browse` v1 checkpoint is
-accepted and merged. The capability is available only through the reviewed,
-bounded, account-affine WorkerJob path, with worker opt-in required. Issue #27
+is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
+`threads.browser.thread.open` v1 checkpoints are accepted and merged. Both are
+DONE for their checkpoints and available only through the reviewed, bounded,
+account-affine WorkerJob path, with explicit worker opt-in required. Issue #27
 remains OPEN because two capabilities are still blocked.
 
 The coordinator accepted production UI evidence for
-`threads.browser.thread.open` on 2026-09-28 and authorized its v1 implementation
-only from `main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`. Its target is one
+`threads.browser.thread.open` on 2026-09-28, and PR #40 accepted and merged its
+v1 implementation from `main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`. Its target is one
 bounded relative `/@<username>/post/<id>` path. After normalizing one trailing
 slash, the browser pathname must equal that path exactly. Recognition requires
 the exact target permalink href, an exact matching `/@<username>` author href,
@@ -43,18 +44,19 @@ closed. Redirects, off-origin navigation, pathname mismatch, or a loaded target
 without the reviewed exact anchor create durable `REMOTE_STATE_UNCERTAIN`
 intervention. No login or challenge selectors are inferred.
 
-Thread open uses the Capability Router and account-affine WorkerJob path. The
-implementation does not use canonical metadata, `main`, `article`, generated
-CSS classes, or a localized Back label. Its result contains only the versioned
-recognized target reference. Feed browse remains accepted and available through
-the same bounded WorkerJob path with worker opt-in.
+Thread open is DONE for this checkpoint and uses the Capability Router and
+account-affine WorkerJob path, with explicit worker opt-in. The implementation
+does not use canonical metadata, `main`, `article`, generated CSS classes, or a
+localized Back label. Its result contains only the versioned recognized target
+reference. Feed browse remains DONE and available through the same bounded
+WorkerJob path with worker opt-in.
 
 `threads.browser.profile.open` and `threads.browser.media.local_upload` remain
-`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unadvertised and unrouted. Local media
-remains worker-local staging only; publish/submit is excluded. Synthetic
-fixtures test the reviewed contracts but are not production evidence. #28
-remains unauthorized; LIKE/FOLLOW remain VERIFY. Issue #27 remains OPEN because
-two approved capabilities still need production UI evidence and implementation.
+`BLOCKED_UI_EVIDENCE`, unadvertised and unrouted. Local media remains
+worker-local staging only; publish/submit is excluded. Synthetic fixtures test
+the reviewed contracts but are not production evidence. #28 remains
+unauthorized; LIKE/FOLLOW remain VERIFY. Issue #27 remains OPEN because these
+two capabilities remain blocked.
 
 Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
 production release work until the coordinator explicitly authorizes the
@@ -243,9 +245,9 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
 4. Keep #27 OPEN because `threads.browser.profile.open` and
    `threads.browser.media.local_upload` remain blocked, unadvertised, and
-   unrouted. `threads.browser.feed.browse` v1 is accepted and available only
-   through the bounded WorkerJob path with worker opt-in. Thread open v1 is
-   authorized only under the checkpoint described above.
+   unrouted. `threads.browser.feed.browse` and `threads.browser.thread.open`
+   v1 are DONE and available only through the bounded account-affine WorkerJob
+   path with explicit worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
@@ -263,14 +265,14 @@ CI green is necessary but not sufficient.
 ## 11. C5-01 post-merge status
 
 PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, PR #37's
-C5-01 contract/evidence-gate foundation is accepted, and PR #39's
-`threads.browser.feed.browse` v1 checkpoint is accepted and merged. Feed browse
-is available only through the reviewed bounded, account-affine WorkerJob path
-and requires worker opt-in. On 2026-09-28, the coordinator also accepted
-production UI evidence and authorized `threads.browser.thread.open` v1 from
-`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`; its implementation is limited
-to that bounded read workflow. Issue #27 remains OPEN because
+C5-01 contract/evidence-gate foundation is accepted, PR #39's
+`threads.browser.feed.browse` v1 is accepted and merged, and PR #40's
+`threads.browser.thread.open` v1 is accepted and merged. Both capabilities are
+DONE for their checkpoints and available only through the reviewed bounded,
+account-affine WorkerJob path with explicit worker opt-in. Thread open remains
+limited to the accepted bounded read workflow. Issue #27 remains OPEN because
 `threads.browser.profile.open` and `threads.browser.media.local_upload` remain
-`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unrouted, and unadvertised. This does
-not authorize #28 or close #27. LIKE/FOLLOW remain VERIFY; no browser mutation
-or publish/submit scope is authorized.
+`BLOCKED_UI_EVIDENCE`, unrouted, and unadvertised; local media remains
+staging-only. Synthetic fixtures are not production evidence. #28 remains
+unauthorized; LIKE/FOLLOW remain VERIFY. No browser mutation or publish/submit
+scope is authorized.

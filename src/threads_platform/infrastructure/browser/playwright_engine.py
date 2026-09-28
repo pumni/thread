@@ -119,7 +119,7 @@ _THREAD_OPEN_SCRIPT = r"""
       if (links.length > 64) return {outcome: 'invalid'};
       let targetLinkCount = 0;
       let hasCompetingPost = false;
-      let hasTargetAuthor = false;
+      let targetAuthorCount = 0;
       let hasCompetingAuthor = false;
       for (const link of links) {
         const path = semanticPath(link.getAttribute('href'));
@@ -128,7 +128,7 @@ _THREAD_OPEN_SCRIPT = r"""
           if (path === targetRef) targetLinkCount += 1;
           else hasCompetingPost = true;
         } else if (/^\/@[A-Za-z0-9._]{1,30}\/?$/.test(path)) {
-          if (path === authorPath) hasTargetAuthor = true;
+          if (path === authorPath) targetAuthorCount += 1;
           else hasCompetingAuthor = true;
         }
       }
@@ -141,7 +141,7 @@ _THREAD_OPEN_SCRIPT = r"""
         const text = (region.textContent || '').replace(/\s+/g, ' ').trim();
         return text.length > 0 && text.length <= 1000;
       });
-      if (targetLinkCount > 0 && hasTargetAuthor && hasBoundedText) {
+      if (targetLinkCount > 0 && targetAuthorCount === 1 && hasBoundedText) {
         associatedRoot = node;
         break;
       }

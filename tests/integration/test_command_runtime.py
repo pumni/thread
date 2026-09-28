@@ -814,6 +814,7 @@ async def test_browser_read_capability_routes_to_affine_worker_with_bounded_inpu
     assert job is not None
     assert job.assigned_worker_id == worker_id
     assert job.account_affinity_required is True
+    assert job.preemptible is True
     expected_input = (
         {"max_items": 7}
         if command_type == "threads.browser.feed.browse"
@@ -822,6 +823,7 @@ async def test_browser_read_capability_routes_to_affine_worker_with_bounded_inpu
     assert job.input_data == expected_input
     claimed = await worker_jobs.claim_next(worker_id)
     assert claimed is not None
+    assert claimed.preemptible is True
     assert claimed.input_data == expected_input
 
 

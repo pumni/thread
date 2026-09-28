@@ -19,6 +19,7 @@ from threads_platform.domain.workers import BrowserSessionState, NetworkProtocol
 from threads_platform.workers.browser import (
     BROWSER_FEED_ORIGIN,
     BrowserAdapterError,
+    BrowserNetworkRouteUnsupported,
     BrowserSurface,
     ChallengeDetected,
     RemoteSessionStateUncertain,
@@ -28,6 +29,7 @@ from threads_platform.workers.browser import (
 from threads_platform.workers.browser_capability_dispatch import BrowserCapabilityJobDispatcher
 from threads_platform.workers.sessions import BrowserSessionOpenResult, NetworkRoute
 from threads_platform.workers.thread_open import (
+    THREAD_OPEN_ALLOWED_FAILURE_CODES,
     THREAD_OPEN_ANCESTOR_BOUND,
     THREAD_OPEN_CAPABILITY_NAME,
     THREAD_OPEN_CAPABILITY_VERSION,
@@ -195,6 +197,52 @@ async def test_thread_worker_rejects_wrong_worker_affinity_before_open() -> None
     assert manager.open_count == 0
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("unsupported_capability", "UNSUPPORTED_BROWSER_CAPABILITY"),
+        ("retry_safety", "WORKER_JOB_RETRY_SAFETY_MISMATCH"),
+        ("invalid_input", "WORKER_JOB_INPUT_INVALID"),
+        ("session_unavailable", "BROWSER_SESSION_UNAVAILABLE"),
+        ("unsupported_network_route", "BROWSER_NETWORK_ROUTE_UNSUPPORTED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_thread_worker_direct_failure_codes_are_declared(
+    failure: str,
+    expected_code: str,
+) -> None:
+    worker_id, account_id = uuid4(), uuid4()
+    client = _MemoryControl(worker_id, account_id)
+    manager = _MemorySessionManager(worker_id, account_id)
+    if failure == "unsupported_capability":
+        client.snapshot = replace(
+            client.snapshot,
+            capability_version=THREAD_OPEN_CAPABILITY_VERSION + 1,
+        )
+    elif failure == "retry_safety":
+        client.snapshot = replace(
+            client.snapshot,
+            retry_safety=WorkerJobRetrySafety.RECONCILIATION_REQUIRED,
+        )
+    elif failure == "invalid_input":
+        client.snapshot = replace(client.snapshot, input_data={"unexpected": "value"})
+    elif failure == "session_unavailable":
+        manager.open_error = ValueError("session unavailable")
+    else:
+        manager.open_error = BrowserNetworkRouteUnsupported()
+    worker = BrowserThreadOpenWorker(
+        worker_id,
+        cast(ThreadOpenWorkerControlClient, client),
+        cast(ThreadOpenBrowserSessionManager, manager),
+    )
+
+    await worker(client.snapshot)
+
+    assert expected_code in THREAD_OPEN_ALLOWED_FAILURE_CODES
+    assert client.failures == [(expected_code, expected_code == "BROWSER_SESSION_UNAVAILABLE")]
+
+
 @pytest.mark.asyncio
 async def test_browser_capability_dispatcher_uses_only_registered_handlers() -> None:
     worker_id, account_id = uuid4(), uuid4()
@@ -331,6 +379,7 @@ class _MemorySessionManager:
         account_id: UUID,
         *,
         session_state: BrowserSessionState = BrowserSessionState.AUTHENTICATED,
+        open_error: Exception | None = None,
     ) -> None:
         now = datetime.now(UTC)
         self.context = WorkerAccountContext(account_id, worker_id, "profile-main", None)
@@ -357,10 +406,13 @@ class _MemorySessionManager:
         )
         self.open_count = 0
         self.closed_accounts: list[UUID] = []
+        self.open_error = open_error
 
     async def open(self, context: WorkerAccountContext) -> BrowserSessionOpenResult:
         self.open_count += 1
         self.context = context
+        if self.open_error is not None:
+            raise self.open_error
         return self.opened
 
     def browser_session(self, account_id: UUID) -> WorkerBrowserSession | None:

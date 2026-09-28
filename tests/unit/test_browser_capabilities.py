@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from threads_platform.application.browser_capabilities import (
     BROWSER_CAPABILITY_CONTRACTS,
+    COMMON_FAILURES,
     BrowserCapabilityContract,
     BrowserCapabilityStatus,
     BrowserFeedResultV1,
@@ -99,6 +100,12 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
                 assert decision.target is RouteTarget.WAITING_INTERVENTION
             else:
                 assert decision.target is RouteTarget.UNSUPPORTED
+
+    contracts = {contract.name: contract for contract in BROWSER_CAPABILITY_CONTRACTS}
+    assert contracts["threads.browser.profile.open"].allowed_failure_codes == COMMON_FAILURES
+    assert contracts["threads.browser.media.local_upload"].allowed_failure_codes == (
+        COMMON_FAILURES | {"MEDIA_FILE_REJECTED", "MEDIA_UPLOAD_FAILED"}
+    )
 
 
 @pytest.mark.parametrize(

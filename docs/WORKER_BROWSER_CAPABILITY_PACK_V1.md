@@ -2,12 +2,11 @@
 
 ## Activation status
 
-The C5-01 catalog contains four v1 names. The coordinator accepted scrubbed
-production UI evidence for `threads.browser.feed.browse` and
-`threads.browser.thread.open`; feed.browse is accepted and merged, and thread
-open v1 is authorized for its own bounded implementation checkpoint from
-`main@dafd04a40aa8dcc3456ce7e0e49d341e69047435`. Both use the reviewed,
-account-affine WorkerJob path and require worker opt-in via
+The C5-01 catalog contains four v1 names. PR #39's
+`threads.browser.feed.browse` v1 and PR #40's `threads.browser.thread.open` v1
+are accepted and merged, and DONE for their checkpoints. Both are available
+only through their reviewed, bounded, account-affine WorkerJob paths and
+require explicit worker opt-in via
 `THREADS_WORKER_FEED_BROWSE_ENABLED` and `THREADS_WORKER_THREAD_OPEN_ENABLED`
 (both default false). `profile.open` and `media.local_upload` remain
 `BLOCKED_UI_EVIDENCE`, unavailable to routing and worker advertisement. C3's
@@ -177,11 +176,14 @@ workflow has a 30-second wall-clock limit and does not checkpoint feed text or
 raw page data.
 
 Synthetic fixtures exercise the accepted semantic contracts and their failure
-cases; they are not production evidence for profile.open or media.local_upload.
+cases; they are not production evidence that the Threads UI matches those
+contracts or evidence for profile.open or media.local_upload.
 
-`threads.browser.profile.open` and `threads.browser.media.local_upload` remain
-blocked. LIKE/FOLLOW, browser
+`threads.browser.feed.browse` and `threads.browser.thread.open` are DONE for
+their checkpoints. `threads.browser.profile.open` and
+`threads.browser.media.local_upload` remain `BLOCKED_UI_EVIDENCE`, unrouted and
+unadvertised; media remains staging-only. LIKE/FOLLOW remain VERIFY. Browser
 Reply/Repost/Share/Create/Post, publish/submit, scheduler, AccountActivityPlan,
-and durable priority preemption are outside this checkpoint. Issue #27 remains
-open because two browser capabilities remain blocked; this checkpoint does not
-authorize `profile.open`, `media.local_upload`, #28, or any additional capability.
+and durable priority preemption remain outside this scope. Issue #27 remains
+OPEN because two browser capabilities remain blocked. #28 remains unauthorized;
+no mutation or publish/submit scope is authorized.
