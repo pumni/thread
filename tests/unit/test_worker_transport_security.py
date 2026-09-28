@@ -49,6 +49,7 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
         now + timedelta(seconds=90),
         True,
     )
+    session_valid = True
 
     class FakeWorkerControl:
         async def authenticate_session(self, token: str) -> AuthenticatedWorkerSession | None:
@@ -57,7 +58,7 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
             return AuthenticatedWorkerSession(worker_id, now + timedelta(minutes=15))
 
         async def authenticate(self, token: str) -> object:
-            return worker_id if token == "session-token" else None
+            return worker_id if token == "session-token" and session_valid else None
 
         def session_time_remaining(self, session: AuthenticatedWorkerSession) -> float:
             assert session.worker_id == worker_id
@@ -106,6 +107,12 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
                 "status": "ONLINE",
                 "protocol_compatible": True,
             }
+            # Let the server close the socket before TestClient tears down the task.
+            session_valid = False
+            websocket.send_json({"type": "worker.heartbeat", "healthy": True})
+            with pytest.raises(WebSocketDisconnect) as disconnect:
+                websocket.receive_json()
+            assert disconnect.value.code == 4401
 
 
 def test_wss_closes_when_the_authenticated_session_expires() -> None:
