@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     Browser,
@@ -8,6 +10,7 @@ from playwright.async_api import (
     Page,
     Playwright,
     ProxySettings,
+    Route,
     async_playwright,
 )
 from playwright.async_api import (
@@ -19,6 +22,8 @@ from playwright.async_api import (
 
 from threads_platform.domain.workers import NetworkProtocol
 from threads_platform.workers.browser import (
+    BROWSER_FEED_CANDIDATE_BOUND,
+    BROWSER_FEED_ORIGIN,
     BrowserContractError,
     BrowserEngineSession,
     BrowserLaunchRequest,
@@ -26,9 +31,59 @@ from threads_platform.workers.browser import (
     BrowserProcessCrashed,
     BrowserRuntimeUnavailable,
     BrowserSurface,
+    FeedAncestorObservation,
+    FeedCandidateObservation,
     LocatorNotFound,
     NavigationTimeout,
+    UnsupportedUIState,
 )
+
+_FEED_SCAN_SCRIPT = r"""
+({allowedOrigin, ancestorBound, candidateBound}) => {
+  if (window.location.origin !== allowedOrigin) return {ok: false};
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  if (anchors.length > 1000) return {ok: false};
+  const parsePath = (href) => {
+    try {
+      const url = new URL(href, window.location.href);
+      if (url.origin !== allowedOrigin || url.search || url.hash) return null;
+      if (/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(url.pathname)) {
+        return 'post';
+      }
+      if (/^\/@[A-Za-z0-9._]{1,30}\/?$/.test(url.pathname)) return 'profile';
+    } catch (_) {
+      return null;
+    }
+    return null;
+  };
+  const candidates = anchors.filter((anchor) => parsePath(anchor.getAttribute('href')) === 'post');
+  if (candidates.length > candidateBound) return {ok: false};
+  const candidateEvidence = candidates.map((anchor) => {
+    const ancestors = [];
+    let node = anchor.parentElement;
+    while (node && ancestors.length < ancestorBound) {
+      const descendantAnchors = Array.from(node.querySelectorAll('a[href]'));
+      const semanticHrefs = descendantAnchors
+        .map((link) => link.getAttribute('href'))
+        .filter((href) => href !== null && parsePath(href) !== null);
+      const textNodes = Array.from(
+        node.querySelectorAll('span[dir="auto"], div[dir="auto"]')
+      );
+      ancestors.push({
+        hrefs: semanticHrefs.slice(0, 64),
+        linksTruncated: semanticHrefs.length > 64,
+        textRegions: textNodes.slice(0, 20).map((element) =>
+          (element.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 501)
+        ),
+        textRegionsTruncated: textNodes.length > 20,
+      });
+      node = node.parentElement;
+    }
+    return {permalinkHref: anchor.getAttribute('href'), ancestors};
+  });
+  return {ok: true, candidates: candidateEvidence};
+}
+"""
 
 
 class PlaywrightBrowserEngine:
@@ -59,6 +114,8 @@ class PlaywrightBrowserEngine:
                 headless=request.headless,
                 proxy=proxy,
                 accept_downloads=False,
+                # The route guard must see every top-level navigation request.
+                service_workers="block",
             )
         except PlaywrightError:
             await playwright.stop()
@@ -93,22 +150,99 @@ class _PlaywrightBrowserSession:
         self._navigation_timeout_ms = navigation_timeout_ms
         self._crashed = False
         self._closed = False
+        self._allowed_navigation_origins: frozenset[str] = frozenset()
+        self._navigation_guard_installed = False
+        self._blocked_navigation = False
+        self._blocked_redirect = False
+        self._navigation_timed_out = False
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
 
-    async def navigate(self, url: str) -> None:
+    async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self._ensure_alive()
+        normalized_allowed_origins = frozenset(
+            origin
+            for allowed_origin in allowed_origins
+            if (origin := _normalized_browser_origin(allowed_origin)) is not None
+        )
+        if not normalized_allowed_origins:
+            raise UnsupportedUIState()
+        if self._allowed_navigation_origins and (
+            normalized_allowed_origins != self._allowed_navigation_origins
+        ):
+            raise UnsupportedUIState()
+        self._allowed_navigation_origins = normalized_allowed_origins
+
         try:
+            if not self._navigation_guard_installed:
+                await self._page.route("**/*", self._guard_navigation)
+                self._navigation_guard_installed = True
             await self._page.goto(
                 url,
                 wait_until="domcontentloaded",
                 timeout=self._navigation_timeout_ms,
             )
+            self._raise_navigation_policy_error()
         except PlaywrightTimeoutError:
+            self._raise_guard_rejection()
             raise NavigationTimeout() from None
         except PlaywrightError:
             self._ensure_alive()
+            self._raise_guard_rejection()
             raise BrowserRuntimeUnavailable("BROWSER_NAVIGATION_FAILED") from None
+
+    async def _guard_navigation(self, route: Route) -> None:
+        request = route.request
+        try:
+            is_main_navigation = (
+                request.is_navigation_request() and request.frame == self._page.main_frame
+            )
+        except PlaywrightError:
+            is_main_navigation = True
+        if not is_main_navigation:
+            await route.continue_()
+            return
+        if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
+            self._blocked_navigation = True
+            await route.abort("blockedbyclient")
+            return
+        try:
+            response = await route.fetch(
+                max_redirects=0,
+                timeout=max(1, int(self._navigation_timeout_ms * 0.9)),
+            )
+        except PlaywrightTimeoutError:
+            self._navigation_timed_out = True
+            try:
+                await route.abort()
+            except PlaywrightError:
+                pass
+            return
+        except PlaywrightError:
+            try:
+                await route.abort()
+            except PlaywrightError:
+                pass
+            return
+        if 300 <= response.status < 400:
+            self._blocked_redirect = True
+            await route.abort("blockedbyclient")
+            return
+        await route.fulfill(response=response)
+
+    def _raise_navigation_policy_error(self) -> None:
+        self._raise_guard_rejection()
+        if (
+            self._allowed_navigation_origins
+            and _normalized_browser_origin(self._page.url) not in self._allowed_navigation_origins
+        ):
+            raise UnsupportedUIState()
+
+    def _raise_guard_rejection(self) -> None:
+        if self._blocked_navigation or self._blocked_redirect:
+            raise UnsupportedUIState()
+        if self._navigation_timed_out:
+            raise NavigationTimeout()
 
     async def inspect_surface(self) -> BrowserSurface:
         self._ensure_alive()
@@ -133,6 +267,36 @@ class _PlaywrightBrowserSession:
             session_state=session_state,
             required_root_present=True,
         )
+
+    async def collect_feed_candidates(
+        self, *, ancestor_bound: int
+    ) -> tuple[FeedCandidateObservation, ...]:
+        self._ensure_alive()
+        self._raise_navigation_policy_error()
+        if not 1 <= ancestor_bound <= 12:
+            raise BrowserContractError()
+        try:
+            payload = await self._page.evaluate(
+                _FEED_SCAN_SCRIPT,
+                {
+                    "allowedOrigin": BROWSER_FEED_ORIGIN,
+                    "ancestorBound": ancestor_bound,
+                    "candidateBound": BROWSER_FEED_CANDIDATE_BOUND,
+                },
+            )
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
+        return _feed_candidate_observations(payload)
+
+    async def scroll_feed(self) -> None:
+        self._ensure_alive()
+        self._raise_navigation_policy_error()
+        try:
+            await self._page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight, 1))")
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_FEED_SCROLL_FAILED") from None
 
     async def close(self) -> None:
         if self._closed:
@@ -185,6 +349,61 @@ class _PlaywrightBrowserSession:
             self._crashed = True
 
 
+def _feed_candidate_observations(payload: object) -> tuple[FeedCandidateObservation, ...]:
+    if not isinstance(payload, dict):
+        raise BrowserContractError()
+    data = cast(dict[str, object], payload)
+    candidate_value = data.get("candidates")
+    if data.get("ok") is not True or not isinstance(candidate_value, list):
+        raise BrowserContractError()
+    raw_candidates = cast(list[object], candidate_value)
+
+    candidates: list[FeedCandidateObservation] = []
+    for raw_candidate in raw_candidates:
+        if not isinstance(raw_candidate, dict):
+            raise BrowserContractError()
+        candidate = cast(dict[str, object], raw_candidate)
+        permalink_href = candidate.get("permalinkHref")
+        ancestor_value = candidate.get("ancestors")
+        if not isinstance(permalink_href, str) or not isinstance(ancestor_value, list):
+            raise BrowserContractError()
+        raw_ancestors = cast(list[object], ancestor_value)
+        ancestors: list[FeedAncestorObservation] = []
+        for raw_ancestor in raw_ancestors:
+            if not isinstance(raw_ancestor, dict):
+                raise BrowserContractError()
+            ancestor = cast(dict[str, object], raw_ancestor)
+            href_values = ancestor.get("hrefs")
+            text_values = ancestor.get("textRegions")
+            links_truncated = ancestor.get("linksTruncated")
+            text_regions_truncated = ancestor.get("textRegionsTruncated")
+            if (
+                not isinstance(href_values, list)
+                or not isinstance(text_values, list)
+                or not isinstance(links_truncated, bool)
+                or not isinstance(text_regions_truncated, bool)
+            ):
+                raise BrowserContractError()
+            hrefs = cast(list[object], href_values)
+            text_regions = cast(list[object], text_values)
+            if not all(isinstance(href, str) for href in hrefs) or not all(
+                isinstance(text, str) for text in text_regions
+            ):
+                raise BrowserContractError()
+            ancestors.append(
+                FeedAncestorObservation(
+                    hrefs=tuple(cast(str, href) for href in hrefs),
+                    text_regions=tuple(cast(str, text) for text in text_regions),
+                    links_truncated=links_truncated,
+                    text_regions_truncated=text_regions_truncated,
+                )
+            )
+        candidates.append(
+            FeedCandidateObservation(permalink_href=permalink_href, ancestors=tuple(ancestors))
+        )
+    return tuple(candidates)
+
+
 def playwright_proxy_settings(request: BrowserLaunchRequest) -> ProxySettings | None:
     route = request.network_route
     credentials = request.proxy_credentials
@@ -219,3 +438,26 @@ def playwright_proxy_settings(request: BrowserLaunchRequest) -> ProxySettings | 
         if credentials.password is not None:
             settings["password"] = credentials.password
     return settings
+
+
+def _normalized_browser_origin(url: str) -> str | None:
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    hostname = hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is None or (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+        return f"{scheme}://{hostname}"
+    return f"{scheme}://{hostname}:{port}"

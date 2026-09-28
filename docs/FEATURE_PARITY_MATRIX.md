@@ -20,6 +20,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 ## 3. Delivery status
 
 - DONE — implemented in current codebase.
+- IN REVIEW — implementation exists in an unaccepted checkpoint PR.
 - PLANNED — approved future scope.
 - BLOCKED — authorized but cannot activate until a named external decision/evidence gate clears.
 - VERIFY — capability/permission/recovery semantics require verification before activation.
@@ -62,7 +63,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Login using persistent profile | Operator login + persisted session | HUMAN_ASSISTED | Worker + operator | none | PLANNED | P0 | no password-as-core model |
 | Session health | Browser session lifecycle | BROWSER_ASSISTED | Worker | Human intervention | DONE | P0 | C3 session-state reporting; login/challenges remain operator-assisted |
 | Per-account proxy | NetworkProfile | BROWSER_ASSISTED | assigned Worker | DIRECT only when no NetworkProfile is configured | DONE | P1 | configured unsupported routes fail closed; no proxy-to-DIRECT fallback; account-scoped routing config and credential references only, not evasion |
-| Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | bounded read contract; reviewed production feed UI evidence required |
+| Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | IN REVIEW | P1 | evidence accepted 2026-09-28; v1 permalink-pivot workflow bounded to 20 items, 5 feed iterations, and 30 seconds; account-affine WorkerJob only |
 | Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit Thread; reviewed production UI evidence required |
 | Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit profile; reviewed production UI evidence required |
 | Stage local media | `threads.browser.media.local_upload` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | worker-local staging only; no publish/submit; reviewed production UI evidence required |

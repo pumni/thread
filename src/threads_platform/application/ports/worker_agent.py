@@ -1,5 +1,5 @@
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
@@ -42,6 +42,7 @@ class WorkerJobSnapshot:
     lease_expires_at: datetime | None
     retry_safety: WorkerJobRetrySafety
     checkpoint: dict[str, object] | None
+    input_data: dict[str, object] = field(default_factory=lambda: dict[str, object]())
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,9 +1,10 @@
 # Windows Worker Agent foundation
 
-The C3-01 entrypoint is `python -m threads_platform.workers`. It runs a single local agent
+The Worker Agent entrypoint is `python -m threads_platform.workers`. It runs a single local agent
 process, authenticates through Worker Protocol v2 over HTTPS, reports presence/capacity, and
-reconciles durable WorkerJobs after reconnect. C3-01 installs no browser engine and advertises
-no business-action capabilities, so it does not claim or execute browser work.
+reconciles durable WorkerJobs after reconnect. By default it advertises no business capabilities.
+An explicitly provisioned worker can opt in to `threads.browser.feed.browse` v1 by setting
+`THREADS_WORKER_FEED_BROWSE_ENABLED=true`; that enables only the reviewed read-only feed workflow.
 
 By default local state lives below `%LOCALAPPDATA%/ThreadsOperations`:
 
@@ -16,6 +17,10 @@ Configure `THREADS_WORKER_CONTROL_PLANE_URL` with an HTTPS origin. The HTTP clie
 certificate verification enabled and rejects URLs containing credentials. Set optional
 `THREADS_WORKER_DISPLAY_NAME`, `THREADS_WORKER_AGENT_VERSION`,
 `THREADS_WORKER_MAX_CONCURRENT_JOBS`, and `THREADS_WORKER_MAX_BROWSER_SESSIONS` values as needed.
+Feed browsing also requires the pinned Playwright package and its matching Chromium browser
+binary to be provisioned on the worker. Browser sessions use the assigned account's managed
+profile and NetworkProfile. Routes that reference proxy credentials fail closed because this
+entrypoint has no production proxy-secret provider.
 
 For a first enrollment, provide the one-time C1 enrollment code through
 `THREADS_WORKER_ENROLLMENT_CODE` using the deployment's protected configuration mechanism. The

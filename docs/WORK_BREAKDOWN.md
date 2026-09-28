@@ -16,13 +16,13 @@ Completed:
 ### Canonical C5-01 state after the contract/evidence-gate foundation is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
-is accepted and merged, but issue #27 remains **OPEN/BLOCKED** because reviewed
-production Threads UI evidence and an executable production UI workflow have
-not been accepted. The four commands remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`;
-production routing returns `UNSUPPORTED` without a WorkerJob, and workers must
-not advertise them. Local media is staging-only, with no publish/submit. #28
-remains unauthorized; LIKE/FOLLOW remain VERIFY. This checkpoint is not
-production-ready and does not close #27.
+is accepted and merged. The coordinator accepted scrubbed production UI
+evidence for `threads.browser.feed.browse` on 2026-09-28 and authorized its v1
+permalink-pivot implementation only. This feed-only continuation is awaiting
+checkpoint review; issue #27 remains **OPEN**. The other three commands remain
+`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED` and are not advertised or routed.
+Local media remains staging-only, with no publish/submit. #28 remains
+unauthorized; LIKE/FOLLOW remain VERIFY. This checkpoint does not close #27.
 
 Issue #3 remains a production/release gate.
 
@@ -142,12 +142,12 @@ Browser enrichment waits for C3 and must route through C2.
 ## 8. C5 — Browser Capabilities and Account Activity
 
 Issues:
-- PR #37 C5-01 contract/evidence-gate foundation — accepted/merged in the
-  post-merge state; issue #27 remains OPEN/BLOCKED until reviewed production
-  Threads UI evidence and an executable production UI workflow are accepted.
-  All four commands remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`; no WorkerJob
-  is created and workers must not advertise them. Local media is staging-only,
-  with no publish/submit;
+- PR #37 C5-01 contract/evidence-gate foundation — accepted and merged;
+- #27 feed.browse continuation — production evidence accepted on 2026-09-28;
+  only `threads.browser.feed.browse` v1 is implemented in this checkpoint and
+  awaits review. It routes only through an account-affine WorkerJob. Thread
+  open, profile open, and local media staging remain blocked and unadvertised;
+  local media remains staging-only, with no publish/submit;
 - #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
   coordinator decision after the #27 checkpoint review.
 

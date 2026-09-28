@@ -154,6 +154,41 @@ async def test_protocol_v2_worker_can_claim_eligible_jobs(
     assert claimed.id == queued.id
 
 
+async def test_worker_job_input_data_persists_through_claim_and_repository_read(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = MutableClock()
+    worker_id = await add_worker(unit_of_work_factory, now=clock.now(), protocol_version=2)
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.worker_capabilities.replace_for_worker(
+            worker_id,
+            [
+                WorkerCapability(
+                    worker_id,
+                    "threads.browser.feed.browse",
+                    1,
+                    advertised_at=clock.now(),
+                )
+            ],
+        )
+    jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    queued = await jobs.enqueue(
+        "threads.browser.feed.browse",
+        1,
+        input_data={"max_items": 17},
+    )
+
+    claimed = await jobs.claim_next(worker_id)
+
+    assert claimed is not None
+    assert claimed.id == queued.id
+    assert claimed.input_data == {"max_items": 17}
+    async with unit_of_work_factory() as unit_of_work:
+        stored = await unit_of_work.worker_jobs.get(queued.id)
+    assert stored is not None
+    assert stored.input_data == {"max_items": 17}
+
+
 async def test_account_affinity_and_worker_eligibility_are_enforced(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:

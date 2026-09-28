@@ -76,6 +76,7 @@ class WorkerJobService:
         max_attempts: int = 3,
         retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY,
         operation_class: OperationClass = OperationClass.READ,
+        input_data: dict[str, object] | None = None,
     ) -> WorkerJob:
         self._ensure_capability_not_blocked(capability_name)
         now = normalize_utc(self._clock.now())
@@ -97,6 +98,7 @@ class WorkerJobService:
                 max_attempts=max_attempts,
                 retry_safety=retry_safety,
                 operation_class=operation_class,
+                input_data=input_data,
             )
         self.publish_available(job, notification_worker_ids, now=now)
         return job
@@ -119,6 +121,7 @@ class WorkerJobService:
         max_attempts: int = 3,
         retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY,
         operation_class: OperationClass = OperationClass.READ,
+        input_data: dict[str, object] | None = None,
     ) -> tuple[WorkerJob, tuple[UUID, ...]]:
         self._ensure_capability_not_blocked(capability_name)
         occurred_at = normalize_utc(now)
@@ -169,6 +172,7 @@ class WorkerJobService:
             capability_name=capability_name,
             capability_version=capability_version,
             operation_class=operation_class,
+            input_data=input_data or {},
             priority=priority,
             preemptible=preemptible,
             scheduled_at=schedule,

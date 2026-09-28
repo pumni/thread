@@ -24,7 +24,7 @@ from threads_platform.domain.capabilities import RouteTarget
 from threads_platform.domain.workers import WorkerCapability
 
 
-def test_c5_contracts_are_typed_versioned_and_blocked_without_reviewed_ui_evidence() -> None:
+def test_c5_contracts_are_typed_versioned_with_feed_only_available() -> None:
     expected = {
         "threads.browser.feed.browse": ("READ", True, "BrowserFeedResultV1"),
         "threads.browser.thread.open": ("READ", True, "BrowserTargetOpenResultV1"),
@@ -47,8 +47,18 @@ def test_c5_contracts_are_typed_versioned_and_blocked_without_reviewed_ui_eviden
         assert contract.preemptible is preemptible
         assert contract.result_schema == result_schema
         assert contract.result_schema_version == 1
-        assert contract.status is BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE
-        assert contract.blocked_reason_code == "BROWSER_UI_EVIDENCE_REQUIRED"
+        expected_status = (
+            BrowserCapabilityStatus.AVAILABLE
+            if contract.name == "threads.browser.feed.browse"
+            else BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE
+        )
+        expected_block = (
+            None
+            if expected_status is BrowserCapabilityStatus.AVAILABLE
+            else "BROWSER_UI_EVIDENCE_REQUIRED"
+        )
+        assert contract.status is expected_status
+        assert contract.blocked_reason_code == expected_block
         assert contract.required_session_state.value == "AUTHENTICATED"
         assert contract.irreversible_boundary is False
         assert contract.name in KNOWN_COMMAND_TYPES
@@ -56,9 +66,10 @@ def test_c5_contracts_are_typed_versioned_and_blocked_without_reviewed_ui_eviden
         assert policy is not None
         assert policy.worker_capability_name == contract.name
         assert policy.blocked_reason_code == contract.blocked_reason_code
+        browser_mode_allowed = expected_status is BrowserCapabilityStatus.AVAILABLE
         assert (
             router.worker_execution_allowed(contract.name, AccountExecutionMode.BROWSER_ONLY)
-            is False
+            is browser_mode_allowed
         )
         for mode in AccountExecutionMode:
             decision = router.decide(
@@ -68,8 +79,15 @@ def test_c5_contracts_are_typed_versioned_and_blocked_without_reviewed_ui_eviden
                 mode,
                 evidence,
             )
-            assert decision.target is RouteTarget.UNSUPPORTED
-            assert decision.reason_code == "BROWSER_UI_EVIDENCE_REQUIRED"
+            if expected_status is BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE:
+                assert decision.target is RouteTarget.UNSUPPORTED
+                assert decision.reason_code == "BROWSER_UI_EVIDENCE_REQUIRED"
+            elif mode in {AccountExecutionMode.BROWSER_ONLY, AccountExecutionMode.HYBRID}:
+                assert decision.target is RouteTarget.WORKER_JOB
+            elif mode is AccountExecutionMode.MANUAL:
+                assert decision.target is RouteTarget.WAITING_INTERVENTION
+            else:
+                assert decision.target is RouteTarget.UNSUPPORTED
 
 
 @pytest.mark.parametrize(
@@ -154,7 +172,14 @@ def test_c5_result_schemas_exclude_dom_and_worker_local_paths() -> None:
         )
 
 
-@pytest.mark.parametrize("contract", BROWSER_CAPABILITY_CONTRACTS)
+@pytest.mark.parametrize(
+    "contract",
+    [
+        contract
+        for contract in BROWSER_CAPABILITY_CONTRACTS
+        if contract.status is BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE
+    ],
+)
 async def test_workers_cannot_advertise_ui_evidence_blocked_capabilities(
     contract: BrowserCapabilityContract,
 ) -> None:

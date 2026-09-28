@@ -19,6 +19,7 @@ from threads_platform.domain.workers import BrowserSessionState
 
 
 class BrowserCapabilityStatus(StrEnum):
+    AVAILABLE = "AVAILABLE"
     BLOCKED_UI_EVIDENCE = "BLOCKED_UI_EVIDENCE"
 
 
@@ -74,7 +75,7 @@ class BrowserCapabilityContract:
     intervention_types: frozenset[str]
     irreversible_boundary: bool
     status: BrowserCapabilityStatus
-    blocked_reason_code: str
+    blocked_reason_code: str | None
     max_items: int | None = None
     max_scroll_iterations: int | None = None
     max_duration_seconds: int | None = None
@@ -90,7 +91,6 @@ class BrowserCapabilityContract:
             or self.ui_contract_version < 1
             or not self.result_schema.strip()
             or self.result_schema_version < 1
-            or not self.blocked_reason_code.strip()
         ):
             raise ValueError("browser capability contract fields are required")
         if not self.safe_checkpoints or len(set(self.safe_checkpoints)) != len(
@@ -101,6 +101,11 @@ class BrowserCapabilityContract:
             self.blocked_reason_code != "BROWSER_UI_EVIDENCE_REQUIRED"
         ):
             raise ValueError("UI evidence blocked capabilities require the matching reason")
+        if (
+            self.status is BrowserCapabilityStatus.AVAILABLE
+            and self.blocked_reason_code is not None
+        ):
+            raise ValueError("available browser capabilities cannot have a blocked reason")
         if self.max_items is not None and self.max_items < 1:
             raise ValueError("browser capability item bound must be positive")
         if self.max_scroll_iterations is not None and self.max_scroll_iterations < 1:
@@ -118,6 +123,8 @@ COMMON_FAILURES = frozenset(
         "UNSUPPORTED_UI_STATE",
         "BROWSER_NAVIGATION_TIMEOUT",
         "BROWSER_PROCESS_CRASHED",
+        "BROWSER_RUNTIME_UNAVAILABLE",
+        "BROWSER_ACCOUNT_AFFINITY_MISMATCH",
         "WORKER_JOB_LEASE_LOST",
     }
 )
@@ -137,13 +144,20 @@ BROWSER_CAPABILITY_CONTRACTS: tuple[BrowserCapabilityContract, ...] = (
         safe_checkpoints=("BEFORE_NAVIGATION", "FEED_READY", "ITEM_BATCH"),
         result_schema="BrowserFeedResultV1",
         result_schema_version=1,
-        allowed_failure_codes=COMMON_FAILURES,
+        allowed_failure_codes=COMMON_FAILURES
+        | {
+            "BROWSER_SESSION_UNAVAILABLE",
+            "BROWSER_NETWORK_ROUTE_UNSUPPORTED",
+            "UNSUPPORTED_BROWSER_CAPABILITY",
+            "WORKER_JOB_INPUT_INVALID",
+            "WORKER_JOB_RETRY_SAFETY_MISMATCH",
+        },
         intervention_types=SESSION_INTERVENTIONS,
         irreversible_boundary=False,
-        status=BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE,
-        blocked_reason_code="BROWSER_UI_EVIDENCE_REQUIRED",
+        status=BrowserCapabilityStatus.AVAILABLE,
+        blocked_reason_code=None,
         max_items=20,
-        max_scroll_iterations=5,
+        max_scroll_iterations=4,
         max_duration_seconds=30,
     ),
     BrowserCapabilityContract(

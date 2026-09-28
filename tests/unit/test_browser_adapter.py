@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import threads_platform.infrastructure.browser.playwright_engine as playwright_engine
 from threads_platform.application.ports.worker_agent import (
     LocalRecoveryEntry,
     LocalSessionState,
@@ -36,6 +37,7 @@ from threads_platform.workers.browser import (
     BrowserAccountAffinityMismatch,
     BrowserAdapterError,
     BrowserContractError,
+    BrowserFeedEngineSession,
     BrowserLaunchRequest,
     BrowserNavigationPolicy,
     BrowserNetworkRouteUnsupported,
@@ -57,6 +59,7 @@ from threads_platform.workers.browser import (
     WorkerJobRetrySafetyViolation,
     classify_browser_surface,
 )
+from threads_platform.workers.feed_browse import normalize_feed_candidates
 from threads_platform.workers.sessions import (
     BrowserSessionOpenResult,
     LocalBrowserSessionManager,
@@ -66,16 +69,38 @@ from threads_platform.workers.sessions import (
 
 
 @pytest.fixture
-def synthetic_origin() -> Iterator[str]:
+def synthetic_redirect_target_requests() -> list[str]:
+    return []
+
+
+@pytest.fixture
+def synthetic_origin(synthetic_redirect_target_requests: list[str]) -> Iterator[str]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
             if path == "/slow":
-                time.sleep(0.4)
-            body = _SYNTHETIC_DOCUMENTS.get(
-                path,
-                _document("AUTHENTICATED"),
-            )
+                time.sleep(1.5)
+            if path == "/redirect-out":
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://localhost:{server.server_address[1]}/redirect-target",
+                )
+                self.end_headers()
+                return
+            if path == "/redirect-target":
+                synthetic_redirect_target_requests.append(path)
+            if path == "/delayed-redirect":
+                body = (
+                    "<html><body><script>setTimeout(() => {"
+                    f"window.location.href = 'http://localhost:{server.server_address[1]}"
+                    "/redirect-target'; }, 20);</script></body></html>"
+                ).encode()
+            else:
+                body = _SYNTHETIC_DOCUMENTS.get(
+                    path,
+                    _document("AUTHENTICATED"),
+                )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -117,7 +142,7 @@ def test_playwright_managed_profile_contract_navigation_and_cleanup(
         adapter = PlaywrightBrowserAdapter(
             worker_id,
             resolver,
-            PlaywrightBrowserEngine(navigation_timeout_ms=100),
+            PlaywrightBrowserEngine(navigation_timeout_ms=1_000),
         )
         managed_manager = ManagedPlaywrightBrowserSessionManager(
             manager,
@@ -154,6 +179,111 @@ def test_playwright_managed_profile_contract_navigation_and_cleanup(
         assert store.active_session_count() == 0
         current = store.get_session(account_id)
         assert current is not None and current.state is BrowserSessionState.STOPPED
+
+    asyncio.run(scenario())
+
+
+def test_playwright_rejects_navigation_redirect_to_unreviewed_origin(
+    tmp_path: Path,
+    synthetic_origin: str,
+    synthetic_redirect_target_requests: list[str],
+) -> None:
+    async def scenario() -> None:
+        profile_directory = tmp_path / "redirect-profile"
+        profile_directory.mkdir()
+        account_id = uuid4()
+        session = await PlaywrightBrowserEngine(navigation_timeout_ms=5_000).open(
+            BrowserLaunchRequest(
+                worker_id=uuid4(),
+                account_id=account_id,
+                profile_ref="redirect-profile",
+                profile_directory=profile_directory,
+                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            with pytest.raises(UnsupportedUIState):
+                await session.navigate(
+                    f"{synthetic_origin}/redirect-out",
+                    allowed_origins=frozenset({synthetic_origin}),
+                )
+        finally:
+            await session.close()
+        assert synthetic_redirect_target_requests == []
+
+    asyncio.run(scenario())
+
+
+def test_playwright_keeps_origin_guard_after_document_load(
+    tmp_path: Path,
+    synthetic_origin: str,
+    synthetic_redirect_target_requests: list[str],
+) -> None:
+    async def scenario() -> None:
+        profile_directory = tmp_path / "delayed-redirect-profile"
+        profile_directory.mkdir()
+        account_id = uuid4()
+        session = await PlaywrightBrowserEngine(navigation_timeout_ms=5_000).open(
+            BrowserLaunchRequest(
+                worker_id=uuid4(),
+                account_id=account_id,
+                profile_ref="delayed-redirect-profile",
+                profile_directory=profile_directory,
+                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            await session.navigate(
+                f"{synthetic_origin}/delayed-redirect",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            await asyncio.sleep(0.3)
+            with pytest.raises(UnsupportedUIState):
+                await cast(BrowserFeedEngineSession, session).collect_feed_candidates(
+                    ancestor_bound=8
+                )
+        finally:
+            await session.close()
+        assert synthetic_redirect_target_requests == []
+
+    asyncio.run(scenario())
+
+
+def test_playwright_feed_scan_uses_reviewed_semantic_markers_only(
+    tmp_path: Path,
+    synthetic_origin: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        worker_id, account_id = uuid4(), uuid4()
+        profile_directory = tmp_path / "feed-profile"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine().open(
+            BrowserLaunchRequest(
+                worker_id=worker_id,
+                account_id=account_id,
+                profile_ref="feed-profile",
+                profile_directory=profile_directory,
+                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        await session.navigate(
+            f"{synthetic_origin}/feed", allowed_origins=frozenset({synthetic_origin})
+        )
+        candidates = await cast(BrowserFeedEngineSession, session).collect_feed_candidates(
+            ancestor_bound=8
+        )
+        normalized = normalize_feed_candidates(candidates, max_items=5)
+        await session.close()
+
+        assert len(normalized) == 1
+        assert normalized[0].thread_ref == "https://www.threads.com/@alice/post/post-1"
+        assert normalized[0].text_excerpt == "Synthetic public text"
+        assert candidates[0].ancestors[0].text_regions == ("Synthetic public text",)
 
     asyncio.run(scenario())
 
@@ -364,8 +494,13 @@ def test_unknown_ui_contracts_and_missing_markers_fail_closed() -> None:
 def test_navigation_policy_allows_only_allowlisted_loopback_http() -> None:
     policy = _local_policy("http://127.0.0.1:41000")
     policy.validate("http://127.0.0.1:41000/synthetic")
+    BrowserNavigationPolicy(frozenset({"https://www.threads.com"})).validate(
+        "https://www.threads.com/"
+    )
     with pytest.raises(UnsupportedUIState):
-        BrowserNavigationPolicy(frozenset({"https://threads.net"})).validate("https://threads.net")
+        BrowserNavigationPolicy(frozenset({"https://www.threads.com"})).validate(
+            "https://threads.net/"
+        )
     with pytest.raises(UnsupportedUIState):
         policy.validate("http://example.test:41000/synthetic")
 
@@ -689,6 +824,13 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/unknown": _document("AUTHENTICATED", version="17"),
     "/missing": _document("AUTHENTICATED", include_root=False),
     "/no-contract": b"<html><body><main data-worker-ui-root></main></body></html>",
+    "/feed": (
+        b"<!doctype html><html><body><section><div>"
+        b'<a href="/@alice/post/post-1">permalink</a>'
+        b'<a href="/@alice/">author</a>'
+        b'<div dir="auto">Synthetic   public text</div>'
+        b"</div></section></body></html>"
+    ),
 }
 
 
@@ -728,8 +870,8 @@ class _MemoryBrowserSession:
         self.crash_on_navigation = crash_on_navigation
         self.closed = False
 
-    async def navigate(self, url: str) -> None:
-        _ = url
+    async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
+        _ = (url, allowed_origins)
         if self.crash_on_navigation:
             raise BrowserProcessCrashed()
 

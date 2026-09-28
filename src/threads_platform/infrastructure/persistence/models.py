@@ -938,6 +938,7 @@ class WorkerJobRecord(Base):
         nullable=False,
         server_default=text("'READ'"),
     )
+    input_data: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
     status: Mapped[WorkerJobStatus] = mapped_column(
         enum_type(WorkerJobStatus, "worker_job_status"), nullable=False
     )

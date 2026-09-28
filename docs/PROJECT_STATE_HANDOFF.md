@@ -24,18 +24,27 @@ Engineering completed:
 ### Canonical C5-01 state after the contract/evidence-gate foundation is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
-is accepted and merged; issue #27 remains OPEN/BLOCKED because no reviewed
-production Threads UI evidence or executable production UI workflow has been
-accepted. C5-01 is not production-ready, and #27 is not closed.
+is accepted and merged. On 2026-09-28 the coordinator accepted scrubbed
+production UI evidence for `threads.browser.feed.browse` and authorized its v1
+implementation only. This focused continuation implements that workflow and
+is awaiting checkpoint review; issue #27 remains OPEN and is not closed.
 
-The four approved command contracts—`threads.browser.feed.browse`,
+Only `threads.browser.feed.browse` v1 is authorized for implementation. Its
+reviewed production markers are the `/@<username>` profile link,
+`/@<username>/post/<id>` permalink, and `[dir="auto"]` text region. The approved
+workflow pivots on each permalink and selects the nearest ancestor within a
+strict bound that proves the permalink, exactly one compatible author link, and
+bounded text while containing no neighboring post permalink. It fails closed
+when that association is ambiguous or cannot be proven. Feed routing is through
+the Capability Router and account-affine WorkerJob only.
+
 `threads.browser.thread.open`, `threads.browser.profile.open`, and
-`threads.browser.media.local_upload`—remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`.
-Production routing returns `UNSUPPORTED` without creating a WorkerJob, and
-workers must not advertise these blocked capabilities. Local media remains
-worker-local staging only; publish/submit is excluded. Synthetic fixtures do not
-qualify as production UI evidence, and selectors/workflows must not be guessed.
-#28 remains unauthorized; LIKE/FOLLOW remain VERIFY.
+`threads.browser.media.local_upload` remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`;
+workers must not advertise them. Local media remains worker-local staging only;
+publish/submit is excluded. Synthetic fixtures test the reviewed contract but
+are not production evidence. #28 remains unauthorized; LIKE/FOLLOW remain
+VERIFY. This feed-only checkpoint does not close #27 or authorize another C5
+capability.
 
 Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
 production release work until the coordinator explicitly authorizes the
@@ -222,10 +231,10 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Keep #27 OPEN/BLOCKED until reviewed, scrubbed production Threads UI evidence
-   and an executable production UI workflow are accepted. Until then, routing
-   must create no WorkerJob for these contracts and workers must not advertise
-   them.
+4. Keep #27 OPEN until the feed-only implementation checkpoint is accepted.
+   Only `threads.browser.feed.browse` has accepted production UI evidence and
+   implementation authorization; the other three approved contracts remain
+   blocked, unadvertised, and unrouted.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
@@ -242,10 +251,10 @@ CI green is necessary but not sufficient.
 
 ## 11. C5-01 post-merge status
 
-PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`. Once PR #37 is
-merged, its C5-01 contract/evidence-gate foundation is accepted, while issue
-#27 remains OPEN/BLOCKED until reviewed production Threads UI evidence and an
-executable production UI workflow are accepted. The four commands remain
-`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`; routing creates no WorkerJob and
-workers must not advertise them. This does not authorize production activation,
-close #27, or authorize #28. LIKE/FOLLOW remain VERIFY.
+PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, and PR #37's
+C5-01 contract/evidence-gate foundation is accepted. The coordinator accepted
+feed evidence on 2026-09-28 and authorized the `threads.browser.feed.browse`
+v1 permalink-pivot workflow only. This continuation is pending coordinator
+review; issue #27 remains OPEN. The other three contracts remain
+`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unrouted and unadvertised. This does
+not authorize #28 or close #27. LIKE/FOLLOW remain VERIFY.

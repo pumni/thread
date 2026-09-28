@@ -2400,6 +2400,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
         record.account_affinity_required = job.account_affinity_required
         record.capability_name = job.capability_name
         record.capability_version = job.capability_version
+        record.input_data = job.input_data
         record.status = job.status
         record.priority = job.priority
         record.preemptible = job.preemptible
@@ -2431,6 +2432,7 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
             account_affinity_required=record.account_affinity_required,
             capability_name=record.capability_name,
             capability_version=record.capability_version,
+            input_data=record.input_data,
             operation_class=OperationClass(record.operation_class),
             status=WorkerJobStatus(record.status),
             priority=record.priority,
