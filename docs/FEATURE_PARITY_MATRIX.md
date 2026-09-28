@@ -39,7 +39,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Priority interruption | Durable priority/preemption | HYBRID | Scheduler/WorkerJob | cancellation at safe boundary | PLANNED | P1 | replaces stop_browsing |
 | Text publish | Threads text post | HYBRID | Official API | Browser | DONE/API | P0 | Browser fallback C3/C5 |
 | Image publish by URL | Threads image post | HYBRID | Official API | Browser | DONE/API | P0 | API requires media contract |
-| Local image/file stage | Local browser media staging | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | C5 only stages local media; production composer UI evidence required; publish/submit excluded |
+| Local image/file stage | Local browser media staging | BROWSER_ASSISTED | assigned Worker | Operator opens composer | DONE | P1 | PR #43 accepted and merged; image-only jpg/jpeg/png/webp staging in the already-open composer; account-affine WorkerJob; worker opt-in required; publish/submit excluded |
 | Video publish | Threads video post | HYBRID | Official API | Browser | DONE/API | P0 | live media behavior still TP-002 gate |
 | Multi-media post | Carousel | HYBRID | Official API | Browser | DONE/API | P0 | container workflow |
 | Quote content | Quote Thread | HYBRID | Official API | Browser | DONE/API | P1 | live permission still VERIFY |
@@ -66,7 +66,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | DONE | P1 | evidence-backed v1 permalink-pivot workflow bounded to 20 items, 5 feed iterations, and 30 seconds; account-affine WorkerJob only; worker opt-in required |
 | Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | DONE | P1 | PR #40 accepted and merged; exact-path, exact-permalink v1; reviewed bounded account-affine WorkerJob path only; worker opt-in required |
 | Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | DONE | P1 | PR #41 accepted and merged; production evidence accepted (2 public profiles); exact normalized `/@<username>` path, one non-empty `<h1>`, nearest bounded DIV ancestor with exact target href(s) and no post permalink; account-affine WorkerJob only; worker opt-in required |
-| Stage local media | `threads.browser.media.local_upload` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED_UI_EVIDENCE | P1 | worker-local staging only; no publish/submit; reviewed production UI evidence required |
+| Stage local media | `threads.browser.media.local_upload` | BROWSER_ASSISTED / MUTATION | assigned Worker | Operator opens composer | DONE | P1 | PR #43 accepted and merged; non-preemptible, RECONCILIATION_REQUIRED, irreversible file selection; correlated HTTP 200 upload plus same-composer preview; image-only; worker opt-in required; no publish/submit |
 | Like | LikeThread | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | retain only if product requires |
 | Follow/unfollow | FollowUser | BROWSER_ASSISTED | Browser Worker | none | VERIFY | P2 | no Facebook friend semantics |
 | Random reactions | None | UNSUPPORTED | none | none | DROP | - | random engagement is not an architecture objective |

@@ -195,6 +195,21 @@ class BrowserProfileOpenEngineSession(BrowserEngineSession, Protocol):
     async def verify_profile_target(self, *, target_ref: str, ancestor_bound: int) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedMediaComposer:
+    """Opaque, process-local handle for one verified composer dialog."""
+
+    token: UUID
+
+
+class BrowserMediaEngineSession(BrowserEngineSession, Protocol):
+    async def prepare_media_composer(self) -> PreparedMediaComposer | None: ...
+
+    async def stage_local_media(self, composer: PreparedMediaComposer, file_path: Path) -> None: ...
+
+    async def discard_media_composer(self, composer: PreparedMediaComposer) -> None: ...
+
+
 class BrowserEngine(Protocol):
     async def open(self, request: BrowserLaunchRequest) -> BrowserEngineSession: ...
 
@@ -741,6 +756,47 @@ class WorkerBrowserSession:
         except RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
+
+    async def prepare_media_composer(self) -> PreparedMediaComposer | None:
+        if self._closed:
+            raise BrowserProcessCrashed()
+        if self._session_state is not BrowserSessionState.AUTHENTICATED:
+            raise UnsupportedUIState()
+        if self._job_execution is None or self._job_execution.account_id != self._account_id:
+            raise BrowserAccountAffinityMismatch()
+        await self._job_execution.renew()
+        engine_session = cast(BrowserMediaEngineSession, self._engine_session)
+        try:
+            return await engine_session.prepare_media_composer()
+        except SessionExpired:
+            await self._report_state_and_intervention(
+                BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
+            )
+            raise
+        except ChallengeDetected:
+            await self._report_state_and_intervention(
+                BrowserSessionState.CHALLENGE_REQUIRED,
+                "CHALLENGE_REQUIRED",
+                "CHALLENGE_REQUIRED",
+            )
+            raise
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise
+
+    async def stage_local_media(self, composer: PreparedMediaComposer, file_path: Path) -> None:
+        if self._closed:
+            raise BrowserProcessCrashed()
+        if self._session_state is not BrowserSessionState.AUTHENTICATED:
+            raise UnsupportedUIState()
+        if self._job_execution is None or self._job_execution.account_id != self._account_id:
+            raise BrowserAccountAffinityMismatch()
+        engine_session = cast(BrowserMediaEngineSession, self._engine_session)
+        await engine_session.stage_local_media(composer, file_path)
+
+    async def discard_media_composer(self, composer: PreparedMediaComposer) -> None:
+        engine_session = cast(BrowserMediaEngineSession, self._engine_session)
+        await engine_session.discard_media_composer(composer)
 
     async def inspect_contract(self) -> BrowserSurfaceState:
         if self._closed:

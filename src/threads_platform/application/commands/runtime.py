@@ -483,6 +483,8 @@ class CommandRuntime:
                     if command.command_type == "threads.browser.thread.open"
                     else {"profile_ref": command.payload["profile_ref"]}
                     if command.command_type == "threads.browser.profile.open"
+                    else {"media_ref": command.payload["media_ref"]}
+                    if command.command_type == "threads.browser.media.local_upload"
                     else None
                 ),
             )

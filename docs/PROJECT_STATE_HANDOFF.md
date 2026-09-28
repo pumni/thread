@@ -21,7 +21,7 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-### Canonical C5-01 state after the profile.open checkpoint is merged
+### Canonical C5-01 state after the media.local_upload checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
@@ -31,7 +31,10 @@ account-affine WorkerJob path, with explicit worker opt-in required. PR #41's
 `threads.browser.profile.open` v1 is accepted and merged, DONE for its
 checkpoint, and available only through the same bounded account-affine path
 with explicit worker opt-in. All three read capabilities are DONE for their
-checkpoints. Issue #27 remains OPEN because local media is still blocked.
+checkpoints. PR #43's `threads.browser.media.local_upload` v1 is accepted and
+merged, DONE for its checkpoint, and available only through the reviewed,
+bounded, account-affine WorkerJob path with explicit worker opt-in. Issue #27
+remains OPEN pending the coordinator's final canonical closure.
 
 The coordinator accepted production UI evidence for
 `threads.browser.thread.open` on 2026-09-28, and PR #40 accepted and merged its
@@ -66,11 +69,20 @@ ambiguity, and over-bound association fail closed. The implementation does not
 use canonical metadata, `main`, `article`, generated CSS classes, localized
 labels, or generic profile links outside that association.
 
-`threads.browser.media.local_upload` remains `BLOCKED_UI_EVIDENCE`, unadvertised
-and unrouted. Local media remains worker-local staging only; publish/submit is
-excluded. Synthetic fixtures test the reviewed contracts but are not
-production evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. Issue
-#27 remains OPEN because media.local_upload remains blocked.
+`threads.browser.media.local_upload` v1 is an operator-assisted image staging
+mutation for jpg/jpeg/png/webp files. The operator must open the composer; the
+Worker does not click Create. Before selection, the Worker proves exactly one
+dialog, one textbox, and one file input associated with that dialog. It arms
+the network observer before selecting the worker-local file and reports
+success only after the correlated approved-origin upload POST returns HTTP 200
+and a blob preview remains in the same composer. Uncertain outcomes after
+selection require `AMBIGUOUS_OUTCOME`; the file is never selected again.
+WorkerJobs are non-preemptible and use `RECONCILIATION_REQUIRED`. Video fails
+closed. The capability does not publish or submit, and Remove is not a
+rollback. Worker opt-in defaults off. Synthetic fixtures test the reviewed
+contracts but are not production evidence. #28 remains unauthorized;
+LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond this
+bounded staging capability, and publish/submit remains outside scope.
 
 Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
 production release work until the coordinator explicitly authorizes the
@@ -257,8 +269,8 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Keep #27 OPEN because `threads.browser.media.local_upload` remains blocked,
-   unadvertised, and unrouted. Feed browse, thread open, and profile.open are
+4. Keep #27 OPEN until the coordinator performs its final canonical closure.
+   Feed browse, thread open, profile.open, and image-only media.local_upload are
    DONE for their checkpoints. Each available capability uses the bounded
    account-affine WorkerJob path with explicit worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
@@ -280,17 +292,22 @@ CI green is necessary but not sufficient.
 PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, PR #37's
 C5-01 contract/evidence-gate foundation is accepted, PR #39's
 `threads.browser.feed.browse` v1 and PR #40's `threads.browser.thread.open` v1
-are accepted and merged. PR #41's `threads.browser.profile.open` v1 is also
-accepted and merged. All three read capabilities are DONE for their
-checkpoints and available only through reviewed bounded, account-affine
+are accepted and merged. PR #41's `threads.browser.profile.open` v1 and
+PR #43's `threads.browser.media.local_upload` v1 are also accepted and merged.
+All three read capabilities and the image-only media staging capability are
+DONE for their checkpoints and available only through reviewed bounded, account-affine
 WorkerJob paths with explicit worker opt-in. Profile recognition uses exact
 normalized pathname equality, one non-empty `<h1>`, and the nearest bounded
 `<div>` ancestor containing exact target-profile href(s) and no post permalink;
 duplicate exact profile hrefs inside that association are valid. No exact
 target href anywhere after load uses `REMOTE_STATE_UNCERTAIN`; exact hrefs only
 outside the `<div>` association, malformed, contaminated, ambiguous, or
-over-bound associations fail closed. Issue #27 remains OPEN because
-`threads.browser.media.local_upload` is still `BLOCKED_UI_EVIDENCE`, unrouted,
-and unadvertised; local media remains staging-only. Synthetic fixtures are not
+over-bound associations fail closed. Media local upload accepts only
+worker-local image refs for jpg/jpeg/png/webp, requires an already-open
+operator composer and the correlated successful upload response plus preview,
+and reports uncertain post-selection outcomes as `AMBIGUOUS_OUTCOME`. It is
+non-preemptible, uses reconciliation-required retry safety, and never publishes,
+submits, or removes the staged image. Worker opt-in defaults off. Issue #27
+remains OPEN pending final coordinator closure. Synthetic fixtures are not
 production evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No
-browser mutation or publish/submit scope is authorized.
+additional mutation or publish/submit scope is authorized.

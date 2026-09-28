@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    ElementHandle,
     Page,
     Playwright,
     ProxySettings,
+    Request,
+    Response,
     Route,
     async_playwright,
 )
@@ -36,7 +41,9 @@ from threads_platform.workers.browser import (
     FeedAncestorObservation,
     FeedCandidateObservation,
     LocatorNotFound,
+    MediaUploadFailed,
     NavigationTimeout,
+    PreparedMediaComposer,
     RemoteSessionStateUncertain,
     UnsupportedUIState,
 )
@@ -89,6 +96,30 @@ _FEED_SCAN_SCRIPT = r"""
   return {ok: true, candidates: candidateEvidence};
 }
 """
+
+_MEDIA_COMPOSER_IS_ACTIVE_SCRIPT = r"""
+(dialog) => {
+  const activeDialogs = Array.from(document.querySelectorAll('[role="dialog"]'))
+    .filter((node) => node.getClientRects().length > 0
+      && getComputedStyle(node).visibility !== 'hidden'
+      && node.getAttribute('aria-hidden') !== 'true');
+  return dialog.isConnected
+    && dialog.getAttribute('role') === 'dialog'
+    && activeDialogs.length === 1
+    && activeDialogs[0] === dialog;
+}
+"""
+
+_MEDIA_UPLOAD_PATH = re.compile(r"^/rupload_igphoto/fb_uploader_[0-9]+$")
+_MEDIA_UPLOAD_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_MEDIA_UPLOAD_DUPLICATE_SETTLE_SECONDS = 0.15
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMediaComposerElements:
+    dialog: ElementHandle
+    file_input: ElementHandle
+
 
 _THREAD_OPEN_SCRIPT = r"""
 ({allowedOrigin, targetRef, targetAuthor, ancestorBound}) => {
@@ -280,6 +311,7 @@ class _PlaywrightBrowserSession:
         self._approved_document_loaded = False
         self._remote_state_uncertain = False
         self._navigation_timed_out = False
+        self._prepared_media_composers: dict[UUID, _PreparedMediaComposerElements] = {}
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
 
@@ -474,6 +506,160 @@ class _PlaywrightBrowserSession:
             self._ensure_alive()
             raise BrowserRuntimeUnavailable("BROWSER_PROFILE_INSPECTION_FAILED") from None
         _verify_profile_target_result(payload)
+
+    async def prepare_media_composer(self) -> PreparedMediaComposer | None:
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        if _normalized_browser_origin(self._page.url) != BROWSER_FEED_ORIGIN:
+            raise RemoteSessionStateUncertain()
+        try:
+            dialogs = self._page.locator('[role="dialog"]').filter(visible=True)
+            dialog_count = await dialogs.count()
+            if dialog_count == 0:
+                return None
+            if dialog_count != 1:
+                raise BrowserContractError()
+            dialog = dialogs
+            if await dialog.locator('[role="textbox"]').count() != 1:
+                raise BrowserContractError()
+            file_inputs = self._page.locator('input[type="file"]')
+            if await file_inputs.count() != 1:
+                raise BrowserContractError()
+            file_input = dialog.locator('input[type="file"]')
+            if await file_input.count() != 1:
+                raise BrowserContractError()
+            accept = await file_input.get_attribute("accept")
+            if not _accepts_reviewed_images(accept):
+                raise BrowserContractError()
+            dialog_handle = await dialog.element_handle()
+            file_input_handle = await file_input.element_handle()
+        except BrowserContractError:
+            raise
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_MEDIA_COMPOSER_INSPECTION_FAILED") from None
+
+        token = uuid4()
+        self._prepared_media_composers[token] = _PreparedMediaComposerElements(
+            dialog_handle,
+            file_input_handle,
+        )
+        return PreparedMediaComposer(token)
+
+    async def stage_local_media(self, composer: PreparedMediaComposer, file_path: Path) -> None:
+        elements = self._prepared_media_composers.pop(composer.token, None)
+        self._ensure_alive()
+        await self._raise_navigation_policy_error()
+        if elements is None:
+            raise BrowserContractError()
+        try:
+            current_origin = _normalized_browser_origin(self._page.url)
+            if current_origin != BROWSER_FEED_ORIGIN:
+                raise RemoteSessionStateUncertain()
+            if not await elements.dialog.evaluate(_MEDIA_COMPOSER_IS_ACTIVE_SCRIPT):
+                raise BrowserContractError()
+            file_input_connected = await elements.file_input.evaluate(
+                "(node) => node.isConnected && node.matches('input[type=\"file\"]')"
+            )
+            if not file_input_connected:
+                raise BrowserContractError()
+
+            matching_requests: list[Request] = []
+            matching_responses: list[Response] = []
+            finished_requests: list[Request] = []
+            request_finished = asyncio.Event()
+            selection_started = False
+
+            def on_request(request: Request) -> None:
+                if selection_started and _media_upload_endpoint(request.url) is not None:
+                    matching_requests.append(request)
+
+            def on_response(response: Response) -> None:
+                if selection_started and _media_upload_endpoint(response.url) is not None:
+                    matching_responses.append(response)
+
+            def on_request_finished(request: Request) -> None:
+                if selection_started and _media_upload_endpoint(request.url) is not None:
+                    finished_requests.append(request)
+                    request_finished.set()
+
+            self._page.on("request", on_request)
+            self._page.on("response", on_response)
+            self._page.on("requestfinished", on_request_finished)
+            try:
+                selection_started = True
+                await elements.file_input.set_input_files(
+                    str(file_path), timeout=self._navigation_timeout_ms
+                )
+                try:
+                    await asyncio.wait_for(
+                        request_finished.wait(), timeout=self._navigation_timeout_ms / 1000
+                    )
+                except TimeoutError:
+                    raise MediaUploadFailed() from None
+
+                try:
+                    await asyncio.sleep(_MEDIA_UPLOAD_DUPLICATE_SETTLE_SECONDS)
+                except PlaywrightTimeoutError:
+                    raise MediaUploadFailed() from None
+
+                await self._raise_navigation_policy_error()
+                if (
+                    len(matching_requests) != 1
+                    or len(matching_responses) != 1
+                    or len(finished_requests) != 1
+                ):
+                    raise MediaUploadFailed()
+                request = matching_requests[0]
+                finished_request = finished_requests[0]
+                response = matching_responses[0]
+                request_endpoint = _media_upload_endpoint(request.url)
+                response_endpoint = _media_upload_endpoint(response.url)
+                response_request_endpoint = _media_upload_endpoint(response.request.url)
+                finished_endpoint = _media_upload_endpoint(finished_request.url)
+                if (
+                    request.method != "POST"
+                    or request_endpoint is None
+                    or request_endpoint[0] != current_origin
+                    or finished_request.method != request.method
+                    or finished_endpoint != request_endpoint
+                    or response_endpoint != request_endpoint
+                    or response_request_endpoint != request_endpoint
+                    or response.request.method != request.method
+                    or response.request.url != finished_request.url
+                    or response.request.method != "POST"
+                    or response.status != 200
+                ):
+                    raise MediaUploadFailed()
+
+                same_dialog = await elements.dialog.evaluate(_MEDIA_COMPOSER_IS_ACTIVE_SCRIPT)
+                preview_count = await elements.dialog.evaluate(
+                    "(dialog) => dialog.querySelectorAll('img[src^=\"blob:\"]').length"
+                )
+                if not same_dialog or not isinstance(preview_count, int) or preview_count < 1:
+                    raise MediaUploadFailed()
+            finally:
+                self._page.remove_listener("request", on_request)
+                self._page.remove_listener("response", on_response)
+                self._page.remove_listener("requestfinished", on_request_finished)
+        except BrowserContractError, MediaUploadFailed, RemoteSessionStateUncertain:
+            raise
+        except PlaywrightTimeoutError:
+            self._ensure_alive()
+            raise MediaUploadFailed() from None
+        except PlaywrightError:
+            self._ensure_alive()
+            raise BrowserRuntimeUnavailable("BROWSER_MEDIA_UPLOAD_FAILED") from None
+
+    async def discard_media_composer(self, composer: PreparedMediaComposer) -> None:
+        elements = self._prepared_media_composers.pop(composer.token, None)
+        if elements is None:
+            return
+        for handle in (elements.file_input, elements.dialog):
+            try:
+                await handle.dispose()
+            except PlaywrightError:
+                pass
 
     async def scroll_feed(self) -> None:
         self._ensure_alive()
@@ -677,3 +863,20 @@ def _normalized_browser_origin(url: str) -> str | None:
     if port is None or (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
         return f"{scheme}://{hostname}"
     return f"{scheme}://{hostname}:{port}"
+
+
+def _accepts_reviewed_images(value: str | None) -> bool:
+    if value is None:
+        return False
+    accepted = {item.strip().casefold() for item in value.split(",") if item.strip()}
+    return "image/*" in accepted or _MEDIA_UPLOAD_MIME_TYPES.issubset(accepted)
+
+
+def _media_upload_endpoint(url: str) -> tuple[str | None, str] | None:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if _MEDIA_UPLOAD_PATH.fullmatch(parsed.path) is None:
+        return None
+    return _normalized_browser_origin(url), parsed.path
