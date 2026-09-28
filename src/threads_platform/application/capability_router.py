@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
+from threads_platform.application.browser_capabilities import browser_capability_policies
 from threads_platform.domain.accounts import AccountExecutionMode, AccountStatus
 from threads_platform.domain.capabilities import (
     BusinessCapabilityPolicy,
@@ -128,6 +129,7 @@ _POLICIES = (
         CapabilityExecutionClass.NATIVE_API,
         OperationClass.MUTATION,
     ),
+    *browser_capability_policies(),
 )
 
 BUSINESS_CAPABILITIES: Mapping[str, BusinessCapabilityPolicy] = {
@@ -175,9 +177,14 @@ class CapabilityRouter:
                 CapabilityExecutionClass.HUMAN_ASSISTED,
             }
             and worker_allowed
+            and policy.blocked_reason_code is None
             and policy.worker_capability_name is not None
             and account_mode in {AccountExecutionMode.BROWSER_ONLY, AccountExecutionMode.HYBRID}
         )
+
+    def worker_capability_advertisement_allowed(self, capability_name: str) -> bool:
+        policy = self.policy_for(capability_name)
+        return policy is None or policy.blocked_reason_code is None
 
     def decide(
         self,
@@ -220,6 +227,17 @@ class CapabilityRouter:
                 "WORKER_JOB_REQUIRES_INTERVENTION"
                 if requires_intervention
                 else "EXISTING_WORKER_JOB",
+            )
+
+        if policy.blocked_reason_code is not None:
+            return self._decision(
+                command_id,
+                account_id,
+                policy,
+                account_mode,
+                RouteTarget.UNSUPPORTED,
+                None,
+                policy.blocked_reason_code,
             )
 
         if policy.execution_class is CapabilityExecutionClass.UNSUPPORTED:

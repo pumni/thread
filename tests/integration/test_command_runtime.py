@@ -27,7 +27,7 @@ from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.config.settings import Settings
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
-from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
+from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass, RouteTarget
 from threads_platform.domain.commands import AttemptStatus, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxEvent, OutboxStatus
 from threads_platform.domain.publishing import ThreadPost
@@ -728,6 +728,46 @@ async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
         assert api_route is not None
         assert worker_route.executor is CapabilityExecutor.WORKER
         assert api_route.executor is CapabilityExecutor.API
+
+
+@pytest.mark.parametrize(
+    ("command_type", "payload"),
+    [
+        ("threads.browser.feed.browse", {"max_items": 10}),
+        ("threads.browser.thread.open", {"thread_ref": "thread-1"}),
+        ("threads.browser.profile.open", {"profile_ref": "profile-1"}),
+        ("threads.browser.media.local_upload", {"media_ref": "image-1.jpg"}),
+    ],
+)
+async def test_c5_without_reviewed_ui_evidence_rejects_before_worker_job_enqueue(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    command_type: str,
+    payload: dict[str, object],
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+    worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=clock,
+        worker_job_service=worker_jobs,
+    )
+    raw_command = command_body(account_id, clock, command_type=command_type)
+    raw_command["payload"] = payload
+
+    receipt = await runtime.receive(raw_command)
+    result = await runtime.process(receipt.command_id)
+
+    assert result.status is CommandStatus.REJECTED
+    async with unit_of_work_factory() as unit_of_work:
+        route = await unit_of_work.command_route_decisions.get_latest_for_command(
+            receipt.command_id
+        )
+        assert route is not None
+        assert route.target is RouteTarget.UNSUPPORTED
+        assert route.reason_code == "BROWSER_UI_EVIDENCE_REQUIRED"
+        assert await unit_of_work.worker_jobs.get_by_command_id(receipt.command_id) is None
 
 
 async def test_account_execution_lease_has_one_owner_and_fences_reclaim(

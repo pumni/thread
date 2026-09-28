@@ -1,8 +1,11 @@
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import uuid4
 
 import pytest
 
+from threads_platform.application.ports.repositories import UnitOfWorkFactory
+from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.worker_jobs import WorkerJob
 
@@ -57,3 +60,20 @@ def test_worker_job_claim_and_fencing_reject_old_lease() -> None:
 
     assert not job.owns_lease(first_worker, first_token, now + timedelta(seconds=6))
     assert job.owns_lease(second_worker, next_token, now + timedelta(seconds=6))
+
+
+@pytest.mark.parametrize(
+    "capability_name",
+    [
+        "threads.browser.feed.browse",
+        "threads.browser.thread.open",
+        "threads.browser.profile.open",
+        "threads.browser.media.local_upload",
+    ],
+)
+async def test_ui_evidence_blocked_browser_capabilities_cannot_enqueue_or_claim(
+    capability_name: str,
+) -> None:
+    service = WorkerJobService(cast(UnitOfWorkFactory, lambda: None))
+    with pytest.raises(WorkerJobControlError, match="BROWSER_UI_EVIDENCE_REQUIRED"):
+        await service.enqueue(capability_name, 1)
