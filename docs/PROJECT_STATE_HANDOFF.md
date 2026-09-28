@@ -21,11 +21,13 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-The current checkpoint is **C5-01 — Browser capability pack v1 (#27)** on
-`batch/c5-01-browser-capability-pack`. The four approved capability contracts are
-declared, but all remain blocked pending reviewed production Threads UI evidence;
-no production selectors or browser workflows were added. See
-`docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` and its checkpoint PR for evidence.
+The audit reconciliation in PR #38 is awaiting acceptance and merge. Until then,
+**C5-01 (#27) is PAUSED** and PR [#37](https://github.com/pumni/thread/pull/37)
+must remain open/unmerged and must not advance. If PR #38 is accepted and merged,
+the prior authorization resumes for #27 only. Its four approved capability
+contracts remain blocked pending reviewed production Threads UI evidence; no
+production selectors or browser workflows are treated as verified without that
+evidence. #28 remains unauthorized, and LIKE/FOLLOW remain VERIFY.
 
 Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
 production release work until the coordinator explicitly authorizes the
@@ -157,7 +159,9 @@ Critical invariants:
 - PostgreSQL is authoritative;
 - WebSocket is notification/presence only;
 - durable worker mutations use authenticated HTTPS;
-- stale worker cannot checkpoint/finalize;
+- only a current, unexpired WorkerJob lease with matching worker and fencing token
+  can checkpoint/finalize; stale presence alone does not revoke that lease, while
+  expired, mismatched, or reclaimed tokens cannot mutate the job;
 - browser account jobs respect persistent affinity;
 - workers do not invent business actions;
 - browser automation does not enter domain;
@@ -186,7 +190,8 @@ deletes replies rooted in discovered Threads (clearing parent links among those
 rows first), while retaining replies rooted in published posts. Re-upgrading
 recreates empty C4 tables and cannot restore the deleted data. The seeded
 downgrade regression in `tests/integration/test_c4_migration.py` covers this
-behavior.
+existing migration behavior. This documents migration 0009 specifically; it does
+not change the global stop condition for destructive migration assumptions.
 
 ## 8. Threads API baseline
 
@@ -209,11 +214,11 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Review the C5-01 checkpoint PR. All four capabilities currently report
-   `BROWSER_UI_EVIDENCE_REQUIRED`; review or provide scrubbed observed evidence
-   before any production capability is enabled.
+4. Keep #27 PAUSED and PR #37 open/unmerged without advancing it until PR #38 is
+   accepted and merged. After that, resume only the prior #27 authorization; all
+   four capabilities still require reviewed, scrubbed production UI evidence.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
-6. Stop after #27 for coordinator review before #28 AccountActivityPlan/preemption.
+6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
 Do not guess production Threads selectors from synthetic fixtures. Any production UI contract must be based on reviewed observed UI evidence and must fail closed when the contract does not match.
 

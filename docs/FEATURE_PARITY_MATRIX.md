@@ -61,7 +61,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Chrome profile per account | BrowserProfile | BROWSER_ASSISTED | assigned Worker | none | DONE | P0 | C3 logical profile_ref; filesystem paths remain worker-local |
 | Login using persistent profile | Operator login + persisted session | HUMAN_ASSISTED | Worker + operator | none | PLANNED | P0 | no password-as-core model |
 | Session health | Browser session lifecycle | BROWSER_ASSISTED | Worker | Human intervention | DONE | P0 | C3 session-state reporting; login/challenges remain operator-assisted |
-| Per-account proxy | NetworkProfile | BROWSER_ASSISTED | assigned Worker | direct connection if policy allows | DONE | P1 | account-scoped routing config; credential references only, not evasion |
+| Per-account proxy | NetworkProfile | BROWSER_ASSISTED | assigned Worker | DIRECT only when no NetworkProfile is configured | DONE | P1 | configured unsupported routes fail closed; no proxy-to-DIRECT fallback; account-scoped routing config and credential references only, not evasion |
 | Feed browsing | `threads.browser.feed.browse` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | bounded read contract; reviewed production feed UI evidence required |
 | Open/read thread | `threads.browser.thread.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit Thread; reviewed production UI evidence required |
 | Open profile | `threads.browser.profile.open` | BROWSER_ASSISTED | assigned Worker | none | BLOCKED | P1 | one explicit profile; reviewed production UI evidence required |

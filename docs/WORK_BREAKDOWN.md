@@ -13,12 +13,13 @@ Completed:
 - C3-02 PR #35 — issue #26 accepted and merged.
 - C4 PR #36 — issue #8 accepted and merged.
 
-Current authorized implementation checkpoint:
-- **C5-01 — Browser capability pack v1**
-  - #27 only
-- PR #37 is open and unmerged on `batch/c5-01-browser-capability-pack` at
-  `0f55550ad06b6545a3a4d056607052aef02fab75`; its two GitHub checks pass.
-- The four C5-01 contracts remain blocked pending reviewed production UI evidence.
+Current checkpoint hold:
+- **C5-01 / #27 is PAUSED** until audit reconciliation PR #38 is accepted and
+  merged. PR [#37](https://github.com/pumni/thread/pull/37) remains open/unmerged
+  and must not advance.
+- After PR #38 is accepted and merged, the prior authorization resumes for #27
+  only; the four capability contracts remain blocked pending reviewed production
+  UI evidence. #28 remains unauthorized and LIKE/FOLLOW remain VERIFY.
 
 Issue #3 remains a production/release gate.
 
@@ -138,8 +139,12 @@ Browser enrichment waits for C3 and must route through C2.
 ## 8. C5 — Browser Capabilities and Account Activity
 
 Issues:
-- #27 capability pack v1 — **CURRENT AUTHORIZED ITEM**, under review in PR #37;
-- #28 AccountActivityPlan/priority/preemption — not authorized until #27 checkpoint review.
+- #27 capability pack v1 — **PAUSED** until audit reconciliation PR #38 is
+  accepted and merged; PR #37 must not advance during the hold. Afterward, the
+  prior #27-only authorization resumes, still gated by reviewed production UI
+  evidence;
+- #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
+  coordinator decision after the #27 checkpoint review.
 
 Browser capabilities must be explicit and independently reviewable.
 
@@ -185,7 +190,7 @@ Codex stops and reports instead of improvising when:
 - anti-detect/fingerprint-evasion behavior appears in scope;
 - a side effect cannot be reconciled safely;
 - quality gates would need weakening;
-- a migration downgrade's data loss cannot be documented and covered by a seeded regression;
+- destructive migration assumptions are required;
 - current official API behavior materially contradicts the documented capability contract.
 
 ## 13. Parallelism
