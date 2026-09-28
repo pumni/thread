@@ -195,7 +195,11 @@ class BrowserFeedBrowseWorker:
             await self._fail(execution, "BROWSER_NAVIGATION_TIMEOUT", retryable=True)
         except (BrowserContractError, BrowserAdapterError) as error:
             raw_code = getattr(error, "code", "BROWSER_CONTRACT_MISMATCH")
-            if raw_code in {"SESSION_EXPIRED", "CHALLENGE_REQUIRED"}:
+            if raw_code in {
+                "SESSION_EXPIRED",
+                "CHALLENGE_REQUIRED",
+                "REMOTE_STATE_UNCERTAIN",
+            }:
                 return
             code = (
                 raw_code

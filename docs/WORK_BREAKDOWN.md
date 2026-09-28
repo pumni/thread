@@ -13,16 +13,17 @@ Completed:
 - C3-02 PR #35 — issue #26 accepted and merged.
 - C4 PR #36 — issue #8 accepted and merged.
 
-### Canonical C5-01 state after the contract/evidence-gate foundation is merged
+### Canonical C5-01 state after the feed.browse checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
-is accepted and merged. The coordinator accepted scrubbed production UI
-evidence for `threads.browser.feed.browse` on 2026-09-28 and authorized its v1
-permalink-pivot implementation only. This feed-only continuation is awaiting
-checkpoint review; issue #27 remains **OPEN**. The other three commands remain
-`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED` and are not advertised or routed.
-Local media remains staging-only, with no publish/submit. #28 remains
-unauthorized; LIKE/FOLLOW remain VERIFY. This checkpoint does not close #27.
+is accepted and merged. PR #39's `threads.browser.feed.browse` v1 checkpoint is
+accepted and merged. Feed browse is available only through the reviewed,
+bounded, account-affine WorkerJob path, and workers must opt in to the
+capability. Issue #27 remains **OPEN** because thread.open, profile.open, and
+media.local_upload remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unadvertised
+and unrouted. Local media remains staging-only, with no publish/submit. #28
+remains unauthorized; LIKE/FOLLOW remain VERIFY. No browser mutation or
+publish/submit scope is authorized.
 
 Issue #3 remains a production/release gate.
 
@@ -143,11 +144,11 @@ Browser enrichment waits for C3 and must route through C2.
 
 Issues:
 - PR #37 C5-01 contract/evidence-gate foundation — accepted and merged;
-- #27 feed.browse continuation — production evidence accepted on 2026-09-28;
-  only `threads.browser.feed.browse` v1 is implemented in this checkpoint and
-  awaits review. It routes only through an account-affine WorkerJob. Thread
-  open, profile open, and local media staging remain blocked and unadvertised;
-  local media remains staging-only, with no publish/submit;
+- #27 feed.browse continuation — PR #39's `threads.browser.feed.browse` v1 is
+  accepted and merged, available only through the bounded account-affine
+  WorkerJob path with worker opt-in. Thread open, profile open, and local media
+  staging remain blocked, unadvertised, and unrouted; local media remains
+  staging-only, with no publish/submit;
 - #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
   coordinator decision after the #27 checkpoint review.
 

@@ -152,7 +152,7 @@ BROWSER_CAPABILITY_CONTRACTS: tuple[BrowserCapabilityContract, ...] = (
             "WORKER_JOB_INPUT_INVALID",
             "WORKER_JOB_RETRY_SAFETY_MISMATCH",
         },
-        intervention_types=SESSION_INTERVENTIONS,
+        intervention_types=SESSION_INTERVENTIONS | {"REMOTE_STATE_UNCERTAIN"},
         irreversible_boundary=False,
         status=BrowserCapabilityStatus.AVAILABLE,
         blocked_reason_code=None,

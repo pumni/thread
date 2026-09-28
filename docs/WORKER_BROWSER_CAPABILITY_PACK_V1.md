@@ -4,10 +4,11 @@
 
 The C5-01 catalog contains four v1 names. On 2026-09-28, the coordinator
 accepted scrubbed production UI evidence for `threads.browser.feed.browse` and
-authorized implementation of that capability only. This checkpoint implements
-its bounded permalink-pivot workflow and routes it through an account-affine
-WorkerJob. The other three capabilities remain `BLOCKED_UI_EVIDENCE`, unavailable
-to routing and worker advertisement. C3's `worker.synthetic` contract remains a
+authorized implementation of that capability only. PR #39's feed.browse v1
+checkpoint is accepted and merged. Feed browse is available only through the
+reviewed bounded, account-affine WorkerJob path, with worker opt-in required.
+The other three capabilities remain `BLOCKED_UI_EVIDENCE`, unavailable to
+routing and worker advertisement. C3's `worker.synthetic` contract remains a
 local fixture, not production UI evidence.
 
 The `ui_contract_id` values below are application contract names. The feed's
@@ -63,10 +64,17 @@ reviewed production evidence.
 
 All capabilities require the existing C3 managed account session to be
 `AUTHENTICATED`. The declared session interventions are `LOGIN_REQUIRED`,
-`SESSION_EXPIRED`, and `CHALLENGE_REQUIRED`; local upload also permits
-`REMOTE_STATE_UNCERTAIN`. Existing C3 session reporting and WorkerJob fencing are
-the required implementation paths. The capability contracts add no alternate
-session or job journal.
+`SESSION_EXPIRED`, and `CHALLENGE_REQUIRED`. Feed browse and local upload also
+permit `REMOTE_STATE_UNCERTAIN`. If an authenticated feed navigation receives a
+redirect, it is blocked before following and requests durable
+`REMOTE_STATE_UNCERTAIN` intervention. A bounded read with no reviewed permalink
+candidates does the same, including when the feed may simply be exhausted; the
+available production evidence cannot distinguish that from a remote session
+transition. This path does not guess a login or challenge selector. Malformed,
+ambiguous, or over-bound feed association evidence remains a fail-closed
+contract failure. Existing C3 session reporting and WorkerJob fencing are the
+required implementation paths; these contracts add no alternate session or job
+journal.
 
 Declared bounded failure codes are `BROWSER_CONTRACT_MISMATCH`,
 `BROWSER_REQUIRED_MARKER_NOT_FOUND`, `UNSUPPORTED_UI_STATE`,
@@ -144,5 +152,5 @@ cases. They are not production evidence for the other three capabilities.
 `threads.browser.media.local_upload` remain blocked. LIKE/FOLLOW, browser
 Reply/Repost/Share/Create/Post, publish/submit, scheduler, AccountActivityPlan,
 and durable priority preemption are outside this checkpoint. Issue #27 remains
-open for coordinator review; this implementation does not authorize another
-capability.
+open because the three other browser capabilities are blocked; this checkpoint
+does not authorize another capability.

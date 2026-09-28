@@ -69,6 +69,11 @@ class ChallengeDetected(BrowserAdapterError):
         super().__init__("CHALLENGE_REQUIRED")
 
 
+class RemoteSessionStateUncertain(BrowserAdapterError):
+    def __init__(self) -> None:
+        super().__init__("REMOTE_STATE_UNCERTAIN")
+
+
 class NavigationTimeout(BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("BROWSER_NAVIGATION_TIMEOUT")
@@ -591,6 +596,9 @@ class WorkerBrowserSession:
             await self._job_execution.renew()
         try:
             await self._engine_session.navigate(url, allowed_origins=policy.allowed_origins)
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise
         except BrowserProcessCrashed:
             await self._set_state(BrowserSessionState.ERROR)
             if self._job_execution is not None:
@@ -630,6 +638,9 @@ class WorkerBrowserSession:
                 "CHALLENGE_REQUIRED",
             )
             raise
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise
 
     async def scroll_feed(self) -> None:
         if self._closed:
@@ -653,6 +664,9 @@ class WorkerBrowserSession:
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
+            raise
+        except RemoteSessionStateUncertain:
+            await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
     async def inspect_contract(self) -> BrowserSurfaceState:

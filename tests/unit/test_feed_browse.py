@@ -21,6 +21,7 @@ from threads_platform.workers.browser import (
     BrowserSurface,
     FeedAncestorObservation,
     FeedCandidateObservation,
+    RemoteSessionStateUncertain,
     WorkerBrowserSession,
     WorkerJobExecution,
     WorkerJobLeaseLost,
@@ -294,10 +295,15 @@ async def test_feed_worker_routes_session_states_to_intervention(
 
 
 @pytest.mark.asyncio
-async def test_unrecognized_feed_page_fails_with_typed_contract_error() -> None:
+async def test_feed_worker_intervenes_on_session_transition_after_navigation() -> None:
     worker_id, account_id = uuid4(), uuid4()
     client = _MemoryControl(worker_id, account_id)
-    manager = _MemorySessionManager(worker_id, account_id, batches=[()])
+    manager = _MemorySessionManager(
+        worker_id,
+        account_id,
+        batches=[()],
+        transition_after_navigation=True,
+    )
     handler = BrowserFeedBrowseWorker(
         worker_id,
         cast(FeedWorkerControlClient, client),
@@ -306,8 +312,13 @@ async def test_unrecognized_feed_page_fails_with_typed_contract_error() -> None:
 
     await handler(client.snapshot)
 
-    assert client.snapshot.status is WorkerJobStatus.FAILED_FINAL
-    assert client.failures == [("BROWSER_CONTRACT_MISMATCH", False)]
+    assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
+    assert client.interventions == [("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")]
+    assert manager.session.navigated == [f"{BROWSER_FEED_ORIGIN}/"]
+    assert manager.session.collect_count == 1
+    assert manager.session.scroll_count == 0
+    assert client.failures == []
+    assert client.completed_result is None
     await handler.aclose()
 
 
@@ -492,6 +503,8 @@ class _MemorySession:
         profile_ref: str,
         batches: list[tuple[FeedCandidateObservation, ...]],
         state: BrowserSessionState,
+        *,
+        transition_after_navigation: bool = False,
     ) -> None:
         self.account_id = account_id
         self.profile_ref = profile_ref
@@ -501,6 +514,7 @@ class _MemorySession:
         self.scroll_count = 0
         self.navigated: list[str] = []
         self.execution: object | None = None
+        self.transition_after_navigation = transition_after_navigation
 
     def bind_worker_job(self, execution: object) -> None:
         self.execution = execution
@@ -515,6 +529,10 @@ class _MemorySession:
         assert ancestor_bound == FEED_ANCESTOR_BOUND
         index = self.collect_count
         self.collect_count += 1
+        if self.transition_after_navigation and self.navigated:
+            execution = cast(WorkerJobExecution, self.execution)
+            await execution.request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
+            raise RemoteSessionStateUncertain()
         return self.batches[index] if index < len(self.batches) else ()
 
     async def scroll_feed(self) -> None:
@@ -529,6 +547,7 @@ class _MemorySessionManager:
         *,
         batches: list[tuple[FeedCandidateObservation, ...]],
         session_state: BrowserSessionState = BrowserSessionState.AUTHENTICATED,
+        transition_after_navigation: bool = False,
     ) -> None:
         self.context = WorkerAccountContext(account_id, worker_id, "profile-main", None)
         now = datetime.now(UTC)
@@ -543,7 +562,13 @@ class _MemorySessionManager:
             ),
             NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
         )
-        self.session = _MemorySession(account_id, "profile-main", batches, session_state)
+        self.session = _MemorySession(
+            account_id,
+            "profile-main",
+            batches,
+            session_state,
+            transition_after_navigation=transition_after_navigation,
+        )
         self.open_count = 0
         self.closed_accounts: list[UUID] = []
 

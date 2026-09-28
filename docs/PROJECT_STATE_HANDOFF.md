@@ -21,13 +21,13 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-### Canonical C5-01 state after the contract/evidence-gate foundation is merged
+### Canonical C5-01 state after the feed.browse checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
-is accepted and merged. On 2026-09-28 the coordinator accepted scrubbed
-production UI evidence for `threads.browser.feed.browse` and authorized its v1
-implementation only. This focused continuation implements that workflow and
-is awaiting checkpoint review; issue #27 remains OPEN and is not closed.
+is accepted and merged. PR #39's `threads.browser.feed.browse` v1 checkpoint is
+accepted and merged. The capability is available only through the reviewed,
+bounded, account-affine WorkerJob path, with worker opt-in required. Issue #27
+remains OPEN because the other three capabilities are still blocked.
 
 Only `threads.browser.feed.browse` v1 is authorized for implementation. Its
 reviewed production markers are the `/@<username>` profile link,
@@ -231,10 +231,11 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Keep #27 OPEN until the feed-only implementation checkpoint is accepted.
-   Only `threads.browser.feed.browse` has accepted production UI evidence and
-   implementation authorization; the other three approved contracts remain
-   blocked, unadvertised, and unrouted.
+4. Keep #27 OPEN because `threads.browser.thread.open`,
+   `threads.browser.profile.open`, and `threads.browser.media.local_upload`
+   remain blocked, unadvertised, and unrouted. `threads.browser.feed.browse` v1
+   is accepted and available only through the bounded WorkerJob path with
+   worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
@@ -251,10 +252,12 @@ CI green is necessary but not sufficient.
 
 ## 11. C5-01 post-merge status
 
-PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, and PR #37's
-C5-01 contract/evidence-gate foundation is accepted. The coordinator accepted
-feed evidence on 2026-09-28 and authorized the `threads.browser.feed.browse`
-v1 permalink-pivot workflow only. This continuation is pending coordinator
-review; issue #27 remains OPEN. The other three contracts remain
-`BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`, unrouted and unadvertised. This does
-not authorize #28 or close #27. LIKE/FOLLOW remain VERIFY.
+PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, PR #37's
+C5-01 contract/evidence-gate foundation is accepted, and PR #39's
+`threads.browser.feed.browse` v1 checkpoint is accepted and merged. Feed browse
+is available only through the reviewed bounded, account-affine WorkerJob path
+and requires worker opt-in. Issue #27 remains OPEN because thread.open,
+profile.open, and media.local_upload remain `BLOCKED / BROWSER_UI_EVIDENCE_REQUIRED`,
+unrouted, and unadvertised. This does not authorize #28 or close #27.
+LIKE/FOLLOW remain VERIFY; no browser mutation or publish/submit scope is
+authorized.

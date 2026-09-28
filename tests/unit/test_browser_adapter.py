@@ -45,11 +45,13 @@ from threads_platform.workers.browser import (
     BrowserSurface,
     BrowserSurfaceState,
     ChallengeDetected,
+    FeedCandidateObservation,
     LocatorNotFound,
     ManagedPlaywrightBrowserSessionManager,
     MediaUploadFailed,
     NavigationTimeout,
     PlaywrightBrowserAdapter,
+    RemoteSessionStateUncertain,
     SessionExpired,
     UnsupportedUIState,
     WorkerBrowserSession,
@@ -183,7 +185,7 @@ def test_playwright_managed_profile_contract_navigation_and_cleanup(
     asyncio.run(scenario())
 
 
-def test_playwright_rejects_navigation_redirect_to_unreviewed_origin(
+def test_playwright_redirect_requests_intervention_without_following_target(
     tmp_path: Path,
     synthetic_origin: str,
     synthetic_redirect_target_requests: list[str],
@@ -203,7 +205,7 @@ def test_playwright_rejects_navigation_redirect_to_unreviewed_origin(
             )
         )
         try:
-            with pytest.raises(UnsupportedUIState):
+            with pytest.raises(RemoteSessionStateUncertain):
                 await session.navigate(
                     f"{synthetic_origin}/redirect-out",
                     allowed_origins=frozenset({synthetic_origin}),
@@ -247,6 +249,41 @@ def test_playwright_keeps_origin_guard_after_document_load(
         finally:
             await session.close()
         assert synthetic_redirect_target_requests == []
+
+    asyncio.run(scenario())
+
+
+def test_playwright_feed_without_reviewed_permalink_evidence_is_uncertain(
+    tmp_path: Path,
+    synthetic_origin: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        account_id = uuid4()
+        profile_directory = tmp_path / "session-transition-profile"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine().open(
+            BrowserLaunchRequest(
+                worker_id=uuid4(),
+                account_id=account_id,
+                profile_ref="session-transition-profile",
+                profile_directory=profile_directory,
+                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            await session.navigate(
+                f"{synthetic_origin}/login",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            with pytest.raises(RemoteSessionStateUncertain):
+                await cast(BrowserFeedEngineSession, session).collect_feed_candidates(
+                    ancestor_bound=8
+                )
+        finally:
+            await session.close()
 
     asyncio.run(scenario())
 
@@ -331,6 +368,51 @@ def test_synthetic_session_states_report_durable_interventions(tmp_path: Path) -
             assert state is not None and state.state is expected_state
             assert client.interventions[-1] == (expected_state.value, expected_state.value)
             await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_session_transition_after_navigation_records_durable_intervention(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        worker_id, account_id = uuid4(), uuid4()
+        context, manager, _, resolver, _ = await _managed_session(
+            tmp_path,
+            worker_id,
+            account_id,
+            "transition-profile",
+            open_session=False,
+        )
+        reserved = await manager.open(context)
+        await manager.transition(account_id, BrowserSessionState.STARTING)
+        authenticated = await manager.transition(account_id, BrowserSessionState.AUTHENTICATED)
+        opened = replace(reserved, state=authenticated)
+        engine = _MemoryBrowserEngine(remote_uncertain_on_collect=True)
+        adapter = PlaywrightBrowserAdapter(worker_id, resolver, engine)
+        job = _running_job(worker_id, account_id)
+        client = _MemoryWorkerJobControl(worker_id, account_id, job)
+        execution = WorkerJobExecution(job, worker_id, client)
+        session = await adapter.open_reserved_session(
+            context,
+            opened,
+            transition=manager.transition,
+            close_session=manager.close,
+            job_execution=execution,
+            headless=True,
+        )
+
+        await session.navigate(
+            "http://127.0.0.1:41000/feed", _local_policy("http://127.0.0.1:41000")
+        )
+        with pytest.raises(RemoteSessionStateUncertain):
+            await session.collect_feed_candidates(ancestor_bound=8)
+
+        assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
+        assert client.interventions == [("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")]
+        assert engine.sessions[0].collect_count == 1
+        assert engine.sessions[0].scroll_count == 0
+        await session.close()
 
     asyncio.run(scenario())
 
@@ -728,6 +810,7 @@ def test_required_error_messages_are_bounded_codes() -> None:
         LocatorNotFound(),
         SessionExpired(),
         ChallengeDetected(),
+        RemoteSessionStateUncertain(),
         NavigationTimeout(),
         ActionOutcomeAmbiguous(intervention_recorded=False),
         MediaUploadFailed(),
@@ -865,9 +948,13 @@ class _MemoryBrowserSession:
         surface: BrowserSurface | None = None,
         *,
         crash_on_navigation: bool = False,
+        remote_uncertain_on_collect: bool = False,
     ) -> None:
         self.surface = surface or _surface("AUTHENTICATED")
         self.crash_on_navigation = crash_on_navigation
+        self.remote_uncertain_on_collect = remote_uncertain_on_collect
+        self.collect_count = 0
+        self.scroll_count = 0
         self.closed = False
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
@@ -878,18 +965,37 @@ class _MemoryBrowserSession:
     async def inspect_surface(self) -> BrowserSurface:
         return self.surface
 
+    async def collect_feed_candidates(
+        self, *, ancestor_bound: int
+    ) -> tuple[FeedCandidateObservation, ...]:
+        _ = ancestor_bound
+        self.collect_count += 1
+        if self.remote_uncertain_on_collect:
+            raise RemoteSessionStateUncertain()
+        return ()
+
+    async def scroll_feed(self) -> None:
+        self.scroll_count += 1
+
     async def close(self) -> None:
         self.closed = True
 
 
 class _MemoryBrowserEngine:
-    def __init__(self) -> None:
+    def __init__(self, *, remote_uncertain_on_collect: bool = False) -> None:
         self.requests: list[BrowserLaunchRequest] = []
         self.surface = _surface("AUTHENTICATED")
+        self.remote_uncertain_on_collect = remote_uncertain_on_collect
+        self.sessions: list[_MemoryBrowserSession] = []
 
     async def open(self, request: BrowserLaunchRequest) -> _MemoryBrowserSession:
         self.requests.append(request)
-        return _MemoryBrowserSession(self.surface)
+        session = _MemoryBrowserSession(
+            self.surface,
+            remote_uncertain_on_collect=self.remote_uncertain_on_collect,
+        )
+        self.sessions.append(session)
+        return session
 
 
 class _MemoryProxyCredentials:

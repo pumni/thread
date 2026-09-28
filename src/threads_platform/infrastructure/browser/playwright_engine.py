@@ -36,12 +36,15 @@ from threads_platform.workers.browser import (
     FeedCandidateObservation,
     LocatorNotFound,
     NavigationTimeout,
+    RemoteSessionStateUncertain,
     UnsupportedUIState,
 )
 
 _FEED_SCAN_SCRIPT = r"""
 ({allowedOrigin, ancestorBound, candidateBound}) => {
-  if (window.location.origin !== allowedOrigin) return {ok: false};
+  if (window.location.origin !== allowedOrigin) {
+    return {ok: false, reason: 'origin_mismatch'};
+  }
   const anchors = Array.from(document.querySelectorAll('a[href]'));
   if (anchors.length > 1000) return {ok: false};
   const parsePath = (href) => {
@@ -155,7 +158,7 @@ class _PlaywrightBrowserSession:
         self._navigation_guard_installed = False
         self._navigation_guard_lock = asyncio.Lock()
         self._blocked_navigation = False
-        self._blocked_redirect = False
+        self._remote_redirect = False
         self._navigation_timed_out = False
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
@@ -228,7 +231,7 @@ class _PlaywrightBrowserSession:
                     pass
                 return
             if 300 <= response.status < 400:
-                self._blocked_redirect = True
+                self._remote_redirect = True
                 await route.abort("blockedbyclient")
                 return
             await route.fulfill(response=response)
@@ -241,12 +244,14 @@ class _PlaywrightBrowserSession:
                 and _normalized_browser_origin(self._page.url)
                 not in self._allowed_navigation_origins
             ):
-                raise UnsupportedUIState()
+                raise RemoteSessionStateUncertain()
 
     async def _raise_guard_rejection(self) -> None:
         async with self._navigation_guard_lock:
-            if self._blocked_navigation or self._blocked_redirect:
+            if self._blocked_navigation:
                 raise UnsupportedUIState()
+            if self._remote_redirect:
+                raise RemoteSessionStateUncertain()
             if self._navigation_timed_out:
                 raise NavigationTimeout()
 
@@ -359,10 +364,14 @@ def _feed_candidate_observations(payload: object) -> tuple[FeedCandidateObservat
     if not isinstance(payload, dict):
         raise BrowserContractError()
     data = cast(dict[str, object], payload)
+    if data.get("reason") == "origin_mismatch":
+        raise RemoteSessionStateUncertain()
     candidate_value = data.get("candidates")
     if data.get("ok") is not True or not isinstance(candidate_value, list):
         raise BrowserContractError()
     raw_candidates = cast(list[object], candidate_value)
+    if not raw_candidates:
+        raise RemoteSessionStateUncertain()
 
     candidates: list[FeedCandidateObservation] = []
     for raw_candidate in raw_candidates:

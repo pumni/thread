@@ -61,6 +61,8 @@ def test_c5_contracts_are_typed_versioned_with_feed_only_available() -> None:
         assert contract.blocked_reason_code == expected_block
         assert contract.required_session_state.value == "AUTHENTICATED"
         assert contract.irreversible_boundary is False
+        if contract.name == "threads.browser.feed.browse":
+            assert "REMOTE_STATE_UNCERTAIN" in contract.intervention_types
         assert contract.name in KNOWN_COMMAND_TYPES
         policy = router.policy_for(contract.name)
         assert policy is not None
