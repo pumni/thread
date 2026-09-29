@@ -1241,13 +1241,13 @@ async def test_presence_expiry_blocks_new_claims_and_preserves_queued_job(
     expired = await WorkerControlService(
         unit_of_work_factory, clock=scenario.clock
     ).expire_presence(now=scenario.clock.now(), limit=1)
-    claimed = await scenario.service.claim_next(scenario.worker_id)
+    with pytest.raises(WorkerJobControlError, match="WORKER_NOT_ELIGIBLE"):
+        await scenario.service.claim_next(scenario.worker_id)
     async with unit_of_work_factory() as unit_of_work:
         queued = await unit_of_work.worker_jobs.get(scenario.job_id)
         attempts = await unit_of_work.worker_job_attempts.list_for_job(scenario.job_id)
 
     assert expired == 1
-    assert claimed is None
     assert queued is not None and queued.status is WorkerJobStatus.QUEUED
     assert attempts == []
 

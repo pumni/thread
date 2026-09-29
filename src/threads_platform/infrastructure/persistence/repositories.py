@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import and_, case, delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.elements import ColumnElement
 
 from threads_platform.application.ports.repositories import (
@@ -2410,6 +2411,9 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
         record.last_heartbeat_at = worker.last_heartbeat_at
         record.presence_expires_at = worker.presence_expires_at
         record.updated_at = worker.updated_at
+        # Preserve the explicit domain timestamp even when it equals the stored
+        # value; otherwise the column's onupdate default replaces it with DB now().
+        flag_modified(record, "updated_at")
         await self._session.flush()
 
     async def list_expired_presence_for_update(self, now: datetime, limit: int) -> list[WorkerNode]:
