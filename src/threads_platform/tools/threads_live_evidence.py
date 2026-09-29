@@ -134,7 +134,14 @@ _SECRET_QUERY_NAMES = frozenset(
         "token",
     }
 )
-_SAFE_CURSOR_FIELD_NAMES = frozenset({"cursorpageobservation", "pollingcursorreadyevidence"})
+_SAFE_CURSOR_FIELD_NAMES = frozenset(
+    {
+        "cursorpageobservation",
+        "pollingcursorreadyevidence",
+        "repeatedcursor",
+        "samecursoracrossruns",
+    }
+)
 
 
 class PacketClassification(StrEnum):
@@ -281,11 +288,7 @@ _CASE_MATRIX = (
 _MATRIX_BY_ID = {case.case_id: case for case in _CASE_MATRIX}
 _TOKEN_READINESS_CASES = frozenset({"A01", "A02", "A03", "A04", "A05", "A06"})
 _POLLING_READINESS_CASES = frozenset(case.case_id for case in _CASE_MATRIX if case.phase is Phase.B)
-_FULL_READINESS_CASES = frozenset(
-    case.case_id
-    for case in _CASE_MATRIX
-    if case.phase in {Phase.A, Phase.B, Phase.C} or case.case_id in {"D01", "D02", "D03"}
-)
+_FULL_READINESS_CASES = frozenset(case.case_id for case in _CASE_MATRIX)
 
 Alias = Annotated[
     str,
@@ -553,11 +556,9 @@ class ThreadsLiveEvidencePacket(StrictEvidenceModel):
         ):
             raise ValueError("token-provider readiness requires all Phase A critical cases to pass")
         if readiness.polling_cursor_ready_evidence and not _cases_pass(
-            results, _TOKEN_READINESS_CASES | _POLLING_READINESS_CASES
+            results, _POLLING_READINESS_CASES
         ):
-            raise ValueError(
-                "polling readiness requires all Phase A and Phase B critical cases to pass"
-            )
+            raise ValueError("polling readiness requires all Phase B critical cases to pass")
         if readiness.full_tp002_ready and (
             not readiness.token_provider_ready_evidence
             or not readiness.polling_cursor_ready_evidence

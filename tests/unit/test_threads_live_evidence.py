@@ -27,6 +27,40 @@ def _template_packet() -> dict[str, Any]:
     return json.loads(_TEMPLATE_PATH.read_text(encoding="utf-8"))
 
 
+def _synthetic_live_packet() -> dict[str, Any]:
+    document = _template_packet()
+    document["packet_classification"] = "SCRUBBED_LIVE_EVIDENCE"
+    document["observed_at_utc"] = "2026-09-29T05:00:00Z"
+    document["operator_alias"] = "OPERATOR1"
+    document["reviewer_alias"] = "REVIEWER1"
+    document["environment_classification"] = "META_DEVELOPMENT_APP_DEDICATED_TEST_ACCOUNT"
+    document["official_source_references_reviewed"] = [
+        "https://developers.facebook.com/docs/threads"
+    ]
+    for case in document["cases"]:
+        case["evidence_class"] = "LIVE_SCRUBBED"
+    return document
+
+
+def _set_cases_pass(document: dict[str, Any], case_ids: set[str] | None = None) -> None:
+    for case in document["cases"]:
+        if case_ids is None or case["case_id"] in case_ids:
+            case["result"] = "PASS"
+            case["http_status"] = 200
+
+
+def _set_reviewed_readiness(
+    document: dict[str, Any], *, token: bool = False, polling: bool = False, full: bool = False
+) -> None:
+    document["critical_path_readiness"] = {
+        "token_provider_ready_evidence": token,
+        "polling_cursor_ready_evidence": polling,
+        "full_tp002_ready": full,
+        "reviewed_at_utc": "2026-09-29T06:00:00Z",
+        "review_note": "Synthetic offline model test review.",
+    }
+
+
 def _rejection(packet: dict[str, Any]) -> str:
     with pytest.raises(PacketRejectedError) as exc_info:
         validate_packet_json(json.dumps(packet))
@@ -154,14 +188,46 @@ def test_oauth_code_exchange_url_is_rejected_without_echo() -> None:
     assert "SYNTHETIC_SENTINEL_AUTHORIZATION_CODE" not in diagnostic
 
 
-def test_raw_cursor_field_is_rejected() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "cursor",
+        "raw_cursor",
+        "after",
+        "after_value",
+        "paging_after",
+        "next_page",
+        "cursor_metadata",
+    ),
+)
+def test_unapproved_cursor_fields_are_rejected(field_name: str) -> None:
     packet = _template_packet()
-    packet["cases"][0]["unexpected"] = {"after": "SYNTHETIC_SENTINEL_CURSOR"}
+    packet["cases"][0]["unexpected"] = {field_name: "SYNTHETIC_SENTINEL_CURSOR"}
 
     diagnostic = _rejection(packet)
 
     assert "raw cursor field" in diagnostic
     assert "SYNTHETIC_SENTINEL_CURSOR" not in diagnostic
+
+
+def test_scrubbed_cursor_relationship_observation_is_accepted() -> None:
+    packet = _synthetic_live_packet()
+    cursor_case = next(case for case in packet["cases"] if case["case_id"] == "B10")
+    cursor_case["cursor_page_observation"] = {
+        "after_parameter_present": True,
+        "paging_after_present": True,
+        "repeated_cursor": True,
+        "same_cursor_across_runs": False,
+        "after_value_fingerprint": f"sha256:{'a' * 64}",
+        "returned_after_fingerprint": f"sha256:{'b' * 64}",
+    }
+
+    validated = validate_packet_json(json.dumps(packet))
+    validated_cursor_case = next(case for case in validated.cases if case.case_id == "B10")
+
+    assert validated_cursor_case.cursor_page_observation is not None
+    assert validated_cursor_case.cursor_page_observation.repeated_cursor is True
+    assert validated_cursor_case.cursor_page_observation.same_cursor_across_runs is False
 
 
 def test_malformed_cursor_fingerprint_is_rejected() -> None:
@@ -203,6 +269,85 @@ def test_template_cannot_be_changed_into_completed_live_evidence() -> None:
     packet["cases"][0]["http_status"] = 200
 
     assert "template classification cannot contain live observations" in _rejection(packet)
+
+
+def test_polling_readiness_is_independent_from_phase_a() -> None:
+    packet = _synthetic_live_packet()
+    phase_b_case_ids = {
+        case["case_id"] for case in packet["cases"] if case["case_id"].startswith("B")
+    }
+    _set_cases_pass(packet, phase_b_case_ids)
+    _set_reviewed_readiness(packet, polling=True)
+
+    accepted = validate_packet_json(json.dumps(packet))
+
+    assert all(case.result.value == "NOT_AVAILABLE" for case in accepted.cases[:6])
+    assert all(case.result.value == "PASS" for case in accepted.cases[6:19])
+    assert accepted.critical_path_readiness.polling_cursor_ready_evidence
+    assert not accepted.critical_path_readiness.token_provider_ready_evidence
+
+    packet["critical_path_readiness"]["token_provider_ready_evidence"] = True
+    assert "token-provider readiness requires all Phase A critical cases to pass" in _rejection(
+        packet
+    )
+
+
+def test_token_provider_readiness_is_independent_from_phase_b() -> None:
+    packet = _synthetic_live_packet()
+    phase_a_case_ids = {
+        case["case_id"] for case in packet["cases"] if case["case_id"].startswith("A")
+    }
+    _set_cases_pass(packet, phase_a_case_ids)
+    _set_reviewed_readiness(packet, token=True)
+
+    accepted = validate_packet_json(json.dumps(packet))
+
+    assert all(case.result.value == "PASS" for case in accepted.cases[:6])
+    assert all(case.result.value == "NOT_AVAILABLE" for case in accepted.cases[6:])
+    assert accepted.critical_path_readiness.token_provider_ready_evidence
+    assert not accepted.critical_path_readiness.polling_cursor_ready_evidence
+
+
+def test_incomplete_phase_b_cannot_claim_polling_readiness() -> None:
+    packet = _synthetic_live_packet()
+    phase_b_case_ids = {
+        case["case_id"] for case in packet["cases"] if case["case_id"].startswith("B")
+    }
+    _set_cases_pass(packet, phase_b_case_ids)
+    incomplete_case = next(case for case in packet["cases"] if case["case_id"] == "B13")
+    incomplete_case["result"] = "NOT_AVAILABLE"
+    incomplete_case["http_status"] = None
+    _set_reviewed_readiness(packet, polling=True)
+
+    assert "polling readiness requires all Phase B critical cases to pass" in _rejection(packet)
+
+
+def test_full_readiness_rejects_unavailable_d04_and_d05() -> None:
+    packet = _synthetic_live_packet()
+    incomplete_case_ids = {case["case_id"] for case in packet["cases"]} - {"D04", "D05"}
+    _set_cases_pass(packet, incomplete_case_ids)
+    _set_reviewed_readiness(packet, token=True, polling=True, full=True)
+
+    assert [case["result"] for case in packet["cases"][-2:]] == [
+        "NOT_AVAILABLE",
+        "NOT_AVAILABLE",
+    ]
+    assert "full TP-002 readiness requires reviewed Phase A-D critical cases to pass" in _rejection(
+        packet
+    )
+
+
+def test_full_readiness_accepts_synthetic_complete_phase_a_to_d_matrix() -> None:
+    packet = _synthetic_live_packet()
+    _set_cases_pass(packet)
+    _set_reviewed_readiness(packet, token=True, polling=True, full=True)
+
+    validated = validate_packet_json(json.dumps(packet))
+
+    assert all(case.result.value == "PASS" for case in validated.cases)
+    assert validated.critical_path_readiness.token_provider_ready_evidence
+    assert validated.critical_path_readiness.polling_cursor_ready_evidence
+    assert validated.critical_path_readiness.full_tp002_ready
 
 
 @pytest.mark.parametrize(
