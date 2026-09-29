@@ -35,6 +35,7 @@ from threads_platform.domain.worker_jobs import (
     WorkerIntervention,
     WorkerJob,
     WorkerJobAttempt,
+    WorkerJobCancelRequest,
 )
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
@@ -437,6 +438,20 @@ class WorkerJobAttemptRepository(Protocol):
     async def update(self, attempt: WorkerJobAttempt) -> None: ...
 
 
+class WorkerJobCancelRequestRepository(Protocol):
+    async def add(self, request: WorkerJobCancelRequest) -> None: ...
+
+    async def get_pending_for_job(
+        self, job_id: UUID, *, for_update: bool = False
+    ) -> WorkerJobCancelRequest | None: ...
+
+    async def get(self, request_id: UUID) -> WorkerJobCancelRequest | None: ...
+
+    async def latest_generation(self, job_id: UUID) -> int: ...
+
+    async def update(self, request: WorkerJobCancelRequest) -> None: ...
+
+
 class WorkerInterventionRepository(Protocol):
     async def add(self, intervention: WorkerIntervention) -> None: ...
 
@@ -471,6 +486,7 @@ class UnitOfWork(Protocol):
     worker_security: WorkerSecurityRepository
     worker_jobs: WorkerJobRepository
     worker_job_attempts: WorkerJobAttemptRepository
+    worker_job_cancel_requests: WorkerJobCancelRequestRepository
     worker_interventions: WorkerInterventionRepository
     account_execution_leases: AccountExecutionLeaseRepository
     command_route_decisions: CommandRouteDecisionRepository

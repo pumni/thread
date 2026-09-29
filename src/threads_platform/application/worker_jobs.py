@@ -1,7 +1,12 @@
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
+from threads_platform.application.browser_capabilities import (
+    BROWSER_CAPABILITY_CONTRACTS,
+    BrowserCapabilityStatus,
+)
 from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.clock import Clock, SystemClock
 from threads_platform.application.commands.results import enqueue_command_result
@@ -9,6 +14,7 @@ from threads_platform.application.errors import CommandNotFound
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
 from threads_platform.application.worker_notifications import WorkerNotificationHub
 from threads_platform.application.worker_protocol import is_worker_protocol_supported
+from threads_platform.domain.account_activities import ScheduledActivityMaterializationStatus
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
 from threads_platform.domain.commands import Command, CommandStatus
@@ -19,10 +25,31 @@ from threads_platform.domain.worker_jobs import (
     WorkerJob,
     WorkerJobAttempt,
     WorkerJobAttemptStatus,
+    WorkerJobCancelRequest,
     WorkerJobRetrySafety,
     WorkerJobStatus,
 )
 from threads_platform.domain.workers import WorkerNode, WorkerStatus
+
+_CANCELLATION_SAFE_CHECKPOINTS = {
+    "threads.browser.feed.browse": frozenset({"BEFORE_NAVIGATION", "FEED_READY", "ITEM_BATCH"}),
+    "threads.browser.thread.open": frozenset({"BEFORE_NAVIGATION", "THREAD_READY"}),
+    "threads.browser.profile.open": frozenset(
+        {"BEFORE_NAVIGATION", "BEFORE_PROFILE_INSPECTION", "PROFILE_READY"}
+    ),
+}
+_CANCELLABLE_ACTIVITY_CAPABILITIES = {
+    contract.name: frozenset(
+        _CANCELLATION_SAFE_CHECKPOINTS[contract.name] & frozenset(contract.safe_checkpoints)
+    )
+    for contract in BROWSER_CAPABILITY_CONTRACTS
+    if contract.name in _CANCELLATION_SAFE_CHECKPOINTS
+    and contract.version == 1
+    and contract.operation_class is OperationClass.READ
+    and contract.preemptible
+    and contract.status is BrowserCapabilityStatus.AVAILABLE
+}
+_CANCEL_REASON_CODE = re.compile(r"^[A-Z0-9_]{1,120}$")
 
 
 class WorkerJobControlError(ValueError):
@@ -238,6 +265,14 @@ class WorkerJobService:
                     if account_lease is None:
                         continue
                     coordination_generation = account_lease.fencing_generation
+                if (
+                    candidate.status is WorkerJobStatus.RUNNING
+                    and candidate.lease_expires_at is not None
+                    and candidate.lease_expires_at <= now
+                ):
+                    await self._supersede_pending_cancel(
+                        unit_of_work, candidate.id, now, "TARGET_ATTEMPT_ENDED"
+                    )
                 job = await unit_of_work.worker_jobs.claim(
                     candidate,
                     worker_id,
@@ -276,6 +311,7 @@ class WorkerJobService:
             if not await self._renew_account_coordination(unit_of_work, job, now):
                 raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
             await unit_of_work.worker_jobs.update(job)
+            await self._attach_pending_cancel(unit_of_work, job, now)
         return job
 
     async def checkpoint(
@@ -293,6 +329,107 @@ class WorkerJobService:
             if not await self._owns_account_coordination(unit_of_work, job, now):
                 raise WorkerJobControlError("WORKER_JOB_ACCOUNT_COORDINATION_LOST")
             await unit_of_work.worker_jobs.update(job)
+            await self._attach_pending_cancel(unit_of_work, job, now)
+        return job
+
+    async def request_cancel(
+        self,
+        job_id: UUID,
+        *,
+        reason_code: str,
+        now: datetime,
+    ) -> WorkerJobCancelRequest:
+        occurred_at = normalize_utc(now)
+        if _CANCEL_REASON_CODE.fullmatch(reason_code) is None:
+            raise WorkerJobControlError("CANCEL_REASON_INVALID")
+        async with self._unit_of_work_factory() as unit_of_work:
+            job = await self._locked_job(unit_of_work, job_id)
+            attempt = await self._validate_cancel_target(unit_of_work, job, occurred_at)
+            pending = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+                job.id, for_update=True
+            )
+            if pending is not None:
+                if pending.target_attempt_id == attempt.id:
+                    return pending
+                pending.supersede(occurred_at, "TARGET_ATTEMPT_ENDED")
+                await unit_of_work.worker_job_cancel_requests.update(pending)
+            request = WorkerJobCancelRequest(
+                worker_job_id=job.id,
+                generation=(await unit_of_work.worker_job_cancel_requests.latest_generation(job.id))
+                + 1,
+                target_attempt_id=attempt.id,
+                target_attempt_number=attempt.attempt_number,
+                reason_code=reason_code,
+                requested_at=occurred_at,
+            )
+            await unit_of_work.worker_job_cancel_requests.add(request)
+        return request
+
+    async def acknowledge_cancel(
+        self,
+        job_id: UUID,
+        worker_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
+    ) -> WorkerJob:
+        now = normalize_utc(self._clock.now())
+        async with self._unit_of_work_factory() as unit_of_work:
+            job = await self._locked_job(unit_of_work, job_id)
+            if not job.owns_lease(worker_id, lease_token, now):
+                raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            if not job.preemptible:
+                raise WorkerJobControlError("WORKER_JOB_NOT_PREEMPTIBLE")
+            allowed_phases = _CANCELLABLE_ACTIVITY_CAPABILITIES.get(job.capability_name)
+            if (
+                job.capability_version != 1
+                or job.operation_class is not OperationClass.READ
+                or allowed_phases is None
+                or checkpoint_phase not in allowed_phases
+            ):
+                raise WorkerJobControlError("CANCEL_CHECKPOINT_NOT_SAFE")
+            checkpoint = job.checkpoint
+            if not isinstance(checkpoint, dict) or checkpoint.get("phase") != checkpoint_phase:
+                raise WorkerJobControlError("CANCEL_CHECKPOINT_MISMATCH")
+            attempt = await self._running_attempt(unit_of_work, job.id)
+            if (
+                attempt.attempt_number != job.attempt_count
+                or attempt.worker_id != worker_id
+                or attempt.lease_token != lease_token
+            ):
+                raise WorkerJobControlError("WORKER_JOB_ATTEMPT_STALE")
+            request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+                job.id, for_update=True
+            )
+            if (
+                request is None
+                or request.id != cancel_request_id
+                or request.generation != generation
+                or request.target_attempt_id != attempt.id
+                or request.target_attempt_number != attempt.attempt_number
+            ):
+                raise WorkerJobControlError("CANCEL_REQUEST_STALE")
+            await self._validate_materialized_activity_link(unit_of_work, job)
+            generation_fence = job.account_coordination_generation
+            if not job.cancel(worker_id, lease_token, now, request.reason_code):
+                raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            request.acknowledge(now, checkpoint_phase)
+            await unit_of_work.worker_job_cancel_requests.update(request)
+            attempt.status = WorkerJobAttemptStatus.CANCELLED
+            attempt.finished_at = now
+            attempt.error_code = request.reason_code
+            await unit_of_work.worker_job_attempts.update(attempt)
+            await unit_of_work.worker_jobs.update(job)
+            await self._finalize_command(
+                unit_of_work,
+                job,
+                CommandStatus.CANCELLED,
+                now,
+                error_code=request.reason_code,
+            )
+            await self._release_account_coordination(unit_of_work, job, generation_fence, now)
         return job
 
     async def complete(
@@ -310,6 +447,7 @@ class WorkerJobService:
             generation = job.account_coordination_generation
             if not job.complete(worker_id, lease_token, now, result):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            await self._supersede_pending_cancel(unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED")
             attempt = await self._running_attempt(unit_of_work, job.id)
             attempt.status = WorkerJobAttemptStatus.SUCCEEDED
             attempt.finished_at = now
@@ -352,6 +490,7 @@ class WorkerJobService:
                 retry_at=retry_at,
             ):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            await self._supersede_pending_cancel(unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED")
             attempt = await self._running_attempt(unit_of_work, job.id)
             attempt.finished_at = now
             attempt.error_code = error_code
@@ -410,6 +549,7 @@ class WorkerJobService:
             generation = job.account_coordination_generation
             if not job.require_intervention(worker_id, lease_token, now):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+            await self._supersede_pending_cancel(unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED")
             if intervention_type == "AMBIGUOUS_OUTCOME":
                 job.retry_safety = WorkerJobRetrySafety.RECONCILIATION_REQUIRED
             attempt = await self._running_attempt(unit_of_work, job.id)
@@ -494,6 +634,8 @@ class WorkerJobService:
             if worker is None or worker.status is WorkerStatus.DISABLED:
                 raise WorkerJobControlError("WORKER_NOT_FOUND")
             jobs = await unit_of_work.worker_jobs.list_for_reconcile(worker_id, now)
+            for job in jobs:
+                await self._attach_pending_cancel(unit_of_work, job, now)
         return WorkerJobReconciliation(tuple(jobs))
 
     async def recover_expired(self, limit: int = 50) -> int:
@@ -504,6 +646,9 @@ class WorkerJobService:
             for job in jobs:
                 generation = job.account_coordination_generation
                 attempt = await unit_of_work.worker_job_attempts.get_running_for_update(job.id)
+                await self._supersede_pending_cancel(
+                    unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED"
+                )
                 if job.deadline_at is not None and job.deadline_at <= now:
                     if attempt is not None:
                         attempt.status = WorkerJobAttemptStatus.FAILED_FINAL
@@ -617,6 +762,95 @@ class WorkerJobService:
             job.account_coordination_generation,
             now,
         )
+
+    async def _validate_cancel_target(
+        self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime
+    ) -> WorkerJobAttempt:
+        if job.status is not WorkerJobStatus.RUNNING:
+            raise WorkerJobControlError("WORKER_JOB_NOT_RUNNING")
+        if not job.preemptible:
+            raise WorkerJobControlError("WORKER_JOB_NOT_PREEMPTIBLE")
+        if (
+            job.capability_version != 1
+            or not _CANCELLABLE_ACTIVITY_CAPABILITIES.get(job.capability_name)
+            or job.operation_class is not OperationClass.READ
+        ):
+            raise WorkerJobControlError("WORKER_JOB_CANCELLATION_UNSUPPORTED")
+        if (
+            job.lease_worker_id is None
+            or job.lease_token is None
+            or not job.owns_lease(job.lease_worker_id, job.lease_token, now)
+        ):
+            raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
+        attempt = await self._running_attempt(unit_of_work, job.id)
+        if (
+            attempt.attempt_number != job.attempt_count
+            or attempt.worker_id != job.lease_worker_id
+            or attempt.lease_token != job.lease_token
+        ):
+            raise WorkerJobControlError("WORKER_JOB_ATTEMPT_STALE")
+        await self._validate_materialized_activity_link(unit_of_work, job)
+        return attempt
+
+    async def _validate_materialized_activity_link(
+        self, unit_of_work: UnitOfWork, job: WorkerJob
+    ) -> None:
+        if job.command_id is None or not job.command_id.startswith("activity:"):
+            raise WorkerJobControlError("WORKER_JOB_NOT_MATERIALIZED_ACTIVITY")
+        try:
+            activity_id = UUID(job.command_id.removeprefix("activity:"))
+        except ValueError as error:
+            raise WorkerJobControlError("WORKER_JOB_NOT_MATERIALIZED_ACTIVITY") from error
+        if job.command_id != f"activity:{activity_id}":
+            raise WorkerJobControlError("WORKER_JOB_NOT_MATERIALIZED_ACTIVITY")
+        activity = await unit_of_work.scheduled_activities.get(activity_id)
+        command = await unit_of_work.commands.get_by_command_id_for_update(job.command_id)
+        if (
+            activity is None
+            or activity.materialization_status
+            is not ScheduledActivityMaterializationStatus.MATERIALIZED
+            or activity.command_id != job.command_id
+            or activity.account_id != job.account_id
+            or activity.activity_type_snapshot != job.capability_name
+            or command is None
+            or command.command_type != job.capability_name
+            or command.account_id != job.account_id
+            or command.status is not CommandStatus.WAITING_EXECUTION
+        ):
+            raise WorkerJobControlError("WORKER_JOB_NOT_MATERIALIZED_ACTIVITY")
+
+    async def _attach_pending_cancel(
+        self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime
+    ) -> None:
+        job.pending_cancel_request = None
+        if (
+            job.status is not WorkerJobStatus.RUNNING
+            or job.lease_expires_at is None
+            or job.lease_expires_at <= now
+        ):
+            return
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(job.id)
+        if request is None:
+            return
+        attempt = await unit_of_work.worker_job_attempts.get_running_for_update(job.id)
+        if (
+            attempt is not None
+            and request.target_attempt_id == attempt.id
+            and request.target_attempt_number == attempt.attempt_number == job.attempt_count
+            and attempt.worker_id == job.lease_worker_id
+            and attempt.lease_token == job.lease_token
+        ):
+            job.pending_cancel_request = request
+
+    async def _supersede_pending_cancel(
+        self, unit_of_work: UnitOfWork, job_id: UUID, now: datetime, reason: str
+    ) -> None:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+            job_id, for_update=True
+        )
+        if request is not None:
+            request.supersede(now, reason)
+            await unit_of_work.worker_job_cancel_requests.update(request)
 
     async def _account_policy_allows_claim(
         self, unit_of_work: UnitOfWork, job: WorkerJob, worker_id: UUID

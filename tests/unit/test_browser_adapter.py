@@ -20,6 +20,7 @@ from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAccountContext,
     WorkerControlClientError,
+    WorkerJobCancelSnapshot,
     WorkerJobSnapshot,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
@@ -814,6 +815,61 @@ def test_session_transition_after_navigation_records_durable_intervention(
     asyncio.run(scenario())
 
 
+def test_pending_cancellation_on_renew_stops_before_the_next_browser_action(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        worker_id, account_id = uuid4(), uuid4()
+        context, manager, _, resolver, reserved = await _managed_session(
+            tmp_path,
+            worker_id,
+            account_id,
+            "cancel-profile",
+            open_session=False,
+        )
+        reserved = await manager.open(context)
+        await manager.transition(account_id, BrowserSessionState.STARTING)
+        authenticated = await manager.transition(account_id, BrowserSessionState.AUTHENTICATED)
+        opened = replace(reserved, state=authenticated)
+        job = replace(
+            _running_job(worker_id, account_id),
+            capability_name="threads.browser.feed.browse",
+        )
+        client = _MemoryWorkerJobControl(worker_id, account_id, job)
+        execution = WorkerJobExecution(job, worker_id, client)
+        engine = _MemoryBrowserEngine()
+        adapter = PlaywrightBrowserAdapter(worker_id, resolver, engine)
+        session = await adapter.open_reserved_session(
+            context,
+            opened,
+            transition=manager.transition,
+            close_session=manager.close,
+            job_execution=execution,
+            headless=True,
+        )
+
+        await execution.checkpoint({"phase": "BEFORE_NAVIGATION"})
+        cancel_request = WorkerJobCancelSnapshot(
+            request_id=uuid4(),
+            generation=1,
+            reason_code="OPERATOR_REQUESTED",
+            requested_at=datetime.now(UTC),
+        )
+        client.pending_cancel_on_renew = cancel_request
+        with pytest.raises(WorkerJobLeaseLost):
+            await session.navigate(
+                "https://www.threads.com/",
+                BrowserNavigationPolicy(frozenset({"https://www.threads.com"})),
+            )
+
+        assert client.cancel_calls == [(cancel_request.request_id, 1, "BEFORE_NAVIGATION")]
+        assert engine.sessions[0].navigate_count == 0
+        assert client.snapshot.status is WorkerJobStatus.CANCELLED
+        await session.close()
+
+    asyncio.run(scenario())
+
+
 def test_playwright_credentials_stay_in_memory_and_are_account_scoped(tmp_path: Path) -> None:
     async def scenario() -> None:
         worker_id = uuid4()
@@ -1505,10 +1561,12 @@ class _MemoryBrowserSession:
         self.remote_uncertain_on_collect = remote_uncertain_on_collect
         self.collect_count = 0
         self.scroll_count = 0
+        self.navigate_count = 0
         self.closed = False
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         _ = (url, allowed_origins)
+        self.navigate_count += 1
         if self.crash_on_navigation:
             raise BrowserProcessCrashed()
 
@@ -1569,9 +1627,14 @@ class _MemoryWorkerJobControl:
         self.lose_lease = False
         self.lose_lease_on_checkpoint_phase: str | None = None
         self.interventions: list[tuple[str, str]] = []
+        self.pending_cancel_on_renew: WorkerJobCancelSnapshot | None = None
+        self.cancel_calls: list[tuple[UUID, int, str]] = []
 
     async def renew_job(self, job_id: UUID, lease_token: UUID) -> WorkerJobSnapshot:
         self._verify(job_id, lease_token)
+        if self.pending_cancel_on_renew is not None:
+            self.snapshot = replace(self.snapshot, pending_cancel=self.pending_cancel_on_renew)
+            self.pending_cancel_on_renew = None
         return self.snapshot
 
     async def checkpoint_job(
@@ -1582,6 +1645,27 @@ class _MemoryWorkerJobControl:
             self.lose_lease = True
             raise WorkerControlClientError("WORKER_JOB_LEASE_LOST")
         self.snapshot = replace(self.snapshot, checkpoint=checkpoint)
+        return self.snapshot
+
+    async def cancel_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
+    ) -> WorkerJobSnapshot:
+        self._verify(job_id, lease_token)
+        self.cancel_calls.append((cancel_request_id, generation, checkpoint_phase))
+        self.snapshot = replace(
+            self.snapshot,
+            status=WorkerJobStatus.CANCELLED,
+            lease_worker_id=None,
+            lease_token=None,
+            lease_expires_at=None,
+            pending_cancel=None,
+        )
         return self.snapshot
 
     async def complete_job(

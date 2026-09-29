@@ -15,6 +15,7 @@ from threads_platform.application.ports.worker_agent import (
     WorkerAccountContext,
     WorkerAgentPresence,
     WorkerControlClientError,
+    WorkerJobCancelSnapshot,
     WorkerJobSnapshot,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
@@ -235,6 +236,30 @@ class HttpWorkerControlClient:
             raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
         return _job_snapshot(response)
 
+    async def cancel_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
+    ) -> WorkerJobSnapshot:
+        response = await self._request(
+            "POST",
+            f"/v1/workers/jobs/{job_id}/cancel",
+            json={
+                "lease_token": str(lease_token),
+                "cancel_request_id": str(cancel_request_id),
+                "generation": generation,
+                "checkpoint_phase": checkpoint_phase,
+            },
+            authenticated=True,
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return _job_snapshot(response)
+
     async def complete_job(
         self, job_id: UUID, lease_token: UUID, result: dict[str, object]
     ) -> WorkerJobSnapshot:
@@ -407,6 +432,12 @@ def _presence(worker_id: UUID, payload: dict[str, object] | None) -> WorkerAgent
 
 def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
     try:
+        pending_cancel_payload = payload.get("pending_cancel")
+        pending_cancel = (
+            None
+            if pending_cancel_payload is None
+            else _worker_job_cancel_snapshot(pending_cancel_payload)
+        )
         return WorkerJobSnapshot(
             job_id=_uuid_field(payload, "id"),
             capability_name=_text_field(payload, "capability_name"),
@@ -420,6 +451,28 @@ def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
             retry_safety=WorkerJobRetrySafety(_text_field(payload, "retry_safety")),
             checkpoint=_optional_object_field(payload, "checkpoint"),
             input_data=_optional_object_field(payload, "input_data") or {},
+            pending_cancel=pending_cancel,
+        )
+    except (ValueError, TypeError) as error:
+        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+
+
+def _worker_job_cancel_snapshot(value: object) -> WorkerJobCancelSnapshot:
+    if not isinstance(value, dict):
+        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+    payload = cast(dict[str, object], value)
+    if set(payload) != {"request_id", "generation", "reason_code", "requested_at"}:
+        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+    generation = _int_field(payload, "generation")
+    reason_code = _text_field(payload, "reason_code")
+    if generation < 1 or re.fullmatch(r"[A-Z0-9_]{1,120}", reason_code) is None:
+        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+    try:
+        return WorkerJobCancelSnapshot(
+            request_id=_uuid_field(payload, "request_id"),
+            generation=generation,
+            reason_code=reason_code,
+            requested_at=_datetime_field(payload, "requested_at"),
         )
     except (ValueError, TypeError) as error:
         raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error

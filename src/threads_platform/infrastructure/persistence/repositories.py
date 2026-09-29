@@ -28,6 +28,7 @@ from threads_platform.application.ports.repositories import (
     WorkerCapabilityRepository,
     WorkerInterventionRepository,
     WorkerJobAttemptRepository,
+    WorkerJobCancelRequestRepository,
     WorkerJobRepository,
     WorkerRepository,
     WorkerSecurityRepository,
@@ -92,6 +93,8 @@ from threads_platform.domain.worker_jobs import (
     WorkerJob,
     WorkerJobAttempt,
     WorkerJobAttemptStatus,
+    WorkerJobCancelRequest,
+    WorkerJobCancelRequestStatus,
     WorkerJobRetrySafety,
     WorkerJobStatus,
 )
@@ -145,6 +148,7 @@ from threads_platform.infrastructure.persistence.models import (
     WorkerEnrollmentRecord,
     WorkerInterventionRecord,
     WorkerJobAttemptRecord,
+    WorkerJobCancelRequestRecord,
     WorkerJobRecord,
     WorkerNodeRecord,
     WorkerSessionRecord,
@@ -2856,6 +2860,89 @@ class SQLAlchemyWorkerJobAttemptRepository(WorkerJobAttemptRepository):
             started_at=record.started_at,
             finished_at=record.finished_at,
             error_code=record.error_code,
+        )
+
+
+class SQLAlchemyWorkerJobCancelRequestRepository(WorkerJobCancelRequestRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, request: WorkerJobCancelRequest) -> None:
+        self._session.add(self._record(request))
+        await self._session.flush()
+
+    async def get_pending_for_job(
+        self, job_id: UUID, *, for_update: bool = False
+    ) -> WorkerJobCancelRequest | None:
+        statement = (
+            select(WorkerJobCancelRequestRecord)
+            .where(
+                WorkerJobCancelRequestRecord.worker_job_id == job_id,
+                WorkerJobCancelRequestRecord.status == WorkerJobCancelRequestStatus.PENDING,
+            )
+            .order_by(WorkerJobCancelRequestRecord.generation.desc())
+            .limit(1)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        record = await self._session.scalar(statement)
+        return self._domain(record) if record is not None else None
+
+    async def latest_generation(self, job_id: UUID) -> int:
+        value = await self._session.scalar(
+            select(func.coalesce(func.max(WorkerJobCancelRequestRecord.generation), 0)).where(
+                WorkerJobCancelRequestRecord.worker_job_id == job_id
+            )
+        )
+        return int(value or 0)
+
+    async def get(self, request_id: UUID) -> WorkerJobCancelRequest | None:
+        record = await self._session.get(WorkerJobCancelRequestRecord, request_id)
+        return self._domain(record) if record is not None else None
+
+    async def update(self, request: WorkerJobCancelRequest) -> None:
+        record = await self._session.get(WorkerJobCancelRequestRecord, request.id)
+        if record is None:
+            raise LookupError(f"WorkerJobCancelRequest not found: {request.id}")
+        record.status = request.status
+        record.acknowledged_at = request.acknowledged_at
+        record.safe_checkpoint = request.safe_checkpoint
+        record.superseded_at = request.superseded_at
+        record.superseded_reason = request.superseded_reason
+        await self._session.flush()
+
+    @staticmethod
+    def _record(request: WorkerJobCancelRequest) -> WorkerJobCancelRequestRecord:
+        return WorkerJobCancelRequestRecord(
+            id=request.id,
+            worker_job_id=request.worker_job_id,
+            generation=request.generation,
+            target_attempt_id=request.target_attempt_id,
+            target_attempt_number=request.target_attempt_number,
+            reason_code=request.reason_code,
+            requested_at=request.requested_at,
+            status=request.status,
+            acknowledged_at=request.acknowledged_at,
+            safe_checkpoint=request.safe_checkpoint,
+            superseded_at=request.superseded_at,
+            superseded_reason=request.superseded_reason,
+        )
+
+    @staticmethod
+    def _domain(record: WorkerJobCancelRequestRecord) -> WorkerJobCancelRequest:
+        return WorkerJobCancelRequest(
+            id=record.id,
+            worker_job_id=record.worker_job_id,
+            generation=record.generation,
+            target_attempt_id=record.target_attempt_id,
+            target_attempt_number=record.target_attempt_number,
+            reason_code=record.reason_code,
+            requested_at=record.requested_at,
+            status=WorkerJobCancelRequestStatus(record.status),
+            acknowledged_at=record.acknowledged_at,
+            safe_checkpoint=record.safe_checkpoint,
+            superseded_at=record.superseded_at,
+            superseded_reason=record.superseded_reason,
         )
 
 

@@ -163,6 +163,13 @@ class WorkerSessionReportResponse(BaseModel):
     updated_at: AwareDatetime
 
 
+class WorkerJobCancelResponse(BaseModel):
+    request_id: UUID
+    generation: int
+    reason_code: str
+    requested_at: AwareDatetime
+
+
 class WorkerJobResponse(BaseModel):
     id: UUID
     command_id: str | None
@@ -185,6 +192,7 @@ class WorkerJobResponse(BaseModel):
     checkpoint: dict[str, object] | None
     result: dict[str, object] | None
     error_code: str | None
+    pending_cancel: WorkerJobCancelResponse | None = None
 
 
 class WorkerJobReconcileResponse(BaseModel):
@@ -197,6 +205,13 @@ class WorkerJobLeaseRequest(_WorkerRequest):
 
 class WorkerJobCheckpointRequest(WorkerJobLeaseRequest):
     checkpoint: dict[str, object]
+
+
+class WorkerJobCancelRequest(_WorkerRequest):
+    lease_token: UUID
+    cancel_request_id: UUID
+    generation: int = Field(ge=1)
+    checkpoint_phase: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,79}$")
 
 
 class WorkerJobCompleteRequest(WorkerJobLeaseRequest):
@@ -512,6 +527,26 @@ def create_worker_router(
             ) from error
         return _worker_job_response(job)
 
+    @router.post("/jobs/{job_id}/cancel", response_model=WorkerJobResponse)
+    async def acknowledge_worker_job_cancel(
+        job_id: UUID,
+        request: WorkerJobCancelRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerJobResponse:
+        worker_id = await authenticated_worker(authorization)
+        try:
+            job = await require_job_service().acknowledge_cancel(
+                job_id,
+                worker_id,
+                request.lease_token,
+                cancel_request_id=request.cancel_request_id,
+                generation=request.generation,
+                checkpoint_phase=request.checkpoint_phase,
+            )
+        except WorkerJobControlError as error:
+            raise _worker_job_error(error) from error
+        return _worker_job_response(job)
+
     @router.post("/jobs/{job_id}/complete", response_model=WorkerJobResponse)
     async def complete_worker_job(
         job_id: UUID,
@@ -774,6 +809,16 @@ def _worker_job_response(job: WorkerJob) -> WorkerJobResponse:
         checkpoint=job.checkpoint,
         result=job.result,
         error_code=job.error_code,
+        pending_cancel=(
+            WorkerJobCancelResponse(
+                request_id=job.pending_cancel_request.id,
+                generation=job.pending_cancel_request.generation,
+                reason_code=job.pending_cancel_request.reason_code,
+                requested_at=job.pending_cancel_request.requested_at,
+            )
+            if job.pending_cancel_request is not None
+            else None
+        ),
     )
 
 

@@ -36,6 +36,84 @@ class WorkerJobAttemptStatus(StrEnum):
     FAILED_FINAL = "FAILED_FINAL"
     ABANDONED = "ABANDONED"
     WAITING_INTERVENTION = "WAITING_INTERVENTION"
+    CANCELLED = "CANCELLED"
+
+
+class WorkerJobCancelRequestStatus(StrEnum):
+    PENDING = "PENDING"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+@dataclass(slots=True)
+class WorkerJobCancelRequest:
+    worker_job_id: UUID
+    generation: int
+    target_attempt_id: UUID
+    target_attempt_number: int
+    reason_code: str
+    requested_at: datetime
+    id: UUID = field(default_factory=uuid4)
+    status: WorkerJobCancelRequestStatus = WorkerJobCancelRequestStatus.PENDING
+    acknowledged_at: datetime | None = None
+    safe_checkpoint: str | None = None
+    superseded_at: datetime | None = None
+    superseded_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.generation < 1 or self.target_attempt_number < 1:
+            raise ValueError("cancel request generation and target attempt must be positive")
+        if re.fullmatch(r"[A-Z0-9_]{1,120}", self.reason_code) is None:
+            raise ValueError("cancel request reason must be a bounded code")
+        self.requested_at = normalize_utc(self.requested_at)
+        self.acknowledged_at = normalize_utc(self.acknowledged_at) if self.acknowledged_at else None
+        self.superseded_at = normalize_utc(self.superseded_at) if self.superseded_at else None
+        self.status = WorkerJobCancelRequestStatus(self.status)
+        if self.status is WorkerJobCancelRequestStatus.PENDING:
+            if any(
+                value is not None
+                for value in (
+                    self.acknowledged_at,
+                    self.safe_checkpoint,
+                    self.superseded_at,
+                    self.superseded_reason,
+                )
+            ):
+                raise ValueError("pending cancel request cannot have a terminal outcome")
+        elif self.status is WorkerJobCancelRequestStatus.ACKNOWLEDGED:
+            if (
+                self.acknowledged_at is None
+                or self.safe_checkpoint is None
+                or self.superseded_at is not None
+                or self.superseded_reason is not None
+            ):
+                raise ValueError("acknowledged cancel request requires checkpoint and timestamp")
+        elif (
+            self.acknowledged_at is not None
+            or self.safe_checkpoint is not None
+            or self.superseded_at is None
+            or self.superseded_reason is None
+            or re.fullmatch(r"[A-Z0-9_]{1,120}", self.superseded_reason) is None
+        ):
+            raise ValueError("superseded cancel request requires a bounded reason and timestamp")
+
+    def acknowledge(self, at: datetime, safe_checkpoint: str) -> None:
+        if self.status is not WorkerJobCancelRequestStatus.PENDING:
+            raise ValueError("only a pending cancel request can be acknowledged")
+        if not safe_checkpoint or len(safe_checkpoint) > 80:
+            raise ValueError("safe checkpoint must be bounded")
+        self.status = WorkerJobCancelRequestStatus.ACKNOWLEDGED
+        self.acknowledged_at = normalize_utc(at)
+        self.safe_checkpoint = safe_checkpoint
+
+    def supersede(self, at: datetime, reason: str) -> None:
+        if self.status is not WorkerJobCancelRequestStatus.PENDING:
+            raise ValueError("only a pending cancel request can be superseded")
+        if re.fullmatch(r"[A-Z0-9_]{1,120}", reason) is None:
+            raise ValueError("superseded reason must be a bounded code")
+        self.status = WorkerJobCancelRequestStatus.SUPERSEDED
+        self.superseded_at = normalize_utc(at)
+        self.superseded_reason = reason
 
 
 class WorkerInterventionStatus(StrEnum):
@@ -74,6 +152,7 @@ class WorkerJob:
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     completed_at: datetime | None = None
+    pending_cancel_request: WorkerJobCancelRequest | None = None
 
     def __post_init__(self) -> None:
         if not self.capability_name.strip() or self.capability_version < 1:
@@ -226,6 +305,20 @@ class WorkerJob:
         self.completed_at = occurred_at
         self.updated_at = occurred_at
         self._clear_lease()
+        return True
+
+    def cancel(self, worker_id: UUID, lease_token: UUID, now: datetime, reason_code: str) -> bool:
+        occurred_at = normalize_utc(now)
+        if not self.preemptible or not self.owns_lease(worker_id, lease_token, occurred_at):
+            return False
+        if re.fullmatch(r"[A-Z0-9_]{1,120}", reason_code) is None:
+            raise ValueError("WorkerJob cancellation requires a bounded reason code")
+        self.status = WorkerJobStatus.CANCELLED
+        self.error_code = reason_code
+        self.completed_at = occurred_at
+        self.updated_at = occurred_at
+        self._clear_lease()
+        self.pending_cancel_request = None
         return True
 
     def fail(

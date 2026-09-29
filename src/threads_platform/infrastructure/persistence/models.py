@@ -59,6 +59,7 @@ from threads_platform.domain.sync import SyncRunStatus
 from threads_platform.domain.worker_jobs import (
     WorkerInterventionStatus,
     WorkerJobAttemptStatus,
+    WorkerJobCancelRequestStatus,
     WorkerJobRetrySafety,
     WorkerJobStatus,
 )
@@ -1186,6 +1187,7 @@ class WorkerJobAttemptRecord(Base):
     __tablename__ = "worker_job_attempts"
     __table_args__ = (
         UniqueConstraint("worker_job_id", "attempt_number", name="uq_worker_job_attempt_number"),
+        UniqueConstraint("worker_job_id", "id", name="uq_worker_job_attempt_job_id_id"),
         UniqueConstraint("lease_token", name="uq_worker_job_attempt_lease_token"),
         Index("ix_worker_job_attempts_job_status", "worker_job_id", "status"),
     )
@@ -1207,6 +1209,75 @@ class WorkerJobAttemptRecord(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(120))
+
+
+class WorkerJobCancelRequestRecord(Base):
+    __tablename__ = "worker_job_cancel_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "worker_job_id", "generation", name="uq_worker_job_cancel_request_generation"
+        ),
+        CheckConstraint("generation > 0", name="ck_worker_job_cancel_request_generation"),
+        CheckConstraint(
+            "target_attempt_number > 0", name="ck_worker_job_cancel_request_attempt_number"
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'ACKNOWLEDGED', 'SUPERSEDED')",
+            name="ck_worker_job_cancel_request_status",
+        ),
+        CheckConstraint(
+            "length(reason_code) BETWEEN 1 AND 120 AND reason_code ~ '^[A-Z0-9_]+$'",
+            name="ck_worker_job_cancel_request_reason_code",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND acknowledged_at IS NULL AND safe_checkpoint IS NULL "
+            "AND superseded_at IS NULL AND superseded_reason IS NULL) OR "
+            "(status = 'ACKNOWLEDGED' AND acknowledged_at IS NOT NULL "
+            "AND safe_checkpoint IS NOT NULL AND superseded_at IS NULL "
+            "AND superseded_reason IS NULL) OR "
+            "(status = 'SUPERSEDED' AND acknowledged_at IS NULL AND safe_checkpoint IS NULL "
+            "AND superseded_at IS NOT NULL AND superseded_reason IS NOT NULL "
+            "AND length(superseded_reason) BETWEEN 1 AND 120 "
+            "AND superseded_reason ~ '^[A-Z0-9_]+$')",
+            name="ck_worker_job_cancel_request_outcome",
+        ),
+        CheckConstraint(
+            "safe_checkpoint IS NULL OR safe_checkpoint IN ("
+            "'BEFORE_NAVIGATION', 'FEED_READY', 'ITEM_BATCH', 'THREAD_READY', "
+            "'BEFORE_PROFILE_INSPECTION', 'PROFILE_READY')",
+            name="ck_worker_job_cancel_request_safe_checkpoint",
+        ),
+        ForeignKeyConstraint(
+            ["worker_job_id", "target_attempt_id"],
+            ["worker_job_attempts.worker_job_id", "worker_job_attempts.id"],
+            ondelete="RESTRICT",
+            name="fk_worker_job_cancel_request_target_attempt",
+        ),
+        Index(
+            "uq_worker_job_cancel_request_pending_attempt",
+            "worker_job_id",
+            "target_attempt_id",
+            unique=True,
+            postgresql_where=text("status = 'PENDING'"),
+        ),
+        Index("ix_worker_job_cancel_request_status", "worker_job_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    worker_job_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_attempt_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    target_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[WorkerJobCancelRequestStatus] = mapped_column(
+        enum_type(WorkerJobCancelRequestStatus, "worker_job_cancel_request_status"),
+        nullable=False,
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    safe_checkpoint: Mapped[str | None] = mapped_column(String(80))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_reason: Mapped[str | None] = mapped_column(String(120))
 
 
 class WorkerInterventionRecord(Base):

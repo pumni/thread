@@ -1,7 +1,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -14,8 +14,10 @@ from threads_platform.application.worker_control import (
     WorkerControlService,
     WorkerPresence,
 )
+from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.application.worker_notifications import WorkerNotificationHub
 from threads_platform.config.settings import Settings
+from threads_platform.domain.worker_jobs import WorkerJob, WorkerJobStatus
 from threads_platform.domain.workers import WorkerStatus
 
 
@@ -37,6 +39,86 @@ def test_worker_websocket_rejects_plain_ws() -> None:
             with client.websocket_connect("ws://worker.test/v1/workers/connect"):
                 pass
     assert disconnect.value.code == 4403
+
+
+def test_authenticated_https_cancel_ack_is_narrow_and_rejects_extra_request_fields() -> None:
+    worker_id = uuid4()
+    job_id = uuid4()
+    lease_token = uuid4()
+    request_id = uuid4()
+    captured: list[tuple[object, ...]] = []
+
+    class FakeWorkerControl:
+        async def authenticate(self, token: str) -> UUID | None:
+            return worker_id if token == "worker-session" else None
+
+    class FakeWorkerJobService:
+        async def acknowledge_cancel(
+            self,
+            requested_job_id: UUID,
+            requested_worker_id: UUID,
+            requested_lease_token: UUID,
+            *,
+            cancel_request_id: UUID,
+            generation: int,
+            checkpoint_phase: str,
+        ) -> WorkerJob:
+            captured.append(
+                (
+                    requested_job_id,
+                    requested_worker_id,
+                    requested_lease_token,
+                    cancel_request_id,
+                    generation,
+                    checkpoint_phase,
+                )
+            )
+            return WorkerJob(
+                id=requested_job_id,
+                capability_name="threads.browser.feed.browse",
+                capability_version=1,
+                status=WorkerJobStatus.CANCELLED,
+                preemptible=True,
+            )
+
+    app = create_app(
+        Settings(worker_tls_required=True),
+        worker_control_service=cast(WorkerControlService, FakeWorkerControl()),
+        worker_job_service=cast(WorkerJobService, FakeWorkerJobService()),
+    )
+    client = TestClient(app, base_url="https://worker.test")
+    headers = {"Authorization": "Bearer worker-session"}
+    request_body = {
+        "lease_token": str(lease_token),
+        "cancel_request_id": str(request_id),
+        "generation": 3,
+        "checkpoint_phase": "BEFORE_NAVIGATION",
+    }
+    with client:
+        typed_client = cast(httpx.Client, client)
+        response = typed_client.post(
+            f"/v1/workers/jobs/{job_id}/cancel", headers=headers, json=request_body
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "CANCELLED"
+        assert captured == [
+            (
+                job_id,
+                worker_id,
+                lease_token,
+                request_id,
+                3,
+                "BEFORE_NAVIGATION",
+            )
+        ]
+
+        invalid = typed_client.post(
+            f"/v1/workers/jobs/{job_id}/cancel",
+            headers=headers,
+            json={**request_body, "reason_code": "CALLER_CONTROLLED"},
+        )
+    assert invalid.status_code == 422
+    assert len(captured) == 1
 
 
 def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:

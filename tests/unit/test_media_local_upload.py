@@ -432,6 +432,26 @@ class _MemoryControl:
         self.snapshot = replace(self.snapshot, checkpoint=checkpoint)
         return self.snapshot
 
+    async def cancel_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
+    ) -> WorkerJobSnapshot:
+        self._verify(job_id, lease_token)
+        _ = (cancel_request_id, generation, checkpoint_phase)
+        self.snapshot = replace(
+            self.snapshot,
+            status=WorkerJobStatus.CANCELLED,
+            lease_worker_id=None,
+            lease_token=None,
+            lease_expires_at=None,
+        )
+        return self.snapshot
+
     async def complete_job(
         self, job_id: UUID, lease_token: UUID, result: dict[str, object]
     ) -> WorkerJobSnapshot:

@@ -10,6 +10,7 @@ import pytest
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAccountContext,
+    WorkerJobCancelSnapshot,
     WorkerJobSnapshot,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
@@ -240,6 +241,53 @@ async def test_feed_worker_deduplicates_across_scrolls_and_enforces_iteration_bo
     await handler.aclose()
 
 
+@pytest.mark.parametrize("phase", ("BEFORE_NAVIGATION", "FEED_READY", "ITEM_BATCH"))
+@pytest.mark.asyncio
+async def test_feed_worker_acknowledges_cancel_at_each_safe_checkpoint_without_later_browser_work(
+    phase: str,
+) -> None:
+    worker_id, account_id = uuid4(), uuid4()
+    client = _MemoryControl(worker_id, account_id, max_items=20)
+    client.cancel_after_checkpoint_phase = phase
+    lease_token = client.snapshot.lease_token
+    manager = _MemorySessionManager(
+        worker_id,
+        account_id,
+        batches=[(_candidate("post-1"),), (_candidate("post-2", username="bob"),)],
+    )
+    handler = BrowserFeedBrowseWorker(
+        worker_id,
+        cast(FeedWorkerControlClient, client),
+        cast(FeedBrowserSessionManager, manager),
+    )
+
+    await handler(client.snapshot)
+
+    assert client.snapshot.status is WorkerJobStatus.CANCELLED
+    assert client.completed_result is None
+    assert client.failures == []
+    assert client.cancellation_acks == [
+        (
+            client.snapshot.job_id,
+            lease_token,
+            client.cancel_request_id,
+            client.cancel_generation,
+            phase,
+        )
+    ]
+    if phase == "BEFORE_NAVIGATION":
+        assert manager.session.navigated == []
+        assert manager.session.collect_count == manager.session.scroll_count == 0
+    elif phase == "FEED_READY":
+        assert len(manager.session.navigated) == 1
+        assert manager.session.collect_count == 1
+        assert manager.session.scroll_count == 0
+    else:
+        assert len(manager.session.navigated) == 1
+        assert manager.session.collect_count == 2
+        assert manager.session.scroll_count == 1
+
+
 @pytest.mark.asyncio
 async def test_feed_worker_requires_authenticated_session_and_account_affinity() -> None:
     worker_id, account_id = uuid4(), uuid4()
@@ -417,6 +465,10 @@ class _MemoryControl:
         self.interventions: list[tuple[str, str]] = []
         self.failures: list[tuple[str, bool]] = []
         self.lose_renew = False
+        self.cancel_after_checkpoint_phase: str | None = None
+        self.cancel_request_id = uuid4()
+        self.cancel_generation = 7
+        self.cancellation_acks: list[tuple[UUID, UUID, UUID, int, str]] = []
 
     async def account_context(self, account_id: UUID) -> WorkerAccountContext:
         assert account_id == self.account_id
@@ -433,6 +485,39 @@ class _MemoryControl:
     ) -> WorkerJobSnapshot:
         self._verify(job_id, lease_token)
         self.snapshot = replace(self.snapshot, checkpoint=checkpoint)
+        if checkpoint.get("phase") == self.cancel_after_checkpoint_phase:
+            self.snapshot = replace(
+                self.snapshot,
+                pending_cancel=WorkerJobCancelSnapshot(
+                    self.cancel_request_id,
+                    self.cancel_generation,
+                    "OPERATOR_REQUESTED",
+                    datetime.now(UTC),
+                ),
+            )
+        return self.snapshot
+
+    async def cancel_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
+    ) -> WorkerJobSnapshot:
+        self._verify(job_id, lease_token)
+        self.cancellation_acks.append(
+            (job_id, lease_token, cancel_request_id, generation, checkpoint_phase)
+        )
+        self.snapshot = replace(
+            self.snapshot,
+            status=WorkerJobStatus.CANCELLED,
+            lease_worker_id=None,
+            lease_token=None,
+            lease_expires_at=None,
+            pending_cancel=None,
+        )
         return self.snapshot
 
     async def complete_job(

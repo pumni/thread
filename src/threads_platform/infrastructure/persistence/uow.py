@@ -27,6 +27,7 @@ from threads_platform.application.ports.repositories import (
     WorkerCapabilityRepository,
     WorkerInterventionRepository,
     WorkerJobAttemptRepository,
+    WorkerJobCancelRequestRepository,
     WorkerJobRepository,
     WorkerRepository,
     WorkerSecurityRepository,
@@ -53,6 +54,7 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyWorkerCapabilityRepository,
     SQLAlchemyWorkerInterventionRepository,
     SQLAlchemyWorkerJobAttemptRepository,
+    SQLAlchemyWorkerJobCancelRequestRepository,
     SQLAlchemyWorkerJobRepository,
     SQLAlchemyWorkerRepository,
     SQLAlchemyWorkerSecurityRepository,
@@ -110,6 +112,9 @@ class SQLAlchemyUnitOfWork:
         self.worker_jobs: WorkerJobRepository = SQLAlchemyWorkerJobRepository(self._session)
         self.worker_job_attempts: WorkerJobAttemptRepository = SQLAlchemyWorkerJobAttemptRepository(
             self._session
+        )
+        self.worker_job_cancel_requests: WorkerJobCancelRequestRepository = (
+            SQLAlchemyWorkerJobCancelRequestRepository(self._session)
         )
         self.worker_interventions: WorkerInterventionRepository = (
             SQLAlchemyWorkerInterventionRepository(self._session)

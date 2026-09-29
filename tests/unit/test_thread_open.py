@@ -12,6 +12,7 @@ from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAccountContext,
     WorkerControlClientError,
+    WorkerJobCancelSnapshot,
     WorkerJobSnapshot,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
@@ -83,6 +84,43 @@ async def test_thread_worker_completes_with_only_normalized_recognition_result()
         "recognized": True,
     }
     assert client.snapshot.checkpoint == {"phase": "THREAD_READY"}
+
+
+@pytest.mark.parametrize("phase", ("BEFORE_NAVIGATION", "THREAD_READY"))
+@pytest.mark.asyncio
+async def test_thread_worker_acknowledges_cancel_without_later_browser_work(phase: str) -> None:
+    worker_id, account_id = uuid4(), uuid4()
+    client = _MemoryControl(worker_id, account_id)
+    client.cancel_after_checkpoint_phase = phase
+    lease_token = client.snapshot.lease_token
+    assert lease_token is not None
+    manager = _MemorySessionManager(worker_id, account_id)
+    worker = BrowserThreadOpenWorker(
+        worker_id,
+        cast(ThreadOpenWorkerControlClient, client),
+        cast(ThreadOpenBrowserSessionManager, manager),
+    )
+
+    await worker(client.snapshot)
+
+    assert client.snapshot.status is WorkerJobStatus.CANCELLED
+    assert client.completed is None
+    assert client.failures == []
+    assert client.cancellation_acks == [
+        (
+            client.snapshot.job_id,
+            lease_token,
+            client.cancel_request_id,
+            client.cancel_generation,
+            phase,
+        )
+    ]
+    if phase == "BEFORE_NAVIGATION":
+        assert manager.engine.navigation == []
+        assert manager.engine.verifications == []
+    else:
+        assert len(manager.engine.navigation) == 1
+        assert len(manager.engine.verifications) == 1
 
 
 @pytest.mark.parametrize(
@@ -290,6 +328,10 @@ class _MemoryControl:
         self.renew_calls = 0
         self.lose_lease_on_renew_call: int | None = None
         self.lose_lease_on_checkpoint_phase: str | None = None
+        self.cancel_after_checkpoint_phase: str | None = None
+        self.cancel_request_id = uuid4()
+        self.cancel_generation = 7
+        self.cancellation_acks: list[tuple[UUID, UUID, UUID, int, str]] = []
 
     async def account_context(self, account_id: UUID) -> WorkerAccountContext:
         assert account_id == self.account_id
@@ -309,6 +351,39 @@ class _MemoryControl:
         if checkpoint.get("phase") == self.lose_lease_on_checkpoint_phase:
             raise WorkerControlClientError("WORKER_JOB_LEASE_LOST")
         self.snapshot = replace(self.snapshot, checkpoint=checkpoint)
+        if checkpoint.get("phase") == self.cancel_after_checkpoint_phase:
+            self.snapshot = replace(
+                self.snapshot,
+                pending_cancel=WorkerJobCancelSnapshot(
+                    self.cancel_request_id,
+                    self.cancel_generation,
+                    "OPERATOR_REQUESTED",
+                    datetime.now(UTC),
+                ),
+            )
+        return self.snapshot
+
+    async def cancel_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
+    ) -> WorkerJobSnapshot:
+        self._verify(job_id, lease_token)
+        self.cancellation_acks.append(
+            (job_id, lease_token, cancel_request_id, generation, checkpoint_phase)
+        )
+        self.snapshot = replace(
+            self.snapshot,
+            status=WorkerJobStatus.CANCELLED,
+            lease_worker_id=None,
+            lease_token=None,
+            lease_expires_at=None,
+            pending_cancel=None,
+        )
         return self.snapshot
 
     async def complete_job(

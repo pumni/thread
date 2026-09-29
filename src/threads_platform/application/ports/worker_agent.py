@@ -30,6 +30,14 @@ class WorkerAgentPresence:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerJobCancelSnapshot:
+    request_id: UUID
+    generation: int
+    reason_code: str
+    requested_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class WorkerJobSnapshot:
     job_id: UUID
     capability_name: str
@@ -43,6 +51,7 @@ class WorkerJobSnapshot:
     retry_safety: WorkerJobRetrySafety
     checkpoint: dict[str, object] | None
     input_data: dict[str, object] = field(default_factory=lambda: dict[str, object]())
+    pending_cancel: WorkerJobCancelSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +195,16 @@ class WorkerJobControlClient(Protocol):
 
     async def checkpoint_job(
         self, job_id: UUID, lease_token: UUID, checkpoint: dict[str, object]
+    ) -> WorkerJobSnapshot: ...
+
+    async def cancel_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        cancel_request_id: UUID,
+        generation: int,
+        checkpoint_phase: str,
     ) -> WorkerJobSnapshot: ...
 
     async def complete_job(
