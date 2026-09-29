@@ -114,6 +114,16 @@ conversation handler's durable `SyncState` cursor catches up remote data.
 PAUSED schedules keep their due slot without dispatching, and DISABLED
 schedules are terminal. Discovery and mentions recurrence remain deferred.
 
+## TP-002 live evidence preparation
+
+The #65 tooling checkpoint provides an offline packet validator and opaque-value fingerprint helper. Validate a scrubbed packet with:
+
+```powershell
+uv run python -m threads_platform.tools.threads_live_evidence validate docs/examples/threads-live-evidence-v1.template.json
+```
+
+The checked-in file is explicitly `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE`; successful validation proves only that it matches the schema. The tool makes no network calls and accepts no credentials. See the [human live validation runbook](docs/THREADS_LIVE_VALIDATION_RUNBOOK.md) for a later coordinator-authorized #3 session.
+
 ## Delivery workflow
 
 Architecture/issue -> authorized batch -> implementation branch -> Codex -> quality gate -> checkpoint PR -> coordinator acceptance -> merge.

@@ -247,6 +247,8 @@ Must be resolved/accepted before final release security sign-off.
 Does not block safe documentation-contract implementation.
 Does block production activation.
 
+Issue #65 is the authorized tooling-only checkpoint under #3. It prepares the offline packet/runbook/validator and contains no live evidence. Keep #3 OPEN, #55 blocked pending accepted Phase A evidence, and discovery/mentions scheduling blocked pending accepted Phase B polling/cursor evidence.
+
 ## 12. Stop conditions
 
 Codex stops and reports instead of improvising when:
@@ -289,3 +291,7 @@ Every checkpoint PR must report:
 - known limitations;
 - deferred gates;
 - ADR/docs changed.
+
+## 15. TP-002 evidence harness (#65)
+
+The #65 checkpoint adds an offline strict evidence packet validator, recursive secret checks, stdin-only opaque fingerprinting, a template-only matrix, and a human runbook. It does not call Meta, handle real credentials, fabricate live observations, or mark capabilities live-verified. The later human/operator run remains under #3; #55 and discovery/mentions scheduling stay externally blocked until the coordinator accepts their relevant scrubbed evidence.
