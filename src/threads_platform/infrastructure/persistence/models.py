@@ -28,6 +28,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from threads_platform.domain.account_activities import (
+    AccountActivityPlanStatus,
+    ActivityPriority,
+)
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.accounts import AccountExecutionMode, AccountStatus, CredentialStatus
 from threads_platform.domain.capabilities import (
@@ -605,6 +609,174 @@ class ScheduleRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class AccountActivityPlanRecord(Base):
+    __tablename__ = "account_activity_plans"
+    __table_args__ = (
+        UniqueConstraint("account_id", "id", name="uq_account_activity_plans_account_id"),
+        CheckConstraint("revision > 0", name="ck_account_activity_plans_positive_revision"),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'PAUSED', 'DISABLED')",
+            name="ck_account_activity_plans_status",
+        ),
+        CheckConstraint(
+            "revision = 1 OR status_reason IS NOT NULL",
+            name="ck_account_activity_plans_revision_reason",
+        ),
+        CheckConstraint(
+            "status = 'ACTIVE' OR (status_reason IS NOT NULL AND length(status_reason) > 0)",
+            name="ck_account_activity_plans_nonactive_reason",
+        ),
+        Index("ix_account_activity_plans_account_status", "account_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[AccountActivityPlanStatus] = mapped_column(
+        enum_type(AccountActivityPlanStatus, "account_activity_plan_status"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    status_reason: Mapped[str | None] = mapped_column(String(240))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AccountActivityTemplateRecord(Base):
+    __tablename__ = "account_activity_templates"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "plan_id", "id", name="uq_account_activity_templates_account_plan_id"
+        ),
+        ForeignKeyConstraint(
+            ["account_id", "plan_id"],
+            ["account_activity_plans.account_id", "account_activity_plans.id"],
+            ondelete="RESTRICT",
+            name="fk_account_activity_templates_plan_account",
+        ),
+        Index("ix_account_activity_templates_plan", "plan_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    plan_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# Activity documents use JSON to preserve serialized number notation. The domain
+# caps compact JSON at 16 KiB; database checks allow serializer whitespace up to 32 KiB.
+class AccountActivityTemplateRevisionRecord(Base):
+    __tablename__ = "account_activity_template_revisions"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_account_activity_template_revisions_positive"),
+        CheckConstraint(
+            "json_typeof(configuration) = 'object' AND octet_length(configuration::text) <= 32768",
+            name="ck_account_activity_template_revisions_configuration_bound",
+        ),
+        CheckConstraint(
+            "priority IN ('LOW', 'NORMAL', 'HIGH')",
+            name="ck_account_activity_template_revisions_priority",
+        ),
+        ForeignKeyConstraint(
+            ["template_id"],
+            ["account_activity_templates.id"],
+            ondelete="RESTRICT",
+            name="fk_account_activity_template_revisions_template",
+        ),
+    )
+
+    template_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    activity_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    configuration: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default=text("'{}'::json")
+    )
+    priority: Mapped[ActivityPriority] = mapped_column(
+        enum_type(ActivityPriority, "account_activity_priority"), nullable=False
+    )
+    change_reason: Mapped[str] = mapped_column(String(240), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ScheduledActivityRecord(Base):
+    __tablename__ = "scheduled_activities"
+    __table_args__ = (
+        UniqueConstraint(
+            "template_id",
+            "template_revision",
+            "due_at",
+            name="uq_scheduled_activities_template_revision_due_at",
+        ),
+        CheckConstraint("plan_revision > 0", name="ck_scheduled_activities_positive_plan_revision"),
+        CheckConstraint(
+            "template_revision > 0",
+            name="ck_scheduled_activities_positive_template_revision",
+        ),
+        CheckConstraint(
+            "plan_status_snapshot IN ('ACTIVE', 'PAUSED', 'DISABLED')",
+            name="ck_scheduled_activities_plan_status_snapshot",
+        ),
+        CheckConstraint(
+            "json_typeof(configuration_snapshot) = 'object' "
+            "AND octet_length(configuration_snapshot::text) <= 32768",
+            name="ck_scheduled_activities_configuration_bound",
+        ),
+        CheckConstraint(
+            "priority IN ('LOW', 'NORMAL', 'HIGH')",
+            name="ck_scheduled_activities_priority",
+        ),
+        ForeignKeyConstraint(
+            ["account_id", "plan_id"],
+            ["account_activity_plans.account_id", "account_activity_plans.id"],
+            ondelete="RESTRICT",
+            name="fk_scheduled_activities_plan_account",
+        ),
+        ForeignKeyConstraint(
+            ["account_id", "plan_id", "template_id"],
+            [
+                "account_activity_templates.account_id",
+                "account_activity_templates.plan_id",
+                "account_activity_templates.id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_scheduled_activities_template_account_plan",
+        ),
+        ForeignKeyConstraint(
+            ["template_id", "template_revision"],
+            [
+                "account_activity_template_revisions.template_id",
+                "account_activity_template_revisions.revision",
+            ],
+            ondelete="RESTRICT",
+            name="fk_scheduled_activities_template_revision",
+        ),
+        Index("ix_scheduled_activities_account_due", "account_id", "due_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    plan_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    plan_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    plan_name_snapshot: Mapped[str] = mapped_column(String(120), nullable=False)
+    plan_status_snapshot: Mapped[AccountActivityPlanStatus] = mapped_column(
+        enum_type(AccountActivityPlanStatus, "account_activity_plan_status"), nullable=False
+    )
+    plan_status_reason_snapshot: Mapped[str | None] = mapped_column(String(240))
+    template_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    template_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    template_name_snapshot: Mapped[str] = mapped_column(String(120), nullable=False)
+    activity_type_snapshot: Mapped[str] = mapped_column(String(120), nullable=False)
+    configuration_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    priority: Mapped[ActivityPriority] = mapped_column(
+        enum_type(ActivityPriority, "account_activity_priority"), nullable=False
+    )
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    creation_reason: Mapped[str | None] = mapped_column(String(240))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class SyncStateRecord(Base):

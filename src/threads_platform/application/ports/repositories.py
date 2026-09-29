@@ -4,6 +4,11 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from threads_platform.domain.account_activities import (
+    AccountActivityPlan,
+    AccountActivityTemplate,
+    ScheduledActivity,
+)
 from threads_platform.domain.account_execution import (
     AccountExecutionLease,
     AccountExecutionOwnerType,
@@ -53,6 +58,42 @@ class AccountRepository(Protocol):
     async def get_for_update(self, account_id: UUID) -> ThreadsAccount | None: ...
 
     async def update(self, account: ThreadsAccount) -> None: ...
+
+
+class AccountActivityPlanRepository(Protocol):
+    async def add(self, plan: AccountActivityPlan) -> None: ...
+
+    async def get(self, plan_id: UUID) -> AccountActivityPlan | None: ...
+
+    async def get_for_update(self, plan_id: UUID) -> AccountActivityPlan | None: ...
+
+    async def list_for_account(self, account_id: UUID) -> list[AccountActivityPlan]: ...
+
+    async def update(self, plan: AccountActivityPlan) -> None: ...
+
+
+class AccountActivityTemplateRepository(Protocol):
+    async def add_revision(self, template: AccountActivityTemplate) -> None: ...
+
+    async def get_revision(
+        self, template_id: UUID, revision: int
+    ) -> AccountActivityTemplate | None: ...
+
+    async def list_revisions(self, template_id: UUID) -> list[AccountActivityTemplate]: ...
+
+
+class ScheduledActivityRepository(Protocol):
+    async def add_if_absent(self, activity: ScheduledActivity) -> ScheduledActivity: ...
+
+    async def get(self, activity_id: UUID) -> ScheduledActivity | None: ...
+
+    async def get_by_identity(
+        self, template_id: UUID, template_revision: int, due_at: datetime
+    ) -> ScheduledActivity | None: ...
+
+    async def list_for_account(
+        self, account_id: UUID, *, limit: int = 100
+    ) -> list[ScheduledActivity]: ...
 
 
 class CommandRepository(Protocol):
@@ -404,6 +445,9 @@ class WorkerInterventionRepository(Protocol):
 
 class UnitOfWork(Protocol):
     accounts: AccountRepository
+    activity_plans: AccountActivityPlanRepository
+    activity_templates: AccountActivityTemplateRepository
+    scheduled_activities: ScheduledActivityRepository
     commands: CommandRepository
     attempts: CommandAttemptRepository
     posts: PostRepository

@@ -29,8 +29,9 @@ with explicit worker opt-in. It stages only worker-local jpg/jpeg/png/webp
 files through an operator-opened composer; it does not publish, submit, or
 remove staged content. Issue #27 is **CLOSED / COMPLETED** after all C5-01
 acceptance criteria were satisfied. Synthetic fixtures are not production
-evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No additional
-browser mutation or publish/submit scope is authorized.
+evidence. At that checkpoint #28 remained unauthorized; issue #45 later
+authorized C5-02/1 only. LIKE/FOLLOW remain VERIFY. No additional browser
+mutation or publish/submit scope is authorized.
 
 Issue #3 remains a production/release gate.
 
@@ -162,8 +163,11 @@ Issues:
   for its checkpoint, image-only, operator-assisted, and available through the
   bounded account-affine WorkerJob path with explicit opt-in; it stages media
   only and never publishes or submits;
-- #27 is CLOSED / COMPLETED; #28 AccountActivityPlan/priority/preemption remains
-  unauthorized until separately authorized.
+- #27 is CLOSED / COMPLETED;
+- #45 authorizes C5-02/1: the durable `AccountActivityPlan`, versioned activity
+  template, immutable `ScheduledActivity` occurrence, and priority foundation;
+- the due runner, Command materialization, Worker changes, cancellation, and
+  preemption work under parent #28 remain outside this checkpoint.
 
 Browser capabilities must be explicit and independently reviewable.
 
