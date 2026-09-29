@@ -25,7 +25,7 @@ from threads_platform.domain.account_activities import (
     ActivityPriority,
     ScheduledActivity,
 )
-from threads_platform.domain.accounts import ThreadsAccount
+from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.worker_jobs import (
     WorkerJob,
@@ -106,7 +106,9 @@ async def _running_activity_job(
     clock = MutableClock()
     worker_id = uuid4()
     account = ThreadsAccount(
-        threads_user_id=f"cancel-test-{uuid4()}", username="cancel_test_account"
+        threads_user_id=f"cancel-test-{uuid4()}",
+        username="cancel_test_account",
+        execution_mode=AccountExecutionMode.BROWSER_ONLY,
     )
     profile = BrowserProfile(worker_id, f"profile-{uuid4()}")
     assignment = AccountWorkerAssignment(account.id, worker_id, profile.profile_ref)
@@ -148,6 +150,9 @@ async def _running_activity_job(
         clock.now() - timedelta(seconds=1),
         created_at=clock.now() - timedelta(seconds=2),
     )
+    capabilities = [capability]
+    if "threads.browser.feed.browse" not in capabilities:
+        capabilities.append("threads.browser.feed.browse")
     async with unit_of_work_factory() as unit_of_work:
         await unit_of_work.accounts.add(account)
         await unit_of_work.workers.add(worker)
@@ -155,7 +160,10 @@ async def _running_activity_job(
         await unit_of_work.assignments.add(assignment)
         await unit_of_work.worker_capabilities.replace_for_worker(
             worker_id,
-            [WorkerCapability(worker_id, capability, 1, advertised_at=clock.now())],
+            [
+                WorkerCapability(worker_id, name, 1, advertised_at=clock.now())
+                for name in capabilities
+            ],
         )
         await unit_of_work.activity_plans.add(plan)
         await unit_of_work.activity_templates.add_revision(template)
