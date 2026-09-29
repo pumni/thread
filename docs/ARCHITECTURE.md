@@ -607,23 +607,22 @@ another and retain the existing deterministic queue tie order. This checkpoint
 does not add NORMAL-over-LOW preemption, fairness, or process/lease-revocation
 cancellation.
 
-### C6-01/1 PostgreSQL scheduler kernel (#53)
+### C6-01 PostgreSQL scheduler and recurrence (#53, #56)
 
-The scheduler consumes only `ScheduledActivity` occurrences already persisted
-by the Control Plane. One bounded tick calls the existing materialization
-service, drains ready Commands through `CommandRuntime` and the Capability
-Router, then invokes bounded `WorkerJobService` expiry/recovery. It never
-constructs WorkerJobs or executes browser work directly. PostgreSQL
-`ScheduledActivity.due_at`, Command state/deadlines, and WorkerJob scheduling,
-retry, deadline and lease fields remain authoritative. The process loop is a
-wakeup mechanism only; every tick rediscovers work from PostgreSQL after a
-restart.
+The scheduler runs one bounded tick in this order: generate due recurrence
+occurrences, materialize due `ScheduledActivity` rows, drain ready Commands
+through `CommandRuntime` and the Capability Router, then invoke bounded
+`WorkerJobService` recovery. It never constructs WorkerJobs or executes
+browser work directly. PostgreSQL occurrence, Command, and WorkerJob rows
+remain authoritative. The process loop is a wakeup mechanism only; every tick
+rediscovers work from PostgreSQL after restart.
 
 The explicit process runs as `python -m threads_platform.scheduler`; it is not
 hidden in FastAPI request handling. Ticks run sequentially within a process.
-Separate processes may run concurrently: due-occurrence and ready-Command
-selection use PostgreSQL `FOR UPDATE SKIP LOCKED`, while existing uniqueness,
-Command routing, WorkerJob recovery and lease fencing remain authoritative.
+Separate processes may run concurrently: recurrence cursor, due-occurrence,
+and ready-Command selection use PostgreSQL row locks and `FOR UPDATE SKIP
+LOCKED`, while existing uniqueness, Command routing, WorkerJob recovery and
+lease fencing remain authoritative.
 The FastAPI lifespan retains worker presence expiry but does not perform
 WorkerJob recovery; recovery requires the explicit scheduler process. FastAPI
 and the scheduler use one CommandRuntime composition helper for the UnitOfWork,
@@ -633,13 +632,38 @@ handler registry. This repository has no concrete production
 LOCAL_API handlers are unavailable until that process dependency is resolved;
 the scheduler reports this explicitly and still processes routes supported by
 the configured composition.
-Configured activity, Command and recovery batch limits are each 1–100, with a
-default of 50. The poll interval defaults to 15 seconds, must be positive, and
-is bounded to 3,600 seconds. No migration or scheduler cursor is used.
+Recurrence is defined by the immutable `AccountActivityTemplate` revision.
+`NONE` has no anchor or interval. `FIXED_INTERVAL` has a UTC anchor and an
+integer interval from 900 through 2,592,000 seconds; its slots are exactly
+`anchor_at + n * interval_seconds` for `n >= 0`. It is allowed only for feed
+browse, thread open, and profile open. There is no jitter, cron, timezone/DST
+grammar, random timing, or catch-up policy beyond generating every due slot.
 
-This checkpoint handles existing occurrences only. Recurrence generation,
-catch-up and timezone rules remain deferred to C6-01/2. Worker offline state
-leaves account-affine browser work in the durable WorkerJob queue; normal worker
+Migration `20260929_0015` backfills existing revisions as `NONE` and adds the
+activity-specific `account_activity_recurrence_states` cursor. A cursor binds
+to one exact template revision and stores only the next/last due timestamps,
+generated count, and audit timestamps. Cursor advancement and the immutable
+`ScheduledActivity.from_plan_template` snapshot insert commit in one
+transaction. A unique occurrence identity and PostgreSQL cursor row locking
+prevent duplicate slots across generator instances. The cursor is initialized
+to the revision anchor. A bounded call advances at most its generation limit;
+later calls continue at the next exact interval slot after restart.
+
+Only the latest template revision generates. Appending a revision leaves old
+occurrences unchanged, stops the old cursor from generating, and starts the
+new revision from its own anchor. `ACTIVE` and `PAUSED` plans both generate
+durable occurrences. The existing materializer leaves paused occurrences
+pending, so resume makes those same rows eligible. `DISABLED` plans generate
+nothing; existing pending rows retain existing `PLAN_DISABLED` handling.
+Downgrade from 0015 is allowed with only `NONE` revisions and no cursor rows;
+it refuses to discard recurrence configuration or cursor history.
+
+Generation, materialization, Command, and recovery limits are each 1–100,
+with a default of 50. The generation setting is
+`THREADS_PLATFORM_SCHEDULER_ACTIVITY_GENERATION_BATCH_LIMIT`; it is separate
+from the materialization limit. The poll interval defaults to 15 seconds,
+must be positive, and is bounded to 3,600 seconds. Worker offline state leaves
+account-affine browser work in the durable WorkerJob queue; normal worker
 eligibility and claim behavior resumes it later. Recovery preserves existing
 retry timing, reconciliation-required intervention, stale-lease fencing, and
 the rule that lease expiry alone does not satisfy safe-boundary preemption.

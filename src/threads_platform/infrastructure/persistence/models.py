@@ -31,6 +31,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from threads_platform.domain.account_activities import (
     AccountActivityPlanStatus,
     ActivityPriority,
+    ActivityRecurrenceKind,
     ScheduledActivityMaterializationStatus,
 )
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
@@ -687,6 +688,26 @@ class AccountActivityTemplateRevisionRecord(Base):
             "priority IN ('LOW', 'NORMAL', 'HIGH')",
             name="ck_account_activity_template_revisions_priority",
         ),
+        CheckConstraint(
+            "recurrence_kind IN ('NONE', 'FIXED_INTERVAL')",
+            name="ck_account_activity_template_revisions_recurrence_kind",
+        ),
+        CheckConstraint(
+            "(recurrence_kind = 'NONE' AND anchor_at IS NULL AND interval_seconds IS NULL) OR "
+            "(recurrence_kind = 'FIXED_INTERVAL' AND anchor_at IS NOT NULL "
+            "AND interval_seconds BETWEEN 900 AND 2592000)",
+            name="ck_account_activity_template_revisions_recurrence_configuration",
+        ),
+        CheckConstraint(
+            "recurrence_kind = 'NONE' OR activity_type IN ("
+            "'threads.browser.feed.browse', 'threads.browser.thread.open', "
+            "'threads.browser.profile.open')",
+            name="ck_account_activity_template_revisions_recurrence_activity_type",
+        ),
+        CheckConstraint(
+            "recurrence_kind = 'NONE' OR anchor_at >= created_at",
+            name="ck_activity_template_recurrence_anchor",
+        ),
         ForeignKeyConstraint(
             ["template_id"],
             ["account_activity_templates.id"],
@@ -707,6 +728,59 @@ class AccountActivityTemplateRevisionRecord(Base):
     )
     change_reason: Mapped[str] = mapped_column(String(240), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recurrence_kind: Mapped[ActivityRecurrenceKind] = mapped_column(
+        String(40),
+        nullable=False,
+        default=ActivityRecurrenceKind.NONE,
+        server_default=text("'NONE'"),
+    )
+    anchor_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    interval_seconds: Mapped[int | None] = mapped_column(Integer)
+
+
+class AccountActivityRecurrenceStateRecord(Base):
+    __tablename__ = "account_activity_recurrence_states"
+    __table_args__ = (
+        CheckConstraint(
+            "template_revision > 0",
+            name="ck_activity_recur_state_positive_revision",
+        ),
+        CheckConstraint(
+            "generated_count >= 0",
+            name="ck_activity_recur_state_count_nonnegative",
+        ),
+        CheckConstraint(
+            "(generated_count = 0 AND last_generated_due_at IS NULL) OR "
+            "(generated_count > 0 AND last_generated_due_at IS NOT NULL "
+            "AND next_due_at > last_generated_due_at)",
+            name="ck_account_activity_recurrence_states_cursor_consistency",
+        ),
+        ForeignKeyConstraint(
+            ["template_id", "template_revision"],
+            [
+                "account_activity_template_revisions.template_id",
+                "account_activity_template_revisions.revision",
+            ],
+            ondelete="RESTRICT",
+            name="fk_account_activity_recurrence_states_template_revision",
+        ),
+        Index(
+            "ix_account_activity_recurrence_states_next_due",
+            "next_due_at",
+            "template_id",
+            "template_revision",
+        ),
+    )
+
+    template_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    template_revision: Mapped[int] = mapped_column(Integer, primary_key=True)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_generated_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    generated_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ScheduledActivityRecord(Base):

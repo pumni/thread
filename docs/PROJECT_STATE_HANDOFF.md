@@ -86,15 +86,25 @@ rollback. Worker opt-in defaults off. Synthetic fixtures test the reviewed
 contracts but are not production evidence. C5-02/#28 completed the durable
 activity foundation, occurrence materialization, trusted priority propagation,
 safe-boundary cancellation and HIGH preemption/profile gate. C6-01/1 (#53)
-consumes existing persisted occurrences with a bounded scheduler process;
-PostgreSQL remains due-state authority and recurrence generation is deferred
-to C6-01/2. WorkerJob recovery requires the explicit scheduler process;
-FastAPI no longer performs WorkerJob recovery in its lifespan and retains only
-worker presence expiry. The app and scheduler share CommandRuntime composition,
-but no concrete production `ThreadsAccessTokenProvider` is available to the
-standalone scheduler, so LOCAL_API handler enablement requires coordinator
-decision. LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond
-this bounded staging capability, and publish/submit remains outside scope.
+added the bounded scheduler process for due materialization, ready Command
+draining and WorkerJob recovery. FastAPI retains worker presence expiry but no
+longer recovers WorkerJobs in its lifespan. The app and scheduler share
+CommandRuntime composition. The standalone production
+`ThreadsAccessTokenProvider` dependency remains separately gated by #55/#3;
+this recurrence checkpoint does not implement token storage or loading.
+
+C6-01/2 (#56) is the authorized recurrence checkpoint on this branch. It adds
+only `NONE` and deterministic `FIXED_INTERVAL` recurrence on immutable
+`AccountActivityTemplate` revisions. PostgreSQL cursor rows and occurrence
+rows are authoritative; the scheduler loop remains wakeup-only. Fixed slots
+use UTC anchor plus integer interval arithmetic (900–2,592,000 seconds), with
+no cron, jitter, or timezone grammar. ACTIVE and PAUSED plans generate durable
+occurrences; PAUSED rows remain PENDING for resume. DISABLED plans stop
+generation. A newer template revision supersedes only ungenerated older slots;
+existing occurrences remain immutable. Generation, materialization, Command,
+and recovery each retain separate bounded batch limits. Parent #9 remains open.
+LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond this
+bounded staging capability, and publish/submit remains outside scope.
 
 ## 3. Important merged checkpoints
 
@@ -321,11 +331,12 @@ non-preemptible, uses reconciliation-required retry safety, and never publishes,
 submits, or removes the staged image. Worker opt-in defaults off. Issue #27 is
 CLOSED / COMPLETED after all C5-01 acceptance criteria were satisfied.
 Synthetic fixtures are not production evidence. C5-02/#28 is CLOSED /
-COMPLETED after #45, #47, #49 and #51. C6-01/1/#53 is the authorized bounded
-scheduler kernel for existing due occurrences; recurrence is deferred to
-C6-01/2. The explicit scheduler process owns bounded WorkerJob recovery;
-FastAPI lifespan retains worker presence expiry but no longer recovers jobs.
-The standalone scheduler has no repository-supported production
-`ThreadsAccessTokenProvider`; coordinator decision is required before LOCAL_API
-handler execution is available there. LIKE/FOLLOW remain VERIFY. No additional
-mutation or publish/submit scope is authorized.
+COMPLETED after #45, #47, #49 and #51. C6-01/1/#53 added the bounded
+scheduler kernel for durable due work. C6-01/2/#56 is the authorized
+deterministic AccountActivityPlan recurrence checkpoint on this branch. The
+explicit scheduler process owns bounded WorkerJob recovery; FastAPI lifespan
+retains worker presence expiry but no longer recovers jobs. The standalone
+scheduler has no repository-supported production
+`ThreadsAccessTokenProvider`; its deployment dependency is tracked separately
+by #55/#3. LIKE/FOLLOW remain VERIFY. No additional mutation or publish/submit
+scope is authorized.

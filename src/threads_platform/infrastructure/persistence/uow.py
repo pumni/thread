@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
     AccountActivityPlanRepository,
+    AccountActivityRecurrenceStateRepository,
     AccountActivityTemplateRepository,
     AccountExecutionLeaseRepository,
     AccountRepository,
@@ -35,6 +36,7 @@ from threads_platform.application.ports.repositories import (
 )
 from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyAccountActivityPlanRepository,
+    SQLAlchemyAccountActivityRecurrenceStateRepository,
     SQLAlchemyAccountActivityTemplateRepository,
     SQLAlchemyAccountExecutionLeaseRepository,
     SQLAlchemyAccountRepository,
@@ -72,6 +74,9 @@ class SQLAlchemyUnitOfWork:
         )
         self.activity_templates: AccountActivityTemplateRepository = (
             SQLAlchemyAccountActivityTemplateRepository(self._session)
+        )
+        self.activity_recurrence_states: AccountActivityRecurrenceStateRepository = (
+            SQLAlchemyAccountActivityRecurrenceStateRepository(self._session)
         )
         self.scheduled_activities: ScheduledActivityRepository = (
             SQLAlchemyScheduledActivityRepository(self._session)

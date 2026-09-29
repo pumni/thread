@@ -290,6 +290,7 @@ async def test_activity_migration_from_current_schema_and_data_aware_downgrade(
         "account_activity_plans",
         "account_activity_templates",
         "account_activity_template_revisions",
+        "account_activity_recurrence_states",
         "scheduled_activities",
     )
     try:

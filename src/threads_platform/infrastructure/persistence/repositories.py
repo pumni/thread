@@ -2,13 +2,14 @@ import hashlib
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, case, delete, exists, func, or_, select, update
+from sqlalchemy import and_, case, delete, exists, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from threads_platform.application.ports.repositories import (
     AccountActivityPlanRepository,
+    AccountActivityRecurrenceStateRepository,
     AccountActivityTemplateRepository,
     AccountExecutionLeaseRepository,
     AccountRepository,
@@ -38,8 +39,10 @@ from threads_platform.application.ports.repositories import (
 from threads_platform.domain.account_activities import (
     AccountActivityPlan,
     AccountActivityPlanStatus,
+    AccountActivityRecurrenceState,
     AccountActivityTemplate,
     ActivityPriority,
+    ActivityRecurrenceKind,
     ScheduledActivity,
     ScheduledActivityMaterializationStatus,
     configuration_document,
@@ -119,6 +122,7 @@ from threads_platform.domain.workers import (
 )
 from threads_platform.infrastructure.persistence.models import (
     AccountActivityPlanRecord,
+    AccountActivityRecurrenceStateRecord,
     AccountActivityTemplateRecord,
     AccountActivityTemplateRevisionRecord,
     AccountExecutionLeaseRecord,
@@ -352,9 +356,32 @@ class SQLAlchemyAccountActivityTemplateRepository(AccountActivityTemplateReposit
                 priority=template.priority,
                 change_reason=template.change_reason,
                 created_at=template.created_at,
+                recurrence_kind=template.recurrence_kind,
+                anchor_at=template.anchor_at,
+                interval_seconds=template.interval_seconds,
             )
         )
         await self._session.flush()
+        if template.recurrence_kind is ActivityRecurrenceKind.FIXED_INTERVAL:
+            assert template.anchor_at is not None
+            await self._session.execute(
+                postgres_insert(AccountActivityRecurrenceStateRecord)
+                .values(
+                    template_id=template.id,
+                    template_revision=template.revision,
+                    next_due_at=template.anchor_at,
+                    last_generated_due_at=None,
+                    generated_count=0,
+                    created_at=template.created_at,
+                    updated_at=template.created_at,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        AccountActivityRecurrenceStateRecord.template_id,
+                        AccountActivityRecurrenceStateRecord.template_revision,
+                    ]
+                )
+            )
 
     async def get_revision(
         self, template_id: UUID, revision: int
@@ -378,6 +405,26 @@ class SQLAlchemyAccountActivityTemplateRepository(AccountActivityTemplateReposit
         )
         return [self._domain(identity, version) for version in versions]
 
+    async def get_latest_revision_for_update(
+        self, template_id: UUID
+    ) -> AccountActivityTemplate | None:
+        identity = await self._session.scalar(
+            select(AccountActivityTemplateRecord)
+            .where(AccountActivityTemplateRecord.id == template_id)
+            .with_for_update()
+        )
+        if identity is None:
+            return None
+        version = await self._session.scalar(
+            select(AccountActivityTemplateRevisionRecord)
+            .where(AccountActivityTemplateRevisionRecord.template_id == template_id)
+            .order_by(AccountActivityTemplateRevisionRecord.revision.desc())
+            .limit(1)
+        )
+        if version is None:
+            return None
+        return self._domain(identity, version)
+
     @staticmethod
     def _domain(
         identity: AccountActivityTemplateRecord,
@@ -394,6 +441,141 @@ class SQLAlchemyAccountActivityTemplateRepository(AccountActivityTemplateReposit
             priority=ActivityPriority(version.priority),
             change_reason=version.change_reason,
             created_at=version.created_at,
+            recurrence_kind=ActivityRecurrenceKind(version.recurrence_kind),
+            anchor_at=version.anchor_at,
+            interval_seconds=version.interval_seconds,
+        )
+
+
+class SQLAlchemyAccountActivityRecurrenceStateRepository(AccountActivityRecurrenceStateRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_if_absent(self, state: AccountActivityRecurrenceState) -> None:
+        await self._session.execute(
+            postgres_insert(AccountActivityRecurrenceStateRecord)
+            .values(**self._values(state))
+            .on_conflict_do_nothing(
+                index_elements=[
+                    AccountActivityRecurrenceStateRecord.template_id,
+                    AccountActivityRecurrenceStateRecord.template_revision,
+                ]
+            )
+        )
+
+    async def get(
+        self, template_id: UUID, template_revision: int
+    ) -> AccountActivityRecurrenceState | None:
+        record = await self._session.get(
+            AccountActivityRecurrenceStateRecord, (template_id, template_revision)
+        )
+        return self._domain(record) if record is not None else None
+
+    async def get_next_due_for_update(
+        self,
+        now: datetime,
+        *,
+        exclude: frozenset[tuple[UUID, int]] = frozenset(),
+    ) -> AccountActivityRecurrenceState | None:
+        latest_revision = (
+            select(func.max(AccountActivityTemplateRevisionRecord.revision))
+            .where(
+                AccountActivityTemplateRevisionRecord.template_id
+                == AccountActivityRecurrenceStateRecord.template_id
+            )
+            .correlate(AccountActivityRecurrenceStateRecord)
+            .scalar_subquery()
+        )
+        statement = (
+            select(AccountActivityRecurrenceStateRecord)
+            .join(
+                AccountActivityTemplateRevisionRecord,
+                and_(
+                    AccountActivityTemplateRevisionRecord.template_id
+                    == AccountActivityRecurrenceStateRecord.template_id,
+                    AccountActivityTemplateRevisionRecord.revision
+                    == AccountActivityRecurrenceStateRecord.template_revision,
+                ),
+            )
+            .join(
+                AccountActivityTemplateRecord,
+                AccountActivityTemplateRecord.id
+                == AccountActivityRecurrenceStateRecord.template_id,
+            )
+            .join(
+                AccountActivityPlanRecord,
+                AccountActivityPlanRecord.id == AccountActivityTemplateRecord.plan_id,
+            )
+            .where(
+                AccountActivityRecurrenceStateRecord.next_due_at <= normalize_utc(now),
+                AccountActivityTemplateRevisionRecord.revision == latest_revision,
+                AccountActivityTemplateRevisionRecord.recurrence_kind
+                == ActivityRecurrenceKind.FIXED_INTERVAL,
+                AccountActivityPlanRecord.status.in_(
+                    (AccountActivityPlanStatus.ACTIVE, AccountActivityPlanStatus.PAUSED)
+                ),
+            )
+        )
+        if exclude:
+            statement = statement.where(
+                ~tuple_(
+                    AccountActivityRecurrenceStateRecord.template_id,
+                    AccountActivityRecurrenceStateRecord.template_revision,
+                ).in_(exclude)
+            )
+        record = await self._session.scalar(
+            statement.order_by(
+                AccountActivityRecurrenceStateRecord.next_due_at,
+                AccountActivityRecurrenceStateRecord.template_id,
+                AccountActivityRecurrenceStateRecord.template_revision,
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True, of=AccountActivityRecurrenceStateRecord)
+        )
+        return self._domain(record) if record is not None else None
+
+    async def update(self, state: AccountActivityRecurrenceState) -> None:
+        record = await self._session.scalar(
+            select(AccountActivityRecurrenceStateRecord)
+            .where(
+                AccountActivityRecurrenceStateRecord.template_id == state.template_id,
+                AccountActivityRecurrenceStateRecord.template_revision == state.template_revision,
+            )
+            .with_for_update()
+        )
+        if record is None:
+            raise LookupError(
+                "account activity recurrence state not found: "
+                f"{state.template_id}/{state.template_revision}"
+            )
+        record.next_due_at = state.next_due_at
+        record.last_generated_due_at = state.last_generated_due_at
+        record.generated_count = state.generated_count
+        record.updated_at = state.updated_at
+        await self._session.flush()
+
+    @staticmethod
+    def _values(state: AccountActivityRecurrenceState) -> dict[str, object]:
+        return {
+            "template_id": state.template_id,
+            "template_revision": state.template_revision,
+            "next_due_at": state.next_due_at,
+            "last_generated_due_at": state.last_generated_due_at,
+            "generated_count": state.generated_count,
+            "created_at": state.created_at,
+            "updated_at": state.updated_at,
+        }
+
+    @staticmethod
+    def _domain(record: AccountActivityRecurrenceStateRecord) -> AccountActivityRecurrenceState:
+        return AccountActivityRecurrenceState(
+            template_id=record.template_id,
+            template_revision=record.template_revision,
+            next_due_at=record.next_due_at,
+            last_generated_due_at=record.last_generated_due_at,
+            generated_count=record.generated_count,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
         )
 
 

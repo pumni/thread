@@ -70,12 +70,17 @@ Configure `THREADS_PLATFORM_DATABASE_URL` and run this separate process:
 uv run python -m threads_platform.scheduler
 ~~~
 
-The poll interval is wakeup latency only; PostgreSQL `ScheduledActivity.due_at`,
-Command state and WorkerJob timing remain authoritative. The process consumes
-already-persisted occurrences and does not generate recurrence. Optional
-environment settings configure the poll interval and per-tick bounds:
+The poll interval is wakeup latency only; PostgreSQL recurrence cursors,
+`ScheduledActivity.due_at`, Command state and WorkerJob timing remain
+authoritative. Each tick generates due fixed-interval occurrences from the
+latest `AccountActivityTemplate` revision, then materializes occurrences,
+drains Commands and recovers WorkerJobs. Recurrence supports `NONE` and UTC
+anchored `FIXED_INTERVAL` only; details and pause/disable semantics are in
+`docs/ARCHITECTURE.md`. Optional environment settings configure the poll
+interval and independent per-tick bounds:
 
 - `THREADS_PLATFORM_SCHEDULER_POLL_INTERVAL_SECONDS` (default 15; positive, maximum 3,600)
+- `THREADS_PLATFORM_SCHEDULER_ACTIVITY_GENERATION_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_ACTIVITY_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_COMMAND_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_RECOVERY_BATCH_LIMIT` (default 50; 1–100)
