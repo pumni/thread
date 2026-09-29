@@ -87,9 +87,14 @@ contracts but are not production evidence. C5-02/#28 completed the durable
 activity foundation, occurrence materialization, trusted priority propagation,
 safe-boundary cancellation and HIGH preemption/profile gate. C6-01/1 (#53)
 consumes existing persisted occurrences with a bounded scheduler process;
-recurrence generation is deferred to C6-01/2. LIKE/FOLLOW remain VERIFY. No
-browser mutation is authorized beyond this bounded staging capability, and
-publish/submit remains outside scope.
+PostgreSQL remains due-state authority and recurrence generation is deferred
+to C6-01/2. WorkerJob recovery requires the explicit scheduler process;
+FastAPI no longer performs WorkerJob recovery in its lifespan and retains only
+worker presence expiry. The app and scheduler share CommandRuntime composition,
+but no concrete production `ThreadsAccessTokenProvider` is available to the
+standalone scheduler, so LOCAL_API handler enablement requires coordinator
+decision. LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond
+this bounded staging capability, and publish/submit remains outside scope.
 
 ## 3. Important merged checkpoints
 
@@ -318,5 +323,9 @@ CLOSED / COMPLETED after all C5-01 acceptance criteria were satisfied.
 Synthetic fixtures are not production evidence. C5-02/#28 is CLOSED /
 COMPLETED after #45, #47, #49 and #51. C6-01/1/#53 is the authorized bounded
 scheduler kernel for existing due occurrences; recurrence is deferred to
-C6-01/2. LIKE/FOLLOW remain VERIFY. No additional mutation or publish/submit
-scope is authorized.
+C6-01/2. The explicit scheduler process owns bounded WorkerJob recovery;
+FastAPI lifespan retains worker presence expiry but no longer recovers jobs.
+The standalone scheduler has no repository-supported production
+`ThreadsAccessTokenProvider`; coordinator decision is required before LOCAL_API
+handler execution is available there. LIKE/FOLLOW remain VERIFY. No additional
+mutation or publish/submit scope is authorized.

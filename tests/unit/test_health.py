@@ -1,6 +1,12 @@
+import asyncio
+from datetime import datetime
+from typing import cast
+
 from httpx import ASGITransport, AsyncClient, Response
 
 from threads_platform.app import create_app
+from threads_platform.application.worker_control import WorkerControlService
+from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.config.settings import Settings
 
 
@@ -11,3 +17,33 @@ async def test_health_endpoint_returns_ok() -> None:
 
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
+
+
+async def test_fastapi_lifespan_keeps_presence_expiry_but_not_worker_job_recovery() -> None:
+    class PresenceService:
+        calls = 0
+
+        async def expire_presence(self) -> int:
+            self.calls += 1
+            return 0
+
+    class RecoveryService:
+        calls = 0
+
+        async def recover_expired(self, limit: int = 50, *, now: datetime | None = None) -> int:
+            self.calls += 1
+            return 0
+
+    presence = PresenceService()
+    recovery = RecoveryService()
+    app = create_app(
+        Settings(log_level="ERROR"),
+        worker_control_service=cast(WorkerControlService, presence),
+        worker_job_service=cast(WorkerJobService, recovery),
+    )
+
+    async with app.router.lifespan_context(app):
+        await asyncio.sleep(0)
+
+    assert presence.calls == 1
+    assert recovery.calls == 0

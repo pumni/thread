@@ -8,8 +8,10 @@ from functools import partial
 from types import FrameType
 from typing import Any
 
+import structlog
+
 from threads_platform.application.clock import SystemClock
-from threads_platform.application.commands.runtime import CommandRuntime
+from threads_platform.application.commands.composition import compose_command_runtime
 from threads_platform.application.scheduler import (
     SchedulerRunner,
     SchedulerRunnerConfig,
@@ -63,12 +65,19 @@ async def _run() -> None:
     engine = create_database_engine(settings.database_url)
     unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
     worker_job_service = WorkerJobService(unit_of_work_factory, clock=clock)
-    command_runtime = CommandRuntime(
+    composition = compose_command_runtime(
         unit_of_work_factory,
-        {},
+        worker_job_service,
+        threads_api_gateway=None,
+        threads_access_token_provider=None,
         clock=clock,
-        worker_job_service=worker_job_service,
     )
+    if not composition.command_handler_registry:
+        structlog.get_logger(__name__).error(
+            "scheduler_local_api_handlers_unavailable",
+            error_code="THREADS_ACCESS_TOKEN_PROVIDER_UNAVAILABLE",
+        )
+    command_runtime = composition.command_runtime
     tick: SchedulerTick = partial(
         run_scheduler_tick,
         unit_of_work_factory,

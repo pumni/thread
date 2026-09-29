@@ -6,8 +6,8 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from threads_platform.application.commands.composition import compose_command_runtime
 from threads_platform.application.commands.runtime import CommandRuntime
-from threads_platform.application.commands.threads_handlers import create_threads_command_handlers
 from threads_platform.application.ports.threads import ThreadsAccessTokenProvider, ThreadsAPI
 from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobService
@@ -66,7 +66,7 @@ def create_app(
                 notifications=notifications,
             )
         if command_runtime is None:
-            handlers = {}
+            api = None
             if threads_access_token_provider is not None:
                 api = threads_api_gateway
                 if api is None:
@@ -76,14 +76,12 @@ def create_app(
                         follow_redirects=False,
                     )
                     api = HttpThreadsAPI(http_client)
-                handlers = create_threads_command_handlers(
-                    api, threads_access_token_provider, unit_of_work_factory
-                )
-            command_runtime = CommandRuntime(
+            command_runtime = compose_command_runtime(
                 unit_of_work_factory,
-                handlers,
-                worker_job_service=resolved_job_service,
-            )
+                resolved_job_service,
+                threads_api_gateway=api,
+                threads_access_token_provider=threads_access_token_provider,
+            ).command_runtime
         if resolved_worker_service is None:
             resolved_worker_service = WorkerControlService(unit_of_work_factory)
         if resolved_session_service is None:
@@ -96,19 +94,12 @@ def create_app(
             if resolved_worker_service is not None
             else None
         )
-        recovery_task = (
-            asyncio.create_task(_recover_worker_jobs(resolved_job_service))
-            if resolved_job_service is not None
-            else None
-        )
         try:
             yield
         finally:
-            tasks = [task for task in (presence_task, recovery_task) if task is not None]
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if presence_task is not None:
+                presence_task.cancel()
+                await asyncio.gather(presence_task, return_exceptions=True)
             if http_client is not None:
                 await http_client.aclose()
             if engine is not None:
@@ -157,19 +148,6 @@ async def _expire_worker_presence(service: WorkerControlService) -> None:
 
             structlog.get_logger(__name__).error(
                 "worker_presence_expiry_failed", error_type=type(error).__name__
-            )
-        await asyncio.sleep(15)
-
-
-async def _recover_worker_jobs(service: WorkerJobService) -> None:
-    while True:
-        try:
-            await service.recover_expired()
-        except Exception as error:
-            import structlog
-
-            structlog.get_logger(__name__).error(
-                "worker_job_recovery_failed", error_type=type(error).__name__
             )
         await asyncio.sleep(15)
 

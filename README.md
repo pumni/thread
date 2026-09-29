@@ -80,6 +80,14 @@ environment settings configure the poll interval and per-tick bounds:
 - `THREADS_PLATFORM_SCHEDULER_COMMAND_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_RECOVERY_BATCH_LIMIT` (default 50; 1–100)
 
+WorkerJob recovery requires this explicit scheduler process; FastAPI no longer
+performs WorkerJob recovery in its lifespan. FastAPI retains worker presence
+expiry. The runtime composition is shared, but this repository has no concrete
+production `ThreadsAccessTokenProvider` available to the standalone process, so
+its LOCAL_API handler registry is unavailable and the process reports that
+condition at startup. Coordinator decision is required before standalone
+scheduler LOCAL_API execution can be enabled.
+
 ## Delivery workflow
 
 Architecture/issue -> authorized batch -> implementation branch -> Codex -> quality gate -> checkpoint PR -> coordinator acceptance -> merge.

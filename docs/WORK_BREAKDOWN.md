@@ -191,7 +191,11 @@ The #53 scheduler processes existing `ScheduledActivity` occurrences only. It
 uses explicit per-tick activity, Command and recovery limits (1–100), supports
 multiple concurrent instances through PostgreSQL row locking, and requires no
 local cursor. AccountActivityPlan recurrence, cron, catch-up and timezone rules
-remain in C6-01/2.
+remain in C6-01/2. The explicit scheduler owns WorkerJob recovery; FastAPI
+retains worker presence expiry but does not recover WorkerJobs in its lifespan.
+FastAPI and scheduler share one CommandRuntime composition. The repository has
+no concrete production `ThreadsAccessTokenProvider` for the standalone process,
+so enabling its LOCAL_API handlers requires a coordinator architecture decision.
 
 ## 10. D — Release
 

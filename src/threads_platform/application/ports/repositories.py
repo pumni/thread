@@ -113,7 +113,9 @@ class CommandRepository(Protocol):
 
     async def get_by_command_id_for_update(self, command_id: str) -> Command | None: ...
 
-    async def get_next_ready_for_update(self, now: datetime) -> Command | None: ...
+    async def get_next_ready_for_update(
+        self, now: datetime, *, exclude_command_ids: frozenset[str] = frozenset()
+    ) -> Command | None: ...
 
     async def save_checkpoint_if_leased(
         self,

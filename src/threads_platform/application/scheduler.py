@@ -118,9 +118,13 @@ async def run_scheduler_tick(
                 error_type=type(caught).__name__,
             )
 
+        attempted_command_ids: set[str] = set()
         for _ in range(command_limit):
             try:
-                result = await command_runtime.process_next(now=occurred_at)
+                result = await command_runtime.process_next(
+                    now=occurred_at,
+                    exclude_command_ids=frozenset(attempted_command_ids),
+                )
             except Exception as caught:
                 if error is None:
                     error = caught
@@ -132,7 +136,14 @@ async def run_scheduler_tick(
                 break
             if result is None:
                 break
-            commands_processed += 1
+            if result.command_id in attempted_command_ids:
+                logger.error(
+                    "scheduler_reselected_command_within_tick",
+                    command_id=result.command_id,
+                )
+                break
+            attempted_command_ids.add(result.command_id)
+            commands_processed = len(attempted_command_ids)
 
         try:
             worker_jobs_recovered = await worker_job_service.recover_expired(

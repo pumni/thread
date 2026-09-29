@@ -10,6 +10,8 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.integration.threads_test_support import FakeThreadsAPI, TokenProvider
+from threads_platform.application.commands.composition import compose_command_runtime
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.scheduler import SchedulerTickResult, run_scheduler_tick
 from threads_platform.application.worker_jobs import WorkerJobService
@@ -21,6 +23,7 @@ from threads_platform.domain.account_activities import (
     ScheduledActivityMaterializationStatus,
 )
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
+from threads_platform.domain.capabilities import RouteTarget
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.worker_jobs import WorkerJobStatus
 from threads_platform.domain.workers import (
@@ -74,13 +77,14 @@ def _services(
 ) -> tuple[CommandRuntime, WorkerJobService]:
     clock = FixedClock(now)
     worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
-    runtime = CommandRuntime(
+    composition = compose_command_runtime(
         unit_of_work_factory,
-        {},
+        worker_jobs,
+        threads_api_gateway=None,
+        threads_access_token_provider=None,
         clock=clock,
-        worker_job_service=worker_jobs,
     )
-    return runtime, worker_jobs
+    return composition.command_runtime, worker_jobs
 
 
 async def _create_activity(
@@ -184,6 +188,170 @@ async def _count_for_command(
     )
 
 
+async def test_scheduler_uses_shared_runtime_composition_for_local_api_commands(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    clock = FixedClock(now)
+    account = ThreadsAccount(
+        threads_user_id=f"scheduler-api-user-{uuid4()}",
+        username="scheduler_api_test",
+        execution_mode=AccountExecutionMode.API_ONLY,
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(account)
+
+    worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    api = FakeThreadsAPI()
+    composition = compose_command_runtime(
+        unit_of_work_factory,
+        worker_jobs,
+        threads_api_gateway=api,
+        threads_access_token_provider=TokenProvider(),
+        clock=clock,
+    )
+    receipt = await composition.command_runtime.receive(
+        {
+            "protocol_version": 1,
+            "command_id": f"scheduler-api-{uuid4()}",
+            "correlation_id": f"scheduler-api-correlation-{uuid4()}",
+            "account_id": str(account.id),
+            "created_at": now.isoformat(),
+            "command_type": "threads.publish_text",
+            "payload": {"text": "handled by the scheduler API composition"},
+        }
+    )
+
+    result = await run_scheduler_tick(
+        unit_of_work_factory,
+        composition.command_runtime,
+        worker_jobs,
+        now=now,
+        activity_limit=1,
+        command_limit=1,
+        recovery_limit=1,
+    )
+
+    async with unit_of_work_factory() as unit_of_work:
+        command = await unit_of_work.commands.get_by_command_id(receipt.command_id)
+    decisions = list(
+        (
+            await db_session.scalars(
+                select(CommandRouteDecisionRecord).where(
+                    CommandRouteDecisionRecord.command_id == receipt.command_id
+                )
+            )
+        ).all()
+    )
+    outbox_results = await db_session.scalar(
+        select(func.count())
+        .select_from(OutboxEventRecord)
+        .where(OutboxEventRecord.aggregate_id == receipt.command_id)
+    )
+    assert result.commands_processed == 1
+    assert command is not None and command.status is CommandStatus.SUCCEEDED
+    assert api.publish_calls == 1
+    assert len(decisions) == 1 and decisions[0].target is RouteTarget.LOCAL_API
+    assert outbox_results == 1
+
+
+async def test_waiting_execution_command_is_attempted_once_per_tick(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    older_at = now - timedelta(minutes=5)
+    api_only_account = ThreadsAccount(
+        threads_user_id=f"scheduler-waiting-user-{uuid4()}",
+        username="scheduler_waiting_test",
+        execution_mode=AccountExecutionMode.API_ONLY,
+    )
+    waiting_command = Command(
+        command_id=f"waiting-{uuid4()}",
+        correlation_id=f"waiting-correlation-{uuid4()}",
+        account_id=api_only_account.id,
+        command_type="threads.publish_text",
+        payload={"text": "wait for configured API executor"},
+        status=CommandStatus.WAITING_EXECUTION,
+        created_at=older_at,
+        received_at=older_at,
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(api_only_account)
+        await unit_of_work.commands.add(waiting_command)
+
+    browser_fixture = await _create_activity(
+        unit_of_work_factory,
+        now=now,
+        due_at=now - timedelta(seconds=1),
+    )
+    runtime, worker_jobs = _services(unit_of_work_factory, now)
+
+    first_tick = await run_scheduler_tick(
+        unit_of_work_factory,
+        runtime,
+        worker_jobs,
+        now=now,
+        activity_limit=1,
+        command_limit=3,
+        recovery_limit=1,
+    )
+
+    browser_command_id = f"activity:{browser_fixture.activity.id}"
+    async with unit_of_work_factory() as unit_of_work:
+        browser_command = await unit_of_work.commands.get_by_command_id(browser_command_id)
+        waiting_job = await unit_of_work.worker_jobs.get_by_command_id(waiting_command.command_id)
+        browser_job = await unit_of_work.worker_jobs.get_by_command_id(browser_command_id)
+    waiting_decisions = list(
+        (
+            await db_session.scalars(
+                select(CommandRouteDecisionRecord).where(
+                    CommandRouteDecisionRecord.command_id == waiting_command.command_id
+                )
+            )
+        ).all()
+    )
+    browser_decisions = list(
+        (
+            await db_session.scalars(
+                select(CommandRouteDecisionRecord).where(
+                    CommandRouteDecisionRecord.command_id == browser_command_id
+                )
+            )
+        ).all()
+    )
+    assert first_tick.commands_processed == 2
+    assert browser_command is not None and browser_command.status is CommandStatus.WAITING_EXECUTION
+    assert waiting_job is None
+    assert browser_job is not None and browser_job.status is WorkerJobStatus.QUEUED
+    assert len(waiting_decisions) == 1
+    assert waiting_decisions[0].target is RouteTarget.WAITING_EXECUTION
+    assert len(browser_decisions) == 1
+    assert browser_decisions[0].target is RouteTarget.WORKER_JOB
+
+    second_tick = await run_scheduler_tick(
+        unit_of_work_factory,
+        runtime,
+        worker_jobs,
+        now=now,
+        activity_limit=1,
+        command_limit=1,
+        recovery_limit=1,
+    )
+    waiting_decisions_next_tick = list(
+        (
+            await db_session.scalars(
+                select(CommandRouteDecisionRecord).where(
+                    CommandRouteDecisionRecord.command_id == waiting_command.command_id
+                )
+            )
+        ).all()
+    )
+    assert second_tick.commands_processed == 1
+    assert len(waiting_decisions_next_tick) == 2
+
+
 async def test_tick_materializes_routes_and_reconstructed_tick_does_not_duplicate(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
     db_session: AsyncSession,
@@ -232,7 +400,9 @@ async def test_crash_after_materialization_restarts_from_database_state(
     fixture = await _create_activity(unit_of_work_factory, now=now)
     first_runtime, first_jobs = _services(unit_of_work_factory, now)
 
-    async def crash_before_route(*, now: datetime | None = None) -> None:
+    async def crash_before_route(
+        *, now: datetime | None = None, exclude_command_ids: frozenset[str] = frozenset()
+    ) -> None:
         raise SimulatedProcessCrash
 
     monkeypatch.setattr(first_runtime, "process_next", crash_before_route)
@@ -444,9 +614,14 @@ async def test_concurrent_ticks_route_one_ready_command_once(
     original_select = SQLAlchemyCommandRepository.get_next_ready_for_update
 
     async def hold_first_command(
-        repository: SQLAlchemyCommandRepository, selected_at: datetime
+        repository: SQLAlchemyCommandRepository,
+        selected_at: datetime,
+        *,
+        exclude_command_ids: frozenset[str] = frozenset(),
     ) -> Command | None:
-        selected = await original_select(repository, selected_at)
+        selected = await original_select(
+            repository, selected_at, exclude_command_ids=exclude_command_ids
+        )
         if selected is not None and not first_selected.is_set():
             first_selected.set()
             await release_first.wait()

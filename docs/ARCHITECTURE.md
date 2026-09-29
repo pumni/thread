@@ -624,6 +624,15 @@ hidden in FastAPI request handling. Ticks run sequentially within a process.
 Separate processes may run concurrently: due-occurrence and ready-Command
 selection use PostgreSQL `FOR UPDATE SKIP LOCKED`, while existing uniqueness,
 Command routing, WorkerJob recovery and lease fencing remain authoritative.
+The FastAPI lifespan retains worker presence expiry but does not perform
+WorkerJob recovery; recovery requires the explicit scheduler process. FastAPI
+and the scheduler use one CommandRuntime composition helper for the UnitOfWork,
+WorkerJobService, CapabilityRouter, Threads API gateway, token provider and
+handler registry. This repository has no concrete production
+`ThreadsAccessTokenProvider` available to the standalone scheduler, so its
+LOCAL_API handlers are unavailable until that process dependency is resolved;
+the scheduler reports this explicitly and still processes routes supported by
+the configured composition.
 Configured activity, Command and recovery batch limits are each 1–100, with a
 default of 50. The poll interval defaults to 15 seconds, must be positive, and
 is bounded to 3,600 seconds. No migration or scheduler cursor is used.
