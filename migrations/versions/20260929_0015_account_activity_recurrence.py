@@ -76,7 +76,7 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "generated_count >= 0",
-            name="ck_account_activity_recurrence_states_nonnegative_generated_count",
+            name="ck_activity_recur_state_count_nonnegative",
         ),
         sa.CheckConstraint(
             "(generated_count = 0 AND last_generated_due_at IS NULL) OR "
