@@ -666,15 +666,14 @@ class AccountActivityTemplateRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-# The domain caps compact JSON at 16 KiB. JSONB text can expand exponent-form
-# numbers into decimal digits, so these database checks use a 1 MiB storage envelope.
+# Activity documents use JSON to preserve serialized number notation. The domain
+# caps compact JSON at 16 KiB; database checks allow serializer whitespace up to 32 KiB.
 class AccountActivityTemplateRevisionRecord(Base):
     __tablename__ = "account_activity_template_revisions"
     __table_args__ = (
         CheckConstraint("revision > 0", name="ck_account_activity_template_revisions_positive"),
         CheckConstraint(
-            "jsonb_typeof(configuration) = 'object' "
-            "AND octet_length(configuration::text) <= 1048576",
+            "json_typeof(configuration) = 'object' AND octet_length(configuration::text) <= 32768",
             name="ck_account_activity_template_revisions_configuration_bound",
         ),
         CheckConstraint(
@@ -694,7 +693,7 @@ class AccountActivityTemplateRevisionRecord(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     activity_type: Mapped[str] = mapped_column(String(120), nullable=False)
     configuration: Mapped[dict[str, Any]] = mapped_column(
-        JSON_DOCUMENT, nullable=False, default=dict, server_default=JSON_OBJECT_DEFAULT
+        JSON, nullable=False, default=dict, server_default=text("'{}'::json")
     )
     priority: Mapped[ActivityPriority] = mapped_column(
         enum_type(ActivityPriority, "account_activity_priority"), nullable=False
@@ -722,8 +721,8 @@ class ScheduledActivityRecord(Base):
             name="ck_scheduled_activities_plan_status_snapshot",
         ),
         CheckConstraint(
-            "jsonb_typeof(configuration_snapshot) = 'object' "
-            "AND octet_length(configuration_snapshot::text) <= 1048576",
+            "json_typeof(configuration_snapshot) = 'object' "
+            "AND octet_length(configuration_snapshot::text) <= 32768",
             name="ck_scheduled_activities_configuration_bound",
         ),
         CheckConstraint(
@@ -771,7 +770,7 @@ class ScheduledActivityRecord(Base):
     template_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     template_name_snapshot: Mapped[str] = mapped_column(String(120), nullable=False)
     activity_type_snapshot: Mapped[str] = mapped_column(String(120), nullable=False)
-    configuration_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    configuration_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     priority: Mapped[ActivityPriority] = mapped_column(
         enum_type(ActivityPriority, "account_activity_priority"), nullable=False
     )

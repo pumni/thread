@@ -70,18 +70,20 @@ async def _create_activity(
     return plan, template, activity
 
 
-async def test_jsonb_storage_envelope_allows_numeric_text_expansion(
+async def test_json_storage_envelope_allows_serializer_whitespace(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
-    # JSONB renders exponent-form numbers as decimal text, exceeding compact domain JSON size.
+    # SQLAlchemy's JSON serializer adds separator spaces beyond the compact domain representation.
     plan, template = await _create_plan_and_template(
-        unit_of_work_factory, configuration={"values": [1e308] * 150}
+        unit_of_work_factory,
+        configuration={"values": [0] * 6_800, "large_numbers": [1e308] * 100},
     )
     activity = ScheduledActivity.from_plan_template(
         plan, template, datetime(2026, 10, 1, 9, tzinfo=UTC)
     )
     async with unit_of_work_factory() as unit_of_work:
-        await unit_of_work.scheduled_activities.add_if_absent(activity)
+        stored = await unit_of_work.scheduled_activities.add_if_absent(activity)
+    assert stored.configuration_snapshot == template.configuration
 
     engine = create_database_engine(os.environ["THREADS_PLATFORM_TEST_DATABASE_URL"])
     try:
@@ -104,10 +106,10 @@ async def test_jsonb_storage_envelope_allows_numeric_text_expansion(
     finally:
         await engine.dispose()
 
-    assert template_text_bytes is not None and template_text_bytes > 32_768
-    assert occurrence_text_bytes is not None and occurrence_text_bytes > 32_768
-    assert template_text_bytes <= 1_048_576
-    assert occurrence_text_bytes <= 1_048_576
+    assert template_text_bytes is not None and template_text_bytes > 16_384
+    assert occurrence_text_bytes is not None and occurrence_text_bytes > 16_384
+    assert template_text_bytes <= 32_768
+    assert occurrence_text_bytes <= 32_768
 
 
 async def test_activity_plan_template_and_occurrence_persist_with_snapshots(

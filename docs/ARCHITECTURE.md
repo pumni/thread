@@ -510,9 +510,9 @@ Account activity is centrally planned.
 `DISABLED` states; paused plans can resume and disabled plans are terminal.
 Activity templates are explicit configuration revisions that reject known
 secret-bearing fields and credential-bearing URLs. The domain/application
-limit is 16 KiB of compact UTF-8 JSON. PostgreSQL allows up to 1 MiB of rendered
-JSONB text as a storage envelope because exponent-form numbers can expand to
-decimal digits; this is not a larger application configuration limit. A
+limit is 16 KiB of compact UTF-8 JSON. PostgreSQL stores activity configuration
+as `json` to preserve serialized number notation, with a 32 KiB database bound
+for serializer whitespace; this is not a larger application configuration limit. A
 `ScheduledActivity` is a durable occurrence that snapshots the
 plan revision and status, template revision and configuration, and semantic
 priority at creation. PostgreSQL enforces uniqueness by

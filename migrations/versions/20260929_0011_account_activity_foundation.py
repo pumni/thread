@@ -71,8 +71,8 @@ def upgrade() -> None:
         unique=False,
     )
 
-    # Domain validation caps compact JSON at 16 KiB; jsonb::text may expand exponent-form
-    # numbers into decimal digits, so the database check is a separate 1 MiB storage envelope.
+    # Domain validation caps compact JSON at 16 KiB. JSON preserves its serialized number
+    # notation; the 32 KiB database envelope allows the serializer's insignificant whitespace.
     op.create_table(
         "account_activity_template_revisions",
         sa.Column("template_id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -81,16 +81,15 @@ def upgrade() -> None:
         sa.Column("activity_type", sa.String(length=120), nullable=False),
         sa.Column(
             "configuration",
-            postgresql.JSONB(astext_type=sa.Text()),
-            server_default=sa.text("'{}'::jsonb"),
+            postgresql.JSON(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::json"),
             nullable=False,
         ),
         sa.Column("priority", sa.String(length=40), nullable=False),
         sa.Column("change_reason", sa.String(length=240), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
-            "jsonb_typeof(configuration) = 'object' "
-            "AND octet_length(configuration::text) <= 1048576",
+            "json_typeof(configuration) = 'object' AND octet_length(configuration::text) <= 32768",
             name="ck_account_activity_template_revisions_configuration_bound",
         ),
         sa.CheckConstraint(
@@ -107,7 +106,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("template_id", "revision"),
     )
 
-    # Keep the occurrence snapshot's JSONB storage envelope consistent with template revisions.
+    # Keep the occurrence snapshot's JSON representation and storage envelope consistent.
     op.create_table(
         "scheduled_activities",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -123,7 +122,7 @@ def upgrade() -> None:
         sa.Column("activity_type_snapshot", sa.String(length=120), nullable=False),
         sa.Column(
             "configuration_snapshot",
-            postgresql.JSONB(astext_type=sa.Text()),
+            postgresql.JSON(astext_type=sa.Text()),
             nullable=False,
         ),
         sa.Column("priority", sa.String(length=40), nullable=False),
@@ -131,8 +130,8 @@ def upgrade() -> None:
         sa.Column("creation_reason", sa.String(length=240), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
-            "jsonb_typeof(configuration_snapshot) = 'object' "
-            "AND octet_length(configuration_snapshot::text) <= 1048576",
+            "json_typeof(configuration_snapshot) = 'object' "
+            "AND octet_length(configuration_snapshot::text) <= 32768",
             name="ck_scheduled_activities_configuration_bound",
         ),
         sa.CheckConstraint(
