@@ -10,7 +10,7 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-01/1 — PostgreSQL scheduler kernel for existing due work (#53)**.
+- **C6-01/4 — Scheduler-owned bounded Worker presence expiry (#60)**.
 
 Not production-ready:
 - issue #3 live Meta OAuth/API validation remains open;
@@ -70,25 +70,29 @@ Configure `THREADS_PLATFORM_DATABASE_URL` and run this separate process:
 uv run python -m threads_platform.scheduler
 ~~~
 
-The poll interval is wakeup latency only; PostgreSQL recurrence cursors,
+The poll interval is wakeup latency only; PostgreSQL
+`worker_nodes.presence_expires_at`, recurrence cursors,
 `ScheduledActivity.due_at`, Command state and WorkerJob timing remain
-authoritative. Each tick generates due fixed-interval occurrences from the
-latest `AccountActivityTemplate` revision, then materializes occurrences,
-drains Commands and recovers WorkerJobs. Recurrence supports `NONE` and UTC
-anchored `FIXED_INTERVAL` only; details and pause/disable semantics are in
+authoritative. Each tick expires stale Worker presence, generates due
+fixed-interval occurrences, dispatches conversation sync schedules, materializes
+`ScheduledActivity` rows, drains Commands and recovers WorkerJobs.
+Presence expiry affects eligibility for new work only; it does not revoke a
+running lease, cancel work or satisfy preemption. Recurrence supports `NONE`
+and UTC anchored `FIXED_INTERVAL` only; details and pause/disable semantics are in
 `docs/ARCHITECTURE.md`. Optional environment settings configure the poll
 interval and independent per-tick bounds:
 
 - `THREADS_PLATFORM_SCHEDULER_POLL_INTERVAL_SECONDS` (default 15; positive, maximum 3,600)
+- `THREADS_PLATFORM_SCHEDULER_PRESENCE_EXPIRY_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_ACTIVITY_GENERATION_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_CONVERSATION_SYNC_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_ACTIVITY_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_COMMAND_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_RECOVERY_BATCH_LIMIT` (default 50; 1–100)
 
-WorkerJob recovery requires this explicit scheduler process; FastAPI no longer
-performs WorkerJob recovery in its lifespan. FastAPI retains worker presence
-expiry. The runtime composition is shared, but this repository has no concrete
+WorkerJob recovery and Worker presence expiry require this explicit scheduler
+process; FastAPI performs neither wakeup in its lifespan. The runtime
+composition is shared, but this repository has no concrete
 production `ThreadsAccessTokenProvider` available to the standalone process, so
 its LOCAL_API handler registry is unavailable and the process reports that
 condition at startup. Coordinator decision is required before standalone

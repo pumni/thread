@@ -148,7 +148,7 @@ async def test_worker_enrollment_authentication_protocol_and_presence(
     assert degraded.status is WorkerStatus.DEGRADED
 
     clock.advance(timedelta(seconds=11))
-    assert await service.expire_presence() == 1
+    assert await service.expire_presence(now=clock.now(), limit=50) == 1
     recovered = await service.heartbeat(worker_id, active_browser_sessions=2)
     assert recovered.status is WorkerStatus.ONLINE
     clock.advance(timedelta(seconds=9))

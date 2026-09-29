@@ -1,4 +1,3 @@
-import asyncio
 from datetime import datetime
 from typing import cast
 
@@ -19,11 +18,11 @@ async def test_health_endpoint_returns_ok() -> None:
         assert response.json() == {"status": "ok"}
 
 
-async def test_fastapi_lifespan_keeps_presence_expiry_but_not_worker_job_recovery() -> None:
+async def test_fastapi_lifespan_does_not_run_worker_maintenance() -> None:
     class PresenceService:
         calls = 0
 
-        async def expire_presence(self) -> int:
+        async def expire_presence(self, *, now: datetime, limit: int) -> int:
             self.calls += 1
             return 0
 
@@ -43,7 +42,7 @@ async def test_fastapi_lifespan_keeps_presence_expiry_but_not_worker_job_recover
     )
 
     async with app.router.lifespan_context(app):
-        await asyncio.sleep(0)
+        pass
 
-    assert presence.calls == 1
+    assert presence.calls == 0
     assert recovery.calls == 0

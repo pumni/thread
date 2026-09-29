@@ -19,6 +19,7 @@ from threads_platform.application.account_activity_materialization import (
 from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.ports.repositories import UnitOfWork
+from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
 from threads_platform.domain.account_activities import (
     AccountActivityPlan,
@@ -1224,6 +1225,72 @@ async def test_high_preemption_waits_for_safe_ack_then_claims(
     assert preemption.status is WorkerJobPreemptionStatus.SATISFIED
     claimed_high = await scenario.service.claim_next(scenario.worker_id)
     assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_presence_expiry_blocks_new_claims_and_preserves_queued_job(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory, claim=False)
+    async with unit_of_work_factory() as unit_of_work:
+        worker = await unit_of_work.workers.get_for_update(scenario.worker_id)
+        assert worker is not None
+        worker.presence_expires_at = scenario.clock.now() - timedelta(seconds=1)
+        await unit_of_work.workers.update(worker)
+
+    expired = await WorkerControlService(
+        unit_of_work_factory, clock=scenario.clock
+    ).expire_presence(now=scenario.clock.now(), limit=1)
+    with pytest.raises(WorkerJobControlError, match="WORKER_NOT_ELIGIBLE"):
+        await scenario.service.claim_next(scenario.worker_id)
+    async with unit_of_work_factory() as unit_of_work:
+        queued = await unit_of_work.worker_jobs.get(scenario.job_id)
+        attempts = await unit_of_work.worker_job_attempts.list_for_job(scenario.job_id)
+
+    assert expired == 1
+    assert queued is not None and queued.status is WorkerJobStatus.QUEUED
+    assert attempts == []
+
+
+@pytest.mark.asyncio
+async def test_presence_expiry_preserves_running_lease_and_unresolved_preemption(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    async with unit_of_work_factory() as unit_of_work:
+        before = await unit_of_work.worker_jobs.get(scenario.job_id)
+    assert before is not None
+    async with unit_of_work_factory() as unit_of_work:
+        worker = await unit_of_work.workers.get_for_update(scenario.worker_id)
+        assert worker is not None
+        worker.presence_expires_at = scenario.clock.now() - timedelta(seconds=1)
+        await unit_of_work.workers.update(worker)
+
+    service = WorkerControlService(unit_of_work_factory, clock=scenario.clock)
+    assert await service.expire_presence(now=scenario.clock.now(), limit=1) == 1
+    assert await scenario.service.recover_expired(now=scenario.clock.now()) == 0
+
+    async with unit_of_work_factory() as unit_of_work:
+        worker = await unit_of_work.workers.get(scenario.worker_id)
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+        attempt = await unit_of_work.worker_job_attempts.get_running_for_update(scenario.job_id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+
+    assert worker is not None and worker.status is WorkerStatus.OFFLINE
+    assert victim is not None and victim.status is WorkerJobStatus.RUNNING
+    assert victim.lease_worker_id == scenario.worker_id
+    assert victim.lease_token == scenario.lease_token
+    assert victim.lease_expires_at == before.lease_expires_at
+    assert victim.account_coordination_generation == before.account_coordination_generation
+    assert attempt is not None and attempt.status is WorkerJobAttemptStatus.RUNNING
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert request is not None and request.status is WorkerJobCancelRequestStatus.PENDING
 
 
 @pytest.mark.asyncio

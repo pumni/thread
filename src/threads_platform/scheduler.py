@@ -18,6 +18,7 @@ from threads_platform.application.scheduler import (
     SchedulerTick,
     run_scheduler_tick,
 )
+from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.config.settings import get_settings
 from threads_platform.infrastructure.persistence.database import (
@@ -65,6 +66,7 @@ async def _run() -> None:
     engine = create_database_engine(settings.database_url)
     unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
     worker_job_service = WorkerJobService(unit_of_work_factory, clock=clock)
+    worker_control_service = WorkerControlService(unit_of_work_factory, clock=clock)
     composition = compose_command_runtime(
         unit_of_work_factory,
         worker_job_service,
@@ -83,9 +85,11 @@ async def _run() -> None:
         unit_of_work_factory,
         command_runtime,
         worker_job_service,
+        worker_control_service=worker_control_service,
     )
     runner_config = SchedulerRunnerConfig(
         poll_interval=timedelta(seconds=settings.scheduler_poll_interval_seconds),
+        presence_expiry_limit=settings.scheduler_presence_expiry_batch_limit,
         generation_limit=settings.scheduler_activity_generation_batch_limit,
         conversation_sync_limit=settings.scheduler_conversation_sync_batch_limit,
         activity_limit=settings.scheduler_activity_batch_limit,

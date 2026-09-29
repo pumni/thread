@@ -270,9 +270,11 @@ Reclaim:
 
 Presence controls whether a worker can receive new work. The default presence TTL
 is 90 seconds. `hello` and `heartbeat` update `last_heartbeat_at` and
-`presence_expires_at`; `expire_presence()` changes an expired ONLINE or DEGRADED
-worker to OFFLINE. A claim requires status ONLINE, a supported protocol/capability
-schema, and `presence_expires_at > now` (as well as assignment and account policy).
+`presence_expires_at`; bounded scheduler maintenance changes an expired ONLINE
+or DEGRADED worker to OFFLINE. PostgreSQL `presence_expires_at` is authoritative;
+the scheduler poll interval controls wakeup latency only. A claim requires
+status ONLINE, a supported protocol/capability schema, and
+`presence_expires_at > now` (as well as assignment and account policy).
 DEGRADED, DRAINING, OFFLINE, DISABLED, and UPGRADE_REQUIRED workers cannot claim.
 
 Presence does not own a running WorkerJob. Its PostgreSQL lease is authoritative:
@@ -607,32 +609,36 @@ another and retain the existing deterministic queue tie order. This checkpoint
 does not add NORMAL-over-LOW preemption, fairness, or process/lease-revocation
 cancellation.
 
-### C6-01 PostgreSQL scheduler and recurrence (#53, #56, #58)
+### C6-01 PostgreSQL scheduler and recurrence (#53, #56, #58, #60)
 
-The scheduler runs one bounded tick in this order: generate due recurrence
-occurrences, dispatch due conversation sync schedules, materialize due
-`ScheduledActivity` rows, drain ready Commands through `CommandRuntime` and
-the Capability Router, then invoke bounded `WorkerJobService` recovery. It
-never constructs WorkerJobs or executes browser work directly. PostgreSQL
-occurrence, schedule, Command, and WorkerJob rows remain authoritative. The
-process loop is a wakeup mechanism only; every tick rediscovers work from
-PostgreSQL after restart.
+The scheduler runs one bounded tick in this order: expire stale Worker presence,
+generate due recurrence occurrences, dispatch due conversation sync schedules,
+materialize due `ScheduledActivity` rows, drain ready Commands through
+`CommandRuntime` and the Capability Router, then invoke bounded
+`WorkerJobService` recovery. It never constructs WorkerJobs or executes browser
+work directly. PostgreSQL `presence_expires_at`, occurrence, schedule, Command,
+and WorkerJob rows remain authoritative. The process loop is a wakeup mechanism
+only; every tick rediscovers work from PostgreSQL after restart.
 
 The explicit process runs as `python -m threads_platform.scheduler`; it is not
 hidden in FastAPI request handling. Ticks run sequentially within a process.
-Separate processes may run concurrently: recurrence cursor, due-occurrence,
-conversation schedule, and ready-Command selection use PostgreSQL row locks
-and `FOR UPDATE SKIP LOCKED`, while existing uniqueness, Command routing,
-WorkerJob recovery and lease fencing remain authoritative.
-The FastAPI lifespan retains worker presence expiry but does not perform
-WorkerJob recovery; recovery requires the explicit scheduler process. FastAPI
+Separate processes may run concurrently: expired Worker selection, recurrence
+cursor, due-occurrence, conversation schedule, and ready-Command selection use
+PostgreSQL row locks and `FOR UPDATE SKIP LOCKED`, while existing uniqueness,
+Command routing, WorkerJob recovery and lease fencing remain authoritative.
+Presence expiry affects eligibility for new work only. It does not revoke a
+WorkerJob lease, cancel a job, acknowledge preemption, release account/browser
+coordination, terminate a browser process, or change an Attempt outcome. The
+FastAPI lifespan performs neither Worker presence expiry nor WorkerJob
+recovery; both wakeups require the explicit scheduler process. FastAPI
 and the scheduler use one CommandRuntime composition helper for the UnitOfWork,
 WorkerJobService, CapabilityRouter, Threads API gateway, token provider and
 handler registry. This repository has no concrete production
 `ThreadsAccessTokenProvider` available to the standalone scheduler, so its
 LOCAL_API handlers are unavailable until that process dependency is resolved;
 the scheduler reports this explicitly and still processes routes supported by
-the configured composition.
+the configured composition. Presence expiry has an independent per-tick limit
+of 1–100 Workers, default 50.
 Recurrence is defined by the immutable `AccountActivityTemplate` revision.
 `NONE` has no anchor or interval. `FIXED_INTERVAL` has a UTC anchor and an
 integer interval from 900 through 2,592,000 seconds; its slots are exactly

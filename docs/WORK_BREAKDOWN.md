@@ -188,22 +188,26 @@ Issues:
 - #53 C6-01/1 PostgreSQL scheduler kernel for existing due work;
 - #56 C6-01/2 deterministic AccountActivityPlan recurrence generation;
 - #58 C6-01/3 durable periodic `threads.sync_conversation` scheduling;
+- #60 C6-01/4 scheduler-owned bounded Worker presence expiry;
 - #9 later durable scheduler/fleet orchestration checkpoints;
 - #10 observability/security/Windows packaging/deployment.
 
 C6 turns explicit jobs/plans into durable operations and establishes deploy/update/recovery procedures.
 The #53 scheduler owns due materialization, ready Command draining, and
-WorkerJob recovery. #56 adds deterministic recurrence for already-defined
+WorkerJob recovery; #60 adds bounded Worker presence expiry. #56 adds
+deterministic recurrence for already-defined
 `AccountActivityTemplate` revisions. PostgreSQL due state and activity-specific
 recurrence cursors are authoritative; the loop only wakes bounded ticks and
 re-discovers state after restart. Fixed intervals use UTC anchors and integer
 seconds, with no cron or timezone grammar. `ACTIVE` and `PAUSED` generate
 occurrences; paused rows remain pending for resume. `DISABLED` generates
 nothing. Only the latest template revision generates, while old occurrence
-snapshots remain immutable. Generation, materialization, Command and recovery
-limits are independently bounded to 1–100 and support concurrent scheduler
-instances through PostgreSQL locking. FastAPI retains worker presence expiry
-but does not recover WorkerJobs in its lifespan. FastAPI and scheduler share
+snapshots remain immutable. Presence expiry, generation, materialization,
+Command and recovery limits are independently bounded to 1–100 and support concurrent scheduler
+instances through PostgreSQL locking. Presence expiry uses authoritative
+`worker_nodes.presence_expires_at`, ordered bounded PostgreSQL row locking, and
+changes only new-work eligibility; FastAPI owns neither presence expiry nor
+WorkerJob recovery in its lifespan. FastAPI and scheduler share
 one CommandRuntime composition. The standalone scheduler's production
 `ThreadsAccessTokenProvider` remains a separate #55/#3 deployment dependency.
 Issue #58 adds a narrow conversation-sync schedule and immutable dispatch

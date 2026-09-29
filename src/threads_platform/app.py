@@ -1,4 +1,3 @@
-import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -89,17 +88,9 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
-        presence_task = (
-            asyncio.create_task(_expire_worker_presence(resolved_worker_service))
-            if resolved_worker_service is not None
-            else None
-        )
         try:
             yield
         finally:
-            if presence_task is not None:
-                presence_task.cancel()
-                await asyncio.gather(presence_task, return_exceptions=True)
             if http_client is not None:
                 await http_client.aclose()
             if engine is not None:
@@ -136,20 +127,6 @@ def create_app(
         return HealthResponse(status="ok")
 
     return application
-
-
-async def _expire_worker_presence(service: WorkerControlService) -> None:
-    while True:
-        try:
-            await service.expire_presence()
-        except Exception as error:
-            # Keep token and request data out of the diagnostic event.
-            import structlog
-
-            structlog.get_logger(__name__).error(
-                "worker_presence_expiry_failed", error_type=type(error).__name__
-            )
-        await asyncio.sleep(15)
 
 
 app = create_app()
