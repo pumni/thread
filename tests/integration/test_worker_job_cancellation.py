@@ -301,15 +301,29 @@ async def _enqueue_high_activity(
     *,
     deadline_in: timedelta | None = None,
 ) -> WorkerJob:
+    if deadline_in is not None:
+        now = scenario.clock.now()
+        command = Command(
+            command_id=f"internal-high-feed:{uuid4()}",
+            correlation_id=f"internal-high-feed-correlation:{uuid4()}",
+            account_id=scenario.account_id,
+            command_type="threads.browser.feed.browse",
+            payload={"max_items": 5},
+            priority=ActivityPriority.HIGH.worker_job_priority,
+            created_at=now,
+            received_at=now,
+            deadline_at=now + deadline_in,
+        )
+        command.transition(CommandStatus.VALIDATED, now)
+        async with unit_of_work_factory() as unit_of_work:
+            await unit_of_work.commands.add(command)
+        return await _route_materialized_activity(
+            unit_of_work_factory, scenario, command.command_id
+        )
+
     command_id = await _materialize_priority_activity(
         unit_of_work_factory, scenario, ActivityPriority.HIGH
     )
-    if deadline_in is not None:
-        async with unit_of_work_factory() as unit_of_work:
-            command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
-            assert command is not None
-            command.deadline_at = scenario.clock.now() + deadline_in
-            await unit_of_work.commands.update(command)
     return await _route_materialized_activity(unit_of_work_factory, scenario, command_id)
 
 
