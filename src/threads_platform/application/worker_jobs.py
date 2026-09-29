@@ -749,53 +749,57 @@ class WorkerJobService:
                 await self._attach_pending_cancel(unit_of_work, job, now)
         return WorkerJobReconciliation(tuple(jobs))
 
-    async def recover_expired(self, limit: int = 50) -> int:
-        now = normalize_utc(self._clock.now())
+    async def recover_expired(self, limit: int = 50, *, now: datetime | None = None) -> int:
+        occurred_at = normalize_utc(now if now is not None else self._clock.now())
         recovered = 0
         async with self._unit_of_work_factory() as unit_of_work:
-            jobs = await unit_of_work.worker_jobs.list_expired_for_update(now, limit)
+            jobs = await unit_of_work.worker_jobs.list_expired_for_update(occurred_at, limit)
             for job in jobs:
                 generation = job.account_coordination_generation
                 attempt = await unit_of_work.worker_job_attempts.get_running_for_update(job.id)
                 await self._supersede_pending_cancel(
-                    unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED"
+                    unit_of_work, job.id, occurred_at, "TARGET_ATTEMPT_ENDED"
                 )
-                if job.deadline_at is not None and job.deadline_at <= now:
+                if job.deadline_at is not None and job.deadline_at <= occurred_at:
                     if attempt is not None:
                         attempt.status = WorkerJobAttemptStatus.FAILED_FINAL
-                        attempt.finished_at = now
+                        attempt.finished_at = occurred_at
                         attempt.error_code = "JOB_DEADLINE_EXPIRED"
                         await unit_of_work.worker_job_attempts.update(attempt)
                     intervention = await unit_of_work.worker_interventions.get_open_for_job(job.id)
                     if intervention is not None:
                         intervention.status = WorkerInterventionStatus.CANCELLED
-                        intervention.resolved_at = now
+                        intervention.resolved_at = occurred_at
                         intervention.resolved_by = "system:deadline"
                         await unit_of_work.worker_interventions.update(intervention)
-                    job.expire(now)
+                    job.expire(occurred_at)
                     await unit_of_work.worker_jobs.update(job)
-                    await self._release_account_coordination(unit_of_work, job, generation, now)
+                    await self._release_account_coordination(
+                        unit_of_work, job, generation, occurred_at
+                    )
                     await self._finalize_command(
                         unit_of_work,
                         job,
                         CommandStatus.EXPIRED,
-                        now,
+                        occurred_at,
                         error_code="JOB_DEADLINE_EXPIRED",
                     )
                 elif job.attempt_count >= job.max_attempts:
                     if attempt is not None:
                         attempt.status = WorkerJobAttemptStatus.FAILED_FINAL
-                        attempt.finished_at = now
+                        attempt.finished_at = occurred_at
                         attempt.error_code = "WORKER_JOB_ATTEMPTS_EXHAUSTED"
                         await unit_of_work.worker_job_attempts.update(attempt)
-                    job.finalize_failure(now, "WORKER_JOB_ATTEMPTS_EXHAUSTED")
+                    job.finalize_failure(occurred_at, "WORKER_JOB_ATTEMPTS_EXHAUSTED")
                     await unit_of_work.worker_jobs.update(job)
-                    await self._release_account_coordination(unit_of_work, job, generation, now)
+                    await self._release_account_coordination(
+                        unit_of_work, job, generation, occurred_at
+                    )
                     await self._finalize_command(
                         unit_of_work,
                         job,
                         CommandStatus.FAILED_FINAL,
-                        now,
+                        occurred_at,
                         error_code="WORKER_JOB_ATTEMPTS_EXHAUSTED",
                     )
                 elif (
@@ -805,28 +809,32 @@ class WorkerJobService:
                     owner = job.lease_worker_id or job.assigned_worker_id
                     if attempt is not None:
                         attempt.status = WorkerJobAttemptStatus.WAITING_INTERVENTION
-                        attempt.finished_at = now
+                        attempt.finished_at = occurred_at
                         attempt.error_code = "AMBIGUOUS_OUTCOME"
                         await unit_of_work.worker_job_attempts.update(attempt)
-                    job.suspend_for_intervention(now, "AMBIGUOUS_OUTCOME")
+                    job.suspend_for_intervention(occurred_at, "AMBIGUOUS_OUTCOME")
                     await unit_of_work.worker_jobs.update(job)
-                    await self._release_account_coordination(unit_of_work, job, generation, now)
+                    await self._release_account_coordination(
+                        unit_of_work, job, generation, occurred_at
+                    )
                     await self._add_intervention(
                         unit_of_work,
                         job,
                         owner,
                         "AMBIGUOUS_OUTCOME",
                         "LEASE_EXPIRED_WITH_RECONCILIATION_REQUIRED",
-                        now,
+                        occurred_at,
                     )
-                    await self._set_command_waiting_intervention(unit_of_work, job, now)
+                    await self._set_command_waiting_intervention(unit_of_work, job, occurred_at)
                 if job.status in {
                     WorkerJobStatus.SUCCEEDED,
                     WorkerJobStatus.FAILED_FINAL,
                     WorkerJobStatus.CANCELLED,
                     WorkerJobStatus.EXPIRED,
                 }:
-                    await self._supersede_preemptions_for_preemptor(unit_of_work, job.id, now)
+                    await self._supersede_preemptions_for_preemptor(
+                        unit_of_work, job.id, occurred_at
+                    )
                 recovered += 1
         return recovered
 

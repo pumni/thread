@@ -473,9 +473,9 @@ composer, and uses reconciliation after uncertain file selection. It never
 publishes or submits content. Synthetic contracts verify adapter behavior only
 and are not production evidence. Local media references resolve under the
 Worker Agent's managed `media` directory. Issue #27 is CLOSED / COMPLETED after
-all four C5-01 capability checkpoints were accepted. Issue #45 established the
-C5-02/1 activity foundation; issue #47 authorizes C5-02/2 materialization and
-durable priority propagation only, without a background runner or preemption.
+all four C5-01 capability checkpoints were accepted. C5-02/#28 is also CLOSED /
+COMPLETED after #45, #47, #49 and #51. Issue #53 authorizes C6-01/1: a bounded
+scheduler kernel for existing durable occurrences, using the services below.
 See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the per-capability bounds
 and schemas.
 
@@ -606,6 +606,34 @@ generation before HIGH can claim. Equal-priority HIGH jobs do not cancel one
 another and retain the existing deterministic queue tie order. This checkpoint
 does not add NORMAL-over-LOW preemption, fairness, or process/lease-revocation
 cancellation.
+
+### C6-01/1 PostgreSQL scheduler kernel (#53)
+
+The scheduler consumes only `ScheduledActivity` occurrences already persisted
+by the Control Plane. One bounded tick calls the existing materialization
+service, drains ready Commands through `CommandRuntime` and the Capability
+Router, then invokes bounded `WorkerJobService` expiry/recovery. It never
+constructs WorkerJobs or executes browser work directly. PostgreSQL
+`ScheduledActivity.due_at`, Command state/deadlines, and WorkerJob scheduling,
+retry, deadline and lease fields remain authoritative. The process loop is a
+wakeup mechanism only; every tick rediscovers work from PostgreSQL after a
+restart.
+
+The explicit process runs as `python -m threads_platform.scheduler`; it is not
+hidden in FastAPI request handling. Ticks run sequentially within a process.
+Separate processes may run concurrently: due-occurrence and ready-Command
+selection use PostgreSQL `FOR UPDATE SKIP LOCKED`, while existing uniqueness,
+Command routing, WorkerJob recovery and lease fencing remain authoritative.
+Configured activity, Command and recovery batch limits are each 1–100, with a
+default of 50. The poll interval defaults to 15 seconds, must be positive, and
+is bounded to 3,600 seconds. No migration or scheduler cursor is used.
+
+This checkpoint handles existing occurrences only. Recurrence generation,
+catch-up and timezone rules remain deferred to C6-01/2. Worker offline state
+leaves account-affine browser work in the durable WorkerJob queue; normal worker
+eligibility and claim behavior resumes it later. Recovery preserves existing
+retry timing, reconciliation-required intervention, stale-lease fencing, and
+the rule that lease expiry alone does not satisfy safe-boundary preemption.
 
 ## 23. Persistence
 
