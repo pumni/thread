@@ -263,6 +263,8 @@ class BrowserFeedBrowseWorker:
         seen_refs: set[str] = set()
         truncated = False
         await execution.checkpoint({"phase": "BEFORE_NAVIGATION"})
+        if await execution.acknowledge_cancellation_if_pending():
+            return
         await browser_session.navigate(THREADS_FEED_URL, FEED_NAVIGATION_POLICY)
 
         for iteration in range(FEED_ITERATION_BOUND):
@@ -289,6 +291,8 @@ class BrowserFeedBrowseWorker:
                 observations.append(item)
             self._check_deadline(deadline)
             await execution.checkpoint({"phase": "FEED_READY" if iteration == 0 else "ITEM_BATCH"})
+            if await execution.acknowledge_cancellation_if_pending():
+                return
 
             if len(observations) >= max_items:
                 truncated = True

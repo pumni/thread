@@ -170,6 +170,8 @@ class BrowserThreadOpenWorker:
             raise TimeoutError
 
         await execution.checkpoint({"phase": "BEFORE_NAVIGATION"})
+        if await execution.acknowledge_cancellation_if_pending():
+            return
         await browser_session.navigate(
             f"{BROWSER_FEED_ORIGIN}{target_ref}", THREAD_OPEN_NAVIGATION_POLICY
         )
@@ -181,6 +183,8 @@ class BrowserThreadOpenWorker:
             ancestor_bound=THREAD_OPEN_ANCESTOR_BOUND,
         )
         await execution.checkpoint({"phase": "THREAD_READY"})
+        if await execution.acknowledge_cancellation_if_pending():
+            return
         result = BrowserTargetOpenResultV1(
             target_kind="THREAD",
             target_ref=target_ref,

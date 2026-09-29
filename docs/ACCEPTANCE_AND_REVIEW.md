@@ -102,8 +102,15 @@ materialize atomically and idempotently into deterministic `Command` records,
 that paused/disabled plans and unsupported activity types fail closed as
 specified, and that trusted activity priority reaches the existing queued
 WorkerJob claim ordering. Cover PostgreSQL races, rollback/restart, migration,
-and the CRM-v1 priority trust boundary. Running-job preemption remains a later
-checkpoint and is not part of this gate.
+and the CRM-v1 priority trust boundary.
+
+For C5-02/3 (#49), verify attempt-bound durable cancellation requests, unchanged
+lease ownership while pending, authenticated HTTPS snapshots and fenced
+acknowledgement at only the accepted safe checkpoints. Cover PostgreSQL
+terminal races, request supersession on failure/intervention/deadline/reclaim,
+restart/reconcile, atomic Command/WorkerJob/Attempt/outbox updates, and Worker
+handlers stopping browser work after acknowledgement. Cancellation is not
+triggered by priority policy in this checkpoint.
 
 ## 11. Standard quality gate
 

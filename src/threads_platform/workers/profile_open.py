@@ -169,17 +169,23 @@ class BrowserProfileOpenWorker:
             raise TimeoutError
 
         await execution.checkpoint({"phase": "BEFORE_NAVIGATION"})
+        if await execution.acknowledge_cancellation_if_pending():
+            return
         await browser_session.navigate(
             f"{BROWSER_FEED_ORIGIN}{target_ref}", PROFILE_OPEN_NAVIGATION_POLICY
         )
         if self._monotonic() >= deadline:
             raise TimeoutError
         await execution.checkpoint({"phase": "BEFORE_PROFILE_INSPECTION"})
+        if await execution.acknowledge_cancellation_if_pending():
+            return
         await browser_session.verify_profile_target(
             target_ref=target_ref,
             ancestor_bound=PROFILE_OPEN_ANCESTOR_BOUND,
         )
         await execution.checkpoint({"phase": "PROFILE_READY"})
+        if await execution.acknowledge_cancellation_if_pending():
+            return
         result = BrowserTargetOpenResultV1(
             target_kind="PROFILE",
             target_ref=target_ref,

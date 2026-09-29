@@ -18,6 +18,7 @@ class CommandStatus(StrEnum):
     EXPIRED = "EXPIRED"
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_FINAL = "FAILED_FINAL"
+    CANCELLED = "CANCELLED"
 
 
 class AttemptStatus(StrEnum):
@@ -47,6 +48,7 @@ _VALID_TRANSITIONS = frozenset(
         (CommandStatus.WAITING_EXECUTION, CommandStatus.PROCESSING),
         (CommandStatus.WAITING_EXECUTION, CommandStatus.SUCCEEDED),
         (CommandStatus.WAITING_EXECUTION, CommandStatus.FAILED_FINAL),
+        (CommandStatus.WAITING_EXECUTION, CommandStatus.CANCELLED),
         (CommandStatus.WAITING_EXECUTION, CommandStatus.EXPIRED),
         (CommandStatus.WAITING_INTERVENTION, CommandStatus.WAITING_EXECUTION),
         (CommandStatus.WAITING_INTERVENTION, CommandStatus.FAILED_FINAL),
@@ -150,6 +152,7 @@ class Command:
             CommandStatus.REJECTED,
             CommandStatus.EXPIRED,
             CommandStatus.FAILED_FINAL,
+            CommandStatus.CANCELLED,
         }:
             self.completed_at = occurred_at
         if target == CommandStatus.SUCCEEDED:

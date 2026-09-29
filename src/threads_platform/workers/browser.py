@@ -304,6 +304,7 @@ class WorkerJobExecution:
         self._profile_ref = profile_ref
         self._clock = clock or (lambda: datetime.now(UTC))
         self._snapshot = snapshot
+        self._checkpoint_has_pending_action = False
         self._validate_snapshot(snapshot)
         if local_state is not None and snapshot.account_id is None:
             raise ValueError("local WorkerJob recovery requires an account-affine job")
@@ -344,7 +345,43 @@ class WorkerJobExecution:
                 raise WorkerJobLeaseLost() from None
             raise
         self._accept_current_snapshot(snapshot)
+        self._checkpoint_has_pending_action = False
         return self._snapshot
+
+    async def before_browser_action(self) -> None:
+        await self.renew()
+        if not self._checkpoint_has_pending_action and self._snapshot.pending_cancel is not None:
+            await self.acknowledge_cancellation_if_pending()
+            raise WorkerJobLeaseLost()
+        self._checkpoint_has_pending_action = True
+
+    async def acknowledge_cancellation_if_pending(self) -> bool:
+        pending = self._snapshot.pending_cancel
+        if pending is None:
+            return False
+        checkpoint = self._snapshot.checkpoint
+        phase = checkpoint.get("phase") if checkpoint is not None else None
+        if not isinstance(phase, str):
+            raise WorkerJobLeaseLost()
+        try:
+            snapshot = await self._control_client.cancel_job(
+                self._snapshot.job_id,
+                self._lease_token(),
+                cancel_request_id=pending.request_id,
+                generation=pending.generation,
+                checkpoint_phase=phase,
+            )
+        except WorkerControlClientError:
+            # Once observed, cancellation forbids any further browser operation.
+            raise WorkerJobLeaseLost() from None
+        if (
+            snapshot.job_id != self._snapshot.job_id
+            or snapshot.status is not WorkerJobStatus.CANCELLED
+        ):
+            raise WorkerJobLeaseLost()
+        self._snapshot = snapshot
+        self._clear_recovery_entry()
+        return True
 
     async def complete(self, result: dict[str, object]) -> WorkerJobSnapshot:
         try:
@@ -618,7 +655,7 @@ class WorkerBrowserSession:
             raise BrowserProcessCrashed()
         policy.validate(url)
         if self._job_execution is not None:
-            await self._job_execution.renew()
+            await self._job_execution.before_browser_action()
         try:
             await self._engine_session.navigate(url, allowed_origins=policy.allowed_origins)
         except RemoteSessionStateUncertain:
@@ -647,7 +684,7 @@ class WorkerBrowserSession:
             raise UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
-        await self._job_execution.renew()
+        await self._job_execution.before_browser_action()
         engine_session = cast(BrowserFeedEngineSession, self._engine_session)
         try:
             return await engine_session.collect_feed_candidates(ancestor_bound=ancestor_bound)
@@ -674,7 +711,7 @@ class WorkerBrowserSession:
             raise UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
-        await self._job_execution.renew()
+        await self._job_execution.before_browser_action()
         engine_session = cast(BrowserFeedEngineSession, self._engine_session)
         try:
             await engine_session.scroll_feed()
@@ -703,7 +740,7 @@ class WorkerBrowserSession:
             raise UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
-        await self._job_execution.renew()
+        await self._job_execution.before_browser_action()
         engine_session = cast(BrowserThreadOpenEngineSession, self._engine_session)
         try:
             await engine_session.verify_thread_target(
@@ -734,7 +771,7 @@ class WorkerBrowserSession:
             raise UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
-        await self._job_execution.renew()
+        await self._job_execution.before_browser_action()
         engine_session = cast(BrowserProfileOpenEngineSession, self._engine_session)
         try:
             await engine_session.verify_profile_target(
@@ -764,7 +801,7 @@ class WorkerBrowserSession:
             raise UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
-        await self._job_execution.renew()
+        await self._job_execution.before_browser_action()
         engine_session = cast(BrowserMediaEngineSession, self._engine_session)
         try:
             return await engine_session.prepare_media_composer()

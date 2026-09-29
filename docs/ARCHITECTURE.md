@@ -542,11 +542,38 @@ Low-priority activities:
 High-priority CRM mutations:
 - preemptible=false
 
-Preemption is cooperative:
-- Control Plane requests cancellation;
-- Worker reaches a safe boundary;
-- Worker checkpoints/cancels;
-- high-priority work proceeds.
+### C5-02/3 safe-boundary cancellation (#49)
+
+The internal cancellation request targets only a running, preemptible,
+materialized account-activity WorkerJob for feed browse, Thread open, or profile
+open. PostgreSQL records the request against the exact current attempt and
+generation. Requesting cancellation does not change the job, attempt, worker,
+lease token, or lease expiry. Repeating a request for that attempt returns the
+same pending request.
+
+The Worker observes pending request metadata through authenticated HTTPS
+reconcile, renew, or checkpoint snapshots. WSS is advisory. After an existing
+capability checkpoint, the Worker stops browser work and submits the request id,
+generation, and checkpoint phase to `POST /v1/workers/jobs/{job_id}/cancel`.
+If a renew exposes cancellation before any browser action since the latest
+checkpoint, the Worker acknowledges at that checkpoint and skips the action. If
+an action is already in progress, it finishes only to the next existing safe
+checkpoint before acknowledging.
+Acknowledgement is fenced by worker, lease, request, generation, current attempt,
+live lease, and the persisted checkpoint. The accepted phases are:
+
+- feed browse: `BEFORE_NAVIGATION`, `FEED_READY`, `ITEM_BATCH`;
+- Thread open: `BEFORE_NAVIGATION`, `THREAD_READY`;
+- profile open: `BEFORE_NAVIGATION`, `BEFORE_PROFILE_INSPECTION`, `PROFILE_READY`.
+
+One PostgreSQL transaction records the acknowledgement, marks the attempt,
+WorkerJob, and linked Command `CANCELLED`, clears the old lease, and writes the
+Command result outbox event. Completion, failure, intervention, deadline
+recovery, and reclaim lock the WorkerJob row and supersede a pending request if
+they end its target attempt first. Lease expiry never acknowledges cancellation;
+reclaim starts a new attempt and any new request uses the next generation. A
+stale token cannot mutate the job. No priority policy requests cancellation in
+this checkpoint.
 
 No global stop flag.
 

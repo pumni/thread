@@ -337,6 +337,52 @@ Incompatible worker:
 - Both endpoints use the short-lived bearer session over HTTPS. WSS remains advisory and is
   not the source of durable session or capacity state.
 
+### Safe-boundary cancellation (C5-02/3)
+
+Authenticated HTTPS WorkerJob snapshots from reconcile, renew, and checkpoint
+may include `pending_cancel` with exactly `request_id`, `generation`,
+`reason_code`, and `requested_at`. This metadata identifies a durable request
+bound to the current attempt. Requesting cancellation leaves the RUNNING job,
+attempt, worker ownership, lease token, and lease expiry unchanged. Reconcile
+omits a request after its target lease expires; reclaim supersedes the old
+request and uses a new attempt/generation.
+
+After each existing durable safe checkpoint, the preemptible READ handlers stop
+browser work when a pending request is present and send. If a renew exposes a
+request before any browser action since the latest checkpoint, the Worker
+acknowledges at that checkpoint and skips the action. If an action is already
+in progress, it finishes only to the next existing safe checkpoint before
+acknowledging.
+
+```text
+POST /v1/workers/jobs/{job_id}/cancel
+Authorization: Bearer <worker session>
+{
+  "lease_token": "<current lease token>",
+  "cancel_request_id": "<observed request id>",
+  "generation": 1,
+  "checkpoint_phase": "<persisted safe phase>"
+}
+```
+
+The accepted checkpoint phases are fixed by capability contract:
+
+- `threads.browser.feed.browse`: `BEFORE_NAVIGATION`, `FEED_READY`, `ITEM_BATCH`;
+- `threads.browser.thread.open`: `BEFORE_NAVIGATION`, `THREAD_READY`;
+- `threads.browser.profile.open`: `BEFORE_NAVIGATION`,
+  `BEFORE_PROFILE_INSPECTION`, `PROFILE_READY`.
+
+The Control Plane checks the authenticated worker, current unexpired lease,
+request id and generation, current attempt, preemptibility, capability phase,
+and equality with the persisted checkpoint before acknowledging. It atomically
+marks the request `ACKNOWLEDGED`, the attempt, WorkerJob, and linked Command
+`CANCELLED`, clears the lease, and writes the normal Command result event. The
+old token is then unusable. Normal completion, failure, intervention, deadline
+recovery, or reclaim may supersede a pending request if it wins the job-row
+serialization first. Lease expiry, disconnect, process termination, and task
+cancellation are not acknowledgements. No WSS listener is required for
+correctness, and this checkpoint adds no priority-triggered cancellation.
+
 ## 17. Test matrix
 
 C1 must test:
