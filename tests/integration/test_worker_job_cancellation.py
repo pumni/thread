@@ -161,6 +161,13 @@ async def _running_activity_job(
     else:
         assert command is None
         command_id = None
+    if command_id is not None:
+        async with unit_of_work_factory() as unit_of_work:
+            routed_command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
+            assert routed_command is not None
+            routed_command.transition(CommandStatus.VALIDATED, clock.now())
+            routed_command.transition(CommandStatus.WAITING_EXECUTION, clock.now())
+            await unit_of_work.commands.update(routed_command)
     service = WorkerJobService(
         unit_of_work_factory,
         clock=clock,
