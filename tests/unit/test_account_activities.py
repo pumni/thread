@@ -11,6 +11,7 @@ from threads_platform.domain.account_activities import (
     AccountActivityTemplate,
     ActivityPriority,
     ScheduledActivity,
+    ScheduledActivityMaterializationStatus,
 )
 from threads_platform.domain.worker_jobs import WorkerJob
 
@@ -157,6 +158,35 @@ def test_scheduled_activity_identity_is_template_revision_and_due_time() -> None
     assert first.identity == (template.id, template.revision, due_at)
     assert restarted_tick.identity == first.identity
     assert restarted_tick.id != first.id
+
+
+def test_scheduled_activity_materialization_transitions_are_terminal_and_auditable() -> None:
+    plan = _plan()
+    template = _template(plan)
+    at = datetime(2026, 10, 1, 9, tzinfo=UTC)
+    materialized = ScheduledActivity.from_plan_template(plan, template, at)
+    materialized = materialized.mark_materialized(f"activity:{materialized.id}", at)
+
+    assert (
+        materialized.materialization_status is ScheduledActivityMaterializationStatus.MATERIALIZED
+    )
+    assert materialized.command_id == f"activity:{materialized.id}"
+    assert materialized.materialization_at == at
+    assert materialized.materialization_reason is None
+    with pytest.raises(ValueError, match="no longer pending"):
+        materialized.mark_non_materializable("PLAN_DISABLED", at)
+
+    skipped = ScheduledActivity.from_plan_template(plan, template, at)
+    skipped = skipped.mark_non_materializable("UNSUPPORTED_ACTIVITY_TYPE", at)
+
+    assert (
+        skipped.materialization_status is ScheduledActivityMaterializationStatus.NON_MATERIALIZABLE
+    )
+    assert skipped.command_id is None
+    assert skipped.materialization_at == at
+    assert skipped.materialization_reason == "UNSUPPORTED_ACTIVITY_TYPE"
+    with pytest.raises(ValueError, match="no longer pending"):
+        skipped.mark_materialized(f"activity:{skipped.id}", at)
 
 
 def test_occurrence_keeps_immutable_plan_and_template_revision_snapshots() -> None:

@@ -82,12 +82,15 @@ class Command:
     execution_lease_token: UUID | None = None
     execution_lease_expires_at: datetime | None = None
     checkpoint: dict[str, object] | None = None
+    priority: int = 0
 
     def __post_init__(self) -> None:
         if not self.command_id.strip() or not self.correlation_id.strip():
             raise ValueError("command_id and correlation_id must not be empty")
         if not self.command_type.strip() or self.protocol_version < 1:
             raise ValueError("command type and protocol version are invalid")
+        if type(self.priority) is not int or self.priority not in {-100, 0, 100}:
+            raise ValueError("command priority must be LOW (-100), NORMAL (0), or HIGH (100)")
         self.created_at = normalize_utc(self.created_at)
         self.received_at = normalize_utc(self.received_at)
         self.deadline_at = normalize_utc(self.deadline_at) if self.deadline_at is not None else None

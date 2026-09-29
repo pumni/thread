@@ -154,6 +154,35 @@ async def test_protocol_v2_worker_can_claim_eligible_jobs(
     assert claimed.id == queued.id
 
 
+async def test_claim_orders_high_normal_and_low_queued_jobs_by_priority(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = MutableClock()
+    worker_id = await add_worker(unit_of_work_factory, now=clock.now())
+    jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    low = await jobs.enqueue("synthetic.echo", 1, priority=-100)
+    normal = await jobs.enqueue("synthetic.echo", 1, priority=0)
+    high = await jobs.enqueue("synthetic.echo", 1, priority=100)
+
+    claims = [await jobs.claim_next(worker_id) for _ in range(3)]
+
+    assert [claim.id for claim in claims if claim is not None] == [high.id, normal.id, low.id]
+
+
+async def test_equal_priority_claim_keeps_existing_deterministic_id_tie_order(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = MutableClock()
+    worker_id = await add_worker(unit_of_work_factory, now=clock.now())
+    jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    queued = [await jobs.enqueue("synthetic.echo", 1, priority=0) for _ in range(3)]
+    expected_ids = sorted(job.id for job in queued)
+
+    claims = [await jobs.claim_next(worker_id) for _ in range(3)]
+
+    assert [claim.id for claim in claims if claim is not None] == expected_ids
+
+
 async def test_worker_job_input_data_persists_through_claim_and_repository_read(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:

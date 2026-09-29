@@ -20,7 +20,11 @@ from threads_platform.application.crm_protocol_v1 import (
     CommandEnvelopeV1,
     CRMCommandResultV1,
 )
-from threads_platform.application.errors import CRMUnavailable, RetryableCommandError
+from threads_platform.application.errors import (
+    CommandInputError,
+    CRMUnavailable,
+    RetryableCommandError,
+)
 from threads_platform.application.outbox_delivery import OutboxDeliveryWorker
 from threads_platform.application.retry import RetryPolicy
 from threads_platform.application.worker_jobs import WorkerJobService
@@ -28,7 +32,7 @@ from threads_platform.config.settings import Settings
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
 from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
-from threads_platform.domain.commands import AttemptStatus, CommandStatus
+from threads_platform.domain.commands import AttemptStatus, Command, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxEvent, OutboxStatus
 from threads_platform.domain.publishing import ThreadPost
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
@@ -824,6 +828,7 @@ async def test_browser_capability_routes_to_affine_worker_with_bounded_input(
     assert job is not None
     assert job.assigned_worker_id == worker_id
     assert job.account_affinity_required is True
+    assert job.priority == 0
     expected_preemptible = command_type != "threads.browser.media.local_upload"
     expected_retry_safety = (
         WorkerJobRetrySafety.RECONCILIATION_REQUIRED
@@ -847,6 +852,97 @@ async def test_browser_capability_routes_to_affine_worker_with_bounded_input(
     assert claimed.preemptible is expected_preemptible
     assert claimed.retry_safety is expected_retry_safety
     assert claimed.input_data == expected_input
+
+
+async def test_internal_command_priority_propagates_to_worker_job(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account = ThreadsAccount(
+        threads_user_id=f"priority-user-{uuid4()}",
+        username="priority-test",
+        execution_mode=AccountExecutionMode.BROWSER_ONLY,
+    )
+    worker_id = uuid4()
+    worker = WorkerNode(
+        worker_id=worker_id,
+        display_name="Priority test worker",
+        hostname="priority-host",
+        platform="windows",
+        agent_version="1.0.0",
+        protocol_version=2,
+        capabilities_schema_version=1,
+        status=WorkerStatus.ONLINE,
+        last_heartbeat_at=clock.now(),
+        presence_expires_at=clock.now() + timedelta(hours=1),
+        created_at=clock.now(),
+        updated_at=clock.now(),
+    )
+    profile = BrowserProfile(worker_id, f"priority-{uuid4()}")
+    command = Command(
+        command_id=f"activity:{uuid4()}",
+        correlation_id=f"activity-correlation:{uuid4()}",
+        account_id=account.id,
+        command_type="threads.browser.feed.browse",
+        payload={"max_items": 5},
+        priority=100,
+        created_at=clock.now(),
+        received_at=clock.now(),
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(account)
+        await unit_of_work.workers.add(worker)
+        await unit_of_work.browser_profiles.add(profile)
+        await unit_of_work.assignments.add(
+            AccountWorkerAssignment(account.id, worker_id, profile.profile_ref)
+        )
+        await unit_of_work.worker_capabilities.replace_for_worker(
+            worker_id,
+            [
+                WorkerCapability(
+                    worker_id,
+                    "threads.browser.feed.browse",
+                    1,
+                    advertised_at=clock.now(),
+                )
+            ],
+        )
+        await unit_of_work.commands.add(command)
+
+    worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=clock,
+        worker_job_service=worker_jobs,
+    )
+    result = await runtime.process(command.command_id)
+
+    assert result.status is CommandStatus.WAITING_EXECUTION
+    async with unit_of_work_factory() as unit_of_work:
+        job = await unit_of_work.worker_jobs.get_by_command_id(command.command_id)
+    assert job is not None
+    assert job.priority == command.priority == 100
+
+
+async def test_crm_v1_commands_default_to_normal_and_reject_priority_input(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    clock = FixedClock(datetime.now(UTC))
+    account_id = await add_account(unit_of_work_factory)
+    runtime = CommandRuntime(unit_of_work_factory, {}, clock=clock)
+    body = command_body(account_id, clock, command_type="threads.browser.feed.browse")
+    body["payload"] = {"max_items": 5}
+    receipt = await runtime.receive(body)
+
+    async with unit_of_work_factory() as unit_of_work:
+        received = await unit_of_work.commands.get_by_command_id(receipt.command_id)
+    assert received is not None and received.priority == 0
+
+    untrusted_priority = command_body(account_id, clock, command_type="threads.browser.feed.browse")
+    untrusted_priority["priority"] = 100
+    with pytest.raises(CommandInputError, match="INVALID_ENVELOPE"):
+        await runtime.receive(untrusted_priority)
 
 
 async def test_account_execution_lease_has_one_owner_and_fences_reclaim(

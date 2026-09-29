@@ -2,7 +2,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -48,6 +48,12 @@ class ActivityPriority(StrEnum):
             return {-100: cls.LOW, 0: cls.NORMAL, 100: cls.HIGH}[priority]
         except KeyError as error:
             raise ValueError(f"unsupported WorkerJob activity priority: {priority}") from error
+
+
+class ScheduledActivityMaterializationStatus(StrEnum):
+    PENDING = "PENDING"
+    MATERIALIZED = "MATERIALIZED"
+    NON_MATERIALIZABLE = "NON_MATERIALIZABLE"
 
 
 _PLAN_TRANSITIONS: frozenset[tuple[AccountActivityPlanStatus, AccountActivityPlanStatus]] = (
@@ -174,6 +180,12 @@ class ScheduledActivity:
     id: UUID = field(default_factory=uuid4)
     creation_reason: str | None = None
     created_at: datetime = field(default_factory=utc_now)
+    materialization_status: ScheduledActivityMaterializationStatus = (
+        ScheduledActivityMaterializationStatus.PENDING
+    )
+    command_id: str | None = None
+    materialization_at: datetime | None = None
+    materialization_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.plan_revision < 1 or self.template_revision < 1:
@@ -224,6 +236,74 @@ class ScheduledActivity:
                     self.creation_reason, "activity creation reason", MAX_ACTIVITY_REASON_LENGTH
                 ),
             )
+        object.__setattr__(
+            self,
+            "materialization_status",
+            ScheduledActivityMaterializationStatus(self.materialization_status),
+        )
+        if self.command_id is not None:
+            object.__setattr__(
+                self,
+                "command_id",
+                _bounded_text(self.command_id, "materialized command id", 255),
+            )
+        if self.materialization_at is not None:
+            object.__setattr__(self, "materialization_at", normalize_utc(self.materialization_at))
+        if self.materialization_reason is not None:
+            object.__setattr__(
+                self,
+                "materialization_reason",
+                _bounded_text(
+                    self.materialization_reason,
+                    "materialization reason",
+                    MAX_ACTIVITY_REASON_LENGTH,
+                ),
+            )
+        if self.materialization_status is ScheduledActivityMaterializationStatus.PENDING:
+            if any(
+                value is not None
+                for value in (self.command_id, self.materialization_at, self.materialization_reason)
+            ):
+                raise ValueError("pending scheduled activity cannot have a materialization outcome")
+        elif self.materialization_status is ScheduledActivityMaterializationStatus.MATERIALIZED:
+            if self.command_id is None or self.materialization_at is None:
+                raise ValueError(
+                    "materialized scheduled activity requires command id and timestamp"
+                )
+            if self.materialization_reason is not None:
+                raise ValueError(
+                    "materialized scheduled activity cannot have a materialization reason"
+                )
+        elif (
+            self.command_id is not None
+            or self.materialization_at is None
+            or self.materialization_reason is None
+        ):
+            raise ValueError(
+                "non-materializable scheduled activity requires timestamp and reason only"
+            )
+
+    def mark_materialized(self, command_id: str, at: datetime) -> ScheduledActivity:
+        if self.materialization_status is not ScheduledActivityMaterializationStatus.PENDING:
+            raise ValueError("scheduled activity is no longer pending materialization")
+        return replace(
+            self,
+            command_id=_bounded_text(command_id, "materialized command id", 255),
+            materialization_at=normalize_utc(at),
+            materialization_status=ScheduledActivityMaterializationStatus.MATERIALIZED,
+        )
+
+    def mark_non_materializable(self, reason: str, at: datetime) -> ScheduledActivity:
+        if self.materialization_status is not ScheduledActivityMaterializationStatus.PENDING:
+            raise ValueError("scheduled activity is no longer pending materialization")
+        return replace(
+            self,
+            materialization_at=normalize_utc(at),
+            materialization_reason=_bounded_text(
+                reason, "materialization reason", MAX_ACTIVITY_REASON_LENGTH
+            ),
+            materialization_status=ScheduledActivityMaterializationStatus.NON_MATERIALIZABLE,
+        )
 
     @classmethod
     def from_plan_template(

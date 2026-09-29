@@ -31,6 +31,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from threads_platform.domain.account_activities import (
     AccountActivityPlanStatus,
     ActivityPriority,
+    ScheduledActivityMaterializationStatus,
 )
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.accounts import AccountExecutionMode, AccountStatus, CredentialStatus
@@ -167,6 +168,7 @@ class CommandRecord(Base):
         UniqueConstraint("command_id", name="uq_commands_command_id"),
         Index("ix_commands_status_deadline", "status", "deadline_at"),
         Index("ix_commands_execution_lease", "status", "execution_lease_expires_at"),
+        CheckConstraint("priority IN (-100, 0, 100)", name="ck_commands_priority"),
         CheckConstraint(
             "(execution_lease_token IS NULL) = (execution_lease_expires_at IS NULL)",
             name="ck_commands_execution_lease_pair",
@@ -177,6 +179,9 @@ class CommandRecord(Base):
     command_id: Mapped[str] = mapped_column(String(255), nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
     protocol_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     account_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
     )
@@ -729,6 +734,20 @@ class ScheduledActivityRecord(Base):
             "priority IN ('LOW', 'NORMAL', 'HIGH')",
             name="ck_scheduled_activities_priority",
         ),
+        CheckConstraint(
+            "materialization_status IN ('PENDING', 'MATERIALIZED', 'NON_MATERIALIZABLE')",
+            name="ck_scheduled_activities_materialization_status",
+        ),
+        CheckConstraint(
+            "(materialization_status = 'PENDING' AND command_id IS NULL "
+            "AND materialization_at IS NULL AND materialization_reason IS NULL) OR "
+            "(materialization_status = 'MATERIALIZED' AND command_id IS NOT NULL "
+            "AND materialization_at IS NOT NULL AND materialization_reason IS NULL) OR "
+            "(materialization_status = 'NON_MATERIALIZABLE' AND command_id IS NULL "
+            "AND materialization_at IS NOT NULL AND materialization_reason IS NOT NULL "
+            "AND length(materialization_reason) > 0)",
+            name="ck_scheduled_activities_materialization_state",
+        ),
         ForeignKeyConstraint(
             ["account_id", "plan_id"],
             ["account_activity_plans.account_id", "account_activity_plans.id"],
@@ -754,7 +773,19 @@ class ScheduledActivityRecord(Base):
             ondelete="RESTRICT",
             name="fk_scheduled_activities_template_revision",
         ),
+        ForeignKeyConstraint(
+            ["command_id"],
+            ["commands.command_id"],
+            ondelete="RESTRICT",
+            name="fk_scheduled_activities_command",
+        ),
+        UniqueConstraint("command_id", name="uq_scheduled_activities_command_id"),
         Index("ix_scheduled_activities_account_due", "account_id", "due_at"),
+        Index(
+            "ix_scheduled_activities_materialization_due",
+            "materialization_status",
+            "due_at",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -777,6 +808,17 @@ class ScheduledActivityRecord(Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     creation_reason: Mapped[str | None] = mapped_column(String(240))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    materialization_status: Mapped[ScheduledActivityMaterializationStatus] = mapped_column(
+        enum_type(
+            ScheduledActivityMaterializationStatus,
+            "scheduled_activity_materialization_status",
+        ),
+        nullable=False,
+        server_default=text("'PENDING'"),
+    )
+    command_id: Mapped[str | None] = mapped_column(String(255))
+    materialization_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    materialization_reason: Mapped[str | None] = mapped_column(String(240))
 
 
 class SyncStateRecord(Base):
