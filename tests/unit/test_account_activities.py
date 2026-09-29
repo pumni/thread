@@ -303,7 +303,10 @@ def test_occurrence_keeps_immutable_plan_and_template_revision_snapshots() -> No
 
     plan.transition(
         AccountActivityPlanStatus.PAUSED,
-        datetime(2026, 9, 29, 13, tzinfo=UTC),
+        max(
+            datetime(2026, 9, 29, 13, tzinfo=UTC),
+            plan.updated_at + timedelta(microseconds=1),
+        ),
         reason="operator pause",
     )
     updated_template = _template(
