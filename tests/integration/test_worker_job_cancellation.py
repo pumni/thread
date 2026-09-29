@@ -139,9 +139,9 @@ async def _running_activity_job(
     )
     async with unit_of_work_factory() as unit_of_work:
         await unit_of_work.accounts.add(account)
+        await unit_of_work.workers.add(worker)
         await unit_of_work.browser_profiles.add(profile)
         await unit_of_work.assignments.add(assignment)
-        await unit_of_work.workers.add(worker)
         await unit_of_work.worker_capabilities.replace_for_worker(
             worker_id,
             [WorkerCapability(worker_id, capability, 1, advertised_at=clock.now())],
