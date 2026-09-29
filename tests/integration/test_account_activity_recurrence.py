@@ -34,6 +34,7 @@ from threads_platform.domain.account_activities import (
 )
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
 from threads_platform.domain.capabilities import RouteTarget
+from threads_platform.domain.commands import CommandStatus
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
@@ -46,11 +47,15 @@ from threads_platform.infrastructure.persistence.database import (
     create_session_factory,
 )
 from threads_platform.infrastructure.persistence.models import (
+    CommandRecord,
     CommandRouteDecisionRecord,
+    OutboxEventRecord,
+    ScheduledActivityRecord,
     WorkerJobRecord,
 )
 from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyAccountActivityRecurrenceStateRepository,
+    SQLAlchemyScheduledActivityRepository,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
@@ -65,6 +70,7 @@ async def _create_fixed_interval_template(
     anchor_at: datetime,
     interval_seconds: int = 3_600,
     activity_type: str = _FEED_CAPABILITY,
+    priority: ActivityPriority = ActivityPriority.NORMAL,
 ) -> tuple[ThreadsAccount, AccountActivityPlan, AccountActivityTemplate]:
     account = ThreadsAccount(
         threads_user_id=f"recurrence-{uuid4()}",
@@ -83,7 +89,7 @@ async def _create_fixed_interval_template(
         name="Recurring feed browse",
         activity_type=activity_type,
         configuration={"max_items": 3},
-        priority=ActivityPriority.NORMAL,
+        priority=priority,
         change_reason="fixed interval test policy",
         created_at=anchor_at,
         recurrence_kind=ActivityRecurrenceKind.FIXED_INTERVAL,
@@ -95,6 +101,40 @@ async def _create_fixed_interval_template(
         await unit_of_work.activity_plans.add(plan)
         await unit_of_work.activity_templates.add_revision(template)
     return account, plan, template
+
+
+async def _assign_online_worker(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    account: ThreadsAccount,
+    *,
+    now: datetime,
+) -> None:
+    worker_id = uuid4()
+    worker = WorkerNode(
+        worker_id=worker_id,
+        display_name="Recurrence test worker",
+        hostname=f"recurrence-host-{worker_id}",
+        platform="windows",
+        agent_version="1.0.0",
+        protocol_version=1,
+        capabilities_schema_version=1,
+        status=WorkerStatus.ONLINE,
+        max_concurrent_jobs=2,
+        last_heartbeat_at=now,
+        presence_expires_at=now + timedelta(hours=1),
+        created_at=now,
+        updated_at=now,
+    )
+    profile = BrowserProfile(worker_id, f"recurrence-profile-{uuid4()}")
+    assignment = AccountWorkerAssignment(account.id, worker_id, profile.profile_ref)
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.workers.add(worker)
+        await unit_of_work.browser_profiles.add(profile)
+        await unit_of_work.assignments.add(assignment)
+        await unit_of_work.worker_capabilities.replace_for_worker(
+            worker_id,
+            [WorkerCapability(worker_id, _FEED_CAPABILITY, 1, advertised_at=now)],
+        )
 
 
 async def _get_cursor(
@@ -446,6 +486,133 @@ async def test_two_generators_racing_one_cursor_create_one_occurrence(
         await second_engine.dispose()
 
 
+async def test_generator_and_materializer_overlap_create_one_command_and_worker_job(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = datetime.now(UTC)
+    account, _, template = await _create_fixed_interval_template(
+        unit_of_work_factory, anchor_at=anchor
+    )
+    await _assign_online_worker(unit_of_work_factory, account, now=anchor)
+
+    second_engine = create_database_engine(os.environ["THREADS_PLATFORM_TEST_DATABASE_URL"])
+    second_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(second_engine))
+    inserted = asyncio.Event()
+    release = asyncio.Event()
+    original_add = SQLAlchemyScheduledActivityRepository.add_if_absent
+
+    async def hold_after_insert(
+        repository: SQLAlchemyScheduledActivityRepository,
+        activity: ScheduledActivity,
+    ) -> ScheduledActivity:
+        stored = await original_add(repository, activity)
+        inserted.set()
+        await release.wait()
+        return stored
+
+    monkeypatch.setattr(
+        SQLAlchemyScheduledActivityRepository,
+        "add_if_absent",
+        hold_after_insert,
+    )
+    generator_task: asyncio.Task[list[ScheduledActivity]] | None = None
+    try:
+        generator_task = asyncio.create_task(
+            generate_due_account_activity_occurrences(unit_of_work_factory, now=anchor, limit=1)
+        )
+        await asyncio.wait_for(inserted.wait(), timeout=10)
+
+        # This independent PostgreSQL transaction runs after INSERT but before its commit.
+        # READ COMMITTED must not expose the generator's uncommitted occurrence.
+        concurrent_materialization = await asyncio.wait_for(
+            materialize_due_account_activities(second_factory, now=anchor, limit=1),
+            timeout=10,
+        )
+        assert concurrent_materialization == []
+
+        release.set()
+        generated = await generator_task
+        monkeypatch.undo()
+
+        assert len(generated) == 1
+        assert generated[0].template_id == template.id
+        assert generated[0].template_revision == template.revision
+        assert generated[0].due_at == anchor
+
+        cursor = await _get_cursor(unit_of_work_factory, template)
+        assert cursor.generated_count == 1
+        assert cursor.last_generated_due_at == anchor
+        assert cursor.next_due_at == anchor + timedelta(hours=1)
+
+        follow_up_materialization = await materialize_due_account_activities(
+            unit_of_work_factory, now=anchor, limit=1
+        )
+        assert len(follow_up_materialization) == 1
+        command_id = f"activity:{generated[0].id}"
+        assert follow_up_materialization[0].command_id == command_id
+
+        worker_jobs = WorkerJobService(unit_of_work_factory)
+        runtime = compose_command_runtime(
+            unit_of_work_factory,
+            worker_jobs,
+            threads_api_gateway=FakeThreadsAPI(),
+            threads_access_token_provider=TokenProvider(),
+        ).command_runtime
+        execution = await runtime.process_next(now=anchor)
+        assert execution is not None
+        assert execution.status is CommandStatus.WAITING_EXECUTION
+
+        occurrence_count = await db_session.scalar(
+            select(func.count())
+            .select_from(ScheduledActivityRecord)
+            .where(
+                ScheduledActivityRecord.template_id == template.id,
+                ScheduledActivityRecord.template_revision == template.revision,
+                ScheduledActivityRecord.due_at == anchor,
+            )
+        )
+        command_count = await db_session.scalar(
+            select(func.count())
+            .select_from(CommandRecord)
+            .where(CommandRecord.command_id == command_id)
+        )
+        route_count = await db_session.scalar(
+            select(func.count())
+            .select_from(CommandRouteDecisionRecord)
+            .where(CommandRouteDecisionRecord.command_id == command_id)
+        )
+        worker_job_count = await db_session.scalar(
+            select(func.count())
+            .select_from(WorkerJobRecord)
+            .where(WorkerJobRecord.command_id == command_id)
+        )
+        result_outbox_count = await db_session.scalar(
+            select(func.count())
+            .select_from(OutboxEventRecord)
+            .where(OutboxEventRecord.aggregate_id == command_id)
+        )
+
+        assert occurrence_count == 1
+        assert command_count == 1
+        assert route_count == 1
+        assert worker_job_count == 1
+        # A queued WorkerJob is not a terminal Command result.
+        assert result_outbox_count == 0
+        route = await db_session.scalar(
+            select(CommandRouteDecisionRecord).where(
+                CommandRouteDecisionRecord.command_id == command_id
+            )
+        )
+        assert route is not None and route.target is RouteTarget.WORKER_JOB
+    finally:
+        release.set()
+        if generator_task is not None:
+            await asyncio.gather(generator_task, return_exceptions=True)
+        await second_engine.dispose()
+
+
 async def test_generators_split_distinct_due_states_while_one_cursor_is_locked(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
     monkeypatch: pytest.MonkeyPatch,
@@ -605,6 +772,93 @@ async def test_scheduler_tick_generates_materializes_routes_and_creates_one_work
             .where(
                 CommandRouteDecisionRecord.command_id == command.command_id,
                 CommandRouteDecisionRecord.target == RouteTarget.WORKER_JOB,
+            )
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("priority", "expected_worker_job_priority"),
+    [
+        pytest.param(ActivityPriority.LOW, -100, id="low"),
+        pytest.param(ActivityPriority.NORMAL, 0, id="normal"),
+        pytest.param(ActivityPriority.HIGH, 100, id="high"),
+    ],
+)
+async def test_recurrence_priority_snapshot_reaches_worker_job(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+    priority: ActivityPriority,
+    expected_worker_job_priority: int,
+) -> None:
+    now = datetime.now(UTC)
+    account, _, template = await _create_fixed_interval_template(
+        unit_of_work_factory,
+        anchor_at=now,
+        interval_seconds=900,
+        priority=priority,
+    )
+    await _assign_online_worker(unit_of_work_factory, account, now=now)
+
+    worker_jobs = WorkerJobService(unit_of_work_factory)
+    runtime = compose_command_runtime(
+        unit_of_work_factory,
+        worker_jobs,
+        threads_api_gateway=FakeThreadsAPI(),
+        threads_access_token_provider=TokenProvider(),
+    ).command_runtime
+    result = await run_scheduler_tick(
+        unit_of_work_factory,
+        runtime,
+        worker_jobs,
+        now=now,
+        generation_limit=1,
+        activity_limit=1,
+        command_limit=1,
+        recovery_limit=1,
+    )
+
+    async with unit_of_work_factory() as unit_of_work:
+        occurrences = await unit_of_work.scheduled_activities.list_for_account(account.id)
+        cursor = await unit_of_work.activity_recurrence_states.get(template.id, template.revision)
+        command = (
+            await unit_of_work.commands.get_by_command_id(f"activity:{occurrences[0].id}")
+            if occurrences
+            else None
+        )
+        job = (
+            await unit_of_work.worker_jobs.get_by_command_id(f"activity:{occurrences[0].id}")
+            if occurrences
+            else None
+        )
+
+    assert result.activity_occurrences_generated == 1
+    assert result.activities_materialized == 1
+    assert result.commands_processed == 1
+    assert len(occurrences) == 1
+    assert occurrences[0].priority is priority
+    assert cursor is not None and cursor.generated_count == 1
+    assert command is not None and command.priority == expected_worker_job_priority
+    assert job is not None and job.priority == expected_worker_job_priority
+    assert (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(CommandRouteDecisionRecord)
+            .where(
+                CommandRouteDecisionRecord.command_id == command.command_id,
+                CommandRouteDecisionRecord.target == RouteTarget.WORKER_JOB,
+            )
+        )
+        == 1
+    )
+    assert (
+        await db_session.scalar(
+            select(func.count())
+            .select_from(WorkerJobRecord)
+            .where(
+                WorkerJobRecord.command_id == command.command_id,
+                WorkerJobRecord.priority == expected_worker_job_priority,
             )
         )
         == 1
