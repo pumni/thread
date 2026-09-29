@@ -75,7 +75,8 @@ The poll interval is wakeup latency only; PostgreSQL
 `ScheduledActivity.due_at`, Command state and WorkerJob timing remain
 authoritative. Each tick expires stale Worker presence, generates due
 fixed-interval occurrences, dispatches conversation sync schedules, materializes
-`ScheduledActivity` rows, drains Commands and recovers WorkerJobs.
+`ScheduledActivity` rows, drains Commands, recovers WorkerJobs, then pumps due
+outbox deliveries sequentially.
 Presence expiry affects eligibility for new work only; it does not revoke a
 running lease, cancel work or satisfy preemption. Recurrence supports `NONE`
 and UTC anchored `FIXED_INTERVAL` only; details and pause/disable semantics are in
@@ -89,6 +90,15 @@ interval and independent per-tick bounds:
 - `THREADS_PLATFORM_SCHEDULER_ACTIVITY_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_COMMAND_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_RECOVERY_BATCH_LIMIT` (default 50; 1–100)
+- `THREADS_PLATFORM_SCHEDULER_OUTBOX_DELIVERY_BATCH_LIMIT` (default 50; 1–100)
+
+Outbox delivery uses PostgreSQL IntegrationDelivery lease/retry state as its
+authority. A delivery ID is attempted at most once per local tick; multiple
+schedulers can split due deliveries through PostgreSQL claim locking. Delivery
+is at-least-once at the network boundary because a remote success can precede
+local lease finalization. FastAPI does not run an outbox delivery loop. The
+standalone scheduler currently has no production `CRMResultSink`, reports
+`CRM_RESULT_SINK_UNAVAILABLE`, and skips only this stage until #62 is resolved.
 
 WorkerJob recovery and Worker presence expiry require this explicit scheduler
 process; FastAPI performs neither wakeup in its lifespan. The runtime

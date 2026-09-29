@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tests.integration.threads_test_support import FakeThreadsAPI, TokenProvider
 from threads_platform.application.commands.composition import compose_command_runtime
 from threads_platform.application.commands.runtime import CommandRuntime
+from threads_platform.application.crm_protocol_v1 import CRMCommandResultV1
+from threads_platform.application.outbox_delivery import OutboxDeliveryWorker
 from threads_platform.application.scheduler import SchedulerTickResult, run_scheduler_tick
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.domain.account_activities import (
@@ -25,6 +27,7 @@ from threads_platform.domain.account_activities import (
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
 from threads_platform.domain.capabilities import RouteTarget
 from threads_platform.domain.commands import Command, CommandStatus
+from threads_platform.domain.outbox import DeliveryStatus, OutboxStatus
 from threads_platform.domain.worker_jobs import WorkerJobStatus
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
@@ -39,6 +42,7 @@ from threads_platform.infrastructure.persistence.database import (
 )
 from threads_platform.infrastructure.persistence.models import (
     CommandRouteDecisionRecord,
+    IntegrationDeliveryRecord,
     OutboxEventRecord,
     WorkerJobRecord,
 )
@@ -63,6 +67,15 @@ class FixedClock:
 
 class SimulatedProcessCrash(BaseException):
     pass
+
+
+class RecordingCRMResultSink:
+    def __init__(self) -> None:
+        self.results: list[CRMCommandResultV1] = []
+
+    async def deliver_result(self, result: CRMCommandResultV1) -> str | None:
+        self.results.append(result)
+        return f"worker-result-{len(self.results)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -800,6 +813,86 @@ async def test_offline_assigned_worker_keeps_one_queued_job_until_claimable(
     claimed = await worker_jobs.claim_next(fixture.worker_id)
     assert claimed is not None and claimed.command_id == command_id
     assert claimed.status is WorkerJobStatus.RUNNING
+
+
+async def test_terminal_worker_job_result_is_delivered_by_scheduler_outbox_pump(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    fixture = await _create_activity(unit_of_work_factory, now=now)
+    runtime, worker_jobs = _services(unit_of_work_factory, now)
+
+    routed = await run_scheduler_tick(
+        unit_of_work_factory,
+        runtime,
+        worker_jobs,
+        now=now,
+        activity_limit=1,
+        command_limit=1,
+        recovery_limit=1,
+    )
+    command_id = f"activity:{fixture.activity.id}"
+    async with unit_of_work_factory() as unit_of_work:
+        job = await unit_of_work.worker_jobs.get_by_command_id(command_id)
+    assert job is not None
+    claimed = await worker_jobs.claim_next(fixture.worker_id)
+    assert claimed is not None and claimed.lease_token is not None
+    await worker_jobs.complete(
+        claimed.id,
+        fixture.worker_id,
+        claimed.lease_token,
+        {"worker_result": "completed"},
+    )
+
+    sink = RecordingCRMResultSink()
+    delivery_worker = OutboxDeliveryWorker(
+        unit_of_work_factory,
+        sink,
+        clock=FixedClock(now),
+    )
+    delivered = await run_scheduler_tick(
+        unit_of_work_factory,
+        runtime,
+        worker_jobs,
+        now=now,
+        activity_limit=1,
+        command_limit=1,
+        recovery_limit=1,
+        outbox_delivery_worker=delivery_worker,
+        outbox_delivery_limit=1,
+    )
+
+    event = await db_session.scalar(
+        select(OutboxEventRecord).where(OutboxEventRecord.aggregate_id == command_id)
+    )
+    assert event is not None and event.status is OutboxStatus.DELIVERED
+    delivery = await db_session.scalar(
+        select(IntegrationDeliveryRecord).where(IntegrationDeliveryRecord.event_id == event.id)
+    )
+    event_count = await db_session.scalar(
+        select(func.count())
+        .select_from(OutboxEventRecord)
+        .where(OutboxEventRecord.aggregate_id == command_id)
+    )
+    delivery_count = await db_session.scalar(
+        select(func.count())
+        .select_from(IntegrationDeliveryRecord)
+        .where(IntegrationDeliveryRecord.event_id == event.id)
+    )
+    assert delivery is not None and delivery.status is DeliveryStatus.DELIVERED
+    assert event_count == 1
+    assert delivery_count == 1
+    assert routed.commands_processed == 1
+    assert delivered.outbox_deliveries_attempted == 1
+    assert delivered.outbox_deliveries_succeeded == 1
+    assert len(sink.results) == 1
+    result = sink.results[0]
+    assert result.event_id == event.id
+    assert result.command_id == command_id
+    assert result.correlation_id == f"activity-correlation:{fixture.activity.id}"
+    assert result.command_type == _FEED_CAPABILITY
+    assert result.status is CommandStatus.SUCCEEDED
 
 
 async def test_tick_runs_bounded_existing_worker_job_recovery(

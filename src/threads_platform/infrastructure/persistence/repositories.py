@@ -2271,6 +2271,8 @@ class SQLAlchemyIntegrationDeliveryRepository(IntegrationDeliveryRepository):
         now: datetime,
         lease_token: UUID,
         lease_expires_at: datetime,
+        *,
+        exclude_delivery_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[IntegrationDelivery, OutboxEvent] | None:
         due_or_abandoned = or_(
             and_(
@@ -2284,7 +2286,7 @@ class SQLAlchemyIntegrationDeliveryRepository(IntegrationDeliveryRepository):
                 IntegrationDeliveryRecord.lease_expires_at <= now,
             ),
         )
-        result = await self._session.execute(
+        statement = (
             select(IntegrationDeliveryRecord, OutboxEventRecord)
             .join(OutboxEventRecord, OutboxEventRecord.id == IntegrationDeliveryRecord.event_id)
             .where(
@@ -2296,6 +2298,9 @@ class SQLAlchemyIntegrationDeliveryRepository(IntegrationDeliveryRepository):
             .with_for_update(skip_locked=True, of=IntegrationDeliveryRecord)
             .limit(1)
         )
+        if exclude_delivery_ids:
+            statement = statement.where(IntegrationDeliveryRecord.id.not_in(exclude_delivery_ids))
+        result = await self._session.execute(statement)
         row = result.first()
         if row is None:
             return None

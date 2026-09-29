@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     scheduler_activity_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_command_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_recovery_batch_limit: int = Field(default=50, ge=1, le=100)
+    scheduler_outbox_delivery_batch_limit: int = Field(default=50, ge=1, le=100)
     crm_ingress_token: SecretStr | None = None
     worker_admin_token: SecretStr | None = None
     worker_tls_required: bool = True

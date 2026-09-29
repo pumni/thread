@@ -315,6 +315,8 @@ class IntegrationDeliveryRepository(Protocol):
         now: datetime,
         lease_token: UUID,
         lease_expires_at: datetime,
+        *,
+        exclude_delivery_ids: frozenset[UUID] = frozenset(),
     ) -> tuple[IntegrationDelivery, OutboxEvent] | None: ...
 
     async def get_for_update(self, delivery_id: UUID) -> IntegrationDelivery | None: ...

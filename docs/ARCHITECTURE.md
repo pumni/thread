@@ -609,16 +609,17 @@ another and retain the existing deterministic queue tie order. This checkpoint
 does not add NORMAL-over-LOW preemption, fairness, or process/lease-revocation
 cancellation.
 
-### C6-01 PostgreSQL scheduler and recurrence (#53, #56, #58, #60)
+### C6-01 PostgreSQL scheduler and recurrence (#53, #56, #58, #60, #63)
 
 The scheduler runs one bounded tick in this order: expire stale Worker presence,
 generate due recurrence occurrences, dispatch due conversation sync schedules,
 materialize due `ScheduledActivity` rows, drain ready Commands through
 `CommandRuntime` and the Capability Router, then invoke bounded
-`WorkerJobService` recovery. It never constructs WorkerJobs or executes browser
-work directly. PostgreSQL `presence_expires_at`, occurrence, schedule, Command,
-and WorkerJob rows remain authoritative. The process loop is a wakeup mechanism
-only; every tick rediscovers work from PostgreSQL after restart.
+`WorkerJobService` recovery, and finally pump due outbox deliveries. It never
+constructs WorkerJobs or executes browser work directly. PostgreSQL
+`presence_expires_at`, occurrence, schedule, Command, WorkerJob, and
+IntegrationDelivery rows remain authoritative. The process loop is a wakeup
+mechanism only; every tick rediscovers work from PostgreSQL after restart.
 
 The explicit process runs as `python -m threads_platform.scheduler`; it is not
 hidden in FastAPI request handling. Ticks run sequentially within a process.
@@ -639,6 +640,20 @@ LOCAL_API handlers are unavailable until that process dependency is resolved;
 the scheduler reports this explicitly and still processes routes supported by
 the configured composition. Presence expiry has an independent per-tick limit
 of 1–100 Workers, default 50.
+
+The outbox pump is a sequential final tick stage with its own batch limit of
+1–100 deliveries (default 50). PostgreSQL `IntegrationDelivery` due/retry state
+and fenced leases determine claims. Each delivery ID is attempted at most once
+per local tick; multiple scheduler processes can claim distinct due deliveries
+through `FOR UPDATE SKIP LOCKED`. Unexpired PROCESSING, DELIVERED, and FAILED_FINAL
+rows do not consume due selection. Existing retry/deadline rules and stale
+lease fencing remain unchanged. Delivery is at-least-once at the network
+boundary: a remote success can precede local DELIVERED finalization and be
+repeated after lease expiry. The stable event identity remains available for
+remote idempotency. FastAPI has no outbox delivery loop. The standalone
+scheduler has no production `CRMResultSink`; it reports
+`CRM_RESULT_SINK_UNAVAILABLE` and skips only delivery until dependency #62
+defines the transport. No migration is required for this checkpoint.
 Recurrence is defined by the immutable `AccountActivityTemplate` revision.
 `NONE` has no anchor or interval. `FIXED_INTERVAL` has a UTC anchor and an
 integer interval from 900 through 2,592,000 seconds; its slots are exactly
