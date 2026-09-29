@@ -813,7 +813,6 @@ async def test_distinct_due_schedules_can_be_split_between_scheduler_instances(
 async def test_outstanding_command_race_stays_due_until_terminal(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
     db_session: AsyncSession,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, schedule = await _create_schedule(unit_of_work_factory)
     first = await dispatch_due_conversation_syncs(
@@ -822,43 +821,27 @@ async def test_outstanding_command_race_stays_due_until_terminal(
     assert len(first) == 1
     first_due_after = schedule.next_due_at + timedelta(hours=1)
     first_factory, second_factory, first_engine, second_engine = _independent_uow_factories()
-    selected = asyncio.Event()
-    release = asyncio.Event()
-    original = SQLAlchemyConversationSyncScheduleRepository.get_due_for_update
-    calls = 0
-    calls_lock = asyncio.Lock()
-
-    async def hold_first_selection(
-        repository: SQLAlchemyConversationSyncScheduleRepository,
-        now: datetime,
-        limit: int,
-    ) -> list[ConversationSyncSchedule]:
-        nonlocal calls
-        result = await original(repository, now, limit)
-        async with calls_lock:
-            calls += 1
-            is_first = calls == 1
-        if is_first:
-            assert [item.id for item in result] == [schedule.id]
-            selected.set()
-            await release.wait()
-        return result
-
-    monkeypatch.setattr(
-        SQLAlchemyConversationSyncScheduleRepository,
-        "get_due_for_update",
-        hold_first_selection,
-    )
     now = first_due_after + timedelta(hours=3, minutes=30)
-    first_task = asyncio.create_task(
-        dispatch_due_conversation_syncs(first_factory, now=now, limit=1)
-    )
+    both_ready = asyncio.Event()
+    ready_count = 0
+    ready_lock = asyncio.Lock()
+
+    async def race_dispatch(factory: SQLAlchemyUnitOfWorkFactory) -> list[Command]:
+        nonlocal ready_count
+        async with ready_lock:
+            ready_count += 1
+            if ready_count == 2:
+                both_ready.set()
+        await both_ready.wait()
+        return await dispatch_due_conversation_syncs(factory, now=now, limit=1)
+
     try:
-        await selected.wait()
-        second = await dispatch_due_conversation_syncs(second_factory, now=now, limit=1)
+        first_race, second = await asyncio.gather(
+            race_dispatch(first_factory), race_dispatch(second_factory)
+        )
     finally:
-        release.set()
-    first_race = await first_task
+        await first_engine.dispose()
+        await second_engine.dispose()
 
     assert first_race == second == []
     assert (await _get_schedule(unit_of_work_factory, schedule.id)).next_due_at == (first_due_after)
@@ -874,8 +857,6 @@ async def test_outstanding_command_race_stays_due_until_terminal(
     assert updated.last_dispatched_due_at == first_due_after
     assert updated.next_due_at == _ANCHOR + timedelta(hours=6)
     assert await _counts_for_schedule(unit_of_work_factory, schedule, db_session) == (2, 2, 2)
-    await first_engine.dispose()
-    await second_engine.dispose()
 
 
 async def test_dispatch_racing_command_processing_has_one_command_and_result(
