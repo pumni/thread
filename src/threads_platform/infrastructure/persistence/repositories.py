@@ -7,6 +7,8 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
+    AccountActivityPlanRepository,
+    AccountActivityTemplateRepository,
     AccountExecutionLeaseRepository,
     AccountRepository,
     AccountWorkerAssignmentRepository,
@@ -20,6 +22,7 @@ from threads_platform.application.ports.repositories import (
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
+    ScheduledActivityRepository,
     SyncStateRepository,
     WorkerAccountSessionRepository,
     WorkerCapabilityRepository,
@@ -28,6 +31,14 @@ from threads_platform.application.ports.repositories import (
     WorkerJobRepository,
     WorkerRepository,
     WorkerSecurityRepository,
+)
+from threads_platform.domain.account_activities import (
+    AccountActivityPlan,
+    AccountActivityPlanStatus,
+    AccountActivityTemplate,
+    ActivityPriority,
+    ScheduledActivity,
+    configuration_document,
 )
 from threads_platform.domain.account_execution import (
     AccountExecutionLease,
@@ -99,6 +110,9 @@ from threads_platform.domain.workers import (
     WorkerStatus,
 )
 from threads_platform.infrastructure.persistence.models import (
+    AccountActivityPlanRecord,
+    AccountActivityTemplateRecord,
+    AccountActivityTemplateRevisionRecord,
     AccountExecutionLeaseRecord,
     AccountRecord,
     AccountWorkerAssignmentRecord,
@@ -120,6 +134,7 @@ from threads_platform.infrastructure.persistence.models import (
     OutboxEventRecord,
     PostRecord,
     ReplyRecord,
+    ScheduledActivityRecord,
     SearchQueryRecord,
     SyncStateRecord,
     WorkerAccountSessionRecord,
@@ -197,6 +212,267 @@ class SQLAlchemyAccountRepository(AccountRepository):
         record.execution_mode = account.execution_mode
         record.updated_at = account.updated_at
         await self._session.flush()
+
+
+class SQLAlchemyAccountActivityPlanRepository(AccountActivityPlanRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, plan: AccountActivityPlan) -> None:
+        self._session.add(self._record(plan))
+        await self._session.flush()
+
+    async def get(self, plan_id: UUID) -> AccountActivityPlan | None:
+        record = await self._session.get(AccountActivityPlanRecord, plan_id)
+        return self._domain(record) if record is not None else None
+
+    async def get_for_update(self, plan_id: UUID) -> AccountActivityPlan | None:
+        record = await self._session.scalar(
+            select(AccountActivityPlanRecord)
+            .where(AccountActivityPlanRecord.id == plan_id)
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def list_for_account(self, account_id: UUID) -> list[AccountActivityPlan]:
+        records = await self._session.scalars(
+            select(AccountActivityPlanRecord)
+            .where(AccountActivityPlanRecord.account_id == account_id)
+            .order_by(AccountActivityPlanRecord.created_at, AccountActivityPlanRecord.id)
+        )
+        return [self._domain(record) for record in records]
+
+    async def update(self, plan: AccountActivityPlan) -> None:
+        record = await self._session.scalar(
+            select(AccountActivityPlanRecord)
+            .where(AccountActivityPlanRecord.id == plan.id)
+            .with_for_update()
+        )
+        if record is None:
+            raise LookupError(f"account activity plan not found: {plan.id}")
+        if record.account_id != plan.account_id:
+            raise ValueError("account activity plan account is immutable")
+        if plan.revision != record.revision + 1:
+            raise ValueError("account activity plan revision is stale or skipped")
+        record.name = plan.name
+        record.status = plan.status
+        record.revision = plan.revision
+        record.status_reason = plan.status_reason
+        record.updated_at = plan.updated_at
+        await self._session.flush()
+
+    @staticmethod
+    def _record(plan: AccountActivityPlan) -> AccountActivityPlanRecord:
+        return AccountActivityPlanRecord(
+            id=plan.id,
+            account_id=plan.account_id,
+            name=plan.name,
+            status=plan.status,
+            revision=plan.revision,
+            status_reason=plan.status_reason,
+            created_at=plan.created_at,
+            updated_at=plan.updated_at,
+        )
+
+    @staticmethod
+    def _domain(record: AccountActivityPlanRecord) -> AccountActivityPlan:
+        return AccountActivityPlan(
+            id=record.id,
+            account_id=record.account_id,
+            name=record.name,
+            status=AccountActivityPlanStatus(record.status),
+            revision=record.revision,
+            status_reason=record.status_reason,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyAccountActivityTemplateRepository(AccountActivityTemplateRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_revision(self, template: AccountActivityTemplate) -> None:
+        identity = await self._session.scalar(
+            select(AccountActivityTemplateRecord)
+            .where(AccountActivityTemplateRecord.id == template.id)
+            .with_for_update()
+        )
+        if identity is None:
+            if template.revision != 1:
+                raise ValueError("first activity template revision must be 1")
+            await self._session.execute(
+                postgres_insert(AccountActivityTemplateRecord)
+                .values(
+                    id=template.id,
+                    account_id=template.account_id,
+                    plan_id=template.plan_id,
+                    created_at=template.created_at,
+                )
+                .on_conflict_do_nothing(index_elements=[AccountActivityTemplateRecord.id])
+            )
+            identity = await self._session.scalar(
+                select(AccountActivityTemplateRecord)
+                .where(AccountActivityTemplateRecord.id == template.id)
+                .with_for_update()
+            )
+        if identity is None:
+            raise RuntimeError("activity template identity insert was not visible")
+        if identity.account_id != template.account_id or identity.plan_id != template.plan_id:
+            raise ValueError("activity template identity cannot change account or plan")
+
+        latest_revision = await self._session.scalar(
+            select(func.max(AccountActivityTemplateRevisionRecord.revision)).where(
+                AccountActivityTemplateRevisionRecord.template_id == template.id
+            )
+        )
+        expected_revision = 1 if latest_revision is None else latest_revision + 1
+        if template.revision != expected_revision:
+            raise ValueError(
+                f"activity template revision must be {expected_revision}, got {template.revision}"
+            )
+
+        self._session.add(
+            AccountActivityTemplateRevisionRecord(
+                template_id=template.id,
+                revision=template.revision,
+                name=template.name,
+                activity_type=template.activity_type,
+                configuration=configuration_document(template.configuration),
+                priority=template.priority,
+                change_reason=template.change_reason,
+                created_at=template.created_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get_revision(
+        self, template_id: UUID, revision: int
+    ) -> AccountActivityTemplate | None:
+        identity = await self._session.get(AccountActivityTemplateRecord, template_id)
+        version = await self._session.get(
+            AccountActivityTemplateRevisionRecord, (template_id, revision)
+        )
+        if identity is None or version is None:
+            return None
+        return self._domain(identity, version)
+
+    async def list_revisions(self, template_id: UUID) -> list[AccountActivityTemplate]:
+        identity = await self._session.get(AccountActivityTemplateRecord, template_id)
+        if identity is None:
+            return []
+        versions = await self._session.scalars(
+            select(AccountActivityTemplateRevisionRecord)
+            .where(AccountActivityTemplateRevisionRecord.template_id == template_id)
+            .order_by(AccountActivityTemplateRevisionRecord.revision)
+        )
+        return [self._domain(identity, version) for version in versions]
+
+    @staticmethod
+    def _domain(
+        identity: AccountActivityTemplateRecord,
+        version: AccountActivityTemplateRevisionRecord,
+    ) -> AccountActivityTemplate:
+        return AccountActivityTemplate(
+            id=identity.id,
+            account_id=identity.account_id,
+            plan_id=identity.plan_id,
+            revision=version.revision,
+            name=version.name,
+            activity_type=version.activity_type,
+            configuration=version.configuration,
+            priority=ActivityPriority(version.priority),
+            change_reason=version.change_reason,
+            created_at=version.created_at,
+        )
+
+
+class SQLAlchemyScheduledActivityRepository(ScheduledActivityRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_if_absent(self, activity: ScheduledActivity) -> ScheduledActivity:
+        values = self._values(activity)
+        await self._session.execute(
+            postgres_insert(ScheduledActivityRecord)
+            .values(**values)
+            .on_conflict_do_nothing(constraint="uq_scheduled_activities_template_revision_due_at")
+        )
+        stored = await self.get_by_identity(*activity.identity)
+        if stored is None:
+            raise RuntimeError("scheduled activity insert was not visible")
+        return stored
+
+    async def get(self, activity_id: UUID) -> ScheduledActivity | None:
+        record = await self._session.get(ScheduledActivityRecord, activity_id)
+        return self._domain(record) if record is not None else None
+
+    async def get_by_identity(
+        self, template_id: UUID, template_revision: int, due_at: datetime
+    ) -> ScheduledActivity | None:
+        record = await self._session.scalar(
+            select(ScheduledActivityRecord).where(
+                ScheduledActivityRecord.template_id == template_id,
+                ScheduledActivityRecord.template_revision == template_revision,
+                ScheduledActivityRecord.due_at == normalize_utc(due_at),
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    async def list_for_account(
+        self, account_id: UUID, *, limit: int = 100
+    ) -> list[ScheduledActivity]:
+        if limit < 1:
+            raise ValueError("scheduled activity limit must be positive")
+        records = await self._session.scalars(
+            select(ScheduledActivityRecord)
+            .where(ScheduledActivityRecord.account_id == account_id)
+            .order_by(ScheduledActivityRecord.due_at, ScheduledActivityRecord.id)
+            .limit(limit)
+        )
+        return [self._domain(record) for record in records]
+
+    @staticmethod
+    def _values(activity: ScheduledActivity) -> dict[str, object]:
+        return {
+            "id": activity.id,
+            "account_id": activity.account_id,
+            "plan_id": activity.plan_id,
+            "plan_revision": activity.plan_revision,
+            "plan_name_snapshot": activity.plan_name_snapshot,
+            "plan_status_snapshot": activity.plan_status_snapshot,
+            "plan_status_reason_snapshot": activity.plan_status_reason_snapshot,
+            "template_id": activity.template_id,
+            "template_revision": activity.template_revision,
+            "template_name_snapshot": activity.template_name_snapshot,
+            "activity_type_snapshot": activity.activity_type_snapshot,
+            "configuration_snapshot": configuration_document(activity.configuration_snapshot),
+            "priority": activity.priority,
+            "due_at": activity.due_at,
+            "creation_reason": activity.creation_reason,
+            "created_at": activity.created_at,
+        }
+
+    @staticmethod
+    def _domain(record: ScheduledActivityRecord) -> ScheduledActivity:
+        return ScheduledActivity(
+            id=record.id,
+            account_id=record.account_id,
+            plan_id=record.plan_id,
+            plan_revision=record.plan_revision,
+            plan_name_snapshot=record.plan_name_snapshot,
+            plan_status_snapshot=AccountActivityPlanStatus(record.plan_status_snapshot),
+            plan_status_reason_snapshot=record.plan_status_reason_snapshot,
+            template_id=record.template_id,
+            template_revision=record.template_revision,
+            template_name_snapshot=record.template_name_snapshot,
+            activity_type_snapshot=record.activity_type_snapshot,
+            configuration_snapshot=record.configuration_snapshot,
+            priority=ActivityPriority(record.priority),
+            due_at=record.due_at,
+            creation_reason=record.creation_reason,
+            created_at=record.created_at,
+        )
 
 
 class SQLAlchemyAccountExecutionLeaseRepository(AccountExecutionLeaseRepository):

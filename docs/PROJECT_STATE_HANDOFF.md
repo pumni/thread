@@ -35,7 +35,8 @@ checkpoints. PR #43's `threads.browser.media.local_upload` v1 is accepted and
 merged at `59f3d2cf5589b4bdb052b404d58babb0dda7a3e4`, DONE for its checkpoint,
 and available only through the reviewed, bounded, account-affine WorkerJob
 path with explicit worker opt-in. Issue #27 is CLOSED / COMPLETED; all four
-C5-01 capability acceptance criteria are satisfied. #28 remains unauthorized.
+C5-01 capability acceptance criteria are satisfied. At that checkpoint #28
+was not yet authorized; issue #45 later authorized C5-02/1 only.
 
 The coordinator accepted production UI evidence for
 `threads.browser.thread.open` on 2026-09-28, and PR #40 accepted and merged its
@@ -81,13 +82,17 @@ selection require `AMBIGUOUS_OUTCOME`; the file is never selected again.
 WorkerJobs are non-preemptible and use `RECONCILIATION_REQUIRED`. Video fails
 closed. The capability does not publish or submit, and Remove is not a
 rollback. Worker opt-in defaults off. Synthetic fixtures test the reviewed
-contracts but are not production evidence. #28 remains unauthorized;
-LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond this
-bounded staging capability, and publish/submit remains outside scope.
+contracts but are not production evidence. Issue #45 authorizes only the
+C5-02/1 durable foundation; LIKE/FOLLOW remain VERIFY. No browser mutation is
+authorized beyond this bounded staging capability, and publish/submit remains
+outside scope.
 
-Do not start C5-02 AccountActivityPlan/preemption, C6 scheduling/operations, or
-production release work until the coordinator explicitly authorizes the
-corresponding checkpoint.
+Issue #45 explicitly authorizes C5-02 Checkpoint 1 for the durable
+AccountActivityPlan, versioned template, ScheduledActivity occurrence, and
+priority foundation. That authorization excludes a due runner, occurrence to
+Command materialization, Worker execution changes, cancellation, and
+preemption. Later C5-02 execution/preemption, C6 scheduling/operations, and
+production release work still require their own authorization.
 
 ## 3. Important merged checkpoints
 
@@ -275,7 +280,9 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
    capability uses the bounded account-affine WorkerJob path with explicit
    worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
-6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
+6. Keep issue #45 limited to C5-02/1's durable foundation. Runner,
+   Command-materialization, cancellation, Worker, and preemption work under #28
+   still needs separate authorization.
 
 Do not guess production Threads selectors from synthetic fixtures. Any production UI contract must be based on reviewed observed UI evidence and must fail closed when the contract does not match.
 
@@ -311,6 +318,6 @@ and reports uncertain post-selection outcomes as `AMBIGUOUS_OUTCOME`. It is
 non-preemptible, uses reconciliation-required retry safety, and never publishes,
 submits, or removes the staged image. Worker opt-in defaults off. Issue #27 is
 CLOSED / COMPLETED after all C5-01 acceptance criteria were satisfied.
-Synthetic fixtures are not production evidence. #28 remains unauthorized;
-LIKE/FOLLOW remain VERIFY. No additional mutation or publish/submit scope is
-authorized.
+Synthetic fixtures are not production evidence. Issue #45 authorizes only the
+C5-02/1 durable foundation; LIKE/FOLLOW remain VERIFY. No additional mutation
+or publish/submit scope is authorized.

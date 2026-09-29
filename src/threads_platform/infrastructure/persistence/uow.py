@@ -6,6 +6,8 @@ from typing import cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from threads_platform.application.ports.repositories import (
+    AccountActivityPlanRepository,
+    AccountActivityTemplateRepository,
     AccountExecutionLeaseRepository,
     AccountRepository,
     AccountWorkerAssignmentRepository,
@@ -19,6 +21,7 @@ from threads_platform.application.ports.repositories import (
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
+    ScheduledActivityRepository,
     SyncStateRepository,
     WorkerAccountSessionRepository,
     WorkerCapabilityRepository,
@@ -29,6 +32,8 @@ from threads_platform.application.ports.repositories import (
     WorkerSecurityRepository,
 )
 from threads_platform.infrastructure.persistence.repositories import (
+    SQLAlchemyAccountActivityPlanRepository,
+    SQLAlchemyAccountActivityTemplateRepository,
     SQLAlchemyAccountExecutionLeaseRepository,
     SQLAlchemyAccountRepository,
     SQLAlchemyAccountWorkerAssignmentRepository,
@@ -42,6 +47,7 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyOutboxEventRepository,
     SQLAlchemyPostRepository,
     SQLAlchemyReplyRepository,
+    SQLAlchemyScheduledActivityRepository,
     SQLAlchemySyncStateRepository,
     SQLAlchemyWorkerAccountSessionRepository,
     SQLAlchemyWorkerCapabilityRepository,
@@ -57,6 +63,15 @@ class SQLAlchemyUnitOfWork:
     def __init__(self, session_factory: Callable[[], AsyncSession]) -> None:
         self._session = session_factory()
         self.accounts: AccountRepository = SQLAlchemyAccountRepository(self._session)
+        self.activity_plans: AccountActivityPlanRepository = (
+            SQLAlchemyAccountActivityPlanRepository(self._session)
+        )
+        self.activity_templates: AccountActivityTemplateRepository = (
+            SQLAlchemyAccountActivityTemplateRepository(self._session)
+        )
+        self.scheduled_activities: ScheduledActivityRepository = (
+            SQLAlchemyScheduledActivityRepository(self._session)
+        )
         self.account_execution_leases: AccountExecutionLeaseRepository = (
             SQLAlchemyAccountExecutionLeaseRepository(self._session)
         )

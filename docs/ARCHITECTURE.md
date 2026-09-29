@@ -473,7 +473,8 @@ composer, and uses reconciliation after uncertain file selection. It never
 publishes or submits content. Synthetic contracts verify adapter behavior only
 and are not production evidence. Local media references resolve under the
 Worker Agent's managed `media` directory. Issue #27 is CLOSED / COMPLETED after
-all four C5-01 capability checkpoints were accepted. #28 remains unauthorized.
+all four C5-01 capability checkpoints were accepted. At #27 closure #28 was not
+yet authorized; issue #45 later authorized the durable C5-02/1 foundation only.
 See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the per-capability bounds
 and schemas.
 
@@ -502,6 +503,24 @@ C2 may define operation classes:
 ## 22. Activity/preemption
 
 Account activity is centrally planned.
+
+### C5-02/1 durable foundation (#45)
+
+`AccountActivityPlan` is account-scoped and has `ACTIVE`, `PAUSED`, and
+`DISABLED` states; paused plans can resume and disabled plans are terminal.
+Activity templates are explicit, 16 KiB JSON configuration revisions that
+reject known secret-bearing fields and credential-bearing URLs. A
+`ScheduledActivity` is a durable occurrence that snapshots the
+plan revision and status, template revision and configuration, and semantic
+priority at creation. PostgreSQL enforces uniqueness by
+`(template_id, template_revision, due_at)` and restricts deletion of referenced
+plans and template history.
+
+Activity priorities are `LOW`, `NORMAL`, and `HIGH`, mapped to WorkerJob numeric
+priorities `-100`, `0`, and `100`; existing WorkerJob priority `0` remains
+compatible with `NORMAL`. This checkpoint adds persistence and domain contracts
+only. It does not run due activities, materialize Commands, change WorkerJob
+execution, or implement cancellation or preemption.
 
 Low-priority activities:
 - preemptible=true
