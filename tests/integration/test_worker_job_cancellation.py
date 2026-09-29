@@ -16,6 +16,7 @@ import threads_platform.application.worker_jobs as worker_jobs_module
 from threads_platform.application.account_activity_materialization import (
     materialize_due_account_activities,
 )
+from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.ports.repositories import UnitOfWork
 from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
 from threads_platform.domain.account_activities import (
@@ -41,9 +42,13 @@ from threads_platform.domain.workers import (
 )
 from threads_platform.infrastructure.persistence.database import create_database_engine
 from threads_platform.infrastructure.persistence.models import (
+    CommandAttemptRecord,
+    CommandRouteDecisionRecord,
     IntegrationDeliveryRecord,
     OutboxEventRecord,
+    WorkerJobAttemptRecord,
     WorkerJobCancelRequestRecord,
+    WorkerJobRecord,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
@@ -351,6 +356,81 @@ async def test_acknowledgement_atomically_cancels_job_attempt_command_and_outbox
             generation=request.generation,
             checkpoint_phase=phase,
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_process_treats_cancelled_activity_command_as_terminal_noop(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    request = await _cancel_request(scenario)
+    await scenario.service.checkpoint(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        {"phase": "BEFORE_NAVIGATION"},
+    )
+    await scenario.service.acknowledge_cancel(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        cancel_request_id=request.id,
+        generation=request.generation,
+        checkpoint_phase="BEFORE_NAVIGATION",
+    )
+
+    async with unit_of_work_factory() as unit_of_work:
+        cancelled = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+    assert cancelled is not None and cancelled.status is CommandStatus.CANCELLED
+
+    async def persistent_counts() -> tuple[int | None, ...]:
+        return (
+            await db_session.scalar(
+                select(func.count())
+                .select_from(WorkerJobRecord)
+                .where(WorkerJobRecord.command_id == scenario.command_id)
+            ),
+            await db_session.scalar(
+                select(func.count())
+                .select_from(WorkerJobAttemptRecord)
+                .where(WorkerJobAttemptRecord.worker_job_id == scenario.job_id)
+            ),
+            await db_session.scalar(
+                select(func.count())
+                .select_from(CommandRouteDecisionRecord)
+                .where(CommandRouteDecisionRecord.command_id == scenario.command_id)
+            ),
+            await db_session.scalar(
+                select(func.count())
+                .select_from(CommandAttemptRecord)
+                .where(CommandAttemptRecord.command_id == scenario.command_id)
+            ),
+            await db_session.scalar(
+                select(func.count())
+                .select_from(OutboxEventRecord)
+                .where(OutboxEventRecord.aggregate_id == scenario.command_id)
+            ),
+        )
+
+    counts_before = await persistent_counts()
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=scenario.service,
+    )
+    result = await runtime.process(scenario.command_id)
+    idle = await runtime.process_next()
+
+    assert result.status is CommandStatus.CANCELLED
+    assert result.executed is False
+    assert idle is None
+    async with unit_of_work_factory() as unit_of_work:
+        unchanged = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+    assert unchanged is not None and unchanged.status is CommandStatus.CANCELLED
+    assert await persistent_counts() == counts_before
 
 
 @pytest.mark.parametrize(

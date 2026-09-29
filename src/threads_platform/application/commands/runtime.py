@@ -852,5 +852,6 @@ class CommandRuntime:
                 CommandStatus.REJECTED,
                 CommandStatus.EXPIRED,
                 CommandStatus.FAILED_FINAL,
+                CommandStatus.CANCELLED,
             }
         )
