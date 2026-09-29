@@ -34,7 +34,7 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
         "threads.browser.feed.browse": ("READ", True, "BrowserFeedResultV1"),
         "threads.browser.thread.open": ("READ", True, "BrowserTargetOpenResultV1"),
         "threads.browser.profile.open": ("READ", True, "BrowserTargetOpenResultV1"),
-        "threads.browser.media.local_upload": ("MUTATION", True, "BrowserMediaStageResultV1"),
+        "threads.browser.media.local_upload": ("MUTATION", False, "BrowserMediaStageResultV1"),
     }
     assert {contract.name for contract in BROWSER_CAPABILITY_CONTRACTS} == set(expected)
 
@@ -52,31 +52,13 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
         assert contract.preemptible is preemptible
         assert contract.result_schema == result_schema
         assert contract.result_schema_version == 1
-        expected_status = (
-            BrowserCapabilityStatus.AVAILABLE
-            if contract.name
-            in {
-                "threads.browser.feed.browse",
-                "threads.browser.thread.open",
-                "threads.browser.profile.open",
-            }
-            else BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE
-        )
-        expected_block = (
-            None
-            if expected_status is BrowserCapabilityStatus.AVAILABLE
-            else "BROWSER_UI_EVIDENCE_REQUIRED"
-        )
-        assert contract.status is expected_status
-        assert contract.blocked_reason_code == expected_block
+        assert contract.status is BrowserCapabilityStatus.AVAILABLE
+        assert contract.blocked_reason_code is None
         assert contract.required_session_state.value == "AUTHENTICATED"
-        assert contract.irreversible_boundary is False
-        if contract.name in {
-            "threads.browser.feed.browse",
-            "threads.browser.thread.open",
-            "threads.browser.profile.open",
-        }:
-            assert "REMOTE_STATE_UNCERTAIN" in contract.intervention_types
+        assert contract.irreversible_boundary is (
+            contract.name == "threads.browser.media.local_upload"
+        )
+        assert "REMOTE_STATE_UNCERTAIN" in contract.intervention_types
         if contract.name == "threads.browser.thread.open":
             assert contract.safe_checkpoints == ("BEFORE_NAVIGATION", "THREAD_READY")
             assert contract.max_duration_seconds == 30
@@ -91,10 +73,9 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
         assert policy is not None
         assert policy.worker_capability_name == contract.name
         assert policy.blocked_reason_code == contract.blocked_reason_code
-        browser_mode_allowed = expected_status is BrowserCapabilityStatus.AVAILABLE
         assert (
             router.worker_execution_allowed(contract.name, AccountExecutionMode.BROWSER_ONLY)
-            is browser_mode_allowed
+            is True
         )
         for mode in AccountExecutionMode:
             decision = router.decide(
@@ -104,10 +85,7 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
                 mode,
                 evidence,
             )
-            if expected_status is BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE:
-                assert decision.target is RouteTarget.UNSUPPORTED
-                assert decision.reason_code == "BROWSER_UI_EVIDENCE_REQUIRED"
-            elif mode in {AccountExecutionMode.BROWSER_ONLY, AccountExecutionMode.HYBRID}:
+            if mode in {AccountExecutionMode.BROWSER_ONLY, AccountExecutionMode.HYBRID}:
                 assert decision.target is RouteTarget.WORKER_JOB
             elif mode is AccountExecutionMode.MANUAL:
                 assert decision.target is RouteTarget.WAITING_INTERVENTION
@@ -126,7 +104,29 @@ def test_c5_contracts_are_typed_versioned_with_evidence_backed_capabilities_avai
         }
     )
     assert contracts["threads.browser.media.local_upload"].allowed_failure_codes == (
-        COMMON_FAILURES | {"MEDIA_FILE_REJECTED", "MEDIA_UPLOAD_FAILED"}
+        COMMON_FAILURES
+        | {
+            "BROWSER_SESSION_UNAVAILABLE",
+            "BROWSER_NETWORK_ROUTE_UNSUPPORTED",
+            "UNSUPPORTED_BROWSER_CAPABILITY",
+            "WORKER_JOB_INPUT_INVALID",
+            "WORKER_JOB_RETRY_SAFETY_MISMATCH",
+            "MEDIA_FILE_UNAVAILABLE",
+            "MEDIA_FILE_REJECTED",
+            "MEDIA_FILE_TOO_LARGE",
+        }
+    )
+    media = contracts["threads.browser.media.local_upload"]
+    assert media.allowed_upload_extensions == frozenset({".jpg", ".jpeg", ".png", ".webp"})
+    assert media.intervention_types == frozenset(
+        {
+            "LOGIN_REQUIRED",
+            "SESSION_EXPIRED",
+            "CHALLENGE_REQUIRED",
+            "REMOTE_STATE_UNCERTAIN",
+            "AMBIGUOUS_OUTCOME",
+            "OPERATOR_CONFIRMATION_REQUIRED",
+        }
     )
 
 

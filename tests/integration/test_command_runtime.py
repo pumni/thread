@@ -27,11 +27,11 @@ from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.config.settings import Settings
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
-from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass, RouteTarget
+from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
 from threads_platform.domain.commands import AttemptStatus, CommandStatus
 from threads_platform.domain.outbox import DeliveryStatus, OutboxEvent, OutboxStatus
 from threads_platform.domain.publishing import ThreadPost
-from threads_platform.domain.worker_jobs import WorkerJobStatus
+from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
     BrowserProfile,
@@ -748,9 +748,14 @@ async def test_hybrid_router_queues_worker_and_serializes_account_mutations(
             "threads.browser.profile.open",
             {"profile_ref": "/@alice/"},
         ),
+        (
+            "threads.browser.media.local_upload",
+            "threads.browser.media.local_upload",
+            {"media_ref": "image-1.jpg"},
+        ),
     ],
 )
-async def test_browser_read_capability_routes_to_affine_worker_with_bounded_input(
+async def test_browser_capability_routes_to_affine_worker_with_bounded_input(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
     command_type: str,
     capability_name: str,
@@ -819,56 +824,29 @@ async def test_browser_read_capability_routes_to_affine_worker_with_bounded_inpu
     assert job is not None
     assert job.assigned_worker_id == worker_id
     assert job.account_affinity_required is True
-    assert job.preemptible is True
+    expected_preemptible = command_type != "threads.browser.media.local_upload"
+    expected_retry_safety = (
+        WorkerJobRetrySafety.RECONCILIATION_REQUIRED
+        if command_type == "threads.browser.media.local_upload"
+        else WorkerJobRetrySafety.SAFE_TO_RETRY
+    )
+    assert job.preemptible is expected_preemptible
+    assert job.retry_safety is expected_retry_safety
     expected_input = (
         {"max_items": 7}
         if command_type == "threads.browser.feed.browse"
         else {"thread_ref": "/@alice/post/post-7"}
         if command_type == "threads.browser.thread.open"
         else {"profile_ref": "/@alice"}
+        if command_type == "threads.browser.profile.open"
+        else {"media_ref": "image-1.jpg"}
     )
     assert job.input_data == expected_input
     claimed = await worker_jobs.claim_next(worker_id)
     assert claimed is not None
-    assert claimed.preemptible is True
+    assert claimed.preemptible is expected_preemptible
+    assert claimed.retry_safety is expected_retry_safety
     assert claimed.input_data == expected_input
-
-
-@pytest.mark.parametrize(
-    ("command_type", "payload"),
-    [
-        ("threads.browser.media.local_upload", {"media_ref": "image-1.jpg"}),
-    ],
-)
-async def test_c5_without_reviewed_ui_evidence_rejects_before_worker_job_enqueue(
-    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
-    command_type: str,
-    payload: dict[str, object],
-) -> None:
-    clock = FixedClock(datetime.now(UTC))
-    account_id = await add_account(unit_of_work_factory)
-    worker_jobs = WorkerJobService(unit_of_work_factory, clock=clock)
-    runtime = CommandRuntime(
-        unit_of_work_factory,
-        {},
-        clock=clock,
-        worker_job_service=worker_jobs,
-    )
-    raw_command = command_body(account_id, clock, command_type=command_type)
-    raw_command["payload"] = payload
-
-    receipt = await runtime.receive(raw_command)
-    result = await runtime.process(receipt.command_id)
-
-    assert result.status is CommandStatus.REJECTED
-    async with unit_of_work_factory() as unit_of_work:
-        route = await unit_of_work.command_route_decisions.get_latest_for_command(
-            receipt.command_id
-        )
-        assert route is not None
-        assert route.target is RouteTarget.UNSUPPORTED
-        assert route.reason_code == "BROWSER_UI_EVIDENCE_REQUIRED"
-        assert await unit_of_work.worker_jobs.get_by_command_id(receipt.command_id) is None
 
 
 async def test_account_execution_lease_has_one_owner_and_fences_reclaim(

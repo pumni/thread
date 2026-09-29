@@ -4,6 +4,7 @@ import signal
 
 from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
 from threads_platform.infrastructure.worker_agent.identity import WorkerIdentityFileStore
+from threads_platform.infrastructure.worker_agent.local_media import LocalMediaFileResolver
 from threads_platform.infrastructure.worker_agent.local_state import (
     LocalDataRoot,
     LocalProfileDirectoryResolver,
@@ -24,6 +25,11 @@ from threads_platform.workers.feed_browse import (
     FEED_CAPABILITY_NAME,
     FEED_CAPABILITY_VERSION,
     BrowserFeedBrowseWorker,
+)
+from threads_platform.workers.media_local_upload import (
+    MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME,
+    MEDIA_LOCAL_UPLOAD_CAPABILITY_VERSION,
+    BrowserLocalMediaUploadWorker,
 )
 from threads_platform.workers.profile_open import (
     PROFILE_OPEN_CAPABILITY_NAME,
@@ -92,6 +98,17 @@ async def _run() -> None:
             handlers[PROFILE_OPEN_CAPABILITY_NAME] = BrowserProfileOpenWorker(
                 worker_id, client, browser_sessions
             )
+        if (
+            MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME,
+            MEDIA_LOCAL_UPLOAD_CAPABILITY_VERSION,
+        ) in enabled_capabilities:
+            handlers[MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME] = BrowserLocalMediaUploadWorker(
+                worker_id,
+                client,
+                browser_sessions,
+                LocalMediaFileResolver(data_root),
+                state_store,
+            )
         job_handler = BrowserCapabilityJobDispatcher(worker_id, client, handlers)
     agent = WorkerAgent(
         config,
@@ -156,6 +173,10 @@ def enabled_browser_capabilities() -> tuple[tuple[str, int], ...]:
             (
                 _boolean_environment("THREADS_WORKER_PROFILE_OPEN_ENABLED", False),
                 (PROFILE_OPEN_CAPABILITY_NAME, PROFILE_OPEN_CAPABILITY_VERSION),
+            ),
+            (
+                _boolean_environment("THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED", False),
+                (MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME, MEDIA_LOCAL_UPLOAD_CAPABILITY_VERSION),
             ),
         )
         if enabled

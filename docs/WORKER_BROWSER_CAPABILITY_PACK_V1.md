@@ -11,14 +11,17 @@ require explicit worker opt-in via
 (both default false). PR #41's `threads.browser.profile.open` v1 is accepted
 and merged, DONE for its checkpoint, and available only through the same
 account-affine WorkerJob path with explicit opt-in via
-`THREADS_WORKER_PROFILE_OPEN_ENABLED` (default false). `media.local_upload`
-remains `BLOCKED_UI_EVIDENCE`, unavailable to routing and worker advertisement. C3's
-`worker.synthetic` contract remains a local fixture, not production UI evidence.
+`THREADS_WORKER_PROFILE_OPEN_ENABLED` (default false). PR #43's
+`threads.browser.media.local_upload` v1 is accepted and merged, DONE for its
+checkpoint, and available only through the reviewed bounded account-affine
+WorkerJob path with `THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED` (default
+false). C3's `worker.synthetic` contract remains a local fixture, not
+production UI evidence.
 
 The `ui_contract_id` values below are application contract names. The feed and
-thread-open and profile-open version 1 contracts are mapped to their accepted
-semantic evidence; they are not versions reported by Threads. Local media
-remains blocked pending evidence.
+thread-open, profile-open, and image-only local-upload version 1 contracts are
+mapped to their accepted semantic evidence; they are not versions reported by
+Threads.
 
 ## Declared contracts
 
@@ -27,11 +30,37 @@ remains blocked pending evidence.
 | `threads.browser.feed.browse` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, FEED_READY, ITEM_BATCH | `BrowserFeedResultV1`; up to 20 observations, 5 feed iterations, 30 seconds | yes | no | AVAILABLE |
 | `threads.browser.thread.open` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, THREAD_READY | `BrowserTargetOpenResultV1`; one normalized relative Thread permalink, 30 seconds | yes | no | AVAILABLE |
 | `threads.browser.profile.open` v1 | BROWSER_ASSISTED / READ | AUTHENTICATED | BEFORE_NAVIGATION, BEFORE_PROFILE_INSPECTION, PROFILE_READY | `BrowserTargetOpenResultV1`; one normalized relative `/@<username>` path, 30 seconds | yes | no | AVAILABLE |
-| `threads.browser.media.local_upload` v1 | BROWSER_ASSISTED / MUTATION | AUTHENTICATED | BEFORE_LOCAL_STAGE, LOCAL_STAGE_COMPLETE | `BrowserMediaStageResultV1`; image/video kind, bounded byte size, staged flag | yes | no external boundary | BLOCKED_UI_EVIDENCE |
+| `threads.browser.media.local_upload` v1 | BROWSER_ASSISTED / MUTATION | AUTHENTICATED | BEFORE_LOCAL_STAGE, LOCAL_STAGE_COMPLETE | `BrowserMediaStageResultV1`; image kind, bounded byte size, staged flag | no | yes; file selection begins the irreversible upload | AVAILABLE |
 
 The local upload contract permits file selection/staging only. It does not permit
 Publish, Submit, or another irreversible Threads action. Browser-side publishing
 requires a separate reviewed capability and recovery contract.
+
+## Local media upload v1 reviewed contract
+
+The Control Plane accepts only a logical `media_ref`; the assigned Worker
+resolves it beneath its managed media directory. V1 accepts jpg, jpeg, png, and
+webp image files only. Video and all other media fail closed. The command is a
+`MUTATION` with `preemptible=false`, an irreversible boundary around file
+selection, and `RECONCILIATION_REQUIRED` retry safety. A Worker opt-in flag is
+required and defaults to false.
+
+The operator must open the composer before the Worker proceeds. If no composer
+is open, the Worker requests `OPERATOR_CONFIRMATION_REQUIRED` with
+`COMPOSER_OPEN_REQUIRED` before the mutation boundary and does not click a
+Create control. After the operator requeues the job, the Worker proves there is
+exactly one dialog, one textbox, and one page-wide file input associated with
+that dialog before continuing.
+
+The network observer is armed before file selection. Success requires one
+correlated POST to the approved current Threads origin, a pathname matching
+`^/rupload_igphoto/fb_uploader_[0-9]+$`, HTTP 200, and then a
+`img[src^="blob:"]` preview still present in the same composer. A preview
+before the response is not success. Timeout, crash, lease loss, network
+ambiguity, non-200, missing completion, or a mismatched preview after selection
+produces `AMBIGUOUS_OUTCOME`; the Worker never selects the file a second time.
+It does not click Publish, Post, Submit, or Remove. The result contains only
+image kind, byte size, and staged status.
 
 ## Command and result boundary
 
@@ -88,9 +117,9 @@ allowlist is `.jpg`, `.jpeg`, `.png`, `.webp`, `.mp4`, and `.mov`. The source is
 deleted. The resolver returns a worker-local path to infrastructure only; neither
 that path nor file bytes are part of Control Plane payloads or the recovery journal.
 
-This validates local source selection policy only. It does not select a file in a
-Threads composer. That UI step remains blocked until the composer surface has
-reviewed production evidence.
+This validates local source selection policy only. The media.local_upload v1
+Worker accepts only jpg/jpeg/png/webp images; video and other formats fail
+closed before file selection.
 
 ## Session and recovery contract
 
@@ -107,7 +136,9 @@ ambiguous, or over-bound feed association evidence remains a fail-closed
 contract failure. Thread open applies its target path, anchor, author, and text
 checks under the same durable WorkerJob intervention and lease fencing. Profile
 open applies exact-path and bounded-header recognition under the same durable
-WorkerJob intervention and lease fencing. Existing
+WorkerJob intervention and lease fencing. Local media staging uses the durable
+WorkerJob irreversible boundary and lease fencing; once file selection may
+have started, an uncertain result is reconciled rather than retried. Existing
 C3 session reporting and WorkerJob fencing are the required implementation
 paths; these contracts add no alternate session or job journal.
 
@@ -117,15 +148,16 @@ Declared bounded failure codes are `BROWSER_CONTRACT_MISMATCH`,
 `WORKER_JOB_LEASE_LOST`. Feed browsing, thread open, and profile open also allow
 `BROWSER_SESSION_UNAVAILABLE`, `BROWSER_NETWORK_ROUTE_UNSUPPORTED`,
 `UNSUPPORTED_BROWSER_CAPABILITY`, `WORKER_JOB_INPUT_INVALID`, and
-`WORKER_JOB_RETRY_SAFETY_MISMATCH`. Local media staging also declares
-`MEDIA_FILE_REJECTED` and `MEDIA_UPLOAD_FAILED`.
+`WORKER_JOB_RETRY_SAFETY_MISMATCH`. Local media staging additionally declares
+`MEDIA_FILE_UNAVAILABLE`, `MEDIA_FILE_REJECTED`, and `MEDIA_FILE_TOO_LARGE`.
 
 The feed workflow renews the WorkerJob lease before navigation, feed collection,
 and scrolling. Thread and profile open renew before navigation and target
 inspection. These workflows checkpoint only bounded phase codes, and lease loss
 stops all subsequent browser work. Browser timeout or crash does not prove that
-a target is absent. Local media remains evidence-blocked with no executable
-workflow.
+a target is absent. Local media renews the lease before file selection and
+through upload completion; lease loss stops later browser work and yields an
+ambiguous outcome after the irreversible boundary.
 
 ## Accepted feed evidence record
 
@@ -218,14 +250,19 @@ Synthetic fixtures exercise the accepted semantic contracts and their failure
 cases; they are not production evidence that the Threads UI matches those
 contracts.
 
-PR #41's `threads.browser.profile.open` v1 has been accepted and merged.
+PR #41's `threads.browser.profile.open` v1 and PR #43's
+`threads.browser.media.local_upload` v1 have been accepted and merged.
 `threads.browser.feed.browse`, `threads.browser.thread.open`, and
 `threads.browser.profile.open` are DONE for their checkpoints and available
 only through the reviewed bounded account-affine WorkerJob path with explicit
-worker opt-in. `threads.browser.media.local_upload` remains
-`BLOCKED_UI_EVIDENCE`, unrouted and unadvertised; media remains staging-only.
-Synthetic fixtures are not production evidence. LIKE/FOLLOW remain VERIFY. Browser
-Reply/Repost/Share/Create/Post, publish/submit, scheduler, AccountActivityPlan,
-and durable priority preemption remain outside this scope. Issue #27 remains
-OPEN because media.local_upload remains blocked. #28 remains unauthorized;
-no mutation or publish/submit scope is authorized.
+worker opt-in. `threads.browser.media.local_upload` is also DONE for its
+checkpoint and available only through the same bounded account-affine
+WorkerJob path with explicit worker opt-in. It is image-only and stages into an
+operator-opened composer after proving dialog/input association and a correlated
+successful upload response plus same-composer preview. It never publishes,
+submits, or removes staged media. Synthetic fixtures are not production
+evidence. LIKE/FOLLOW remain VERIFY. Browser Reply/Repost/Share/Create/Post,
+publish/submit, scheduler, AccountActivityPlan, and durable priority preemption
+remain outside this scope. Issue #27 remains OPEN pending final coordinator
+closure. #28 remains unauthorized; no additional mutation or publish/submit
+scope is authorized.

@@ -13,7 +13,7 @@ Completed:
 - C3-02 PR #35 — issue #26 accepted and merged.
 - C4 PR #36 — issue #8 accepted and merged.
 
-### Canonical C5-01 state after the profile.open checkpoint is merged
+### Canonical C5-01 state after the media.local_upload checkpoint is merged
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
@@ -22,11 +22,15 @@ DONE for their checkpoints and available only through reviewed, bounded,
 account-affine WorkerJob paths with explicit worker opt-in. PR #41's
 `threads.browser.profile.open` v1 is accepted and merged, DONE for its
 checkpoint, and available only through the same bounded account-affine
-WorkerJob path with explicit worker opt-in. Issue #27 remains **OPEN** because
-`media.local_upload` remains `BLOCKED_UI_EVIDENCE`, unadvertised and unrouted.
-Local media remains staging-only, with no publish/submit. Synthetic fixtures
-are not production evidence. #28 remains unauthorized; LIKE/FOLLOW remain
-VERIFY. No browser mutation or publish/submit scope is authorized.
+WorkerJob path with explicit worker opt-in. PR #43's
+`threads.browser.media.local_upload` v1 is accepted and merged, DONE for its
+checkpoint, and available through the bounded account-affine WorkerJob path
+with explicit worker opt-in. It stages only worker-local jpg/jpeg/png/webp
+files through an operator-opened composer; it does not publish, submit, or
+remove staged content. Issue #27 remains **OPEN** pending final coordinator
+closure. Synthetic fixtures are not production evidence. #28 remains
+unauthorized; LIKE/FOLLOW remain VERIFY. No additional browser mutation or
+publish/submit scope is authorized.
 
 Issue #3 remains a production/release gate.
 
@@ -154,11 +158,13 @@ Issues:
 - PR #41 `threads.browser.profile.open` v1 is accepted and merged, DONE for its
   checkpoint, READ-only, and available through the bounded account-affine
   WorkerJob path with explicit opt-in;
-- `threads.browser.media.local_upload` remains `BLOCKED_UI_EVIDENCE`,
-  unadvertised, and unrouted; local media remains staging-only, with no
-  publish/submit;
-- #28 AccountActivityPlan/priority/preemption — unauthorized pending a separate
-  coordinator decision after the #27 checkpoint review.
+- PR #43 `threads.browser.media.local_upload` v1 is accepted and merged, DONE
+  for its checkpoint, image-only, operator-assisted, and available through the
+  bounded account-affine WorkerJob path with explicit opt-in; it stages media
+  only and never publishes or submits;
+- #27 remains OPEN pending final coordinator closure; #28
+  AccountActivityPlan/priority/preemption remains unauthorized until separately
+  authorized.
 
 Browser capabilities must be explicit and independently reviewable.
 

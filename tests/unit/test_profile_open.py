@@ -63,12 +63,18 @@ def test_profile_worker_advertisement_requires_explicit_opt_in(
         "THREADS_WORKER_FEED_BROWSE_ENABLED",
         "THREADS_WORKER_THREAD_OPEN_ENABLED",
         "THREADS_WORKER_PROFILE_OPEN_ENABLED",
+        "THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED",
     ):
         monkeypatch.delenv(variable, raising=False)
     assert enabled_browser_capabilities() == ()
 
     monkeypatch.setenv("THREADS_WORKER_PROFILE_OPEN_ENABLED", "true")
     assert enabled_browser_capabilities() == ((PROFILE_OPEN_CAPABILITY_NAME, 1),)
+    monkeypatch.setenv("THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED", "true")
+    assert enabled_browser_capabilities() == (
+        (PROFILE_OPEN_CAPABILITY_NAME, 1),
+        ("threads.browser.media.local_upload", 1),
+    )
 
 
 @pytest.mark.asyncio

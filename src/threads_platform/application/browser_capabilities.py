@@ -223,17 +223,36 @@ BROWSER_CAPABILITY_CONTRACTS: tuple[BrowserCapabilityContract, ...] = (
         required_session_state=BrowserSessionState.AUTHENTICATED,
         ui_contract_id="threads.browser.media.local_upload",
         ui_contract_version=1,
-        preemptible=True,
+        preemptible=False,
         safe_checkpoints=("BEFORE_LOCAL_STAGE", "LOCAL_STAGE_COMPLETE"),
         result_schema="BrowserMediaStageResultV1",
         result_schema_version=1,
-        allowed_failure_codes=COMMON_FAILURES | {"MEDIA_FILE_REJECTED", "MEDIA_UPLOAD_FAILED"},
-        intervention_types=SESSION_INTERVENTIONS | {"REMOTE_STATE_UNCERTAIN"},
-        irreversible_boundary=False,
-        status=BrowserCapabilityStatus.BLOCKED_UI_EVIDENCE,
-        blocked_reason_code="BROWSER_UI_EVIDENCE_REQUIRED",
+        allowed_failure_codes=COMMON_FAILURES
+        | {
+            "BROWSER_SESSION_UNAVAILABLE",
+            "BROWSER_NETWORK_ROUTE_UNSUPPORTED",
+            "UNSUPPORTED_BROWSER_CAPABILITY",
+            "WORKER_JOB_INPUT_INVALID",
+            "WORKER_JOB_RETRY_SAFETY_MISMATCH",
+            "MEDIA_FILE_UNAVAILABLE",
+            "MEDIA_FILE_REJECTED",
+            "MEDIA_FILE_TOO_LARGE",
+        },
+        intervention_types=SESSION_INTERVENTIONS
+        | {
+            "REMOTE_STATE_UNCERTAIN",
+            "AMBIGUOUS_OUTCOME",
+            "OPERATOR_CONFIRMATION_REQUIRED",
+        },
+        irreversible_boundary=True,
+        status=BrowserCapabilityStatus.AVAILABLE,
+        blocked_reason_code=None,
         max_upload_bytes=MAX_BROWSER_UPLOAD_BYTES,
-        allowed_upload_extensions=frozenset(BROWSER_MEDIA_EXTENSIONS),
+        allowed_upload_extensions=frozenset(
+            extension
+            for extension, kind in BROWSER_MEDIA_EXTENSIONS.items()
+            if kind is BrowserMediaKind.IMAGE
+        ),
     ),
 )
 

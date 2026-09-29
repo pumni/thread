@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import cast
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -39,6 +39,7 @@ from threads_platform.workers.browser import (
     BrowserContractError,
     BrowserFeedEngineSession,
     BrowserLaunchRequest,
+    BrowserMediaEngineSession,
     BrowserNavigationPolicy,
     BrowserNetworkRouteUnsupported,
     BrowserProcessCrashed,
@@ -78,7 +79,14 @@ def synthetic_redirect_target_requests() -> list[str]:
 
 
 @pytest.fixture
-def synthetic_origin(synthetic_redirect_target_requests: list[str]) -> Iterator[str]:
+def synthetic_upload_count() -> list[int]:
+    return []
+
+
+@pytest.fixture
+def synthetic_origin(
+    synthetic_redirect_target_requests: list[str], synthetic_upload_count: list[int]
+) -> Iterator[str]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
@@ -105,6 +113,9 @@ def synthetic_origin(synthetic_redirect_target_requests: list[str]) -> Iterator[
                     path,
                     _SYNTHETIC_DOCUMENTS.get(path.rstrip("/"), _document("AUTHENTICATED")),
                 )
+            if b"__OTHER_ORIGIN__" in body:
+                other_origin = f"http://localhost:{server.server_address[1]}".encode()
+                body = body.replace(b"__OTHER_ORIGIN__", other_origin)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -113,6 +124,17 @@ def synthetic_origin(synthetic_redirect_target_requests: list[str]) -> Iterator[
                 self.wfile.write(body)
             except OSError:
                 return
+
+        def do_POST(self) -> None:
+            synthetic_upload_count.append(1)
+            time.sleep(0.25)
+            status = 503 if urlsplit(self.path).path.endswith("_503") else 200
+            self.send_response(status)
+            self.send_header("Content-Length", "2")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            self.close_connection = True
 
         def log_message(self, format: str, *args: object) -> None:
             _ = (format, args)
@@ -215,6 +237,167 @@ def test_playwright_redirect_requests_intervention_without_following_target(
         finally:
             await session.close()
         assert synthetic_redirect_target_requests == []
+
+    asyncio.run(scenario())
+
+
+def test_playwright_media_upload_waits_for_matching_response_and_same_dialog_preview(
+    tmp_path: Path,
+    synthetic_origin: str,
+    synthetic_upload_count: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        worker_id, account_id = uuid4(), uuid4()
+        profile_directory = tmp_path / "media-profile"
+        profile_directory.mkdir()
+        file_path = tmp_path / "sample.png"
+        file_path.write_bytes(b"synthetic-image")
+        engine_session = cast(
+            BrowserMediaEngineSession,
+            await PlaywrightBrowserEngine(navigation_timeout_ms=2_000).open(
+                BrowserLaunchRequest(
+                    worker_id=worker_id,
+                    account_id=account_id,
+                    profile_ref="media-profile",
+                    profile_directory=profile_directory,
+                    network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                    headless=True,
+                )
+            ),
+        )
+        page = cast(Any, engine_session)._page  # pyright: ignore[reportPrivateUsage]
+        try:
+            await engine_session.navigate(
+                f"{synthetic_origin}/media-composer",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            composer = await engine_session.prepare_media_composer()
+            assert composer is not None
+            stage = asyncio.create_task(engine_session.stage_local_media(composer, file_path))
+            await page.wait_for_function(
+                "document.querySelector('img')?.getAttribute('src')?.startsWith('blob:')",
+                timeout=2_000,
+            )
+            assert not stage.done()
+            started_at = asyncio.get_running_loop().time()
+            await stage
+            assert asyncio.get_running_loop().time() - started_at >= 0.1
+            assert await page.evaluate("window.unsafeActionCount") == 0
+        finally:
+            await engine_session.close()
+
+    asyncio.run(scenario())
+    assert synthetic_upload_count == [1]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/media-composer-no-response",
+        "/media-composer-duplicate",
+        "/media-composer-non-200",
+        "/media-composer-wrong-method",
+        "/media-composer-off-origin",
+        "/media-composer-extended-path",
+    ],
+)
+def test_playwright_media_upload_requires_one_exact_successful_response(
+    tmp_path: Path,
+    synthetic_origin: str,
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        account_id = uuid4()
+        profile_directory = tmp_path / f"profile-{uuid4()}"
+        profile_directory.mkdir()
+        file_path = tmp_path / "sample.png"
+        file_path.write_bytes(b"synthetic-image")
+        engine_session = cast(
+            BrowserMediaEngineSession,
+            await PlaywrightBrowserEngine(navigation_timeout_ms=300).open(
+                BrowserLaunchRequest(
+                    worker_id=uuid4(),
+                    account_id=account_id,
+                    profile_ref="media-profile",
+                    profile_directory=profile_directory,
+                    network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                    headless=True,
+                )
+            ),
+        )
+        try:
+            await engine_session.navigate(
+                f"{synthetic_origin}{path}",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            composer = await engine_session.prepare_media_composer()
+            assert composer is not None
+            with pytest.raises(MediaUploadFailed):
+                await engine_session.stage_local_media(composer, file_path)
+        finally:
+            await engine_session.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_missing"),
+    [
+        ("/media-no-composer", True),
+        ("/media-multiple-dialogs", False),
+        ("/media-file-input-outside", False),
+        ("/media-unsupported-accept", False),
+    ],
+)
+def test_playwright_media_composer_precondition_is_exact_and_bounded(
+    tmp_path: Path,
+    synthetic_origin: str,
+    path: str,
+    expected_missing: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        account_id = uuid4()
+        profile_directory = tmp_path / f"profile-{uuid4()}"
+        profile_directory.mkdir()
+        engine_session = cast(
+            BrowserMediaEngineSession,
+            await PlaywrightBrowserEngine(navigation_timeout_ms=2_000).open(
+                BrowserLaunchRequest(
+                    worker_id=uuid4(),
+                    account_id=account_id,
+                    profile_ref="media-profile",
+                    profile_directory=profile_directory,
+                    network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                    headless=True,
+                )
+            ),
+        )
+        page = cast(Any, engine_session)._page  # pyright: ignore[reportPrivateUsage]
+        try:
+            await engine_session.navigate(
+                f"{synthetic_origin}{path}",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            if path == "/media-file-input-outside":
+                assert await page.evaluate(
+                    "[document.querySelectorAll('[role=dialog]').length, "
+                    "document.querySelector('[role=dialog]')."
+                    "querySelectorAll('input[type=file]').length, "
+                    "document.querySelectorAll('input[type=file]').length]"
+                ) == [1, 0, 1]
+            if expected_missing:
+                assert await engine_session.prepare_media_composer() is None
+            else:
+                with pytest.raises(BrowserContractError):
+                    await engine_session.prepare_media_composer()
+        finally:
+            await engine_session.close()
 
     asyncio.run(scenario())
 
@@ -1124,6 +1307,21 @@ def _profile_document(body: bytes) -> bytes:
     return b"<!doctype html><html><body>" + body + b"</body></html>"
 
 
+def _media_composer_document(upload_script: bytes) -> bytes:
+    return (
+        b'<!doctype html><html><body><div role="dialog">'
+        b'<div role="textbox" contenteditable="true"></div>'
+        b'<input type="file" accept="image/jpeg,image/png,image/webp">'
+        b'<img><button type="button" onclick="window.unsafeActionCount++">Post</button>'
+        b'<button type="button" onclick="window.unsafeActionCount++">Remove</button>'
+        b"</div><script>window.unsafeActionCount = 0;"
+        b"document.querySelector('input[type=file]').addEventListener('change', (event) => {"
+        b"document.querySelector('img').src = URL.createObjectURL(event.target.files[0]);"
+        + upload_script
+        + b"});</script></body></html>"
+    )
+
+
 _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/authenticated": _document("AUTHENTICATED"),
     "/login": _document("LOGIN_REQUIRED"),
@@ -1223,6 +1421,48 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
         + b"<h1>Public profile</h1>"
         + b"</div>" * 8
         + b"</section>"
+    ),
+    "/media-composer": _media_composer_document(
+        b"fetch('/rupload_igphoto/fb_uploader_123', {method: 'POST'})"
+        b".then((response) => response.arrayBuffer());"
+    ),
+    "/media-composer-no-response": _media_composer_document(b""),
+    "/media-composer-duplicate": _media_composer_document(
+        b"fetch('/rupload_igphoto/fb_uploader_123', {method: 'POST'})"
+        b".then((response) => response.arrayBuffer());"
+        b"fetch('/rupload_igphoto/fb_uploader_123', {method: 'POST'})"
+        b".then((response) => response.arrayBuffer());"
+    ),
+    "/media-composer-non-200": _media_composer_document(
+        b"fetch('/rupload_igphoto/fb_uploader_503', {method: 'POST'})"
+        b".then((response) => response.arrayBuffer());"
+    ),
+    "/media-composer-wrong-method": _media_composer_document(
+        b"fetch('/rupload_igphoto/fb_uploader_123').then((response) => response.arrayBuffer());"
+    ),
+    "/media-composer-off-origin": _media_composer_document(
+        b"fetch('__OTHER_ORIGIN__/rupload_igphoto/fb_uploader_123', {method: 'POST'})"
+        b".then((response) => response.arrayBuffer());"
+    ),
+    "/media-composer-extended-path": _media_composer_document(
+        b"fetch('/rupload_igphoto/fb_uploader_123/extended', {method: 'POST'})"
+        b".then((response) => response.arrayBuffer());"
+    ),
+    "/media-no-composer": b"<!doctype html><html><body></body></html>",
+    "/media-multiple-dialogs": (
+        b'<!doctype html><html><body><div role="dialog"><div role="textbox"></div>'
+        b'<input type="file" accept="image/*"></div><div role="dialog">'
+        b'<div role="textbox"></div><input type="file" accept="image/*"></div>'
+        b"</body></html>"
+    ),
+    "/media-file-input-outside": (
+        b'<!doctype html><html><body><div role="dialog" style="min-height:20px">'
+        b'<div role="textbox" contenteditable="true" style="min-height:20px"></div>'
+        b'</div><input type="file" accept="image/*"></body></html>'
+    ),
+    "/media-unsupported-accept": (
+        b'<!doctype html><html><body><div role="dialog"><div role="textbox"></div>'
+        b'<input type="file" accept="video/*"></div></body></html>'
     ),
 }
 
