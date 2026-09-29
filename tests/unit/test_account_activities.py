@@ -6,10 +6,14 @@ import pytest
 
 from threads_platform.domain.account_activities import (
     MAX_ACTIVITY_CONFIGURATION_BYTES,
+    MAX_ACTIVITY_RECURRENCE_INTERVAL_SECONDS,
+    MIN_ACTIVITY_RECURRENCE_INTERVAL_SECONDS,
     AccountActivityPlan,
     AccountActivityPlanStatus,
+    AccountActivityRecurrenceState,
     AccountActivityTemplate,
     ActivityPriority,
+    ActivityRecurrenceKind,
     ScheduledActivity,
     ScheduledActivityMaterializationStatus,
 )
@@ -120,6 +124,102 @@ def test_activity_template_versions_freeze_and_validate_configuration() -> None:
         first.configuration["new"] = "value"  # type: ignore[index]
     with pytest.raises(TypeError):
         first_options["tags"] = ("changed",)  # type: ignore[index]
+
+
+def test_fixed_interval_template_accepts_exact_bounds_and_normalizes_anchor() -> None:
+    plan = _plan()
+    anchor = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    template = AccountActivityTemplate(
+        account_id=plan.account_id,
+        plan_id=plan.id,
+        name="Browse feed",
+        activity_type="threads.browser.feed.browse",
+        configuration={"max_items": 2},
+        priority=ActivityPriority.NORMAL,
+        change_reason="fixed interval policy",
+        created_at=anchor,
+        recurrence_kind=ActivityRecurrenceKind.FIXED_INTERVAL,
+        anchor_at=anchor,
+        interval_seconds=MIN_ACTIVITY_RECURRENCE_INTERVAL_SECONDS,
+    )
+
+    assert template.recurrence_kind is ActivityRecurrenceKind.FIXED_INTERVAL
+    assert template.anchor_at == anchor
+    assert template.interval_seconds == 900
+
+    maximum = AccountActivityTemplate(
+        account_id=plan.account_id,
+        plan_id=plan.id,
+        name="Open profile",
+        activity_type="threads.browser.profile.open",
+        configuration={"username": "reader"},
+        priority=ActivityPriority.NORMAL,
+        change_reason="maximum interval policy",
+        created_at=anchor,
+        recurrence_kind=ActivityRecurrenceKind.FIXED_INTERVAL,
+        anchor_at=anchor,
+        interval_seconds=MAX_ACTIVITY_RECURRENCE_INTERVAL_SECONDS,
+    )
+    assert maximum.interval_seconds == 2_592_000
+
+
+@pytest.mark.parametrize(
+    ("activity_type", "interval_seconds", "anchor_delta", "kind", "anchor_set"),
+    [
+        ("threads.browser.feed.browse", 899, 0, "FIXED_INTERVAL", True),
+        ("threads.browser.feed.browse", 2_592_001, 0, "FIXED_INTERVAL", True),
+        ("threads.browser.media.local_upload", 900, 0, "FIXED_INTERVAL", True),
+        ("threads.publish_text", 900, 0, "FIXED_INTERVAL", True),
+        ("unknown.activity", 900, 0, "FIXED_INTERVAL", True),
+        ("threads.browser.feed.browse", 900, -1, "FIXED_INTERVAL", True),
+        ("threads.browser.feed.browse", None, 0, "FIXED_INTERVAL", True),
+        ("threads.browser.feed.browse", 900, 0, "NONE", True),
+    ],
+)
+def test_activity_template_rejects_invalid_recurrence(
+    activity_type: str,
+    interval_seconds: int | None,
+    anchor_delta: int,
+    kind: str,
+    anchor_set: bool,
+) -> None:
+    plan = _plan()
+    created_at = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    with pytest.raises(ValueError, match="recurrence|anchor|interval"):
+        AccountActivityTemplate(
+            account_id=plan.account_id,
+            plan_id=plan.id,
+            name="Recurring activity",
+            activity_type=activity_type,
+            configuration={},
+            priority=ActivityPriority.NORMAL,
+            change_reason="test recurrence",
+            created_at=created_at,
+            recurrence_kind=ActivityRecurrenceKind(kind),
+            anchor_at=(created_at + timedelta(seconds=anchor_delta)) if anchor_set else None,
+            interval_seconds=interval_seconds,
+        )
+
+
+def test_recurrence_cursor_uses_exact_interval_arithmetic() -> None:
+    start = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    state = AccountActivityRecurrenceState(
+        template_id=uuid4(),
+        template_revision=1,
+        next_due_at=start,
+        created_at=start,
+        updated_at=start,
+    )
+
+    first = state.advance(3_600, at=start + timedelta(hours=1, minutes=5))
+    second = state.advance(3_600, at=start + timedelta(hours=3, minutes=40))
+
+    assert first == start
+    assert second == start + timedelta(hours=1)
+    assert state.next_due_at == start + timedelta(hours=2)
+    assert state.last_generated_due_at == second
+    assert state.generated_count == 2
+    assert state.updated_at == start + timedelta(hours=3, minutes=40)
 
 
 @pytest.mark.parametrize(

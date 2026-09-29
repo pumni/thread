@@ -31,6 +31,8 @@ class FixedClock:
 
 
 def test_scheduler_runner_config_rejects_invalid_limits_and_poll_interval() -> None:
+    with pytest.raises(ValueError, match="generation_limit"):
+        SchedulerRunnerConfig(generation_limit=0)
     with pytest.raises(ValueError, match="activity_limit"):
         SchedulerRunnerConfig(activity_limit=0)
     with pytest.raises(ValueError, match="command_limit"):
@@ -84,6 +86,7 @@ async def test_runner_executes_tick_then_waits_without_real_sleep() -> None:
     assert tick_calls == [
         {
             "now": now,
+            "generation_limit": 50,
             "activity_limit": 2,
             "command_limit": 3,
             "recovery_limit": 4,

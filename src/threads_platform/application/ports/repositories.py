@@ -6,6 +6,7 @@ from uuid import UUID
 
 from threads_platform.domain.account_activities import (
     AccountActivityPlan,
+    AccountActivityRecurrenceState,
     AccountActivityTemplate,
     ScheduledActivity,
 )
@@ -82,6 +83,27 @@ class AccountActivityTemplateRepository(Protocol):
     ) -> AccountActivityTemplate | None: ...
 
     async def list_revisions(self, template_id: UUID) -> list[AccountActivityTemplate]: ...
+
+    async def get_latest_revision_for_update(
+        self, template_id: UUID
+    ) -> AccountActivityTemplate | None: ...
+
+
+class AccountActivityRecurrenceStateRepository(Protocol):
+    async def add_if_absent(self, state: AccountActivityRecurrenceState) -> None: ...
+
+    async def get(
+        self, template_id: UUID, template_revision: int
+    ) -> AccountActivityRecurrenceState | None: ...
+
+    async def get_next_due_for_update(
+        self,
+        now: datetime,
+        *,
+        exclude: frozenset[tuple[UUID, int]] = frozenset(),
+    ) -> AccountActivityRecurrenceState | None: ...
+
+    async def update(self, state: AccountActivityRecurrenceState) -> None: ...
 
 
 class ScheduledActivityRepository(Protocol):
@@ -497,6 +519,7 @@ class UnitOfWork(Protocol):
     accounts: AccountRepository
     activity_plans: AccountActivityPlanRepository
     activity_templates: AccountActivityTemplateRepository
+    activity_recurrence_states: AccountActivityRecurrenceStateRepository
     scheduled_activities: ScheduledActivityRepository
     commands: CommandRepository
     attempts: CommandAttemptRepository

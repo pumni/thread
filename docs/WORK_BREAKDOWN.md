@@ -170,8 +170,11 @@ Issues:
 - #53 authorizes C6-01/1: a bounded PostgreSQL scheduler kernel for already
   persisted due occurrences, ready Commands through `CommandRuntime`, and
   bounded existing WorkerJob recovery.
+- #56 authorizes C6-01/2: deterministic fixed-interval occurrence generation
+  from immutable AccountActivityTemplate revisions and PostgreSQL cursors.
 - PostgreSQL due state is authoritative; the scheduler loop is wakeup-only.
-  Recurrence generation is deferred to C6-01/2.
+  Generation is bounded separately from materialization, Command draining and
+  WorkerJob recovery.
 
 Browser capabilities must be explicit and independently reviewable.
 
@@ -183,19 +186,25 @@ LIKE/FOLLOW remain VERIFY unless explicitly retained at implementation review.
 
 Issues:
 - #53 C6-01/1 PostgreSQL scheduler kernel for existing due work;
+- #56 C6-01/2 deterministic AccountActivityPlan recurrence generation;
 - #9 later durable scheduler/fleet orchestration checkpoints;
 - #10 observability/security/Windows packaging/deployment.
 
 C6 turns explicit jobs/plans into durable operations and establishes deploy/update/recovery procedures.
-The #53 scheduler processes existing `ScheduledActivity` occurrences only. It
-uses explicit per-tick activity, Command and recovery limits (1–100), supports
-multiple concurrent instances through PostgreSQL row locking, and requires no
-local cursor. AccountActivityPlan recurrence, cron, catch-up and timezone rules
-remain in C6-01/2. The explicit scheduler owns WorkerJob recovery; FastAPI
-retains worker presence expiry but does not recover WorkerJobs in its lifespan.
-FastAPI and scheduler share one CommandRuntime composition. The repository has
-no concrete production `ThreadsAccessTokenProvider` for the standalone process,
-so enabling its LOCAL_API handlers requires a coordinator architecture decision.
+The #53 scheduler owns due materialization, ready Command draining, and
+WorkerJob recovery. #56 adds deterministic recurrence for already-defined
+`AccountActivityTemplate` revisions. PostgreSQL due state and activity-specific
+recurrence cursors are authoritative; the loop only wakes bounded ticks and
+re-discovers state after restart. Fixed intervals use UTC anchors and integer
+seconds, with no cron or timezone grammar. `ACTIVE` and `PAUSED` generate
+occurrences; paused rows remain pending for resume. `DISABLED` generates
+nothing. Only the latest template revision generates, while old occurrence
+snapshots remain immutable. Generation, materialization, Command and recovery
+limits are independently bounded to 1–100 and support concurrent scheduler
+instances through PostgreSQL locking. FastAPI retains worker presence expiry
+but does not recover WorkerJobs in its lifespan. FastAPI and scheduler share
+one CommandRuntime composition. The standalone scheduler's production
+`ThreadsAccessTokenProvider` remains a separate #55/#3 deployment dependency.
 
 ## 10. D — Release
 

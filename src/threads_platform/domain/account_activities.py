@@ -3,7 +3,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 from typing import cast
@@ -48,6 +48,22 @@ class ActivityPriority(StrEnum):
             return {-100: cls.LOW, 0: cls.NORMAL, 100: cls.HIGH}[priority]
         except KeyError as error:
             raise ValueError(f"unsupported WorkerJob activity priority: {priority}") from error
+
+
+class ActivityRecurrenceKind(StrEnum):
+    NONE = "NONE"
+    FIXED_INTERVAL = "FIXED_INTERVAL"
+
+
+MIN_ACTIVITY_RECURRENCE_INTERVAL_SECONDS = 900
+MAX_ACTIVITY_RECURRENCE_INTERVAL_SECONDS = 2_592_000
+RECURRING_ACTIVITY_TYPES = frozenset(
+    {
+        "threads.browser.feed.browse",
+        "threads.browser.thread.open",
+        "threads.browser.profile.open",
+    }
+)
 
 
 class ScheduledActivityMaterializationStatus(StrEnum):
@@ -140,6 +156,9 @@ class AccountActivityTemplate:
     id: UUID = field(default_factory=uuid4)
     revision: int = 1
     created_at: datetime = field(default_factory=utc_now)
+    recurrence_kind: ActivityRecurrenceKind = ActivityRecurrenceKind.NONE
+    anchor_at: datetime | None = None
+    interval_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.revision < 1:
@@ -160,6 +179,32 @@ class AccountActivityTemplate:
         )
         object.__setattr__(self, "configuration", _freeze_configuration(self.configuration))
         object.__setattr__(self, "created_at", normalize_utc(self.created_at))
+        recurrence_kind = ActivityRecurrenceKind(self.recurrence_kind)
+        object.__setattr__(self, "recurrence_kind", recurrence_kind)
+        if recurrence_kind is ActivityRecurrenceKind.NONE:
+            if self.anchor_at is not None or self.interval_seconds is not None:
+                raise ValueError("NONE recurrence cannot have an anchor or interval")
+            return
+
+        if self.activity_type not in RECURRING_ACTIVITY_TYPES:
+            raise ValueError("fixed interval recurrence is not allowed for this activity type")
+        if self.anchor_at is None:
+            raise ValueError("fixed interval recurrence requires an anchor")
+        anchor_at = normalize_utc(self.anchor_at)
+        object.__setattr__(self, "anchor_at", anchor_at)
+        if anchor_at < self.created_at:
+            raise ValueError("recurrence anchor cannot precede template revision creation")
+        if (
+            type(self.interval_seconds) is not int
+            or not MIN_ACTIVITY_RECURRENCE_INTERVAL_SECONDS
+            <= self.interval_seconds
+            <= MAX_ACTIVITY_RECURRENCE_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                "fixed interval recurrence must be between "
+                f"{MIN_ACTIVITY_RECURRENCE_INTERVAL_SECONDS} and "
+                f"{MAX_ACTIVITY_RECURRENCE_INTERVAL_SECONDS} seconds"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +385,52 @@ class ScheduledActivity:
     @property
     def identity(self) -> tuple[UUID, int, datetime]:
         return self.template_id, self.template_revision, self.due_at
+
+
+@dataclass(slots=True)
+class AccountActivityRecurrenceState:
+    template_id: UUID
+    template_revision: int
+    next_due_at: datetime
+    last_generated_due_at: datetime | None = None
+    generated_count: int = 0
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if self.template_revision < 1:
+            raise ValueError("recurrence template revision must be positive")
+        if type(self.generated_count) is not int or self.generated_count < 0:
+            raise ValueError("recurrence generated count must be a non-negative integer")
+        self.next_due_at = normalize_utc(self.next_due_at)
+        if self.last_generated_due_at is not None:
+            self.last_generated_due_at = normalize_utc(self.last_generated_due_at)
+        self.created_at = normalize_utc(self.created_at)
+        self.updated_at = normalize_utc(self.updated_at)
+        if self.updated_at < self.created_at:
+            raise ValueError("recurrence state updated_at cannot precede created_at")
+        if (self.generated_count == 0) != (self.last_generated_due_at is None):
+            raise ValueError("recurrence cursor count and last generated time disagree")
+        if (
+            self.last_generated_due_at is not None
+            and self.next_due_at <= self.last_generated_due_at
+        ):
+            raise ValueError("recurrence next due time must follow the last generated time")
+
+    def advance(self, interval_seconds: int, *, at: datetime) -> datetime:
+        if (
+            type(interval_seconds) is not int
+            or not MIN_ACTIVITY_RECURRENCE_INTERVAL_SECONDS
+            <= interval_seconds
+            <= MAX_ACTIVITY_RECURRENCE_INTERVAL_SECONDS
+        ):
+            raise ValueError("recurrence interval is outside supported bounds")
+        due_at = self.next_due_at
+        self.last_generated_due_at = due_at
+        self.next_due_at = due_at + timedelta(seconds=interval_seconds)
+        self.generated_count += 1
+        self.updated_at = max(self.updated_at, normalize_utc(at))
+        return due_at
 
 
 def configuration_document(configuration: Mapping[str, object]) -> dict[str, object]:
