@@ -110,7 +110,20 @@ acknowledgement at only the accepted safe checkpoints. Cover PostgreSQL
 terminal races, request supersession on failure/intervention/deadline/reclaim,
 restart/reconcile, atomic Command/WorkerJob/Attempt/outbox updates, and Worker
 handlers stopping browser work after acknowledgement. Cancellation is not
-triggered by priority policy in this checkpoint.
+triggered by priority policy in that checkpoint.
+
+For C5-02/4 (#51), verify that only trusted priority-100 Control Plane routing
+creates preemption; the HIGH WorkerJob remains queued until the durable
+preemption relationship is satisfied and the account browser profile is
+quiescent. Cover same-account claim serialization, independent accounts,
+nonbrowser jobs, nonpreemptible media blockers, shared cancellation across
+multiple HIGH jobs, and explicit completion/failure/intervention outcomes.
+Lease expiry is not quiescence: test that the relationship remains unresolved,
+reclaim creates a new attempt and cancellation generation, and the old token
+stays stale. Exercise PostgreSQL HIGH-arrival/claim races, concurrent claims,
+transaction rollback, migration preservation, and downgrade protection. CRM
+protocol v1 remains caller-priority-less; do not add NORMAL-over-LOW
+preemption, fairness, or running-job interruption.
 
 ## 11. Standard quality gate
 

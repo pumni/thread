@@ -16,7 +16,11 @@ from threads_platform.application.worker_notifications import WorkerNotification
 from threads_platform.application.worker_protocol import is_worker_protocol_supported
 from threads_platform.domain.account_activities import ScheduledActivityMaterializationStatus
 from threads_platform.domain.account_execution import AccountExecutionOwnerType
-from threads_platform.domain.capabilities import CapabilityExecutor, OperationClass
+from threads_platform.domain.capabilities import (
+    CapabilityExecutor,
+    OperationClass,
+    RouteTarget,
+)
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.time import normalize_utc
 from threads_platform.domain.worker_jobs import (
@@ -26,6 +30,8 @@ from threads_platform.domain.worker_jobs import (
     WorkerJobAttempt,
     WorkerJobAttemptStatus,
     WorkerJobCancelRequest,
+    WorkerJobPreemption,
+    WorkerJobPreemptionStatus,
     WorkerJobRetrySafety,
     WorkerJobStatus,
 )
@@ -50,6 +56,7 @@ _CANCELLABLE_ACTIVITY_CAPABILITIES = {
     and contract.status is BrowserCapabilityStatus.AVAILABLE
 }
 _CANCEL_REASON_CODE = re.compile(r"^[A-Z0-9_]{1,120}$")
+_BROWSER_PROFILE_CAPABILITY_PREFIX = "threads.browser."
 
 
 class WorkerJobControlError(ValueError):
@@ -165,6 +172,8 @@ class WorkerJobService:
                 raise WorkerJobControlError("COMMAND_NOT_READY_FOR_REMOTE_EXECUTION")
             if command.deadline_at is not None and occurred_at >= command.deadline_at:
                 raise WorkerJobControlError("COMMAND_DEADLINE_EXPIRED")
+            if priority != command.priority:
+                raise WorkerJobControlError("COMMAND_WORKER_JOB_PRIORITY_MISMATCH")
             if account_id is not None and account_id != command.account_id:
                 raise WorkerJobControlError("COMMAND_ACCOUNT_MISMATCH")
             account_id = command.account_id
@@ -213,6 +222,26 @@ class WorkerJobService:
             command.transition(CommandStatus.WAITING_EXECUTION, occurred_at)
             await unit_of_work.commands.update(command)
         await unit_of_work.worker_jobs.add(job)
+        if command is not None and command.priority == 100:
+            route = await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+                command.command_id
+            )
+            if (
+                route is None
+                or route.target is not RouteTarget.WORKER_JOB
+                or route.executor is not CapabilityExecutor.WORKER
+                or route.capability_name != capability_name
+                or route.capability_version != capability_version
+                or route.account_id != command.account_id
+                or route.operation_class is not operation_class
+            ):
+                raise WorkerJobControlError("HIGH_PRIORITY_ROUTE_NOT_TRUSTED")
+            if account_id is None or not affinity_required:
+                raise WorkerJobControlError("HIGH_PRIORITY_ACCOUNT_AFFINITY_REQUIRED")
+            if self._is_browser_profile_worker_job(job):
+                if await unit_of_work.accounts.get_for_update(account_id) is None:
+                    raise WorkerJobControlError("ACCOUNT_NOT_FOUND")
+                await self._arbitrate_high_priority_job(unit_of_work, job, occurred_at)
         if assigned_worker_id is not None:
             notification_worker_ids = (assigned_worker_id,)
         else:
@@ -249,6 +278,10 @@ class WorkerJobService:
             for candidate in candidates:
                 if not await self._account_policy_allows_claim(unit_of_work, candidate, worker_id):
                     continue
+                if not await self._browser_profile_claim_allows(
+                    unit_of_work, candidate, worker, now
+                ):
+                    continue
                 coordination_generation = None
                 if (
                     candidate.account_id is not None
@@ -282,15 +315,15 @@ class WorkerJobService:
                     coordination_generation,
                 )
                 if job is not None:
-                    await unit_of_work.worker_job_attempts.add(
-                        WorkerJobAttempt(
-                            worker_job_id=job.id,
-                            attempt_number=job.attempt_count,
-                            worker_id=worker_id,
-                            lease_token=token,
-                            started_at=now,
-                        )
+                    attempt = WorkerJobAttempt(
+                        worker_job_id=job.id,
+                        attempt_number=job.attempt_count,
+                        worker_id=worker_id,
+                        lease_token=token,
+                        started_at=now,
                     )
+                    await unit_of_work.worker_job_attempts.add(attempt)
+                    await self._request_cancel_for_waiting_preemption(unit_of_work, job, now)
                     break
                 if coordination_generation is not None and candidate.account_id is not None:
                     await unit_of_work.account_execution_leases.release(
@@ -344,26 +377,95 @@ class WorkerJobService:
             raise WorkerJobControlError("CANCEL_REASON_INVALID")
         async with self._unit_of_work_factory() as unit_of_work:
             job = await self._locked_job(unit_of_work, job_id)
-            attempt = await self._validate_cancel_target(unit_of_work, job, occurred_at)
-            pending = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
-                job.id, for_update=True
+            request = await self._request_cancel_in_transaction(
+                unit_of_work, job, reason_code=reason_code, now=occurred_at
             )
-            if pending is not None:
-                if pending.target_attempt_id == attempt.id:
-                    return pending
-                pending.supersede(occurred_at, "TARGET_ATTEMPT_ENDED")
-                await unit_of_work.worker_job_cancel_requests.update(pending)
-            request = WorkerJobCancelRequest(
-                worker_job_id=job.id,
-                generation=(await unit_of_work.worker_job_cancel_requests.latest_generation(job.id))
-                + 1,
-                target_attempt_id=attempt.id,
-                target_attempt_number=attempt.attempt_number,
-                reason_code=reason_code,
-                requested_at=occurred_at,
-            )
-            await unit_of_work.worker_job_cancel_requests.add(request)
         return request
+
+    async def _request_cancel_in_transaction(
+        self,
+        unit_of_work: UnitOfWork,
+        job: WorkerJob,
+        *,
+        reason_code: str,
+        now: datetime,
+    ) -> WorkerJobCancelRequest:
+        if _CANCEL_REASON_CODE.fullmatch(reason_code) is None:
+            raise WorkerJobControlError("CANCEL_REASON_INVALID")
+        attempt = await self._validate_cancel_target(unit_of_work, job, now)
+        pending = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+            job.id, for_update=True
+        )
+        if pending is not None:
+            if pending.target_attempt_id == attempt.id:
+                return pending
+            pending.supersede(now, "TARGET_ATTEMPT_ENDED")
+            await unit_of_work.worker_job_cancel_requests.update(pending)
+        request = WorkerJobCancelRequest(
+            worker_job_id=job.id,
+            generation=(await unit_of_work.worker_job_cancel_requests.latest_generation(job.id))
+            + 1,
+            target_attempt_id=attempt.id,
+            target_attempt_number=attempt.attempt_number,
+            reason_code=reason_code,
+            requested_at=now,
+        )
+        await unit_of_work.worker_job_cancel_requests.add(request)
+        return request
+
+    async def _arbitrate_high_priority_job(
+        self, unit_of_work: UnitOfWork, preemptor: WorkerJob, now: datetime
+    ) -> None:
+        if preemptor.priority != 100 or not self._is_browser_profile_worker_job(preemptor):
+            return
+        assert preemptor.account_id is not None
+        running_jobs = await unit_of_work.worker_jobs.list_running_browser_for_account(
+            preemptor.account_id
+        )
+        for candidate in running_jobs:
+            if candidate.id == preemptor.id or candidate.priority >= preemptor.priority:
+                continue
+            victim = await self._locked_job(unit_of_work, candidate.id)
+            if (
+                victim.status is not WorkerJobStatus.RUNNING
+                or victim.account_id != preemptor.account_id
+                or not victim.account_affinity_required
+                or victim.priority >= preemptor.priority
+            ):
+                continue
+            preemption = await unit_of_work.worker_job_preemptions.add_if_absent(
+                WorkerJobPreemption(
+                    account_id=preemptor.account_id,
+                    preemptor_worker_job_id=preemptor.id,
+                    victim_worker_job_id=candidate.id,
+                    created_at=now,
+                )
+            )
+            if preemption.status is not WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE:
+                continue
+            if (
+                not victim.preemptible
+                or victim.capability_version != 1
+                or victim.operation_class is not OperationClass.READ
+                or victim.capability_name not in _CANCELLABLE_ACTIVITY_CAPABILITIES
+                or victim.lease_expires_at is None
+                or victim.lease_expires_at <= now
+            ):
+                continue
+            try:
+                request = await self._request_cancel_in_transaction(
+                    unit_of_work,
+                    victim,
+                    reason_code="HIGH_PRIORITY_PREEMPTION",
+                    now=now,
+                )
+            except WorkerJobControlError:
+                # Invalid, generic, or no-longer-live victims remain durable blockers,
+                # but only the existing #49 primitive may decide cancellation eligibility.
+                continue
+            if preemption.cancel_request_id != request.id:
+                preemption.cancel_request_id = request.id
+                await unit_of_work.worker_job_preemptions.update(preemption)
 
     async def acknowledge_cancel(
         self,
@@ -429,6 +531,9 @@ class WorkerJobService:
                 now,
                 error_code=request.reason_code,
             )
+            await self._satisfy_preemptions_for_victim(
+                unit_of_work, job.id, now, "CANCEL_ACKNOWLEDGED"
+            )
             await self._release_account_coordination(unit_of_work, job, generation_fence, now)
         return job
 
@@ -448,6 +553,7 @@ class WorkerJobService:
             if not job.complete(worker_id, lease_token, now, result):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
             await self._supersede_pending_cancel(unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED")
+            await self._satisfy_preemptions_for_victim(unit_of_work, job.id, now, "SUCCEEDED")
             attempt = await self._running_attempt(unit_of_work, job.id)
             attempt.status = WorkerJobAttemptStatus.SUCCEEDED
             attempt.finished_at = now
@@ -491,6 +597,7 @@ class WorkerJobService:
             ):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
             await self._supersede_pending_cancel(unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED")
+            await self._satisfy_preemptions_for_victim(unit_of_work, job.id, now, "FAILED")
             attempt = await self._running_attempt(unit_of_work, job.id)
             attempt.finished_at = now
             attempt.error_code = error_code
@@ -550,6 +657,9 @@ class WorkerJobService:
             if not job.require_intervention(worker_id, lease_token, now):
                 raise WorkerJobControlError("WORKER_JOB_LEASE_LOST")
             await self._supersede_pending_cancel(unit_of_work, job.id, now, "TARGET_ATTEMPT_ENDED")
+            await self._satisfy_preemptions_for_victim(
+                unit_of_work, job.id, now, "INTERVENTION_REQUESTED"
+            )
             if intervention_type == "AMBIGUOUS_OUTCOME":
                 job.retry_safety = WorkerJobRetrySafety.RECONCILIATION_REQUIRED
             attempt = await self._running_attempt(unit_of_work, job.id)
@@ -619,6 +729,7 @@ class WorkerJobService:
                     now,
                     error_code=job.error_code or "INTERVENTION_CLOSED",
                 )
+                await self._supersede_preemptions_for_preemptor(unit_of_work, job.id, now)
         if self._notifications is not None:
             for worker_id in notification_worker_ids:
                 self._notifications.publish(
@@ -709,6 +820,13 @@ class WorkerJobService:
                         now,
                     )
                     await self._set_command_waiting_intervention(unit_of_work, job, now)
+                if job.status in {
+                    WorkerJobStatus.SUCCEEDED,
+                    WorkerJobStatus.FAILED_FINAL,
+                    WorkerJobStatus.CANCELLED,
+                    WorkerJobStatus.EXPIRED,
+                }:
+                    await self._supersede_preemptions_for_preemptor(unit_of_work, job.id, now)
                 recovered += 1
         return recovered
 
@@ -804,7 +922,7 @@ class WorkerJobService:
         if job.command_id != f"activity:{activity_id}":
             raise WorkerJobControlError("WORKER_JOB_NOT_MATERIALIZED_ACTIVITY")
         activity = await unit_of_work.scheduled_activities.get(activity_id)
-        command = await unit_of_work.commands.get_by_command_id_for_update(job.command_id)
+        command = await unit_of_work.commands.get_by_command_id(job.command_id)
         if (
             activity is None
             or activity.materialization_status
@@ -812,9 +930,11 @@ class WorkerJobService:
             or activity.command_id != job.command_id
             or activity.account_id != job.account_id
             or activity.activity_type_snapshot != job.capability_name
+            or activity.priority.worker_job_priority != job.priority
             or command is None
             or command.command_type != job.capability_name
             or command.account_id != job.account_id
+            or command.priority != job.priority
             or command.status is not CommandStatus.WAITING_EXECUTION
         ):
             raise WorkerJobControlError("WORKER_JOB_NOT_MATERIALIZED_ACTIVITY")
@@ -851,6 +971,34 @@ class WorkerJobService:
         if request is not None:
             request.supersede(now, reason)
             await unit_of_work.worker_job_cancel_requests.update(request)
+
+    async def _satisfy_preemptions_for_victim(
+        self, unit_of_work: UnitOfWork, job_id: UUID, now: datetime, reason: str
+    ) -> None:
+        preemptions = await unit_of_work.worker_job_preemptions.list_waiting_for_victim(
+            job_id, for_update=True
+        )
+        for preemption in preemptions:
+            preemption.satisfy(now, reason)
+            await unit_of_work.worker_job_preemptions.update(preemption)
+
+    async def _supersede_preemptions_for_preemptor(
+        self, unit_of_work: UnitOfWork, job_id: UUID, now: datetime
+    ) -> None:
+        preemptions = await unit_of_work.worker_job_preemptions.list_waiting_for_preemptor(
+            job_id, for_update=True
+        )
+        victim_ids: set[UUID] = set()
+        for preemption in preemptions:
+            preemption.supersede(now, "PREEMPTOR_ENDED")
+            victim_ids.add(preemption.victim_worker_job_id)
+            await unit_of_work.worker_job_preemptions.update(preemption)
+        for victim_id in victim_ids:
+            remaining = await unit_of_work.worker_job_preemptions.list_waiting_for_victim(victim_id)
+            if not remaining:
+                await self._supersede_pending_cancel(
+                    unit_of_work, victim_id, now, "PREEMPTION_NO_LONGER_PENDING"
+                )
 
     async def _account_policy_allows_claim(
         self, unit_of_work: UnitOfWork, job: WorkerJob, worker_id: UUID
@@ -895,6 +1043,96 @@ class WorkerJobService:
             and policy.worker_capability_name == job.capability_name
             and policy.worker_capability_version == job.capability_version
         )
+
+    async def _browser_profile_claim_allows(
+        self,
+        unit_of_work: UnitOfWork,
+        candidate: WorkerJob,
+        worker: WorkerNode,
+        now: datetime,
+    ) -> bool:
+        if not self._is_browser_profile_worker_job(candidate):
+            return True
+
+        assert candidate.account_id is not None
+
+        waiting = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            candidate.account_id
+        )
+        if any(preemption.preemptor_worker_job_id == candidate.id for preemption in waiting):
+            return False
+
+        is_waiting_victim_reclaim = candidate.status in {
+            WorkerJobStatus.RUNNING,
+            WorkerJobStatus.QUEUED,
+            WorkerJobStatus.FAILED_RETRYABLE,
+        } and any(preemption.victim_worker_job_id == candidate.id for preemption in waiting)
+        if not is_waiting_victim_reclaim:
+            ordered = await unit_of_work.worker_jobs.list_claimable(
+                worker,
+                now,
+                account_id=candidate.account_id,
+                browser_profile_only=True,
+            )
+            if not ordered or ordered[0].id != candidate.id:
+                return False
+
+        running = await unit_of_work.worker_jobs.list_running_browser_for_account(
+            candidate.account_id
+        )
+        if any(job.id != candidate.id for job in running):
+            return False
+
+        if any(preemption.victim_worker_job_id != candidate.id for preemption in waiting):
+            return False
+        return True
+
+    @staticmethod
+    def _is_browser_profile_worker_job(job: WorkerJob) -> bool:
+        return (
+            job.account_id is not None
+            and job.account_affinity_required
+            and job.capability_name.startswith(_BROWSER_PROFILE_CAPABILITY_PREFIX)
+        )
+
+    async def _request_cancel_for_waiting_preemption(
+        self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime
+    ) -> None:
+        if job.account_id is None or not job.account_affinity_required:
+            return
+        waiting = await unit_of_work.worker_job_preemptions.list_waiting_for_victim(
+            job.id, for_update=True
+        )
+        viable: list[WorkerJobPreemption] = []
+        for preemption in waiting:
+            preemptor = await unit_of_work.worker_jobs.get(preemption.preemptor_worker_job_id)
+            if (
+                preemptor is None
+                or preemptor.status
+                not in {WorkerJobStatus.QUEUED, WorkerJobStatus.FAILED_RETRYABLE}
+                or preemptor.priority <= job.priority
+                or (preemptor.deadline_at is not None and preemptor.deadline_at <= now)
+            ):
+                preemption.supersede(now, "PREEMPTOR_ENDED")
+                await unit_of_work.worker_job_preemptions.update(preemption)
+            else:
+                viable.append(preemption)
+        if not viable or job.priority >= 100:
+            return
+        try:
+            request = await self._request_cancel_in_transaction(
+                unit_of_work,
+                job,
+                reason_code="HIGH_PRIORITY_PREEMPTION",
+                now=now,
+            )
+        except WorkerJobControlError:
+            return
+        job.pending_cancel_request = request
+        for preemption in viable:
+            if preemption.cancel_request_id != request.id:
+                preemption.cancel_request_id = request.id
+                await unit_of_work.worker_job_preemptions.update(preemption)
 
     def _ensure_capability_not_blocked(self, capability_name: str) -> None:
         policy = self._capability_router.policy_for(capability_name)

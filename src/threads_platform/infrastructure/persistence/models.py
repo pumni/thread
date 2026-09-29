@@ -60,6 +60,7 @@ from threads_platform.domain.worker_jobs import (
     WorkerInterventionStatus,
     WorkerJobAttemptStatus,
     WorkerJobCancelRequestStatus,
+    WorkerJobPreemptionStatus,
     WorkerJobRetrySafety,
     WorkerJobStatus,
 )
@@ -1217,6 +1218,7 @@ class WorkerJobCancelRequestRecord(Base):
         UniqueConstraint(
             "worker_job_id", "generation", name="uq_worker_job_cancel_request_generation"
         ),
+        UniqueConstraint("worker_job_id", "id", name="uq_worker_job_cancel_request_job_id_id"),
         CheckConstraint("generation > 0", name="ck_worker_job_cancel_request_generation"),
         CheckConstraint(
             "target_attempt_number > 0", name="ck_worker_job_cancel_request_attempt_number"
@@ -1278,6 +1280,60 @@ class WorkerJobCancelRequestRecord(Base):
     safe_checkpoint: Mapped[str | None] = mapped_column(String(80))
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     superseded_reason: Mapped[str | None] = mapped_column(String(120))
+
+
+class WorkerJobPreemptionRecord(Base):
+    __tablename__ = "worker_job_preemptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "preemptor_worker_job_id",
+            "victim_worker_job_id",
+            name="uq_worker_job_preemption_pair",
+        ),
+        CheckConstraint(
+            "preemptor_worker_job_id <> victim_worker_job_id",
+            name="ck_worker_job_preemption_distinct_jobs",
+        ),
+        CheckConstraint(
+            "status IN ('WAITING_FOR_QUIESCENCE', 'SATISFIED', 'SUPERSEDED')",
+            name="ck_worker_job_preemption_status",
+        ),
+        CheckConstraint(
+            "(status = 'WAITING_FOR_QUIESCENCE' AND resolved_at IS NULL "
+            "AND resolution_reason IS NULL) OR "
+            "(status IN ('SATISFIED', 'SUPERSEDED') AND resolved_at IS NOT NULL "
+            "AND resolution_reason IS NOT NULL "
+            "AND length(resolution_reason) BETWEEN 1 AND 120 "
+            "AND resolution_reason ~ '^[A-Z0-9_]+$')",
+            name="ck_worker_job_preemption_resolution",
+        ),
+        ForeignKeyConstraint(
+            ["victim_worker_job_id", "cancel_request_id"],
+            ["worker_job_cancel_requests.worker_job_id", "worker_job_cancel_requests.id"],
+            ondelete="RESTRICT",
+            name="fk_worker_job_preemption_cancel_request",
+        ),
+        Index("ix_worker_job_preemption_account_status", "account_id", "status"),
+        Index("ix_worker_job_preemption_victim_status", "victim_worker_job_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("threads_accounts.id", ondelete="RESTRICT"), nullable=False
+    )
+    preemptor_worker_job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    victim_worker_job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("worker_jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[WorkerJobPreemptionStatus] = mapped_column(
+        enum_type(WorkerJobPreemptionStatus, "worker_job_preemption_status"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_reason: Mapped[str | None] = mapped_column(String(120))
+    cancel_request_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
 
 
 class WorkerInterventionRecord(Base):

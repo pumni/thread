@@ -573,9 +573,39 @@ recovery, and reclaim lock the WorkerJob row and supersede a pending request if
 they end its target attempt first. Lease expiry never acknowledges cancellation;
 reclaim starts a new attempt and any new request uses the next generation. A
 stale token cannot mutate the job. No priority policy requests cancellation in
-this checkpoint.
+this checkpoint; C5-02/4 (#51) adds the narrowly scoped HIGH-priority policy below.
 
 No global stop flag.
+
+### C5-02/4 HIGH safe preemption and profile gate (#51)
+
+Only trusted Control Plane routing of a `HIGH` Command may create a HIGH
+preemptor WorkerJob, with `Command.priority == WorkerJob.priority == 100`.
+CRM protocol v1 remains caller-priority-less. When that WorkerJob is created,
+the same PostgreSQL transaction records a `WorkerJobPreemption` relationship
+for each strictly lower-priority, RUNNING, account-affine browser job on the
+same account. A valid materialized preemptible READ activity also reuses the
+#49 cancellation request primitive in that transaction. Other running browser
+jobs, including `media.local_upload` and generic/unlinked jobs, get no cancel
+request but remain profile blockers.
+
+HIGH stays QUEUED until its relationships reach `SATISFIED` and no browser job
+is still using the account profile. Every account-affine browser candidate,
+regardless of priority, locks the account row and checks both the running-job
+set and unresolved preemption relationships before its job row is claimed.
+The database claim is revalidated under row lock. Different accounts remain
+independent, and nonbrowser WorkerJobs do not use this profile gate.
+
+An explicit current-lease attempt end (safe cancellation acknowledgement,
+completion, failure, or intervention request) satisfies waiting preemptions.
+An ended preemptor supersedes its own waiting relationships; a shared victim
+cancel request remains pending while another HIGH preemptor still waits. Lease
+expiry, recovery, and reclaim never satisfy preemption. Expired victims keep
+HIGH blocked; reclaim creates a new attempt and a new #49 cancellation
+generation before HIGH can claim. Equal-priority HIGH jobs do not cancel one
+another and retain the existing deterministic queue tie order. This checkpoint
+does not add NORMAL-over-LOW preemption, fairness, or process/lease-revocation
+cancellation.
 
 ## 23. Persistence
 
@@ -589,6 +619,8 @@ Expected future tables:
 - network_profiles
 - worker_jobs
 - worker_job_attempts
+- worker_job_cancel_requests
+- worker_job_preemptions
 - worker_interventions
 - worker_account_sessions
 - discovery_campaigns
