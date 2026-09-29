@@ -121,6 +121,16 @@ WorkerJob recovery, each with an independent bounded limit. Discovery and
 mentions recurrence remain deferred pending #3 time-window/cursor semantics.
 Production LOCAL_API execution still depends on #55/#3. This checkpoint does
 not close parent #9.
+
+C6-01/5 (#63) adds bounded, sequential outbox delivery as the final scheduler
+tick stage. PostgreSQL IntegrationDelivery due/retry state and fenced leases
+remain authoritative, with an independent 1–100 delivery limit. Each delivery
+ID is attempted at most once per local tick. Delivery is at-least-once at the
+network boundary; lease reclaim can repeat a remote call whose local DELIVERED
+commit was interrupted. FastAPI does not pump outbox deliveries. The standalone
+scheduler reports `CRM_RESULT_SINK_UNAVAILABLE` and skips only this stage
+until the production transport dependency #62 is resolved. No migration is
+required.
 LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond this
 bounded staging capability, and publish/submit remains outside scope.
 

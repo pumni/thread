@@ -11,6 +11,10 @@ import pytest
 from pydantic import ValidationError
 
 from threads_platform.application.commands.runtime import CommandRuntime
+from threads_platform.application.outbox_delivery import (
+    OutboxDeliveryBatchResult,
+    OutboxDeliveryWorker,
+)
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
 from threads_platform.application.scheduler import (
     MAX_SCHEDULER_BATCH_SIZE,
@@ -44,6 +48,8 @@ def test_scheduler_runner_config_rejects_invalid_limits_and_poll_interval() -> N
         SchedulerRunnerConfig(activity_limit=0)
     with pytest.raises(ValueError, match="command_limit"):
         SchedulerRunnerConfig(command_limit=MAX_SCHEDULER_BATCH_SIZE + 1)
+    with pytest.raises(ValueError, match="outbox_delivery_limit"):
+        SchedulerRunnerConfig(outbox_delivery_limit=MAX_SCHEDULER_BATCH_SIZE + 1)
     with pytest.raises(ValueError, match="poll interval"):
         SchedulerRunnerConfig(poll_interval=timedelta(0))
 
@@ -63,6 +69,23 @@ def test_presence_expiry_setting_has_documented_bounds() -> None:
         Settings(scheduler_presence_expiry_batch_limit=0)
     with pytest.raises(ValidationError):
         Settings(scheduler_presence_expiry_batch_limit=MAX_SCHEDULER_BATCH_SIZE + 1)
+
+
+def test_outbox_delivery_setting_has_documented_bounds() -> None:
+    assert Settings().scheduler_outbox_delivery_batch_limit == 50
+    assert (
+        Settings(scheduler_outbox_delivery_batch_limit=1).scheduler_outbox_delivery_batch_limit == 1
+    )
+    assert (
+        Settings(
+            scheduler_outbox_delivery_batch_limit=MAX_SCHEDULER_BATCH_SIZE
+        ).scheduler_outbox_delivery_batch_limit
+        == MAX_SCHEDULER_BATCH_SIZE
+    )
+    with pytest.raises(ValidationError):
+        Settings(scheduler_outbox_delivery_batch_limit=0)
+    with pytest.raises(ValidationError):
+        Settings(scheduler_outbox_delivery_batch_limit=MAX_SCHEDULER_BATCH_SIZE + 1)
 
 
 @pytest.mark.parametrize("limit", [0, -1, MAX_SCHEDULER_BATCH_SIZE + 1, True])
@@ -94,6 +117,21 @@ async def test_scheduler_rejects_invalid_presence_expiry_limit_before_work(
             activity_limit=1,
             command_limit=1,
             recovery_limit=1,
+        )
+
+
+@pytest.mark.parametrize("limit", [0, -1, MAX_SCHEDULER_BATCH_SIZE + 1, True])
+async def test_scheduler_rejects_invalid_outbox_delivery_limit_before_work(limit: int) -> None:
+    with pytest.raises(ValueError, match="outbox_delivery_limit"):
+        await run_scheduler_tick(
+            cast(UnitOfWorkFactory, object()),
+            cast(CommandRuntime, object()),
+            cast(WorkerJobService, object()),
+            now=datetime(2026, 9, 29, tzinfo=UTC),
+            activity_limit=1,
+            command_limit=1,
+            recovery_limit=1,
+            outbox_delivery_limit=limit,
         )
 
 
@@ -144,6 +182,12 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
     monkeypatch.setattr(scheduler_module, "dispatch_due_conversation_syncs", dispatch)
     monkeypatch.setattr(scheduler_module, "materialize_due_account_activities", materialize)
 
+    async def pump(_worker: object, *, limit: int) -> OutboxDeliveryBatchResult:
+        events.append(("outbox", limit))
+        return OutboxDeliveryBatchResult(attempted=2, succeeded=1)
+
+    monkeypatch.setattr(scheduler_module, "deliver_due_outbox", pump)
+
     result = await run_scheduler_tick(
         cast(UnitOfWorkFactory, object()),
         cast(CommandRuntime, Runtime()),
@@ -156,6 +200,8 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
         activity_limit=7,
         command_limit=1,
         recovery_limit=8,
+        outbox_delivery_worker=cast(OutboxDeliveryWorker, object()),
+        outbox_delivery_limit=9,
     )
 
     assert events == [
@@ -165,6 +211,7 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
         ("materialize", 7),
         ("command", None),
         ("recovery", 8),
+        ("outbox", 9),
     ]
     assert result.worker_presences_expired == 5
     assert result.activity_occurrences_generated == 1
@@ -172,6 +219,8 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
     assert result.activities_materialized == 3
     assert result.commands_processed == 0
     assert result.worker_jobs_recovered == 4
+    assert result.outbox_deliveries_attempted == 2
+    assert result.outbox_deliveries_succeeded == 1
 
 
 async def test_runner_executes_tick_then_waits_without_real_sleep() -> None:
@@ -211,6 +260,7 @@ async def test_runner_executes_tick_then_waits_without_real_sleep() -> None:
             "activity_limit": 2,
             "command_limit": 3,
             "recovery_limit": 4,
+            "outbox_delivery_limit": 50,
         }
     ]
     assert wait_calls == [7]

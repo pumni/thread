@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
+import structlog
 from pydantic import ValidationError
 
 from threads_platform.application.clock import Clock, SystemClock
@@ -14,6 +15,8 @@ from threads_platform.application.retry import RetryPolicy
 from threads_platform.domain.outbox import DeliveryStatus, OutboxStatus
 from threads_platform.domain.time import normalize_utc
 
+MAX_OUTBOX_DELIVERY_BATCH_SIZE = 100
+
 
 @dataclass(frozen=True, slots=True)
 class DeliveryAttemptResult:
@@ -21,6 +24,12 @@ class DeliveryAttemptResult:
     event_id: UUID | None
     status: DeliveryStatus | None
     delivered: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxDeliveryBatchResult:
+    attempted: int
+    succeeded: int
 
 
 class OutboxDeliveryWorker:
@@ -49,7 +58,12 @@ class OutboxDeliveryWorker:
         self._destination = destination
         self._lease_id_factory = lease_id_factory
 
-    async def deliver_one(self) -> DeliveryAttemptResult:
+    async def deliver_one(
+        self,
+        *,
+        exclude_delivery_ids: frozenset[UUID] = frozenset(),
+        on_claimed: Callable[[UUID], None] | None = None,
+    ) -> DeliveryAttemptResult:
         now = normalize_utc(self._clock.now())
         lease_token = self._lease_id_factory()
         async with self._unit_of_work_factory() as unit_of_work:
@@ -58,11 +72,14 @@ class OutboxDeliveryWorker:
                 now,
                 lease_token,
                 now + self._lease_duration,
+                exclude_delivery_ids=exclude_delivery_ids,
             )
         if claimed is None:
             return DeliveryAttemptResult(None, None, None, delivered=False)
 
         delivery, event = claimed
+        if on_claimed is not None:
+            on_claimed(delivery.id)
         if delivery.delivery_deadline_at is not None and now >= delivery.delivery_deadline_at:
             return await self._mark_final_failure(
                 delivery.id,
@@ -194,3 +211,45 @@ class OutboxDeliveryWorker:
         return DeliveryAttemptResult(
             delivery_id, event_id, DeliveryStatus.FAILED_FINAL, delivered=False
         )
+
+
+async def deliver_due_outbox(
+    worker: OutboxDeliveryWorker,
+    *,
+    limit: int,
+) -> OutboxDeliveryBatchResult:
+    """Attempt due deliveries sequentially, at most once per delivery in this batch."""
+    if type(limit) is not int or not 1 <= limit <= MAX_OUTBOX_DELIVERY_BATCH_SIZE:
+        raise ValueError(
+            f"outbox delivery limit must be between 1 and {MAX_OUTBOX_DELIVERY_BATCH_SIZE}"
+        )
+
+    attempted_delivery_ids: set[UUID] = set()
+    succeeded = 0
+    logger = structlog.get_logger(__name__)
+    for _ in range(limit):
+        try:
+            result = await worker.deliver_one(
+                exclude_delivery_ids=frozenset(attempted_delivery_ids),
+                on_claimed=attempted_delivery_ids.add,
+            )
+        except Exception as error:
+            logger.error(
+                "outbox_delivery_attempt_failed_unexpectedly",
+                attempted=len(attempted_delivery_ids),
+                error_type=type(error).__name__,
+            )
+            raise
+        if result.delivery_id is None:
+            break
+        attempted_delivery_ids.add(result.delivery_id)
+        if result.delivered:
+            succeeded += 1
+
+    batch = OutboxDeliveryBatchResult(len(attempted_delivery_ids), succeeded)
+    logger.info(
+        "outbox_delivery_batch_finished",
+        attempted=batch.attempted,
+        succeeded=batch.succeeded,
+    )
+    return batch

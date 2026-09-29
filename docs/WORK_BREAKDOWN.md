@@ -194,7 +194,8 @@ Issues:
 
 C6 turns explicit jobs/plans into durable operations and establishes deploy/update/recovery procedures.
 The #53 scheduler owns due materialization, ready Command draining, and
-WorkerJob recovery; #60 adds bounded Worker presence expiry. #56 adds
+WorkerJob recovery; #60 adds bounded Worker presence expiry; #63 adds bounded
+outbox delivery as the final tick stage. #56 adds
 deterministic recurrence for already-defined
 `AccountActivityTemplate` revisions. PostgreSQL due state and activity-specific
 recurrence cursors are authoritative; the loop only wakes bounded ticks and
@@ -203,7 +204,8 @@ seconds, with no cron or timezone grammar. `ACTIVE` and `PAUSED` generate
 occurrences; paused rows remain pending for resume. `DISABLED` generates
 nothing. Only the latest template revision generates, while old occurrence
 snapshots remain immutable. Presence expiry, generation, materialization,
-Command and recovery limits are independently bounded to 1–100 and support concurrent scheduler
+Command, recovery and outbox delivery limits are independently bounded to 1–100
+and support concurrent scheduler
 instances through PostgreSQL locking. Presence expiry uses authoritative
 `worker_nodes.presence_expires_at`, ordered bounded PostgreSQL row locking, and
 changes only new-work eligibility; FastAPI owns neither presence expiry nor
@@ -218,6 +220,14 @@ The dispatch audit, Command, and schedule cursor update share one transaction.
 Each scheduler process has an independent 1–100 conversation-sync batch limit.
 The Command continues through CommandRuntime and the Capability Router, where
 the existing handler uses SyncState for remote cursor catch-up.
+
+Outbox delivery uses a separate 1–100 per-tick limit and PostgreSQL
+IntegrationDelivery claims/leases. A delivery is attempted at most once per
+local tick; remote network delivery remains at-least-once. Retry, deadline,
+lease-reclaim and stale-token fencing semantics remain unchanged. FastAPI owns
+no delivery loop. The standalone scheduler reports `CRM_RESULT_SINK_UNAVAILABLE`
+and skips only this stage until the separately authorized production transport
+dependency #62 is resolved. No migration or generic event bus is added.
 
 ## 10. D — Release
 

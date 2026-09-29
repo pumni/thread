@@ -79,6 +79,10 @@ async def _run() -> None:
             "scheduler_local_api_handlers_unavailable",
             error_code="THREADS_ACCESS_TOKEN_PROVIDER_UNAVAILABLE",
         )
+    structlog.get_logger(__name__).error(
+        "scheduler_outbox_delivery_unavailable",
+        error_code="CRM_RESULT_SINK_UNAVAILABLE",
+    )
     command_runtime = composition.command_runtime
     tick: SchedulerTick = partial(
         run_scheduler_tick,
@@ -95,6 +99,7 @@ async def _run() -> None:
         activity_limit=settings.scheduler_activity_batch_limit,
         command_limit=settings.scheduler_command_batch_limit,
         recovery_limit=settings.scheduler_recovery_batch_limit,
+        outbox_delivery_limit=settings.scheduler_outbox_delivery_batch_limit,
     )
     runner = SchedulerRunner(tick, runner_config, clock=clock)
     stop_event = asyncio.Event()
