@@ -2,6 +2,8 @@
 
 **Status:** Documentation review is sufficient for implementation planning; **live TP-002 validation remains open** because no dedicated local development app/account has been used. Issue #3 is a production/release gate.
 
+Issue #65 prepares only an offline, secret-safe evidence packet validator and runbook. No live API validation happened in that checkpoint; it does not change any capability from documentation-contract to live-verified. Use [the live validation runbook](THREADS_LIVE_VALIDATION_RUNBOOK.md) and [the packet template](examples/threads-live-evidence-v1.template.json) for a later human-run #3 session.
+
 **Evidence reviewed:** 2026-09-25. Primary evidence is Meta's official Threads API Postman workspace/collection. Meta explicitly states the collection may lag the current developer changelog, so implementation must re-check current developer documentation before changing contracts.
 
 No live account responses are represented by repository documentation-contract fixtures.
@@ -82,6 +84,12 @@ With a dedicated development app/account, collect only scrubbed evidence for:
 - whether pagination cursors are appropriate for durable cross-run polling.
 
 Never record access tokens, app secrets, authorization codes or sensitive account identifiers.
+
+## #65 evidence tooling checkpoint
+
+The evidence model uses `threads-live-evidence-v1`, strict unknown-field rejection, recursive secret-sensitive scanning, and explicit `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE` classification for its checked-in matrix. Its fingerprint helper accepts opaque input through standard input and outputs only `sha256:<64 lowercase hex characters>`; fingerprints are comparison metadata, never authentication material. Validation is offline and does not call Meta.
+
+Issue #3 remains OPEN. No live API validation happened in the #65 PR. #55 remains blocked pending accepted Phase A evidence, and discovery/mentions scheduler policy remains blocked pending accepted Phase B cursor/polling evidence. The Postman collection alone is not runtime proof.
 
 ## Official source links
 

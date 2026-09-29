@@ -371,3 +371,9 @@ The standalone scheduler has no repository-supported
 production `ThreadsAccessTokenProvider`; its deployment dependency is tracked
 separately by #55/#3. LIKE/FOLLOW remain VERIFY. No additional mutation or
 publish/submit scope is authorized.
+
+## 12. TP-002 evidence harness checkpoint #65
+
+Issue #65 prepares only offline evidence tooling: a strict scrubbed `threads-live-evidence-v1` packet, a template classified `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE`, recursive secret validation, opaque-value fingerprinting, and a human runbook. No live API validation happened in the #65 PR, no real credentials were used, and the harness makes no network calls to Meta. The packet template is not evidence and changes no capability from documentation-contract to live-verified.
+
+Issue #3 remains OPEN. #55 remains blocked until a human-run Phase A packet is reviewed and accepted. Discovery/mentions scheduler policy under #9 remains blocked until Phase B polling/cursor evidence is reviewed and accepted. A later human operator must execute the live run with a dedicated Meta development app/account under the runbook; the coordinator independently accepts the evidence.
