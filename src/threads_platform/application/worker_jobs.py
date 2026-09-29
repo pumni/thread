@@ -56,6 +56,7 @@ _CANCELLABLE_ACTIVITY_CAPABILITIES = {
     and contract.status is BrowserCapabilityStatus.AVAILABLE
 }
 _CANCEL_REASON_CODE = re.compile(r"^[A-Z0-9_]{1,120}$")
+_BROWSER_PROFILE_CAPABILITY_PREFIX = "threads.browser."
 
 
 class WorkerJobControlError(ValueError):
@@ -237,9 +238,10 @@ class WorkerJobService:
                 raise WorkerJobControlError("HIGH_PRIORITY_ROUTE_NOT_TRUSTED")
             if account_id is None or not affinity_required:
                 raise WorkerJobControlError("HIGH_PRIORITY_ACCOUNT_AFFINITY_REQUIRED")
-            if await unit_of_work.accounts.get_for_update(account_id) is None:
-                raise WorkerJobControlError("ACCOUNT_NOT_FOUND")
-            await self._arbitrate_high_priority_job(unit_of_work, job, occurred_at)
+            if self._is_browser_profile_worker_job(job):
+                if await unit_of_work.accounts.get_for_update(account_id) is None:
+                    raise WorkerJobControlError("ACCOUNT_NOT_FOUND")
+                await self._arbitrate_high_priority_job(unit_of_work, job, occurred_at)
         if assigned_worker_id is not None:
             notification_worker_ids = (assigned_worker_id,)
         else:
@@ -414,8 +416,9 @@ class WorkerJobService:
     async def _arbitrate_high_priority_job(
         self, unit_of_work: UnitOfWork, preemptor: WorkerJob, now: datetime
     ) -> None:
-        if preemptor.account_id is None or preemptor.priority != 100:
+        if preemptor.priority != 100 or not self._is_browser_profile_worker_job(preemptor):
             return
+        assert preemptor.account_id is not None
         running_jobs = await unit_of_work.worker_jobs.list_running_browser_for_account(
             preemptor.account_id
         )
@@ -1048,20 +1051,16 @@ class WorkerJobService:
         worker: WorkerNode,
         now: datetime,
     ) -> bool:
-        if candidate.account_id is None:
+        if not self._is_browser_profile_worker_job(candidate):
             return True
+
+        assert candidate.account_id is not None
 
         waiting = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
             candidate.account_id
         )
-        if candidate.account_affinity_required and any(
-            preemption.preemptor_worker_job_id == candidate.id for preemption in waiting
-        ):
+        if any(preemption.preemptor_worker_job_id == candidate.id for preemption in waiting):
             return False
-        if not candidate.account_affinity_required or not candidate.capability_name.startswith(
-            "threads.browser."
-        ):
-            return True
 
         is_waiting_victim_reclaim = candidate.status in {
             WorkerJobStatus.RUNNING,
@@ -1087,6 +1086,14 @@ class WorkerJobService:
         if any(preemption.victim_worker_job_id != candidate.id for preemption in waiting):
             return False
         return True
+
+    @staticmethod
+    def _is_browser_profile_worker_job(job: WorkerJob) -> bool:
+        return (
+            job.account_id is not None
+            and job.account_affinity_required
+            and job.capability_name.startswith(_BROWSER_PROFILE_CAPABILITY_PREFIX)
+        )
 
     async def _request_cancel_for_waiting_preemption(
         self, unit_of_work: UnitOfWork, job: WorkerJob, now: datetime

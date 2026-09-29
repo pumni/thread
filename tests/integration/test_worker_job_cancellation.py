@@ -16,6 +16,7 @@ import threads_platform.application.worker_jobs as worker_jobs_module
 from threads_platform.application.account_activity_materialization import (
     materialize_due_account_activities,
 )
+from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.ports.repositories import UnitOfWork
 from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
@@ -26,6 +27,13 @@ from threads_platform.domain.account_activities import (
     ScheduledActivity,
 )
 from threads_platform.domain.accounts import AccountExecutionMode, ThreadsAccount
+from threads_platform.domain.capabilities import (
+    BusinessCapabilityPolicy,
+    CapabilityExecutionClass,
+    CapabilityExecutor,
+    OperationClass,
+    RouteTarget,
+)
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.worker_jobs import (
     WorkerJob,
@@ -288,11 +296,20 @@ async def _route_materialized_activity(
 
 
 async def _enqueue_high_activity(
-    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory, scenario: Scenario
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    scenario: Scenario,
+    *,
+    deadline_in: timedelta | None = None,
 ) -> WorkerJob:
     command_id = await _materialize_priority_activity(
         unit_of_work_factory, scenario, ActivityPriority.HIGH
     )
+    if deadline_in is not None:
+        async with unit_of_work_factory() as unit_of_work:
+            command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
+            assert command is not None
+            command.deadline_at = scenario.clock.now() + deadline_in
+            await unit_of_work.commands.update(command)
     return await _route_materialized_activity(unit_of_work_factory, scenario, command_id)
 
 
@@ -1333,6 +1350,99 @@ async def test_simultaneous_high_arrivals_share_one_cancel_and_claim_gate_serial
 
 
 @pytest.mark.asyncio
+async def test_ended_high_preemptor_does_not_supersede_shared_victim_request(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    high_a = await _enqueue_high_activity(
+        unit_of_work_factory, scenario, deadline_in=timedelta(seconds=1)
+    )
+    high_b = await _enqueue_high_activity(unit_of_work_factory, scenario)
+
+    async with unit_of_work_factory() as unit_of_work:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+        relationship_a = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_a.id, scenario.job_id
+        )
+        relationship_b = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_b.id, scenario.job_id
+        )
+    assert request is not None
+    assert request.status is WorkerJobCancelRequestStatus.PENDING
+    assert relationship_a is not None
+    assert relationship_a.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert relationship_a.cancel_request_id == request.id
+    assert relationship_b is not None
+    assert relationship_b.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert relationship_b.cancel_request_id == request.id
+
+    scenario.clock.advance(timedelta(seconds=2))
+    assert await scenario.service.recover_expired() >= 1
+
+    async with unit_of_work_factory() as unit_of_work:
+        command_a = await unit_of_work.commands.get_by_command_id(high_a.command_id or "")
+        high_a_after = await unit_of_work.worker_jobs.get(high_a.id)
+        relationship_a = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_a.id, scenario.job_id
+        )
+        relationship_b = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_b.id, scenario.job_id
+        )
+        request_after = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+            scenario.job_id
+        )
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+    assert command_a is not None and command_a.status is CommandStatus.EXPIRED
+    assert high_a_after is not None and high_a_after.status is WorkerJobStatus.EXPIRED
+    assert relationship_a is not None
+    assert relationship_a.status is WorkerJobPreemptionStatus.SUPERSEDED
+    assert relationship_b is not None
+    assert relationship_b.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert request_after is not None and request_after.id == request.id
+    assert request_after.status is WorkerJobCancelRequestStatus.PENDING
+    assert relationship_b.cancel_request_id == request.id
+    assert victim is not None and victim.status is WorkerJobStatus.RUNNING
+    assert victim.lease_token == scenario.lease_token
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    await scenario.service.checkpoint(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        {"phase": "FEED_READY"},
+    )
+    await scenario.service.acknowledge_cancel(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        cancel_request_id=request.id,
+        generation=request.generation,
+        checkpoint_phase="FEED_READY",
+    )
+
+    async with unit_of_work_factory() as unit_of_work:
+        victim_command = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+        victim_after = await unit_of_work.worker_jobs.get(scenario.job_id)
+        victim_attempt = await unit_of_work.worker_job_attempts.get_running_for_update(
+            scenario.job_id
+        )
+        relationship_b = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_b.id, scenario.job_id
+        )
+    assert victim_command is not None and victim_command.status is CommandStatus.CANCELLED
+    assert victim_after is not None and victim_after.status is WorkerJobStatus.CANCELLED
+    assert victim_attempt is None
+    attempts = await scenario.service.attempts(scenario.job_id)
+    assert len(attempts) == 1 and attempts[0].status is WorkerJobAttemptStatus.CANCELLED
+    assert relationship_b is not None
+    assert relationship_b.status is WorkerJobPreemptionStatus.SATISFIED
+
+    claimed_b = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_b is not None and claimed_b.id == high_b.id
+
+
+@pytest.mark.asyncio
 async def test_media_running_blocks_high_without_receiving_cancel_request(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
@@ -1647,6 +1757,99 @@ async def test_high_priority_requires_matching_command_and_trusted_worker_route(
     assert stored_command is not None and stored_command.status is CommandStatus.VALIDATED
     assert job is None
     assert relations == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_high_nonbrowser_worker_route_does_not_preempt_or_wait_for_browser(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    synthetic_capability = "synthetic.echo"
+    policy = BusinessCapabilityPolicy(
+        command_type=synthetic_capability,
+        capability_name=synthetic_capability,
+        capability_version=1,
+        execution_class=CapabilityExecutionClass.HYBRID,
+        operation_class=OperationClass.READ,
+        preferred_executor=CapabilityExecutor.WORKER,
+        worker_capability_name=synthetic_capability,
+        worker_capability_version=1,
+    )
+    router = CapabilityRouter({synthetic_capability: policy})
+    service = WorkerJobService(
+        unit_of_work_factory,
+        clock=scenario.clock,
+        capability_router=router,
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        capabilities = await unit_of_work.worker_capabilities.list_for_worker(scenario.worker_id)
+        capabilities.append(
+            WorkerCapability(
+                scenario.worker_id,
+                synthetic_capability,
+                1,
+                advertised_at=scenario.clock.now(),
+            )
+        )
+        await unit_of_work.worker_capabilities.replace_for_worker(scenario.worker_id, capabilities)
+        command = Command(
+            command_id=f"internal-high-{uuid4()}",
+            correlation_id=f"internal-high-correlation-{uuid4()}",
+            account_id=scenario.account_id,
+            command_type=synthetic_capability,
+            payload={},
+            priority=100,
+            created_at=scenario.clock.now(),
+            received_at=scenario.clock.now(),
+        )
+        command.transition(CommandStatus.VALIDATED, scenario.clock.now())
+        await unit_of_work.commands.add(command)
+
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=service,
+        capability_router=router,
+    )
+    result = await runtime.process(command.command_id)
+    assert result.status is CommandStatus.WAITING_EXECUTION
+    async with unit_of_work_factory() as unit_of_work:
+        route = await unit_of_work.command_route_decisions.get_latest_execution_for_command(
+            command.command_id
+        )
+        high_job = await unit_of_work.worker_jobs.get_by_command_id(command.command_id)
+        relationship = (
+            await unit_of_work.worker_job_preemptions.get_for_pair(high_job.id, scenario.job_id)
+            if high_job is not None
+            else None
+        )
+        cancel_request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+            scenario.job_id
+        )
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+    assert route is not None and route.target is RouteTarget.WORKER_JOB
+    assert route.executor is CapabilityExecutor.WORKER
+    assert high_job is not None and high_job.priority == 100
+    assert high_job.command_id == command.command_id
+    assert high_job.account_affinity_required
+    assert relationship is None
+    assert cancel_request is None
+    assert victim is not None and victim.status is WorkerJobStatus.RUNNING
+    assert victim.lease_token == scenario.lease_token
+
+    claimed_high = await service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+    async with unit_of_work_factory() as unit_of_work:
+        victim_after_claim = await unit_of_work.worker_jobs.get(scenario.job_id)
+        relationships_after_claim = (
+            await unit_of_work.worker_job_preemptions.list_waiting_for_account(scenario.account_id)
+        )
+    assert victim_after_claim is not None
+    assert victim_after_claim.status is WorkerJobStatus.RUNNING
+    assert victim_after_claim.lease_token == scenario.lease_token
+    assert relationships_after_claim == []
 
 
 @pytest.mark.parametrize("outcome", ["fail", "intervention"])
