@@ -56,7 +56,7 @@ def upgrade() -> None:
         "'threads.browser.profile.open')",
     )
     op.create_check_constraint(
-        "ck_account_activity_template_revisions_recurrence_anchor",
+        "ck_activity_template_recurrence_anchor",
         "account_activity_template_revisions",
         "recurrence_kind = 'NONE' OR anchor_at >= created_at",
     )
@@ -72,7 +72,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
             "template_revision > 0",
-            name="ck_account_activity_recurrence_states_positive_template_revision",
+            name="ck_activity_recur_state_positive_revision",
         ),
         sa.CheckConstraint(
             "generated_count >= 0",
@@ -124,7 +124,7 @@ def downgrade() -> None:
     )
     op.drop_table("account_activity_recurrence_states")
     op.drop_constraint(
-        "ck_account_activity_template_revisions_recurrence_anchor",
+        "ck_activity_template_recurrence_anchor",
         "account_activity_template_revisions",
         type_="check",
     )
