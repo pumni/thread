@@ -1,4 +1,4 @@
-# Project State Handoff — 2026-09-28
+# Project State Handoff — 2026-09-29
 
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
@@ -21,7 +21,7 @@ Engineering completed:
 - C3 — Windows Worker Agent + fail-closed browser adapter foundation;
 - C4 — API-first Discovery, public-profile enrichment and Leads pipeline.
 
-### Canonical C5-01 state after the media.local_upload checkpoint is merged
+### Canonical C5-01 state after #27 is closed
 
 PR #38 is accepted and merged. PR #37's C5-01 contract/evidence-gate foundation
 is accepted and merged. PR #39's `threads.browser.feed.browse` v1 and PR #40's
@@ -32,9 +32,10 @@ account-affine WorkerJob path, with explicit worker opt-in required. PR #41's
 checkpoint, and available only through the same bounded account-affine path
 with explicit worker opt-in. All three read capabilities are DONE for their
 checkpoints. PR #43's `threads.browser.media.local_upload` v1 is accepted and
-merged, DONE for its checkpoint, and available only through the reviewed,
-bounded, account-affine WorkerJob path with explicit worker opt-in. Issue #27
-remains OPEN pending the coordinator's final canonical closure.
+merged at `59f3d2cf5589b4bdb052b404d58babb0dda7a3e4`, DONE for its checkpoint,
+and available only through the reviewed, bounded, account-affine WorkerJob
+path with explicit worker opt-in. Issue #27 is CLOSED / COMPLETED; all four
+C5-01 capability acceptance criteria are satisfied. #28 remains unauthorized.
 
 The coordinator accepted production UI evidence for
 `threads.browser.thread.open` on 2026-09-28, and PR #40 accepted and merged its
@@ -269,10 +270,10 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
 1. Read root `AGENTS.md` and this handoff.
 2. Confirm `main` includes C4 merge commit `3a9e77b04ec1d68dcd4a285f9e0e9767cddf67a9`.
 3. Inspect issue #27, ADR-0005, ADR-0006, C2 capability routing, C1 WorkerJob lease/recovery, and C3 browser/session abstractions.
-4. Keep #27 OPEN until the coordinator performs its final canonical closure.
-   Feed browse, thread open, profile.open, and image-only media.local_upload are
-   DONE for their checkpoints. Each available capability uses the bounded
-   account-affine WorkerJob path with explicit worker opt-in.
+4. Keep #27 CLOSED / COMPLETED. Feed browse, thread open, profile.open, and
+   image-only media.local_upload are DONE for their checkpoints. Each available
+   capability uses the bounded account-affine WorkerJob path with explicit
+   worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
 6. Keep #28 AccountActivityPlan/preemption unauthorized pending a separate coordinator decision.
 
@@ -293,7 +294,8 @@ PR #38 is merged at `f7cacfa9674d83592d68f0501da096e55250dcde`, PR #37's
 C5-01 contract/evidence-gate foundation is accepted, PR #39's
 `threads.browser.feed.browse` v1 and PR #40's `threads.browser.thread.open` v1
 are accepted and merged. PR #41's `threads.browser.profile.open` v1 and
-PR #43's `threads.browser.media.local_upload` v1 are also accepted and merged.
+PR #43's `threads.browser.media.local_upload` v1 are also accepted and merged
+at `59f3d2cf5589b4bdb052b404d58babb0dda7a3e4`.
 All three read capabilities and the image-only media staging capability are
 DONE for their checkpoints and available only through reviewed bounded, account-affine
 WorkerJob paths with explicit worker opt-in. Profile recognition uses exact
@@ -307,7 +309,8 @@ worker-local image refs for jpg/jpeg/png/webp, requires an already-open
 operator composer and the correlated successful upload response plus preview,
 and reports uncertain post-selection outcomes as `AMBIGUOUS_OUTCOME`. It is
 non-preemptible, uses reconciliation-required retry safety, and never publishes,
-submits, or removes the staged image. Worker opt-in defaults off. Issue #27
-remains OPEN pending final coordinator closure. Synthetic fixtures are not
-production evidence. #28 remains unauthorized; LIKE/FOLLOW remain VERIFY. No
-additional mutation or publish/submit scope is authorized.
+submits, or removes the staged image. Worker opt-in defaults off. Issue #27 is
+CLOSED / COMPLETED after all C5-01 acceptance criteria were satisfied.
+Synthetic fixtures are not production evidence. #28 remains unauthorized;
+LIKE/FOLLOW remain VERIFY. No additional mutation or publish/submit scope is
+authorized.

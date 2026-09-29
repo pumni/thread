@@ -263,6 +263,6 @@ successful upload response plus same-composer preview. It never publishes,
 submits, or removes staged media. Synthetic fixtures are not production
 evidence. LIKE/FOLLOW remain VERIFY. Browser Reply/Repost/Share/Create/Post,
 publish/submit, scheduler, AccountActivityPlan, and durable priority preemption
-remain outside this scope. Issue #27 remains OPEN pending final coordinator
-closure. #28 remains unauthorized; no additional mutation or publish/submit
-scope is authorized.
+remain outside this scope. Issue #27 is CLOSED / COMPLETED after all four
+C5-01 acceptance criteria were satisfied. #28 remains unauthorized; no
+additional mutation or publish/submit scope is authorized.

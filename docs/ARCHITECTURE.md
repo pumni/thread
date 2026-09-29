@@ -472,10 +472,10 @@ operator composer, correlates the upload response with a preview in that same
 composer, and uses reconciliation after uncertain file selection. It never
 publishes or submits content. Synthetic contracts verify adapter behavior only
 and are not production evidence. Local media references resolve under the
-Worker Agent's managed `media` directory. Issue #27 remains OPEN pending final
-coordinator closure; #28 remains unauthorized. See
-`docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the per-capability bounds and
-schemas.
+Worker Agent's managed `media` directory. Issue #27 is CLOSED / COMPLETED after
+all four C5-01 capability checkpoints were accepted. #28 remains unauthorized.
+See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the per-capability bounds
+and schemas.
 
 ## 21. Concurrency
 
