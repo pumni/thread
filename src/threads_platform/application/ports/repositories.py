@@ -331,7 +331,9 @@ class WorkerRepository(Protocol):
 
     async def update(self, worker: WorkerNode) -> None: ...
 
-    async def list_expired_presence(self, now: datetime) -> list[WorkerNode]: ...
+    async def list_expired_presence_for_update(
+        self, now: datetime, limit: int
+    ) -> list[WorkerNode]: ...
 
 
 class WorkerCapabilityRepository(Protocol):

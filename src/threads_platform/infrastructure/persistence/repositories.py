@@ -2412,12 +2412,19 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
         record.updated_at = worker.updated_at
         await self._session.flush()
 
-    async def list_expired_presence(self, now: datetime) -> list[WorkerNode]:
+    async def list_expired_presence_for_update(self, now: datetime, limit: int) -> list[WorkerNode]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("presence expiry limit must be between 1 and 100")
         result = await self._session.scalars(
-            select(WorkerNodeRecord).where(
+            select(WorkerNodeRecord)
+            .where(
                 WorkerNodeRecord.status.in_([WorkerStatus.ONLINE, WorkerStatus.DEGRADED]),
+                WorkerNodeRecord.presence_expires_at.is_not(None),
                 WorkerNodeRecord.presence_expires_at <= now,
             )
+            .order_by(WorkerNodeRecord.presence_expires_at, WorkerNodeRecord.worker_id)
+            .limit(limit)
+            .with_for_update(skip_locked=True, of=WorkerNodeRecord)
         )
         return [self._domain(record) for record in result]
 

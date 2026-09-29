@@ -33,6 +33,9 @@ class WorkerControlError(ValueError):
         self.code = code
 
 
+MAX_PRESENCE_EXPIRY_BATCH_SIZE = 100
+
+
 @dataclass(frozen=True, slots=True)
 class EnrollmentIssued:
     code: str
@@ -428,11 +431,15 @@ class WorkerControlService:
             ),
         )
 
-    async def expire_presence(self) -> int:
-        now = normalize_utc(self._clock.now())
+    async def expire_presence(self, *, now: datetime, limit: int) -> int:
+        if type(limit) is not int or not 1 <= limit <= MAX_PRESENCE_EXPIRY_BATCH_SIZE:
+            raise ValueError(
+                f"presence expiry limit must be between 1 and {MAX_PRESENCE_EXPIRY_BATCH_SIZE}"
+            )
+        now = normalize_utc(now)
         expired_count = 0
         async with self._unit_of_work_factory() as unit_of_work:
-            expired = await unit_of_work.workers.list_expired_presence(now)
+            expired = await unit_of_work.workers.list_expired_presence_for_update(now, limit)
             for snapshot in expired:
                 worker = await unit_of_work.workers.get_for_update(snapshot.worker_id)
                 if (

@@ -22,6 +22,7 @@ from threads_platform.application.conversation_sync_scheduling import (
     dispatch_due_conversation_syncs,
 )
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
+from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.domain.time import normalize_utc
 
@@ -37,11 +38,13 @@ class SchedulerTickResult:
     worker_jobs_recovered: int
     activity_occurrences_generated: int = 0
     conversation_syncs_dispatched: int = 0
+    worker_presences_expired: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class SchedulerRunnerConfig:
     poll_interval: timedelta = timedelta(seconds=15)
+    presence_expiry_limit: int = 50
     generation_limit: int = 50
     conversation_sync_limit: int = 50
     activity_limit: int = 50
@@ -60,6 +63,7 @@ class SchedulerRunnerConfig:
                 f"{MAX_SCHEDULER_POLL_INTERVAL_SECONDS} seconds"
             )
         validate_scheduler_limit("generation_limit", self.generation_limit)
+        validate_scheduler_limit("presence_expiry_limit", self.presence_expiry_limit)
         validate_scheduler_limit("conversation_sync_limit", self.conversation_sync_limit)
         validate_scheduler_limit("activity_limit", self.activity_limit)
         validate_scheduler_limit("command_limit", self.command_limit)
@@ -71,6 +75,7 @@ class SchedulerTick(Protocol):
         self,
         *,
         now: datetime,
+        presence_expiry_limit: int,
         generation_limit: int,
         conversation_sync_limit: int,
         activity_limit: int,
@@ -93,6 +98,8 @@ async def run_scheduler_tick(
     worker_job_service: WorkerJobService,
     *,
     now: datetime,
+    worker_control_service: WorkerControlService | None = None,
+    presence_expiry_limit: int = 50,
     generation_limit: int = 50,
     conversation_sync_limit: int = 50,
     activity_limit: int,
@@ -101,14 +108,19 @@ async def run_scheduler_tick(
 ) -> SchedulerTickResult:
     """Process a bounded snapshot of durable work without retaining tick state."""
     validate_scheduler_limit("activity_limit", activity_limit)
+    validate_scheduler_limit("presence_expiry_limit", presence_expiry_limit)
     validate_scheduler_limit("generation_limit", generation_limit)
     validate_scheduler_limit("conversation_sync_limit", conversation_sync_limit)
     validate_scheduler_limit("command_limit", command_limit)
     validate_scheduler_limit("recovery_limit", recovery_limit)
     occurred_at = normalize_utc(now)
+    resolved_worker_control_service = worker_control_service or WorkerControlService(
+        unit_of_work_factory
+    )
     logger = structlog.get_logger(__name__)
     started_at = time.perf_counter()
     activities_materialized = 0
+    worker_presences_expired = 0
     activity_occurrences_generated = 0
     conversation_syncs_dispatched = 0
     commands_processed = 0
@@ -118,6 +130,7 @@ async def run_scheduler_tick(
     logger.info(
         "scheduler_tick_started",
         now=occurred_at.isoformat(),
+        presence_expiry_limit=presence_expiry_limit,
         generation_limit=generation_limit,
         conversation_sync_limit=conversation_sync_limit,
         activity_limit=activity_limit,
@@ -125,6 +138,20 @@ async def run_scheduler_tick(
         recovery_limit=recovery_limit,
     )
     try:
+        try:
+            worker_presences_expired = await resolved_worker_control_service.expire_presence(
+                now=occurred_at,
+                limit=presence_expiry_limit,
+            )
+        except Exception as caught:
+            if error is None:
+                error = caught
+            logger.error(
+                "scheduler_tick_stage_failed",
+                stage="worker_presence_expiry",
+                error_type=type(caught).__name__,
+            )
+
         try:
             activities = await generate_due_account_activity_occurrences(
                 unit_of_work_factory,
@@ -217,6 +244,7 @@ async def run_scheduler_tick(
         if error is not None:
             raise error
         return SchedulerTickResult(
+            worker_presences_expired=worker_presences_expired,
             activity_occurrences_generated=activity_occurrences_generated,
             conversation_syncs_dispatched=conversation_syncs_dispatched,
             activities_materialized=activities_materialized,
@@ -226,6 +254,7 @@ async def run_scheduler_tick(
     finally:
         logger.info(
             "scheduler_tick_finished",
+            worker_presences_expired=worker_presences_expired,
             activity_occurrences_generated=activity_occurrences_generated,
             conversation_syncs_dispatched=conversation_syncs_dispatched,
             activities_materialized=activities_materialized,
@@ -266,6 +295,7 @@ class SchedulerRunner:
             try:
                 await self._tick(
                     now=normalize_utc(self._clock.now()),
+                    presence_expiry_limit=self._config.presence_expiry_limit,
                     generation_limit=self._config.generation_limit,
                     conversation_sync_limit=self._config.conversation_sync_limit,
                     activity_limit=self._config.activity_limit,

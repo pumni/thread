@@ -37,7 +37,10 @@ and available only through the reviewed, bounded, account-affine WorkerJob
 path with explicit worker opt-in. Issue #27 is CLOSED / COMPLETED; all four
 C5-01 capability acceptance criteria are satisfied. C5-02/#28 is CLOSED /
 COMPLETED after #45, #47, #49 and #51. Issue #53 authorizes C6-01/1, the bounded
-PostgreSQL scheduler kernel for existing due occurrences. Parent #9 remains open.
+PostgreSQL scheduler kernel for existing due occurrences. C6-01/2 (#56) adds
+deterministic AccountActivity recurrence, C6-01/3 (#58) adds durable
+conversation sync scheduling, and C6-01/4 (#60) moves bounded Worker presence
+expiry into the explicit scheduler. Parent #9 remains open.
 
 The coordinator accepted production UI evidence for
 `threads.browser.thread.open` on 2026-09-28, and PR #40 accepted and merged its
@@ -87,9 +90,11 @@ contracts but are not production evidence. C5-02/#28 completed the durable
 activity foundation, occurrence materialization, trusted priority propagation,
 safe-boundary cancellation and HIGH preemption/profile gate. C6-01/1 (#53)
 added the bounded scheduler process for due materialization, ready Command
-draining and WorkerJob recovery. FastAPI retains worker presence expiry but no
-longer recovers WorkerJobs in its lifespan. The app and scheduler share
-CommandRuntime composition. The standalone production
+draining and WorkerJob recovery. C6-01/4 (#60) moves bounded Worker presence
+expiry to that scheduler. PostgreSQL `worker_nodes.presence_expires_at` remains
+authoritative and polling is wakeup latency only. FastAPI performs neither
+presence expiry nor WorkerJob recovery in its lifespan. The app and scheduler
+share CommandRuntime composition. The standalone production
 `ThreadsAccessTokenProvider` dependency remains separately gated by #55/#3;
 neither scheduler checkpoint implements token storage or loading. Parent #9
 remains open.
@@ -347,9 +352,12 @@ Synthetic fixtures are not production evidence. C5-02/#28 is CLOSED /
 COMPLETED after #45, #47, #49 and #51. C6-01/1/#53 added the bounded
 scheduler kernel for durable due work; C6-01/2/#56 added deterministic
 AccountActivityPlan recurrence; C6-01/3/#58 adds durable periodic conversation
-sync scheduling. The explicit scheduler process owns bounded WorkerJob
-recovery; FastAPI lifespan retains worker presence expiry but no longer
-recovers jobs. The standalone scheduler has no repository-supported
+sync scheduling. C6-01/4 (#60) adds bounded, PostgreSQL-locked Worker presence
+expiry as the first scheduler tick stage. Presence controls new-work eligibility
+only and does not affect running WorkerJob leases, attempts, or preemption.
+The explicit scheduler process owns both presence expiry and bounded WorkerJob
+recovery; FastAPI lifespan performs neither. Polling is wakeup latency only.
+The standalone scheduler has no repository-supported
 production `ThreadsAccessTokenProvider`; its deployment dependency is tracked
 separately by #55/#3. LIKE/FOLLOW remain VERIFY. No additional mutation or
 publish/submit scope is authorized.

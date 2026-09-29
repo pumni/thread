@@ -8,6 +8,7 @@ from types import FrameType
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
@@ -18,7 +19,9 @@ from threads_platform.application.scheduler import (
     SchedulerTickResult,
     run_scheduler_tick,
 )
+from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobService
+from threads_platform.config.settings import Settings
 from threads_platform.scheduler import install_shutdown_handlers
 
 
@@ -33,6 +36,8 @@ class FixedClock:
 def test_scheduler_runner_config_rejects_invalid_limits_and_poll_interval() -> None:
     with pytest.raises(ValueError, match="generation_limit"):
         SchedulerRunnerConfig(generation_limit=0)
+    with pytest.raises(ValueError, match="presence_expiry_limit"):
+        SchedulerRunnerConfig(presence_expiry_limit=0)
     with pytest.raises(ValueError, match="conversation_sync_limit"):
         SchedulerRunnerConfig(conversation_sync_limit=0)
     with pytest.raises(ValueError, match="activity_limit"):
@@ -41,6 +46,23 @@ def test_scheduler_runner_config_rejects_invalid_limits_and_poll_interval() -> N
         SchedulerRunnerConfig(command_limit=MAX_SCHEDULER_BATCH_SIZE + 1)
     with pytest.raises(ValueError, match="poll interval"):
         SchedulerRunnerConfig(poll_interval=timedelta(0))
+
+
+def test_presence_expiry_setting_has_documented_bounds() -> None:
+    assert Settings().scheduler_presence_expiry_batch_limit == 50
+    assert (
+        Settings(scheduler_presence_expiry_batch_limit=1).scheduler_presence_expiry_batch_limit == 1
+    )
+    assert (
+        Settings(
+            scheduler_presence_expiry_batch_limit=MAX_SCHEDULER_BATCH_SIZE
+        ).scheduler_presence_expiry_batch_limit
+        == MAX_SCHEDULER_BATCH_SIZE
+    )
+    with pytest.raises(ValidationError):
+        Settings(scheduler_presence_expiry_batch_limit=0)
+    with pytest.raises(ValidationError):
+        Settings(scheduler_presence_expiry_batch_limit=MAX_SCHEDULER_BATCH_SIZE + 1)
 
 
 @pytest.mark.parametrize("limit", [0, -1, MAX_SCHEDULER_BATCH_SIZE + 1, True])
@@ -55,6 +77,33 @@ async def test_scheduler_tick_rejects_invalid_batch_limits_before_work(limit: in
             command_limit=1,
             recovery_limit=1,
         )
+
+
+@pytest.mark.parametrize("limit", [0, -1, MAX_SCHEDULER_BATCH_SIZE + 1, True])
+async def test_scheduler_rejects_invalid_presence_expiry_limit_before_work(
+    limit: int,
+) -> None:
+    with pytest.raises(ValueError, match="presence_expiry_limit"):
+        await run_scheduler_tick(
+            cast(UnitOfWorkFactory, object()),
+            cast(CommandRuntime, object()),
+            cast(WorkerJobService, object()),
+            worker_control_service=cast(WorkerControlService, object()),
+            now=datetime(2026, 9, 29, tzinfo=UTC),
+            presence_expiry_limit=limit,
+            activity_limit=1,
+            command_limit=1,
+            recovery_limit=1,
+        )
+
+
+@pytest.mark.parametrize("limit", [0, -1, MAX_SCHEDULER_BATCH_SIZE + 1, True])
+async def test_presence_expiry_service_rejects_invalid_limit_before_database_work(
+    limit: int,
+) -> None:
+    service = WorkerControlService(cast(UnitOfWorkFactory, object()))
+    with pytest.raises(ValueError, match="presence expiry limit"):
+        await service.expire_presence(now=datetime(2026, 9, 29, tzinfo=UTC), limit=limit)
 
 
 async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_limits(
@@ -86,6 +135,11 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
             events.append(("recovery", limit))
             return 4
 
+    class PresenceExpiry:
+        async def expire_presence(self, *, now: datetime, limit: int) -> int:
+            events.append(("presence", limit))
+            return 5
+
     monkeypatch.setattr(scheduler_module, "generate_due_account_activity_occurrences", generate)
     monkeypatch.setattr(scheduler_module, "dispatch_due_conversation_syncs", dispatch)
     monkeypatch.setattr(scheduler_module, "materialize_due_account_activities", materialize)
@@ -94,7 +148,9 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
         cast(UnitOfWorkFactory, object()),
         cast(CommandRuntime, Runtime()),
         cast(WorkerJobService, Recovery()),
+        worker_control_service=cast(WorkerControlService, PresenceExpiry()),
         now=datetime(2026, 9, 29, tzinfo=UTC),
+        presence_expiry_limit=4,
         generation_limit=5,
         conversation_sync_limit=6,
         activity_limit=7,
@@ -103,12 +159,14 @@ async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_lim
     )
 
     assert events == [
+        ("presence", 4),
         ("generate", 5),
         ("conversation", 6),
         ("materialize", 7),
         ("command", None),
         ("recovery", 8),
     ]
+    assert result.worker_presences_expired == 5
     assert result.activity_occurrences_generated == 1
     assert result.conversation_syncs_dispatched == 2
     assert result.activities_materialized == 3
@@ -147,6 +205,7 @@ async def test_runner_executes_tick_then_waits_without_real_sleep() -> None:
     assert tick_calls == [
         {
             "now": now,
+            "presence_expiry_limit": 50,
             "generation_limit": 50,
             "conversation_sync_limit": 50,
             "activity_limit": 2,
