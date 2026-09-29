@@ -28,11 +28,11 @@ from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWork
 pytestmark = pytest.mark.integration
 
 
-async def _create_activity(
+async def _create_plan_and_template(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
     *,
-    due_at: datetime | None = None,
-) -> tuple[AccountActivityPlan, AccountActivityTemplate, ScheduledActivity]:
+    configuration: dict[str, object] | None = None,
+) -> tuple[AccountActivityPlan, AccountActivityTemplate]:
     account = ThreadsAccount(threads_user_id=f"activity-{uuid4()}", username="activity_test")
     plan = AccountActivityPlan(account_id=account.id, name="Daily account activity")
     template = AccountActivityTemplate(
@@ -40,10 +40,25 @@ async def _create_activity(
         plan_id=plan.id,
         name="Browse feed",
         activity_type="threads.browser.feed.browse",
-        configuration={"max_items": 4, "include_replies": False},
+        configuration=(
+            {"max_items": 4, "include_replies": False} if configuration is None else configuration
+        ),
         priority=ActivityPriority.NORMAL,
         change_reason="initial configuration",
     )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.accounts.add(account)
+        await unit_of_work.activity_plans.add(plan)
+        await unit_of_work.activity_templates.add_revision(template)
+    return plan, template
+
+
+async def _create_activity(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    *,
+    due_at: datetime | None = None,
+) -> tuple[AccountActivityPlan, AccountActivityTemplate, ScheduledActivity]:
+    plan, template = await _create_plan_and_template(unit_of_work_factory)
     activity = ScheduledActivity.from_plan_template(
         plan,
         template,
@@ -51,11 +66,48 @@ async def _create_activity(
         creation_reason="test occurrence",
     )
     async with unit_of_work_factory() as unit_of_work:
-        await unit_of_work.accounts.add(account)
-        await unit_of_work.activity_plans.add(plan)
-        await unit_of_work.activity_templates.add_revision(template)
         await unit_of_work.scheduled_activities.add_if_absent(activity)
     return plan, template, activity
+
+
+async def test_jsonb_storage_envelope_allows_numeric_text_expansion(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    # JSONB renders exponent-form numbers as decimal text, exceeding compact domain JSON size.
+    plan, template = await _create_plan_and_template(
+        unit_of_work_factory, configuration={"values": [1e308] * 150}
+    )
+    activity = ScheduledActivity.from_plan_template(
+        plan, template, datetime(2026, 10, 1, 9, tzinfo=UTC)
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.scheduled_activities.add_if_absent(activity)
+
+    engine = create_database_engine(os.environ["THREADS_PLATFORM_TEST_DATABASE_URL"])
+    try:
+        async with engine.connect() as connection:
+            template_text_bytes = await connection.scalar(
+                text(
+                    "SELECT octet_length(configuration::text) "
+                    "FROM account_activity_template_revisions "
+                    "WHERE template_id = :template_id AND revision = :revision"
+                ),
+                {"template_id": template.id, "revision": template.revision},
+            )
+            occurrence_text_bytes = await connection.scalar(
+                text(
+                    "SELECT octet_length(configuration_snapshot::text) "
+                    "FROM scheduled_activities WHERE id = :activity_id"
+                ),
+                {"activity_id": activity.id},
+            )
+    finally:
+        await engine.dispose()
+
+    assert template_text_bytes is not None and template_text_bytes > 32_768
+    assert occurrence_text_bytes is not None and occurrence_text_bytes > 32_768
+    assert template_text_bytes <= 1_048_576
+    assert occurrence_text_bytes <= 1_048_576
 
 
 async def test_activity_plan_template_and_occurrence_persist_with_snapshots(
@@ -186,28 +238,42 @@ async def test_scheduled_activity_composite_foreign_keys_reject_cross_account_li
 async def test_duplicate_occurrence_creation_is_safe_across_concurrent_transactions(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
-    plan, template, activity = await _create_activity(unit_of_work_factory)
-    duplicate_request = ScheduledActivity.from_plan_template(
-        plan, template, activity.due_at, creation_reason="concurrent restarted tick"
+    plan, template = await _create_plan_and_template(unit_of_work_factory)
+    due_at = datetime(2026, 10, 1, 9, tzinfo=UTC)
+    first_candidate = ScheduledActivity.from_plan_template(
+        plan, template, due_at, creation_reason="concurrent first insert"
     )
+    second_candidate = ScheduledActivity.from_plan_template(
+        plan, template, due_at, creation_reason="concurrent first insert"
+    )
+    assert first_candidate.id != second_candidate.id
+    assert first_candidate.identity == second_candidate.identity
+
+    async with unit_of_work_factory() as unit_of_work:
+        existing = await unit_of_work.scheduled_activities.list_for_account(plan.account_id)
+    assert not any(item.identity == first_candidate.identity for item in existing)
+
     engine = create_database_engine(os.environ["THREADS_PLATFORM_TEST_DATABASE_URL"])
     independent_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
     barrier = asyncio.Barrier(2)
 
     async def create_in_own_transaction(candidate: ScheduledActivity) -> ScheduledActivity:
         async with independent_factory() as unit_of_work:
+            # Release both UoWs immediately before their first insert for this identity.
             await barrier.wait()
             return await unit_of_work.scheduled_activities.add_if_absent(candidate)
 
     try:
         stored = await asyncio.gather(
-            create_in_own_transaction(activity), create_in_own_transaction(duplicate_request)
+            create_in_own_transaction(first_candidate), create_in_own_transaction(second_candidate)
         )
         assert stored[0].id == stored[1].id
-        assert stored[0].id in {activity.id, duplicate_request.id}
+        assert stored[0].id in {first_candidate.id, second_candidate.id}
         async with independent_factory() as unit_of_work:
-            listed = await unit_of_work.scheduled_activities.list_for_account(activity.account_id)
+            listed = await unit_of_work.scheduled_activities.list_for_account(plan.account_id)
         assert len(listed) == 1
+        assert listed[0].id == stored[0].id
+        assert listed[0].identity == first_candidate.identity
     finally:
         await engine.dispose()
 

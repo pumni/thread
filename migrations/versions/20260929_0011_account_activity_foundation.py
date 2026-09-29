@@ -71,6 +71,8 @@ def upgrade() -> None:
         unique=False,
     )
 
+    # Domain validation caps compact JSON at 16 KiB; jsonb::text may expand exponent-form
+    # numbers into decimal digits, so the database check is a separate 1 MiB storage envelope.
     op.create_table(
         "account_activity_template_revisions",
         sa.Column("template_id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -87,7 +89,8 @@ def upgrade() -> None:
         sa.Column("change_reason", sa.String(length=240), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
-            "jsonb_typeof(configuration) = 'object' AND octet_length(configuration::text) <= 32768",
+            "jsonb_typeof(configuration) = 'object' "
+            "AND octet_length(configuration::text) <= 1048576",
             name="ck_account_activity_template_revisions_configuration_bound",
         ),
         sa.CheckConstraint(
@@ -104,6 +107,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("template_id", "revision"),
     )
 
+    # Keep the occurrence snapshot's JSONB storage envelope consistent with template revisions.
     op.create_table(
         "scheduled_activities",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
@@ -128,7 +132,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
             "jsonb_typeof(configuration_snapshot) = 'object' "
-            "AND octet_length(configuration_snapshot::text) <= 32768",
+            "AND octet_length(configuration_snapshot::text) <= 1048576",
             name="ck_scheduled_activities_configuration_bound",
         ),
         sa.CheckConstraint(

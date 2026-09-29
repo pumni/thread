@@ -666,12 +666,15 @@ class AccountActivityTemplateRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+# The domain caps compact JSON at 16 KiB. JSONB text can expand exponent-form
+# numbers into decimal digits, so these database checks use a 1 MiB storage envelope.
 class AccountActivityTemplateRevisionRecord(Base):
     __tablename__ = "account_activity_template_revisions"
     __table_args__ = (
         CheckConstraint("revision > 0", name="ck_account_activity_template_revisions_positive"),
         CheckConstraint(
-            "jsonb_typeof(configuration) = 'object' AND octet_length(configuration::text) <= 32768",
+            "jsonb_typeof(configuration) = 'object' "
+            "AND octet_length(configuration::text) <= 1048576",
             name="ck_account_activity_template_revisions_configuration_bound",
         ),
         CheckConstraint(
@@ -720,7 +723,7 @@ class ScheduledActivityRecord(Base):
         ),
         CheckConstraint(
             "jsonb_typeof(configuration_snapshot) = 'object' "
-            "AND octet_length(configuration_snapshot::text) <= 32768",
+            "AND octet_length(configuration_snapshot::text) <= 1048576",
             name="ck_scheduled_activities_configuration_bound",
         ),
         CheckConstraint(

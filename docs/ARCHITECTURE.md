@@ -508,8 +508,11 @@ Account activity is centrally planned.
 
 `AccountActivityPlan` is account-scoped and has `ACTIVE`, `PAUSED`, and
 `DISABLED` states; paused plans can resume and disabled plans are terminal.
-Activity templates are explicit, 16 KiB JSON configuration revisions that
-reject known secret-bearing fields and credential-bearing URLs. A
+Activity templates are explicit configuration revisions that reject known
+secret-bearing fields and credential-bearing URLs. The domain/application
+limit is 16 KiB of compact UTF-8 JSON. PostgreSQL allows up to 1 MiB of rendered
+JSONB text as a storage envelope because exponent-form numbers can expand to
+decimal digits; this is not a larger application configuration limit. A
 `ScheduledActivity` is a durable occurrence that snapshots the
 plan revision and status, template revision and configuration, and semantic
 priority at creation. PostgreSQL enforces uniqueness by
