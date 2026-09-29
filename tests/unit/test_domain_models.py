@@ -43,6 +43,39 @@ def test_expired_command_cannot_enter_processing() -> None:
         command.transition(CommandStatus.PROCESSING, deadline)
 
 
+def test_command_priority_defaults_to_normal_and_rejects_unmapped_values() -> None:
+    command = Command(
+        command_id="cmd-priority",
+        correlation_id="corr-priority",
+        account_id=uuid4(),
+        command_type="threads.browser.feed.browse",
+        payload={"max_items": 4},
+    )
+
+    assert command.priority == 0
+    for priority in (-100, 0, 100):
+        assert (
+            Command(
+                command_id=f"cmd-priority-{priority}",
+                correlation_id=f"corr-priority-{priority}",
+                account_id=uuid4(),
+                command_type="threads.browser.feed.browse",
+                payload={"max_items": 4},
+                priority=priority,
+            ).priority
+            == priority
+        )
+    with pytest.raises(ValueError, match="command priority"):
+        Command(
+            command_id="cmd-priority-invalid",
+            correlation_id="corr-priority-invalid",
+            account_id=uuid4(),
+            command_type="threads.browser.feed.browse",
+            payload={"max_items": 4},
+            priority=10,
+        )
+
+
 def test_domain_modules_do_not_import_infrastructure_or_transport_libraries() -> None:
     domain_root = Path(__file__).parents[2] / "src" / "threads_platform" / "domain"
     forbidden = {"fastapi", "httpx", "sqlalchemy", "websockets", "starlette"}

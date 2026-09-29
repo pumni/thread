@@ -473,8 +473,9 @@ composer, and uses reconciliation after uncertain file selection. It never
 publishes or submits content. Synthetic contracts verify adapter behavior only
 and are not production evidence. Local media references resolve under the
 Worker Agent's managed `media` directory. Issue #27 is CLOSED / COMPLETED after
-all four C5-01 capability checkpoints were accepted. At #27 closure #28 was not
-yet authorized; issue #45 later authorized the durable C5-02/1 foundation only.
+all four C5-01 capability checkpoints were accepted. Issue #45 established the
+C5-02/1 activity foundation; issue #47 authorizes C5-02/2 materialization and
+durable priority propagation only, without a background runner or preemption.
 See `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` for the per-capability bounds
 and schemas.
 
@@ -519,11 +520,21 @@ priority at creation. PostgreSQL enforces uniqueness by
 `(template_id, template_revision, due_at)` and restricts deletion of referenced
 plans and template history.
 
-Activity priorities are `LOW`, `NORMAL`, and `HIGH`, mapped to WorkerJob numeric
+Activity priorities are `LOW`, `NORMAL`, and `HIGH`, mapped to numeric
 priorities `-100`, `0`, and `100`; existing WorkerJob priority `0` remains
-compatible with `NORMAL`. This checkpoint adds persistence and domain contracts
-only. It does not run due activities, materialize Commands, change WorkerJob
-execution, or implement cancellation or preemption.
+compatible with `NORMAL`.
+
+### C5-02/2 materialization (#47)
+
+The Control Plane materializes only already-persisted, due occurrences into
+deterministic Commands in one PostgreSQL transaction. Pending occurrences on
+paused plans remain pending; disabled plans and unsupported activity types get
+an auditable non-materializable outcome. Only feed browse, Thread open, and
+profile open may materialize. CRM protocol v1 remains priority-less and its
+Commands default to `0`; internally materialized Commands inherit the activity
+priority, which `CommandRuntime` propagates to the existing WorkerJob queue.
+WorkerJob claim ordering applies priority to queued work. This checkpoint adds
+no occurrence generator, timer, cancellation, or running-job preemption.
 
 Low-priority activities:
 - preemptible=true

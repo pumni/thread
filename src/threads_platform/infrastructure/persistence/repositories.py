@@ -38,6 +38,7 @@ from threads_platform.domain.account_activities import (
     AccountActivityTemplate,
     ActivityPriority,
     ScheduledActivity,
+    ScheduledActivityMaterializationStatus,
     configuration_document,
 )
 from threads_platform.domain.account_execution import (
@@ -407,6 +408,56 @@ class SQLAlchemyScheduledActivityRepository(ScheduledActivityRepository):
         record = await self._session.get(ScheduledActivityRecord, activity_id)
         return self._domain(record) if record is not None else None
 
+    async def list_due_pending_for_materialization(
+        self, now: datetime, limit: int
+    ) -> list[ScheduledActivity]:
+        if limit < 1:
+            raise ValueError("scheduled activity materialization limit must be positive")
+        priority_order = case(
+            (ScheduledActivityRecord.priority == ActivityPriority.HIGH, 100),
+            (ScheduledActivityRecord.priority == ActivityPriority.NORMAL, 0),
+            (ScheduledActivityRecord.priority == ActivityPriority.LOW, -100),
+            else_=0,
+        )
+        records = await self._session.scalars(
+            select(ScheduledActivityRecord)
+            .join(
+                AccountActivityPlanRecord,
+                ScheduledActivityRecord.plan_id == AccountActivityPlanRecord.id,
+            )
+            .where(
+                ScheduledActivityRecord.due_at <= normalize_utc(now),
+                ScheduledActivityRecord.materialization_status
+                == ScheduledActivityMaterializationStatus.PENDING,
+                AccountActivityPlanRecord.status != AccountActivityPlanStatus.PAUSED,
+            )
+            .order_by(
+                priority_order.desc(),
+                ScheduledActivityRecord.due_at,
+                ScheduledActivityRecord.created_at,
+                ScheduledActivityRecord.id,
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True, of=ScheduledActivityRecord)
+        )
+        return [self._domain(record) for record in records]
+
+    async def update_materialization(self, activity: ScheduledActivity) -> None:
+        record = await self._session.scalar(
+            select(ScheduledActivityRecord)
+            .where(ScheduledActivityRecord.id == activity.id)
+            .with_for_update()
+        )
+        if record is None:
+            raise LookupError(f"scheduled activity not found: {activity.id}")
+        if record.materialization_status is not ScheduledActivityMaterializationStatus.PENDING:
+            raise ValueError("scheduled activity is no longer pending materialization")
+        record.materialization_status = activity.materialization_status
+        record.command_id = activity.command_id
+        record.materialization_at = activity.materialization_at
+        record.materialization_reason = activity.materialization_reason
+        await self._session.flush()
+
     async def get_by_identity(
         self, template_id: UUID, template_revision: int, due_at: datetime
     ) -> ScheduledActivity | None:
@@ -451,6 +502,10 @@ class SQLAlchemyScheduledActivityRepository(ScheduledActivityRepository):
             "due_at": activity.due_at,
             "creation_reason": activity.creation_reason,
             "created_at": activity.created_at,
+            "materialization_status": activity.materialization_status,
+            "command_id": activity.command_id,
+            "materialization_at": activity.materialization_at,
+            "materialization_reason": activity.materialization_reason,
         }
 
     @staticmethod
@@ -472,6 +527,12 @@ class SQLAlchemyScheduledActivityRepository(ScheduledActivityRepository):
             due_at=record.due_at,
             creation_reason=record.creation_reason,
             created_at=record.created_at,
+            materialization_status=ScheduledActivityMaterializationStatus(
+                record.materialization_status
+            ),
+            command_id=record.command_id,
+            materialization_at=record.materialization_at,
+            materialization_reason=record.materialization_reason,
         )
 
 
@@ -747,6 +808,7 @@ class SQLAlchemyCommandRepository(CommandRepository):
             "command_id": command.command_id,
             "correlation_id": command.correlation_id,
             "protocol_version": command.protocol_version,
+            "priority": command.priority,
             "account_id": command.account_id,
             "command_type": command.command_type,
             "payload": command.payload,
@@ -777,6 +839,7 @@ class SQLAlchemyCommandRepository(CommandRepository):
             correlation_id=record.correlation_id,
             account_id=record.account_id,
             protocol_version=record.protocol_version,
+            priority=record.priority,
             command_type=record.command_type,
             payload=record.payload,
             status=CommandStatus(record.status),

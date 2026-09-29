@@ -470,6 +470,7 @@ class CommandRuntime:
                     else WorkerJobRetrySafety.SAFE_TO_RETRY
                 ),
                 operation_class=decision.operation_class,
+                priority=command.priority,
                 preemptible=command.command_type
                 in {
                     "threads.browser.feed.browse",
