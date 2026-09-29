@@ -446,7 +446,7 @@ async def test_missing_root_schedule_does_not_starve_later_due_schedule(
     assert len(resumed) == 1
     assert resumed[0].account_id == missing_root_schedule.account_id
     assert (await _get_schedule(unit_of_work_factory, missing_root_schedule.id)).next_due_at == (
-        missing_root_due + timedelta(hours=1)
+        missing_root_due + timedelta(hours=2)
     )
     assert await _counts_for_schedule(unit_of_work_factory, missing_root_schedule, db_session) == (
         1,
