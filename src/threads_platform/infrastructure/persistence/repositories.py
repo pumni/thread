@@ -66,6 +66,7 @@ from threads_platform.domain.capabilities import (
     RouteTarget,
 )
 from threads_platform.domain.commands import (
+    TERMINAL_COMMAND_STATUSES,
     AttemptStatus,
     Command,
     CommandAttempt,
@@ -765,6 +766,23 @@ class SQLAlchemyConversationSyncScheduleRepository(ConversationSyncScheduleRepos
             .where(
                 ConversationSyncScheduleRecord.status == ConversationSyncScheduleStatus.ACTIVE,
                 ConversationSyncScheduleRecord.next_due_at <= normalize_utc(now),
+                or_(
+                    ConversationSyncScheduleRecord.last_command_id.is_(None),
+                    exists(
+                        select(1).where(
+                            CommandRecord.command_id
+                            == ConversationSyncScheduleRecord.last_command_id,
+                            CommandRecord.status.in_(TERMINAL_COMMAND_STATUSES),
+                        )
+                    ),
+                ),
+                exists(
+                    select(1).where(
+                        PostRecord.account_id == ConversationSyncScheduleRecord.account_id,
+                        PostRecord.threads_post_id
+                        == ConversationSyncScheduleRecord.threads_post_id,
+                    )
+                ),
             )
             .order_by(
                 ConversationSyncScheduleRecord.next_due_at,

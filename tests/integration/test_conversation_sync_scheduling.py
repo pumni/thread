@@ -341,6 +341,120 @@ async def test_missing_local_root_does_not_create_or_advance_schedule(
     )
 
 
+async def test_nonterminal_schedule_does_not_starve_later_due_schedule(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    _, _, blocked_schedule = await _create_schedule(unit_of_work_factory)
+    previous = await dispatch_due_conversation_syncs(
+        unit_of_work_factory, now=blocked_schedule.next_due_at, limit=1
+    )
+    assert len(previous) == 1
+
+    _, _, later_schedule = await _create_schedule(
+        unit_of_work_factory,
+        anchor_at=blocked_schedule.next_due_at + timedelta(minutes=5),
+    )
+    blocked_due = blocked_schedule.next_due_at + timedelta(hours=1)
+    later_due = later_schedule.next_due_at
+    assert blocked_due < later_due
+    now = later_due + timedelta(minutes=30)
+
+    dispatched = await dispatch_due_conversation_syncs(unit_of_work_factory, now=now, limit=1)
+
+    assert len(dispatched) == 1
+    assert dispatched[0].account_id == later_schedule.account_id
+    blocked_after = await _get_schedule(unit_of_work_factory, blocked_schedule.id)
+    later_after = await _get_schedule(unit_of_work_factory, later_schedule.id)
+    assert blocked_after.next_due_at == blocked_due
+    assert blocked_after.status is ConversationSyncScheduleStatus.ACTIVE
+    assert blocked_after.last_dispatched_due_at == blocked_schedule.next_due_at
+    assert blocked_after.last_command_id == previous[0].command_id
+    assert later_after.next_due_at == later_due + timedelta(hours=1)
+    assert await _counts_for_schedule(unit_of_work_factory, blocked_schedule, db_session) == (
+        1,
+        1,
+        1,
+    )
+    assert await _counts_for_schedule(unit_of_work_factory, later_schedule, db_session) == (
+        1,
+        1,
+        1,
+    )
+
+    await _terminalize_command(
+        unit_of_work_factory, previous[0].command_id, CommandStatus.SUCCEEDED, now
+    )
+    resumed = await dispatch_due_conversation_syncs(unit_of_work_factory, now=now, limit=1)
+
+    assert len(resumed) == 1
+    assert resumed[0].account_id == blocked_schedule.account_id
+    assert (await _get_schedule(unit_of_work_factory, blocked_schedule.id)).next_due_at == (
+        blocked_due + timedelta(hours=1)
+    )
+    assert await _counts_for_schedule(unit_of_work_factory, blocked_schedule, db_session) == (
+        2,
+        2,
+        2,
+    )
+
+
+async def test_missing_root_schedule_does_not_starve_later_due_schedule(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    db_session: AsyncSession,
+) -> None:
+    account_id, _, missing_root_schedule = await _create_schedule(
+        unit_of_work_factory, threads_post_id="missing-local-root"
+    )
+    _, _, later_schedule = await _create_schedule(
+        unit_of_work_factory,
+        anchor_at=missing_root_schedule.next_due_at + timedelta(minutes=5),
+    )
+    missing_root_due = missing_root_schedule.next_due_at
+    later_due = later_schedule.next_due_at
+    assert missing_root_due < later_due
+    now = later_due + timedelta(minutes=30)
+
+    dispatched = await dispatch_due_conversation_syncs(unit_of_work_factory, now=now, limit=1)
+
+    assert len(dispatched) == 1
+    assert dispatched[0].account_id == later_schedule.account_id
+    missing_after = await _get_schedule(unit_of_work_factory, missing_root_schedule.id)
+    later_after = await _get_schedule(unit_of_work_factory, later_schedule.id)
+    assert missing_after.next_due_at == missing_root_due
+    assert missing_after.status is ConversationSyncScheduleStatus.ACTIVE
+    assert missing_after.last_dispatched_due_at is None
+    assert missing_after.last_command_id is None
+    assert later_after.next_due_at == later_due + timedelta(hours=1)
+    assert await _counts_for_schedule(unit_of_work_factory, missing_root_schedule, db_session) == (
+        0,
+        0,
+        0,
+    )
+    assert await _counts_for_schedule(unit_of_work_factory, later_schedule, db_session) == (
+        1,
+        1,
+        1,
+    )
+
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.posts.add(
+            ThreadPost(account_id=account_id, threads_post_id="missing-local-root")
+        )
+    resumed = await dispatch_due_conversation_syncs(unit_of_work_factory, now=now, limit=1)
+
+    assert len(resumed) == 1
+    assert resumed[0].account_id == missing_root_schedule.account_id
+    assert (await _get_schedule(unit_of_work_factory, missing_root_schedule.id)).next_due_at == (
+        missing_root_due + timedelta(hours=1)
+    )
+    assert await _counts_for_schedule(unit_of_work_factory, missing_root_schedule, db_session) == (
+        1,
+        1,
+        1,
+    )
+
+
 async def test_partial_unique_index_allows_history_only_for_disabled_schedules(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:

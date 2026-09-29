@@ -4,22 +4,16 @@ from uuid import UUID
 import structlog
 
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
-from threads_platform.domain.commands import Command, CommandStatus
+from threads_platform.domain.commands import (
+    TERMINAL_COMMAND_STATUSES,
+    Command,
+)
 from threads_platform.domain.conversation_sync import (
     ConversationSyncDispatch,
 )
 from threads_platform.domain.time import normalize_utc
 
 MAX_CONVERSATION_SYNC_DISPATCH_BATCH = 100
-_TERMINAL_COMMAND_STATUSES = frozenset(
-    {
-        CommandStatus.SUCCEEDED,
-        CommandStatus.REJECTED,
-        CommandStatus.EXPIRED,
-        CommandStatus.FAILED_FINAL,
-        CommandStatus.CANCELLED,
-    }
-)
 
 
 async def dispatch_due_conversation_syncs(
@@ -52,7 +46,7 @@ async def dispatch_due_conversation_syncs(
                 )
                 if previous_command is None:
                     raise RuntimeError("conversation sync dispatch references a missing Command")
-                if previous_command.status not in _TERMINAL_COMMAND_STATUSES:
+                if previous_command.status not in TERMINAL_COMMAND_STATUSES:
                     continue
 
             root_post = await unit_of_work.posts.get_by_external_id(

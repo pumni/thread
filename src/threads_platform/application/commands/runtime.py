@@ -40,6 +40,7 @@ from threads_platform.domain.capabilities import (
     RouteTarget,
 )
 from threads_platform.domain.commands import (
+    TERMINAL_COMMAND_STATUSES,
     AttemptStatus,
     Command,
     CommandAttempt,
@@ -854,12 +855,4 @@ class CommandRuntime:
 
     @staticmethod
     def _terminal_statuses() -> frozenset[CommandStatus]:
-        return frozenset(
-            {
-                CommandStatus.SUCCEEDED,
-                CommandStatus.REJECTED,
-                CommandStatus.EXPIRED,
-                CommandStatus.FAILED_FINAL,
-                CommandStatus.CANCELLED,
-            }
-        )
+        return TERMINAL_COMMAND_STATUSES
