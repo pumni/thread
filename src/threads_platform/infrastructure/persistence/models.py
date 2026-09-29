@@ -43,6 +43,10 @@ from threads_platform.domain.capabilities import (
     RouteTarget,
 )
 from threads_platform.domain.commands import AttemptStatus, CommandStatus
+from threads_platform.domain.conversation_sync import (
+    ConversationSyncKind,
+    ConversationSyncScheduleStatus,
+)
 from threads_platform.domain.discovery import (
     DiscoveryCampaignStatus,
     DiscoveryEnrichmentStatus,
@@ -895,6 +899,131 @@ class ScheduledActivityRecord(Base):
     command_id: Mapped[str | None] = mapped_column(String(255))
     materialization_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     materialization_reason: Mapped[str | None] = mapped_column(String(240))
+
+
+class ConversationSyncScheduleRecord(Base):
+    __tablename__ = "conversation_sync_schedules"
+    __table_args__ = (
+        CheckConstraint(
+            "length(btrim(threads_post_id)) > 0",
+            name="ck_conversation_sync_schedules_root_nonblank",
+        ),
+        CheckConstraint(
+            "sync_kind IN ('conversation', 'replies')",
+            name="ck_conversation_sync_schedules_sync_kind",
+        ),
+        CheckConstraint(
+            "interval_seconds BETWEEN 900 AND 2592000",
+            name="ck_conversation_sync_schedules_interval_bounds",
+        ),
+        CheckConstraint(
+            "status IN ('ACTIVE', 'PAUSED', 'DISABLED')",
+            name="ck_conversation_sync_schedules_status",
+        ),
+        CheckConstraint(
+            "revision > 0",
+            name="ck_conversation_sync_schedules_positive_revision",
+        ),
+        CheckConstraint(
+            "next_due_at > anchor_at",
+            name="ck_conversation_sync_schedules_next_due_after_anchor",
+        ),
+        CheckConstraint(
+            "mod(extract(epoch from (next_due_at - anchor_at)), interval_seconds) = 0",
+            name="ck_conversation_sync_schedules_next_due_slot",
+        ),
+        CheckConstraint(
+            "(status = 'ACTIVE' AND status_reason IS NULL) OR "
+            "(status <> 'ACTIVE' AND status_reason IS NOT NULL "
+            "AND length(btrim(status_reason)) > 0)",
+            name="ck_conversation_sync_schedules_status_reason",
+        ),
+        CheckConstraint(
+            "(last_dispatched_due_at IS NULL AND last_command_id IS NULL) OR "
+            "(last_dispatched_due_at IS NOT NULL AND last_command_id IS NOT NULL "
+            "AND next_due_at > last_dispatched_due_at "
+            "AND mod(extract(epoch from (last_dispatched_due_at - anchor_at)), "
+            "interval_seconds) = 0)",
+            name="ck_conversation_sync_schedules_last_dispatch_pair",
+        ),
+        ForeignKeyConstraint(
+            ["account_id"],
+            ["threads_accounts.id"],
+            ondelete="RESTRICT",
+            name="fk_conversation_sync_schedules_account",
+        ),
+        ForeignKeyConstraint(
+            ["last_command_id"],
+            ["commands.command_id"],
+            ondelete="RESTRICT",
+            name="fk_conversation_sync_schedules_last_command",
+        ),
+        Index(
+            "uq_conversation_sync_schedules_active_target",
+            "account_id",
+            "threads_post_id",
+            "sync_kind",
+            unique=True,
+            postgresql_where=text("status <> 'DISABLED'"),
+        ),
+        Index(
+            "ix_conversation_sync_schedules_due",
+            "next_due_at",
+            "id",
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    account_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    threads_post_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    sync_kind: Mapped[ConversationSyncKind] = mapped_column(String(40), nullable=False)
+    anchor_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[ConversationSyncScheduleStatus] = mapped_column(String(40), nullable=False)
+    status_reason: Mapped[str | None] = mapped_column(String(240))
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_dispatched_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_command_id: Mapped[str | None] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ConversationSyncDispatchRecord(Base):
+    __tablename__ = "conversation_sync_dispatches"
+    __table_args__ = (
+        UniqueConstraint(
+            "schedule_id",
+            "due_at",
+            name="uq_conversation_sync_dispatches_schedule_due",
+        ),
+        UniqueConstraint("command_id", name="uq_conversation_sync_dispatches_command"),
+        CheckConstraint(
+            "schedule_revision > 0",
+            name="ck_conversation_sync_dispatches_positive_revision",
+        ),
+        ForeignKeyConstraint(
+            ["schedule_id"],
+            ["conversation_sync_schedules.id"],
+            ondelete="RESTRICT",
+            name="fk_conversation_sync_dispatches_schedule",
+        ),
+        ForeignKeyConstraint(
+            ["command_id"],
+            ["commands.command_id"],
+            ondelete="RESTRICT",
+            name="fk_conversation_sync_dispatches_command",
+        ),
+        Index("ix_conversation_sync_dispatches_schedule_due", "schedule_id", "due_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    schedule_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    schedule_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    command_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class SyncStateRecord(Base):

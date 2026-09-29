@@ -607,22 +607,23 @@ another and retain the existing deterministic queue tie order. This checkpoint
 does not add NORMAL-over-LOW preemption, fairness, or process/lease-revocation
 cancellation.
 
-### C6-01 PostgreSQL scheduler and recurrence (#53, #56)
+### C6-01 PostgreSQL scheduler and recurrence (#53, #56, #58)
 
 The scheduler runs one bounded tick in this order: generate due recurrence
-occurrences, materialize due `ScheduledActivity` rows, drain ready Commands
-through `CommandRuntime` and the Capability Router, then invoke bounded
-`WorkerJobService` recovery. It never constructs WorkerJobs or executes
-browser work directly. PostgreSQL occurrence, Command, and WorkerJob rows
-remain authoritative. The process loop is a wakeup mechanism only; every tick
-rediscovers work from PostgreSQL after restart.
+occurrences, dispatch due conversation sync schedules, materialize due
+`ScheduledActivity` rows, drain ready Commands through `CommandRuntime` and
+the Capability Router, then invoke bounded `WorkerJobService` recovery. It
+never constructs WorkerJobs or executes browser work directly. PostgreSQL
+occurrence, schedule, Command, and WorkerJob rows remain authoritative. The
+process loop is a wakeup mechanism only; every tick rediscovers work from
+PostgreSQL after restart.
 
 The explicit process runs as `python -m threads_platform.scheduler`; it is not
 hidden in FastAPI request handling. Ticks run sequentially within a process.
 Separate processes may run concurrently: recurrence cursor, due-occurrence,
-and ready-Command selection use PostgreSQL row locks and `FOR UPDATE SKIP
-LOCKED`, while existing uniqueness, Command routing, WorkerJob recovery and
-lease fencing remain authoritative.
+conversation schedule, and ready-Command selection use PostgreSQL row locks
+and `FOR UPDATE SKIP LOCKED`, while existing uniqueness, Command routing,
+WorkerJob recovery and lease fencing remain authoritative.
 The FastAPI lifespan retains worker presence expiry but does not perform
 WorkerJob recovery; recovery requires the explicit scheduler process. FastAPI
 and the scheduler use one CommandRuntime composition helper for the UnitOfWork,
@@ -658,8 +659,44 @@ nothing; existing pending rows retain existing `PLAN_DISABLED` handling.
 Downgrade from 0015 is allowed with only `NONE` revisions and no cursor rows;
 it refuses to discard recurrence configuration or cursor history.
 
-Generation, materialization, Command, and recovery limits are each 1–100,
-with a default of 50. The generation setting is
+Periodic conversation sync is limited to the existing
+`threads.sync_conversation` READ Command. A `ConversationSyncSchedule` binds
+one account, local root post ID, sync kind, UTC anchor, and fixed interval from
+900 through 2,592,000 seconds. There is no cron, timezone/DST grammar, jitter,
+or randomization. Its next due time and control state are PostgreSQL-owned;
+the immutable `ConversationSyncDispatch` audit row records each exact due
+slot, schedule revision, and deterministic Command ID. The due slot is the
+identity of a dispatch. If the scheduler was unavailable across several
+intervals, it creates one Command for the oldest due slot and advances the
+next due time to the first interval strictly after `now`; the existing
+`SyncState` cursor performs remote data catch-up.
+
+Only ACTIVE schedules dispatch. PAUSED schedules retain their due time and
+create no Command; resume can dispatch one coalesced due slot. DISABLED is
+terminal, and a partial unique index allows a replacement schedule while
+retaining disabled history. Before dispatch, the service checks the latest
+dispatch's Command under schedule-row serialization. A non-terminal Command
+keeps the schedule due and blocks overlap. A missing account-owned local root
+post likewise creates no Command, dispatch, or cursor movement and is logged
+with a bounded error code. Command creation, dispatch audit insertion, and
+schedule cursor advancement commit in one transaction. IDs derive from
+schedule ID plus exact due timestamp; the Command payload contains only the
+root post ID and `conversation` or `replies`, with priority 0 and no invented
+deadline. The independent
+`THREADS_PLATFORM_SCHEDULER_CONVERSATION_SYNC_BATCH_LIMIT` defaults to 50 and
+allows 1–100 schedules per tick.
+
+The Command still passes through `CommandRuntime` and the Capability Router
+to the LOCAL_API conversation handler. The handler reads and advances the
+existing `SyncState` cursor, so coalescing dispatch history never collapses
+remote cursor catch-up. Production token loading remains gated by #55/#3;
+when the standalone process has no LOCAL_API dependency, its Command remains
+durable and the outstanding-command gate prevents an overlapping dispatch.
+Discovery and mentions recurrence remain deferred because #3 has not
+established the required live time-window/cursor semantics.
+
+Generation, conversation dispatch, materialization, Command, and recovery
+limits are each 1–100, with a default of 50. The generation setting is
 `THREADS_PLATFORM_SCHEDULER_ACTIVITY_GENERATION_BATCH_LIMIT`; it is separate
 from the materialization limit. The poll interval defaults to 15 seconds,
 must be positive, and is bounded to 3,600 seconds. Worker offline state leaves

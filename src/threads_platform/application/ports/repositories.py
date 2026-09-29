@@ -17,6 +17,10 @@ from threads_platform.domain.account_execution import (
 from threads_platform.domain.accounts import ThreadsAccount
 from threads_platform.domain.capabilities import CapabilityRouteDecision, OperationClass
 from threads_platform.domain.commands import Command, CommandAttempt
+from threads_platform.domain.conversation_sync import (
+    ConversationSyncDispatch,
+    ConversationSyncSchedule,
+)
 from threads_platform.domain.discovery import (
     DiscoveredAuthor,
     DiscoveredThread,
@@ -124,6 +128,34 @@ class ScheduledActivityRepository(Protocol):
     async def list_for_account(
         self, account_id: UUID, *, limit: int = 100
     ) -> list[ScheduledActivity]: ...
+
+
+class ConversationSyncScheduleRepository(Protocol):
+    async def add(self, schedule: ConversationSyncSchedule) -> None: ...
+
+    async def get(self, schedule_id: UUID) -> ConversationSyncSchedule | None: ...
+
+    async def get_for_update(self, schedule_id: UUID) -> ConversationSyncSchedule | None: ...
+
+    async def get_due_for_update(
+        self, now: datetime, limit: int
+    ) -> list[ConversationSyncSchedule]: ...
+
+    async def list_for_account(self, account_id: UUID) -> list[ConversationSyncSchedule]: ...
+
+    async def update(self, schedule: ConversationSyncSchedule) -> None: ...
+
+
+class ConversationSyncDispatchRepository(Protocol):
+    async def add_if_absent(
+        self, dispatch: ConversationSyncDispatch
+    ) -> ConversationSyncDispatch: ...
+
+    async def get_latest_for_schedule(
+        self, schedule_id: UUID
+    ) -> ConversationSyncDispatch | None: ...
+
+    async def list_for_schedule(self, schedule_id: UUID) -> list[ConversationSyncDispatch]: ...
 
 
 class CommandRepository(Protocol):
@@ -521,6 +553,8 @@ class UnitOfWork(Protocol):
     activity_templates: AccountActivityTemplateRepository
     activity_recurrence_states: AccountActivityRecurrenceStateRepository
     scheduled_activities: ScheduledActivityRepository
+    conversation_sync_schedules: ConversationSyncScheduleRepository
+    conversation_sync_dispatches: ConversationSyncDispatchRepository
     commands: CommandRepository
     attempts: CommandAttemptRepository
     posts: PostRepository

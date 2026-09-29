@@ -33,6 +33,8 @@ class FixedClock:
 def test_scheduler_runner_config_rejects_invalid_limits_and_poll_interval() -> None:
     with pytest.raises(ValueError, match="generation_limit"):
         SchedulerRunnerConfig(generation_limit=0)
+    with pytest.raises(ValueError, match="conversation_sync_limit"):
+        SchedulerRunnerConfig(conversation_sync_limit=0)
     with pytest.raises(ValueError, match="activity_limit"):
         SchedulerRunnerConfig(activity_limit=0)
     with pytest.raises(ValueError, match="command_limit"):
@@ -53,6 +55,65 @@ async def test_scheduler_tick_rejects_invalid_batch_limits_before_work(limit: in
             command_limit=1,
             recovery_limit=1,
         )
+
+
+async def test_scheduler_tick_runs_independent_stages_in_order_with_separate_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threads_platform.application.scheduler as scheduler_module
+
+    events: list[tuple[str, int | None]] = []
+
+    async def generate(_factory: object, *, now: datetime, limit: int) -> list[object]:
+        events.append(("generate", limit))
+        return [object()]
+
+    async def dispatch(_factory: object, *, now: datetime, limit: int) -> list[object]:
+        events.append(("conversation", limit))
+        return [object(), object()]
+
+    async def materialize(_factory: object, *, now: datetime, limit: int) -> list[object]:
+        events.append(("materialize", limit))
+        return [object(), object(), object()]
+
+    class Runtime:
+        async def process_next(self, **_kwargs: object) -> None:
+            events.append(("command", None))
+            return None
+
+    class Recovery:
+        async def recover_expired(self, *, now: datetime, limit: int) -> int:
+            events.append(("recovery", limit))
+            return 4
+
+    monkeypatch.setattr(scheduler_module, "generate_due_account_activity_occurrences", generate)
+    monkeypatch.setattr(scheduler_module, "dispatch_due_conversation_syncs", dispatch)
+    monkeypatch.setattr(scheduler_module, "materialize_due_account_activities", materialize)
+
+    result = await run_scheduler_tick(
+        cast(UnitOfWorkFactory, object()),
+        cast(CommandRuntime, Runtime()),
+        cast(WorkerJobService, Recovery()),
+        now=datetime(2026, 9, 29, tzinfo=UTC),
+        generation_limit=5,
+        conversation_sync_limit=6,
+        activity_limit=7,
+        command_limit=1,
+        recovery_limit=8,
+    )
+
+    assert events == [
+        ("generate", 5),
+        ("conversation", 6),
+        ("materialize", 7),
+        ("command", None),
+        ("recovery", 8),
+    ]
+    assert result.activity_occurrences_generated == 1
+    assert result.conversation_syncs_dispatched == 2
+    assert result.activities_materialized == 3
+    assert result.commands_processed == 0
+    assert result.worker_jobs_recovered == 4
 
 
 async def test_runner_executes_tick_then_waits_without_real_sleep() -> None:
@@ -87,6 +148,7 @@ async def test_runner_executes_tick_then_waits_without_real_sleep() -> None:
         {
             "now": now,
             "generation_limit": 50,
+            "conversation_sync_limit": 50,
             "activity_limit": 2,
             "command_limit": 3,
             "recovery_limit": 4,

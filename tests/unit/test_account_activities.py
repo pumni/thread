@@ -51,7 +51,10 @@ def _template(
 
 def test_activity_plan_validates_state_transitions_and_revisions() -> None:
     plan = _plan()
-    start = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    start = max(
+        datetime(2026, 9, 29, 12, tzinfo=UTC),
+        plan.updated_at + timedelta(microseconds=1),
+    )
 
     plan.transition(AccountActivityPlanStatus.PAUSED, start, reason="operator pause")
     assert plan.status is AccountActivityPlanStatus.PAUSED

@@ -18,6 +18,9 @@ from threads_platform.application.account_activity_recurrence import (
 )
 from threads_platform.application.clock import Clock, SystemClock
 from threads_platform.application.commands.runtime import CommandRuntime
+from threads_platform.application.conversation_sync_scheduling import (
+    dispatch_due_conversation_syncs,
+)
 from threads_platform.application.ports.repositories import UnitOfWorkFactory
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.domain.time import normalize_utc
@@ -33,12 +36,14 @@ class SchedulerTickResult:
     commands_processed: int
     worker_jobs_recovered: int
     activity_occurrences_generated: int = 0
+    conversation_syncs_dispatched: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class SchedulerRunnerConfig:
     poll_interval: timedelta = timedelta(seconds=15)
     generation_limit: int = 50
+    conversation_sync_limit: int = 50
     activity_limit: int = 50
     command_limit: int = 50
     recovery_limit: int = 50
@@ -55,6 +60,7 @@ class SchedulerRunnerConfig:
                 f"{MAX_SCHEDULER_POLL_INTERVAL_SECONDS} seconds"
             )
         validate_scheduler_limit("generation_limit", self.generation_limit)
+        validate_scheduler_limit("conversation_sync_limit", self.conversation_sync_limit)
         validate_scheduler_limit("activity_limit", self.activity_limit)
         validate_scheduler_limit("command_limit", self.command_limit)
         validate_scheduler_limit("recovery_limit", self.recovery_limit)
@@ -66,6 +72,7 @@ class SchedulerTick(Protocol):
         *,
         now: datetime,
         generation_limit: int,
+        conversation_sync_limit: int,
         activity_limit: int,
         command_limit: int,
         recovery_limit: int,
@@ -87,6 +94,7 @@ async def run_scheduler_tick(
     *,
     now: datetime,
     generation_limit: int = 50,
+    conversation_sync_limit: int = 50,
     activity_limit: int,
     command_limit: int,
     recovery_limit: int,
@@ -94,6 +102,7 @@ async def run_scheduler_tick(
     """Process a bounded snapshot of durable work without retaining tick state."""
     validate_scheduler_limit("activity_limit", activity_limit)
     validate_scheduler_limit("generation_limit", generation_limit)
+    validate_scheduler_limit("conversation_sync_limit", conversation_sync_limit)
     validate_scheduler_limit("command_limit", command_limit)
     validate_scheduler_limit("recovery_limit", recovery_limit)
     occurred_at = normalize_utc(now)
@@ -101,6 +110,7 @@ async def run_scheduler_tick(
     started_at = time.perf_counter()
     activities_materialized = 0
     activity_occurrences_generated = 0
+    conversation_syncs_dispatched = 0
     commands_processed = 0
     worker_jobs_recovered = 0
     error: Exception | None = None
@@ -109,6 +119,7 @@ async def run_scheduler_tick(
         "scheduler_tick_started",
         now=occurred_at.isoformat(),
         generation_limit=generation_limit,
+        conversation_sync_limit=conversation_sync_limit,
         activity_limit=activity_limit,
         command_limit=command_limit,
         recovery_limit=recovery_limit,
@@ -127,6 +138,22 @@ async def run_scheduler_tick(
             logger.error(
                 "scheduler_tick_stage_failed",
                 stage="activity_recurrence_generation",
+                error_type=type(caught).__name__,
+            )
+
+        try:
+            conversation_sync_commands = await dispatch_due_conversation_syncs(
+                unit_of_work_factory,
+                now=occurred_at,
+                limit=conversation_sync_limit,
+            )
+            conversation_syncs_dispatched = len(conversation_sync_commands)
+        except Exception as caught:
+            if error is None:
+                error = caught
+            logger.error(
+                "scheduler_tick_stage_failed",
+                stage="conversation_sync_dispatch",
                 error_type=type(caught).__name__,
             )
 
@@ -191,6 +218,7 @@ async def run_scheduler_tick(
             raise error
         return SchedulerTickResult(
             activity_occurrences_generated=activity_occurrences_generated,
+            conversation_syncs_dispatched=conversation_syncs_dispatched,
             activities_materialized=activities_materialized,
             commands_processed=commands_processed,
             worker_jobs_recovered=worker_jobs_recovered,
@@ -199,6 +227,7 @@ async def run_scheduler_tick(
         logger.info(
             "scheduler_tick_finished",
             activity_occurrences_generated=activity_occurrences_generated,
+            conversation_syncs_dispatched=conversation_syncs_dispatched,
             activities_materialized=activities_materialized,
             commands_processed=commands_processed,
             worker_jobs_recovered=worker_jobs_recovered,
@@ -238,6 +267,7 @@ class SchedulerRunner:
                 await self._tick(
                     now=normalize_utc(self._clock.now()),
                     generation_limit=self._config.generation_limit,
+                    conversation_sync_limit=self._config.conversation_sync_limit,
                     activity_limit=self._config.activity_limit,
                     command_limit=self._config.command_limit,
                     recovery_limit=self._config.recovery_limit,

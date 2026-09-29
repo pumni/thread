@@ -91,18 +91,31 @@ draining and WorkerJob recovery. FastAPI retains worker presence expiry but no
 longer recovers WorkerJobs in its lifespan. The app and scheduler share
 CommandRuntime composition. The standalone production
 `ThreadsAccessTokenProvider` dependency remains separately gated by #55/#3;
-this recurrence checkpoint does not implement token storage or loading.
+neither scheduler checkpoint implements token storage or loading. Parent #9
+remains open.
 
-C6-01/2 (#56) is the authorized recurrence checkpoint on this branch. It adds
-only `NONE` and deterministic `FIXED_INTERVAL` recurrence on immutable
-`AccountActivityTemplate` revisions. PostgreSQL cursor rows and occurrence
-rows are authoritative; the scheduler loop remains wakeup-only. Fixed slots
-use UTC anchor plus integer interval arithmetic (900–2,592,000 seconds), with
-no cron, jitter, or timezone grammar. ACTIVE and PAUSED plans generate durable
-occurrences; PAUSED rows remain PENDING for resume. DISABLED plans stop
-generation. A newer template revision supersedes only ungenerated older slots;
-existing occurrences remain immutable. Generation, materialization, Command,
-and recovery each retain separate bounded batch limits. Parent #9 remains open.
+C6-01/2 (#56) implements only `NONE` and deterministic `FIXED_INTERVAL`
+recurrence on immutable `AccountActivityTemplate` revisions. PostgreSQL
+cursor rows and occurrence rows are authoritative; the scheduler loop remains
+wakeup-only. Fixed slots use UTC anchor plus integer interval arithmetic
+(900–2,592,000 seconds), with no cron, jitter, or timezone grammar. ACTIVE and
+PAUSED plans generate durable occurrences; PAUSED rows remain PENDING for
+resume. DISABLED plans stop generation. A newer template revision supersedes
+only ungenerated older slots; existing occurrences remain immutable.
+
+C6-01/3 (#58) adds durable fixed-interval schedules for the existing
+`threads.sync_conversation` READ Command only. Each schedule has one UTC anchor,
+interval, status/control revision, and due cursor; each dispatch has an
+immutable audit row linked to its deterministic Command. One coalesced Command
+represents the oldest due slot after an outage, and the existing SyncState
+cursor performs remote catch-up. PAUSED schedules retain their due time;
+DISABLED is terminal. A non-terminal prior Command prevents overlap. Command,
+dispatch audit, and cursor advancement commit together. Scheduler order is
+generation, conversation dispatch, materialization, Command draining, and
+WorkerJob recovery, each with an independent bounded limit. Discovery and
+mentions recurrence remain deferred pending #3 time-window/cursor semantics.
+Production LOCAL_API execution still depends on #55/#3. This checkpoint does
+not close parent #9.
 LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond this
 bounded staging capability, and publish/submit remains outside scope.
 
@@ -332,11 +345,11 @@ submits, or removes the staged image. Worker opt-in defaults off. Issue #27 is
 CLOSED / COMPLETED after all C5-01 acceptance criteria were satisfied.
 Synthetic fixtures are not production evidence. C5-02/#28 is CLOSED /
 COMPLETED after #45, #47, #49 and #51. C6-01/1/#53 added the bounded
-scheduler kernel for durable due work. C6-01/2/#56 is the authorized
-deterministic AccountActivityPlan recurrence checkpoint on this branch. The
-explicit scheduler process owns bounded WorkerJob recovery; FastAPI lifespan
-retains worker presence expiry but no longer recovers jobs. The standalone
-scheduler has no repository-supported production
-`ThreadsAccessTokenProvider`; its deployment dependency is tracked separately
-by #55/#3. LIKE/FOLLOW remain VERIFY. No additional mutation or publish/submit
-scope is authorized.
+scheduler kernel for durable due work; C6-01/2/#56 added deterministic
+AccountActivityPlan recurrence; C6-01/3/#58 adds durable periodic conversation
+sync scheduling. The explicit scheduler process owns bounded WorkerJob
+recovery; FastAPI lifespan retains worker presence expiry but no longer
+recovers jobs. The standalone scheduler has no repository-supported
+production `ThreadsAccessTokenProvider`; its deployment dependency is tracked
+separately by #55/#3. LIKE/FOLLOW remain VERIFY. No additional mutation or
+publish/submit scope is authorized.

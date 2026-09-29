@@ -16,6 +16,8 @@ from threads_platform.application.ports.repositories import (
     CommandAttemptRepository,
     CommandRepository,
     CommandRouteDecisionRepository,
+    ConversationSyncDispatchRepository,
+    ConversationSyncScheduleRepository,
     DiscoveryRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
@@ -45,6 +47,8 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyCommandAttemptRepository,
     SQLAlchemyCommandRepository,
     SQLAlchemyCommandRouteDecisionRepository,
+    SQLAlchemyConversationSyncDispatchRepository,
+    SQLAlchemyConversationSyncScheduleRepository,
     SQLAlchemyDiscoveryRepository,
     SQLAlchemyIntegrationDeliveryRepository,
     SQLAlchemyNetworkProfileRepository,
@@ -80,6 +84,12 @@ class SQLAlchemyUnitOfWork:
         )
         self.scheduled_activities: ScheduledActivityRepository = (
             SQLAlchemyScheduledActivityRepository(self._session)
+        )
+        self.conversation_sync_schedules: ConversationSyncScheduleRepository = (
+            SQLAlchemyConversationSyncScheduleRepository(self._session)
+        )
+        self.conversation_sync_dispatches: ConversationSyncDispatchRepository = (
+            SQLAlchemyConversationSyncDispatchRepository(self._session)
         )
         self.account_execution_leases: AccountExecutionLeaseRepository = (
             SQLAlchemyAccountExecutionLeaseRepository(self._session)
