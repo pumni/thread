@@ -28,9 +28,12 @@ from threads_platform.domain.account_activities import (
 from threads_platform.domain.accounts import ThreadsAccount
 from threads_platform.domain.commands import Command, CommandStatus
 from threads_platform.domain.worker_jobs import (
+    WorkerJob,
     WorkerJobAttemptStatus,
     WorkerJobCancelRequest,
     WorkerJobCancelRequestStatus,
+    WorkerJobPreemption,
+    WorkerJobPreemptionStatus,
     WorkerJobStatus,
 )
 from threads_platform.domain.workers import (
@@ -49,6 +52,9 @@ from threads_platform.infrastructure.persistence.models import (
     WorkerJobAttemptRecord,
     WorkerJobCancelRequestRecord,
     WorkerJobRecord,
+)
+from threads_platform.infrastructure.persistence.repositories import (
+    SQLAlchemyWorkerJobPreemptionRepository,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
@@ -215,6 +221,71 @@ async def _cancel_request(
         reason_code=reason_code,
         now=scenario.clock.now(),
     )
+
+
+async def _materialize_priority_activity(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    scenario: Scenario,
+    priority: ActivityPriority,
+) -> str:
+    async with unit_of_work_factory() as unit_of_work:
+        source_activity = await unit_of_work.scheduled_activities.get(scenario.activity_id)
+        assert source_activity is not None
+        plan = await unit_of_work.activity_plans.get(source_activity.plan_id)
+        assert plan is not None
+        template = AccountActivityTemplate(
+            account_id=scenario.account_id,
+            plan_id=plan.id,
+            name=f"{priority.value} preemption candidate",
+            activity_type="threads.browser.feed.browse",
+            configuration={"max_items": 5},
+            priority=priority,
+            change_reason="preemption integration test",
+            created_at=scenario.clock.now(),
+        )
+        activity = ScheduledActivity.from_plan_template(
+            plan,
+            template,
+            scenario.clock.now() - timedelta(seconds=1),
+            created_at=scenario.clock.now(),
+        )
+        await unit_of_work.activity_templates.add_revision(template)
+        await unit_of_work.scheduled_activities.add_if_absent(activity)
+    commands = await materialize_due_account_activities(
+        unit_of_work_factory, now=scenario.clock.now(), limit=10
+    )
+    matching = [command for command in commands if command.command_id == f"activity:{activity.id}"]
+    assert len(matching) == 1
+    assert matching[0].priority == priority.worker_job_priority
+    return matching[0].command_id
+
+
+async def _route_materialized_activity(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    scenario: Scenario,
+    command_id: str,
+) -> WorkerJob:
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=scenario.service,
+    )
+    result = await runtime.process(command_id)
+    assert result.status is CommandStatus.WAITING_EXECUTION
+    async with unit_of_work_factory() as unit_of_work:
+        job = await unit_of_work.worker_jobs.get_by_command_id(command_id)
+    assert job is not None
+    return job
+
+
+async def _enqueue_high_activity(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory, scenario: Scenario
+) -> WorkerJob:
+    command_id = await _materialize_priority_activity(
+        unit_of_work_factory, scenario, ActivityPriority.HIGH
+    )
+    return await _route_materialized_activity(unit_of_work_factory, scenario, command_id)
 
 
 @pytest.mark.asyncio
@@ -1037,21 +1108,657 @@ async def test_downgrade_refuses_cancelled_terminal_states_without_request_histo
 
 
 @pytest.mark.asyncio
-async def test_migration_upgrade_preserves_existing_command_and_attempt_rows(
+async def test_preemption_migration_upgrade_preserves_existing_command_and_attempt_rows(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
     scenario = await _running_activity_job(unit_of_work_factory)
     assert scenario.lease_token is not None
+    pending = await _cancel_request(scenario)
     config = Config("alembic.ini")
-    await asyncio.to_thread(alembic_command.downgrade, config, "20260929_0012")
+    await asyncio.to_thread(alembic_command.downgrade, config, "20260929_0013")
     await asyncio.to_thread(alembic_command.upgrade, config, "head")
 
     async with unit_of_work_factory() as unit_of_work:
         command = await unit_of_work.commands.get_by_command_id(scenario.command_id)
         attempts = await unit_of_work.worker_job_attempts.list_for_job(scenario.job_id)
         job = await unit_of_work.worker_jobs.get(scenario.job_id)
+        request = await unit_of_work.worker_job_cancel_requests.get(pending.id)
     assert command is not None and command.status is CommandStatus.WAITING_EXECUTION
     assert attempts[0].status is WorkerJobAttemptStatus.RUNNING
+    assert job is not None and job.status is WorkerJobStatus.RUNNING
+    assert request is not None and request.status is WorkerJobCancelRequestStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_high_preemption_waits_for_safe_ack_then_claims(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+
+    async with unit_of_work_factory() as unit_of_work:
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+        high_command = await unit_of_work.commands.get_by_command_id(high_job.command_id or "")
+        preemptions = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            scenario.account_id
+        )
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+    assert victim is not None and victim.status is WorkerJobStatus.RUNNING
+    assert victim.lease_token == scenario.lease_token
+    assert high_command is not None and high_command.priority == high_job.priority == 100
+    assert high_job.status is WorkerJobStatus.QUEUED
+    assert len(preemptions) == 1
+    assert preemptions[0].preemptor_worker_job_id == high_job.id
+    assert preemptions[0].victim_worker_job_id == scenario.job_id
+    assert request is not None
+    assert preemptions[0].cancel_request_id == request.id
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    checkpointed = await scenario.service.checkpoint(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        {"phase": "FEED_READY"},
+    )
+    assert checkpointed.pending_cancel_request is not None
+    await scenario.service.acknowledge_cancel(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        cancel_request_id=request.id,
+        generation=request.generation,
+        checkpoint_phase="FEED_READY",
+    )
+
+    async with unit_of_work_factory() as unit_of_work:
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+        command = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+        attempts = await unit_of_work.worker_job_attempts.list_for_job(scenario.job_id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+    assert victim is not None and victim.status is WorkerJobStatus.CANCELLED
+    assert command is not None and command.status is CommandStatus.CANCELLED
+    assert attempts[0].status is WorkerJobAttemptStatus.CANCELLED
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.SATISFIED
+    claimed_high = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_expired_victim_remains_blocking_until_reclaim_and_new_generation_ack(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    old_lease_token = scenario.lease_token
+    assert old_lease_token is not None
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    async with unit_of_work_factory() as unit_of_work:
+        first_request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+            scenario.job_id
+        )
+    assert first_request is not None and first_request.generation == 1
+
+    scenario.clock.advance(timedelta(seconds=6))
+    reclaimed = await scenario.service.claim_next(scenario.worker_id)
+    assert reclaimed is not None and reclaimed.id == scenario.job_id
+    assert reclaimed.attempt_count == 2
+    assert reclaimed.lease_token is not None and reclaimed.lease_token != old_lease_token
+    new_request = reclaimed.pending_cancel_request
+    assert new_request is not None
+    assert new_request.id != first_request.id
+    assert new_request.generation == first_request.generation + 1
+
+    async with unit_of_work_factory() as unit_of_work:
+        old_stored = await unit_of_work.worker_job_cancel_requests.get(first_request.id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+    assert old_stored is not None
+    assert old_stored.status is WorkerJobCancelRequestStatus.SUPERSEDED
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert preemption.cancel_request_id == new_request.id
+
+    with pytest.raises(WorkerJobControlError, match="WORKER_JOB_LEASE_LOST"):
+        await scenario.service.acknowledge_cancel(
+            scenario.job_id,
+            scenario.worker_id,
+            old_lease_token,
+            cancel_request_id=first_request.id,
+            generation=first_request.generation,
+            checkpoint_phase="BEFORE_NAVIGATION",
+        )
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    assert reclaimed.lease_token is not None
+    await scenario.service.checkpoint(
+        scenario.job_id,
+        scenario.worker_id,
+        reclaimed.lease_token,
+        {"phase": "BEFORE_NAVIGATION"},
+    )
+    await scenario.service.acknowledge_cancel(
+        scenario.job_id,
+        scenario.worker_id,
+        reclaimed.lease_token,
+        cancel_request_id=new_request.id,
+        generation=new_request.generation,
+        checkpoint_phase="BEFORE_NAVIGATION",
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+    assert preemption is not None and preemption.status is WorkerJobPreemptionStatus.SATISFIED
+    claimed_high = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_high_arrivals_share_one_cancel_and_claim_gate_serializes(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    command_ids = [
+        await _materialize_priority_activity(unit_of_work_factory, scenario, ActivityPriority.HIGH),
+        await _materialize_priority_activity(unit_of_work_factory, scenario, ActivityPriority.HIGH),
+    ]
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=scenario.service,
+    )
+    await asyncio.gather(*(runtime.process(command_id) for command_id in command_ids))
+    async with unit_of_work_factory() as unit_of_work:
+        preemptions = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            scenario.account_id
+        )
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+        high_jobs = [
+            await unit_of_work.worker_jobs.get_by_command_id(command_id)
+            for command_id in command_ids
+        ]
+    assert len(preemptions) == 2
+    assert request is not None
+    assert {preemption.cancel_request_id for preemption in preemptions} == {request.id}
+    assert all(job is not None and job.status is WorkerJobStatus.QUEUED for job in high_jobs)
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    await scenario.service.checkpoint(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        {"phase": "FEED_READY"},
+    )
+    await scenario.service.acknowledge_cancel(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        cancel_request_id=request.id,
+        generation=request.generation,
+        checkpoint_phase="FEED_READY",
+    )
+    claims = await asyncio.gather(
+        scenario.service.claim_next(scenario.worker_id),
+        WorkerJobService(unit_of_work_factory, clock=scenario.clock).claim_next(scenario.worker_id),
+    )
+    claimed = [job for job in claims if job is not None]
+    assert len(claimed) == 1
+    ordered_ids = sorted(job.id for job in high_jobs if job is not None)
+    assert claimed[0].id == ordered_ids[0]
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    assert claimed[0].lease_token is not None
+    await scenario.service.complete(
+        claimed[0].id,
+        scenario.worker_id,
+        claimed[0].lease_token,
+        {"result_version": 1, "observations": [], "truncated": False},
+    )
+    second = await scenario.service.claim_next(scenario.worker_id)
+    assert second is not None and second.id == ordered_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_media_running_blocks_high_without_receiving_cancel_request(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(
+        unit_of_work_factory,
+        capability="threads.browser.media.local_upload",
+        preemptible=False,
+    )
+    assert scenario.lease_token is not None
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    async with unit_of_work_factory() as unit_of_work:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+    assert request is None
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    await scenario.service.complete(
+        scenario.job_id,
+        scenario.worker_id,
+        scenario.lease_token,
+        {"result_version": 1, "staged": True},
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+    assert preemption is not None and preemption.status is WorkerJobPreemptionStatus.SATISFIED
+    claimed_high = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_unlinked_browser_job_blocks_profile_without_receiving_cancel_request(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(
+        unit_of_work_factory,
+        capability="threads.browser.legacy.read",
+        preemptible=True,
+    )
+    generic = await scenario.service.get(scenario.job_id)
+    assert scenario.lease_token is not None
+
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    async with unit_of_work_factory() as unit_of_work:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(generic.id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(high_job.id, generic.id)
+    assert request is None
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    await scenario.service.complete(
+        generic.id,
+        scenario.worker_id,
+        scenario.lease_token,
+        {"result_version": 1},
+    )
+    async with unit_of_work_factory() as unit_of_work:
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(high_job.id, generic.id)
+    assert preemption is not None and preemption.status is WorkerJobPreemptionStatus.SATISFIED
+    claimed_high = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_low_and_normal_do_not_preempt_and_high_arrival_races_claim_safely(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    low_and_normal_ids = [
+        await _materialize_priority_activity(unit_of_work_factory, scenario, ActivityPriority.LOW),
+        await _materialize_priority_activity(
+            unit_of_work_factory, scenario, ActivityPriority.NORMAL
+        ),
+    ]
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=scenario.service,
+    )
+    await asyncio.gather(*(runtime.process(command_id) for command_id in low_and_normal_ids))
+    async with unit_of_work_factory() as unit_of_work:
+        requests = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(
+            scenario.job_id
+        )
+        preemptions = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            scenario.account_id
+        )
+    assert requests is None
+    assert preemptions == []
+    assert await scenario.service.claim_next(scenario.worker_id) is None
+
+    high_command_id = await _materialize_priority_activity(
+        unit_of_work_factory, scenario, ActivityPriority.HIGH
+    )
+    high_runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=scenario.service,
+    )
+    claim_result, route_result = await asyncio.gather(
+        scenario.service.claim_next(scenario.worker_id),
+        high_runtime.process(high_command_id),
+    )
+    assert claim_result is None
+    assert route_result.status is CommandStatus.WAITING_EXECUTION
+    async with unit_of_work_factory() as unit_of_work:
+        high_job = await unit_of_work.worker_jobs.get_by_command_id(high_command_id)
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+    assert high_job is not None and high_job.status is WorkerJobStatus.QUEUED
+    assert request is not None
+    assert victim is not None and victim.status is WorkerJobStatus.RUNNING
+    assert victim.lease_token == scenario.lease_token
+
+
+@pytest.mark.asyncio
+async def test_high_arbitration_rolls_back_with_command_route_and_cancel_request(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    high_command_id = await _materialize_priority_activity(
+        unit_of_work_factory, scenario, ActivityPriority.HIGH
+    )
+    service = scenario.service
+    original = SQLAlchemyWorkerJobPreemptionRepository.add_if_absent
+
+    async def fail_after_arbitration(
+        repository: SQLAlchemyWorkerJobPreemptionRepository,
+        preemption: WorkerJobPreemption,
+    ) -> WorkerJobPreemption:
+        await original(repository, preemption)
+        raise RuntimeError("simulated transaction abort")
+
+    monkeypatch.setattr(
+        SQLAlchemyWorkerJobPreemptionRepository,
+        "add_if_absent",
+        fail_after_arbitration,
+    )
+    runtime = CommandRuntime(
+        unit_of_work_factory,
+        {},
+        clock=scenario.clock,
+        worker_job_service=service,
+    )
+    with pytest.raises(RuntimeError, match="simulated transaction abort"):
+        await runtime.process(high_command_id)
+
+    async with unit_of_work_factory() as unit_of_work:
+        high_job = await unit_of_work.worker_jobs.get_by_command_id(high_command_id)
+        high_command = await unit_of_work.commands.get_by_command_id(high_command_id)
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+        preemptions = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            scenario.account_id
+        )
+        routes = await unit_of_work.command_route_decisions.get_latest_for_command(high_command_id)
+    assert high_job is None
+    assert high_command is not None and high_command.status is CommandStatus.RECEIVED
+    assert request is None
+    assert preemptions == []
+    assert routes is None
+
+
+@pytest.mark.asyncio
+async def test_preemption_migration_preserves_rows_and_refuses_history_downgrade(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    config = Config("alembic.ini")
+    with pytest.raises(RuntimeError, match="WORKER_JOB_PREEMPTION_DOWNGRADE_BLOCKED"):
+        await asyncio.to_thread(alembic_command.downgrade, config, "20260929_0013")
+
+    await asyncio.to_thread(alembic_command.upgrade, config, "head")
+    async with unit_of_work_factory() as unit_of_work:
+        victim_command = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+        victim_job = await unit_of_work.worker_jobs.get(scenario.job_id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+    assert victim_command is not None and victim_command.status is CommandStatus.WAITING_EXECUTION
+    assert victim_job is not None and victim_job.status is WorkerJobStatus.RUNNING
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+
+
+@pytest.mark.asyncio
+async def test_high_does_not_preempt_high_and_profile_gate_is_account_local(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    victim = await _running_activity_job(unit_of_work_factory)
+    assert victim.lease_token is not None
+    high_one = await _enqueue_high_activity(unit_of_work_factory, victim)
+    async with unit_of_work_factory() as unit_of_work:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(victim.job_id)
+    assert request is not None
+    await victim.service.checkpoint(
+        victim.job_id,
+        victim.worker_id,
+        victim.lease_token,
+        {"phase": "FEED_READY"},
+    )
+    await victim.service.acknowledge_cancel(
+        victim.job_id,
+        victim.worker_id,
+        victim.lease_token,
+        cancel_request_id=request.id,
+        generation=request.generation,
+        checkpoint_phase="FEED_READY",
+    )
+    running_high = await victim.service.claim_next(victim.worker_id)
+    assert running_high is not None and running_high.id == high_one.id
+    assert running_high.lease_token is not None
+
+    high_two = await _enqueue_high_activity(unit_of_work_factory, victim)
+    assert high_two.status is WorkerJobStatus.QUEUED
+    async with unit_of_work_factory() as unit_of_work:
+        high_cancel = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(high_one.id)
+        relationships = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            victim.account_id
+        )
+    assert high_cancel is None
+    assert relationships == []
+    assert await victim.service.claim_next(victim.worker_id) is None
+
+    separate_account = await _running_activity_job(unit_of_work_factory, claim=False)
+    independent = await separate_account.service.claim_next(separate_account.worker_id)
+    assert independent is not None and independent.id == separate_account.job_id
+
+
+@pytest.mark.asyncio
+async def test_nonbrowser_job_can_claim_while_account_browser_job_runs(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    assert scenario.lease_token is not None
+    async with unit_of_work_factory() as unit_of_work:
+        capabilities = await unit_of_work.worker_capabilities.list_for_worker(scenario.worker_id)
+        capabilities.append(
+            WorkerCapability(
+                scenario.worker_id,
+                "synthetic.echo",
+                1,
+                advertised_at=scenario.clock.now(),
+            )
+        )
+        await unit_of_work.worker_capabilities.replace_for_worker(scenario.worker_id, capabilities)
+    unrelated = await scenario.service.enqueue(
+        "synthetic.echo",
+        1,
+        account_id=scenario.account_id,
+        assigned_worker_id=scenario.worker_id,
+        account_affinity_required=False,
+    )
+    claimed = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed is not None and claimed.id == unrelated.id
+
+
+@pytest.mark.asyncio
+async def test_high_priority_requires_matching_command_and_trusted_worker_route(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory, claim=False)
+    command = Command(
+        command_id=f"internal-high-{uuid4()}",
+        correlation_id=f"internal-high-correlation-{uuid4()}",
+        account_id=scenario.account_id,
+        command_type="threads.browser.feed.browse",
+        payload={"max_items": 5},
+        priority=100,
+        created_at=scenario.clock.now(),
+        received_at=scenario.clock.now(),
+    )
+    command.transition(CommandStatus.VALIDATED, scenario.clock.now())
+    async with unit_of_work_factory() as unit_of_work:
+        await unit_of_work.commands.add(command)
+
+    async def enqueue(priority: int) -> WorkerJob:
+        return await scenario.service.enqueue(
+            "threads.browser.feed.browse",
+            1,
+            command_id=command.command_id,
+            account_id=scenario.account_id,
+            assigned_worker_id=scenario.worker_id,
+            account_affinity_required=True,
+            priority=priority,
+            preemptible=True,
+            scheduled_at=scenario.clock.now(),
+            input_data={"max_items": 5},
+        )
+
+    with pytest.raises(WorkerJobControlError, match="COMMAND_WORKER_JOB_PRIORITY_MISMATCH"):
+        await enqueue(0)
+    with pytest.raises(WorkerJobControlError, match="HIGH_PRIORITY_ROUTE_NOT_TRUSTED"):
+        await enqueue(100)
+
+    async with unit_of_work_factory() as unit_of_work:
+        stored_command = await unit_of_work.commands.get_by_command_id(command.command_id)
+        job = await unit_of_work.worker_jobs.get_by_command_id(command.command_id)
+        relations = await unit_of_work.worker_job_preemptions.list_waiting_for_account(
+            scenario.account_id
+        )
+    assert stored_command is not None and stored_command.status is CommandStatus.VALIDATED
+    assert job is None
+    assert relations == []
+
+
+@pytest.mark.parametrize("outcome", ["fail", "intervention"])
+@pytest.mark.asyncio
+async def test_explicit_attempt_end_satisfies_preemption_without_relabeling_outcome(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    outcome: str,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    lease_token = scenario.lease_token
+    assert lease_token is not None
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    async with unit_of_work_factory() as unit_of_work:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+    assert request is not None
+
+    if outcome == "fail":
+        await scenario.service.fail(
+            scenario.job_id,
+            scenario.worker_id,
+            lease_token,
+            error_code="READ_FAILED",
+            retryable=True,
+        )
+        expected_status = WorkerJobStatus.FAILED_RETRYABLE
+    else:
+        await scenario.service.request_intervention(
+            scenario.job_id,
+            scenario.worker_id,
+            lease_token,
+            intervention_type="LOGIN_REQUIRED",
+            detail_code="SESSION_EXPIRED",
+        )
+        expected_status = WorkerJobStatus.WAITING_INTERVENTION
+
+    async with unit_of_work_factory() as unit_of_work:
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+        stored_request = await unit_of_work.worker_job_cancel_requests.get(request.id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+        command = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+    assert victim is not None and victim.status is expected_status
+    assert stored_request is not None
+    assert stored_request.status is WorkerJobCancelRequestStatus.SUPERSEDED
+    assert preemption is not None
+    assert preemption.status is WorkerJobPreemptionStatus.SATISFIED
+    assert command is not None and command.status is not CommandStatus.CANCELLED
+    claimed_high = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_completion_and_cancel_ack_race_has_one_terminal_winner(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    lease_token = scenario.lease_token
+    assert lease_token is not None
+    high_job = await _enqueue_high_activity(unit_of_work_factory, scenario)
+    async with unit_of_work_factory() as unit_of_work:
+        request = await unit_of_work.worker_job_cancel_requests.get_pending_for_job(scenario.job_id)
+    assert request is not None
+    await scenario.service.checkpoint(
+        scenario.job_id,
+        scenario.worker_id,
+        lease_token,
+        {"phase": "FEED_READY"},
+    )
+    results = await asyncio.gather(
+        scenario.service.acknowledge_cancel(
+            scenario.job_id,
+            scenario.worker_id,
+            lease_token,
+            cancel_request_id=request.id,
+            generation=request.generation,
+            checkpoint_phase="FEED_READY",
+        ),
+        scenario.service.complete(
+            scenario.job_id,
+            scenario.worker_id,
+            lease_token,
+            {"result_version": 1, "observations": [], "truncated": False},
+        ),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    assert sum(isinstance(result, WorkerJobControlError) for result in results) == 1
+    async with unit_of_work_factory() as unit_of_work:
+        victim = await unit_of_work.worker_jobs.get(scenario.job_id)
+        preemption = await unit_of_work.worker_job_preemptions.get_for_pair(
+            high_job.id, scenario.job_id
+        )
+        stored_request = await unit_of_work.worker_job_cancel_requests.get(request.id)
+    assert victim is not None
+    assert victim.status in {WorkerJobStatus.CANCELLED, WorkerJobStatus.SUCCEEDED}
+    assert preemption is not None and preemption.status is WorkerJobPreemptionStatus.SATISFIED
+    assert stored_request is not None
+    assert stored_request.status in {
+        WorkerJobCancelRequestStatus.ACKNOWLEDGED,
+        WorkerJobCancelRequestStatus.SUPERSEDED,
+    }
+    claimed_high = await scenario.service.claim_next(scenario.worker_id)
+    assert claimed_high is not None and claimed_high.id == high_job.id
+
+
+@pytest.mark.asyncio
+async def test_preemption_revision_upgrade_preserves_existing_activity_rows(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    scenario = await _running_activity_job(unit_of_work_factory)
+    config = Config("alembic.ini")
+    await asyncio.to_thread(alembic_command.downgrade, config, "20260929_0013")
+    await asyncio.to_thread(alembic_command.upgrade, config, "head")
+    async with unit_of_work_factory() as unit_of_work:
+        activity = await unit_of_work.scheduled_activities.get(scenario.activity_id)
+        command = await unit_of_work.commands.get_by_command_id(scenario.command_id)
+        job = await unit_of_work.worker_jobs.get(scenario.job_id)
+    assert activity is not None
+    assert command is not None and command.status is CommandStatus.WAITING_EXECUTION
     assert job is not None and job.status is WorkerJobStatus.RUNNING
 
 

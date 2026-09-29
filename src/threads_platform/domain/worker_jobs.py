@@ -45,6 +45,56 @@ class WorkerJobCancelRequestStatus(StrEnum):
     SUPERSEDED = "SUPERSEDED"
 
 
+class WorkerJobPreemptionStatus(StrEnum):
+    WAITING_FOR_QUIESCENCE = "WAITING_FOR_QUIESCENCE"
+    SATISFIED = "SATISFIED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+@dataclass(slots=True)
+class WorkerJobPreemption:
+    account_id: UUID
+    preemptor_worker_job_id: UUID
+    victim_worker_job_id: UUID
+    created_at: datetime
+    id: UUID = field(default_factory=uuid4)
+    status: WorkerJobPreemptionStatus = WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE
+    resolved_at: datetime | None = None
+    resolution_reason: str | None = None
+    cancel_request_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if self.preemptor_worker_job_id == self.victim_worker_job_id:
+            raise ValueError("WorkerJob cannot preempt itself")
+        self.status = WorkerJobPreemptionStatus(self.status)
+        self.created_at = normalize_utc(self.created_at)
+        self.resolved_at = normalize_utc(self.resolved_at) if self.resolved_at else None
+        if self.status is WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE:
+            if self.resolved_at is not None or self.resolution_reason is not None:
+                raise ValueError("waiting preemption cannot have a resolution")
+        elif (
+            self.resolved_at is None
+            or self.resolution_reason is None
+            or re.fullmatch(r"[A-Z0-9_]{1,120}", self.resolution_reason) is None
+        ):
+            raise ValueError("resolved preemption requires a bounded reason and timestamp")
+
+    def satisfy(self, at: datetime, reason: str) -> None:
+        self._resolve(WorkerJobPreemptionStatus.SATISFIED, at, reason)
+
+    def supersede(self, at: datetime, reason: str) -> None:
+        self._resolve(WorkerJobPreemptionStatus.SUPERSEDED, at, reason)
+
+    def _resolve(self, status: WorkerJobPreemptionStatus, at: datetime, reason: str) -> None:
+        if self.status is not WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE:
+            raise ValueError("only a waiting preemption can be resolved")
+        if re.fullmatch(r"[A-Z0-9_]{1,120}", reason) is None:
+            raise ValueError("preemption resolution reason must be a bounded code")
+        self.status = status
+        self.resolved_at = normalize_utc(at)
+        self.resolution_reason = reason
+
+
 @dataclass(slots=True)
 class WorkerJobCancelRequest:
     worker_job_id: UUID

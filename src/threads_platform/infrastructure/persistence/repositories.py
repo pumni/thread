@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import and_, case, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from threads_platform.application.ports.repositories import (
     AccountActivityPlanRepository,
@@ -29,6 +30,7 @@ from threads_platform.application.ports.repositories import (
     WorkerInterventionRepository,
     WorkerJobAttemptRepository,
     WorkerJobCancelRequestRepository,
+    WorkerJobPreemptionRepository,
     WorkerJobRepository,
     WorkerRepository,
     WorkerSecurityRepository,
@@ -95,6 +97,8 @@ from threads_platform.domain.worker_jobs import (
     WorkerJobAttemptStatus,
     WorkerJobCancelRequest,
     WorkerJobCancelRequestStatus,
+    WorkerJobPreemption,
+    WorkerJobPreemptionStatus,
     WorkerJobRetrySafety,
     WorkerJobStatus,
 )
@@ -149,6 +153,7 @@ from threads_platform.infrastructure.persistence.models import (
     WorkerInterventionRecord,
     WorkerJobAttemptRecord,
     WorkerJobCancelRequestRecord,
+    WorkerJobPreemptionRecord,
     WorkerJobRecord,
     WorkerNodeRecord,
     WorkerSessionRecord,
@@ -2485,7 +2490,10 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
 
     async def get_for_update(self, job_id: UUID) -> WorkerJob | None:
         record = await self._session.scalar(
-            select(WorkerJobRecord).where(WorkerJobRecord.id == job_id).with_for_update()
+            select(WorkerJobRecord)
+            .where(WorkerJobRecord.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return self._domain(record) if record is not None else None
 
@@ -2507,6 +2515,8 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
         worker: WorkerNode,
         now: datetime,
         limit: int = 50,
+        account_id: UUID | None = None,
+        browser_profile_only: bool = False,
     ) -> list[WorkerJob]:
         occurred_at = normalize_utc(now)
         if limit < 1:
@@ -2555,38 +2565,60 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
                 WorkerJobRecord.lease_expires_at <= occurred_at,
             ),
         )
+        filters = [
+            available_status,
+            or_(
+                WorkerJobRecord.deadline_at.is_(None),
+                WorkerJobRecord.deadline_at > occurred_at,
+            ),
+            WorkerJobRecord.attempt_count < WorkerJobRecord.max_attempts,
+            or_(
+                WorkerJobRecord.attempt_count == 0,
+                WorkerJobRecord.retry_safety == WorkerJobRetrySafety.SAFE_TO_RETRY,
+                WorkerJobRecord.retry_authorized_by_operator.is_(True),
+            ),
+            or_(
+                WorkerJobRecord.assigned_worker_id.is_(None),
+                WorkerJobRecord.assigned_worker_id == worker.worker_id,
+            ),
+            or_(
+                WorkerJobRecord.account_affinity_required.is_(False),
+                has_current_assignment,
+            ),
+            has_capability,
+        ]
+        if account_id is not None:
+            filters.append(WorkerJobRecord.account_id == account_id)
+        if browser_profile_only:
+            filters.extend(
+                [
+                    WorkerJobRecord.account_affinity_required.is_(True),
+                    WorkerJobRecord.capability_name.like("threads.browser.%"),
+                ]
+            )
         candidates = await self._session.scalars(
             select(WorkerJobRecord)
-            .where(
-                available_status,
-                or_(
-                    WorkerJobRecord.deadline_at.is_(None),
-                    WorkerJobRecord.deadline_at > occurred_at,
-                ),
-                WorkerJobRecord.attempt_count < WorkerJobRecord.max_attempts,
-                or_(
-                    WorkerJobRecord.attempt_count == 0,
-                    WorkerJobRecord.retry_safety == WorkerJobRetrySafety.SAFE_TO_RETRY,
-                    WorkerJobRecord.retry_authorized_by_operator.is_(True),
-                ),
-                or_(
-                    WorkerJobRecord.assigned_worker_id.is_(None),
-                    WorkerJobRecord.assigned_worker_id == worker.worker_id,
-                ),
-                or_(
-                    WorkerJobRecord.account_affinity_required.is_(False),
-                    has_current_assignment,
-                ),
-                has_capability,
-            )
+            .where(*filters)
             .order_by(
                 WorkerJobRecord.priority.desc(),
                 WorkerJobRecord.scheduled_at,
                 WorkerJobRecord.created_at,
                 WorkerJobRecord.id,
             )
-            .with_for_update(skip_locked=True)
             .limit(limit)
+        )
+        return [self._domain(record) for record in candidates]
+
+    async def list_running_browser_for_account(self, account_id: UUID) -> list[WorkerJob]:
+        candidates = await self._session.scalars(
+            select(WorkerJobRecord)
+            .where(
+                WorkerJobRecord.account_id == account_id,
+                WorkerJobRecord.account_affinity_required.is_(True),
+                WorkerJobRecord.capability_name.like("threads.browser.%"),
+                WorkerJobRecord.status == WorkerJobStatus.RUNNING,
+            )
+            .order_by(WorkerJobRecord.created_at, WorkerJobRecord.id)
         )
         return [self._domain(record) for record in candidates]
 
@@ -2601,10 +2633,25 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
     ) -> WorkerJob | None:
         occurred_at = normalize_utc(now)
         record = await self._session.scalar(
-            select(WorkerJobRecord).where(WorkerJobRecord.id == job.id).with_for_update()
+            select(WorkerJobRecord)
+            .where(WorkerJobRecord.id == job.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if record is None:
             return None
+        claimed = self._domain(record)
+        try:
+            claimed.claim(
+                worker_id,
+                occurred_at,
+                lease_expires_at,
+                lease_token,
+                account_coordination_generation=account_coordination_generation,
+            )
+        except ValueError:
+            return None
+
         if record.status is WorkerJobStatus.RUNNING:
             previous = await self._session.scalar(
                 select(WorkerJobAttemptRecord)
@@ -2620,17 +2667,6 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
                 previous.finished_at = occurred_at
                 previous.error_code = "LEASE_EXPIRED"
 
-        claimed = self._domain(record)
-        try:
-            claimed.claim(
-                worker_id,
-                occurred_at,
-                lease_expires_at,
-                lease_token,
-                account_coordination_generation=account_coordination_generation,
-            )
-        except ValueError:
-            return None
         self._write(record, claimed)
         await self._session.flush()
         return claimed
@@ -2943,6 +2979,123 @@ class SQLAlchemyWorkerJobCancelRequestRepository(WorkerJobCancelRequestRepositor
             safe_checkpoint=record.safe_checkpoint,
             superseded_at=record.superseded_at,
             superseded_reason=record.superseded_reason,
+        )
+
+
+class SQLAlchemyWorkerJobPreemptionRepository(WorkerJobPreemptionRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_if_absent(self, preemption: WorkerJobPreemption) -> WorkerJobPreemption:
+        statement = (
+            postgres_insert(WorkerJobPreemptionRecord)
+            .values(**self._values(preemption))
+            .on_conflict_do_nothing(constraint="uq_worker_job_preemption_pair")
+            .returning(WorkerJobPreemptionRecord.id)
+        )
+        inserted_id = await self._session.scalar(statement)
+        if inserted_id is not None:
+            return preemption
+        stored = await self._session.scalar(
+            select(WorkerJobPreemptionRecord)
+            .where(
+                WorkerJobPreemptionRecord.preemptor_worker_job_id
+                == preemption.preemptor_worker_job_id,
+                WorkerJobPreemptionRecord.victim_worker_job_id == preemption.victim_worker_job_id,
+            )
+            .with_for_update()
+        )
+        if stored is None:
+            raise RuntimeError("preemption pair conflict disappeared")
+        return self._domain(stored)
+
+    async def get_for_pair(
+        self, preemptor_worker_job_id: UUID, victim_worker_job_id: UUID
+    ) -> WorkerJobPreemption | None:
+        record = await self._session.scalar(
+            select(WorkerJobPreemptionRecord).where(
+                WorkerJobPreemptionRecord.preemptor_worker_job_id == preemptor_worker_job_id,
+                WorkerJobPreemptionRecord.victim_worker_job_id == victim_worker_job_id,
+            )
+        )
+        return self._domain(record) if record is not None else None
+
+    async def list_waiting_for_account(
+        self, account_id: UUID, *, for_update: bool = False
+    ) -> list[WorkerJobPreemption]:
+        return await self._list_waiting(
+            WorkerJobPreemptionRecord.account_id == account_id, for_update=for_update
+        )
+
+    async def list_waiting_for_victim(
+        self, victim_worker_job_id: UUID, *, for_update: bool = False
+    ) -> list[WorkerJobPreemption]:
+        return await self._list_waiting(
+            WorkerJobPreemptionRecord.victim_worker_job_id == victim_worker_job_id,
+            for_update=for_update,
+        )
+
+    async def list_waiting_for_preemptor(
+        self, preemptor_worker_job_id: UUID, *, for_update: bool = False
+    ) -> list[WorkerJobPreemption]:
+        return await self._list_waiting(
+            WorkerJobPreemptionRecord.preemptor_worker_job_id == preemptor_worker_job_id,
+            for_update=for_update,
+        )
+
+    async def _list_waiting(
+        self, predicate: ColumnElement[bool], *, for_update: bool
+    ) -> list[WorkerJobPreemption]:
+        statement = (
+            select(WorkerJobPreemptionRecord)
+            .where(
+                predicate,
+                WorkerJobPreemptionRecord.status
+                == WorkerJobPreemptionStatus.WAITING_FOR_QUIESCENCE,
+            )
+            .order_by(WorkerJobPreemptionRecord.created_at, WorkerJobPreemptionRecord.id)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        records = await self._session.scalars(statement)
+        return [self._domain(record) for record in records]
+
+    async def update(self, preemption: WorkerJobPreemption) -> None:
+        record = await self._session.get(WorkerJobPreemptionRecord, preemption.id)
+        if record is None:
+            raise LookupError(f"WorkerJobPreemption not found: {preemption.id}")
+        record.status = preemption.status
+        record.resolved_at = preemption.resolved_at
+        record.resolution_reason = preemption.resolution_reason
+        record.cancel_request_id = preemption.cancel_request_id
+        await self._session.flush()
+
+    @staticmethod
+    def _values(preemption: WorkerJobPreemption) -> dict[str, object]:
+        return {
+            "id": preemption.id,
+            "account_id": preemption.account_id,
+            "preemptor_worker_job_id": preemption.preemptor_worker_job_id,
+            "victim_worker_job_id": preemption.victim_worker_job_id,
+            "status": preemption.status,
+            "created_at": preemption.created_at,
+            "resolved_at": preemption.resolved_at,
+            "resolution_reason": preemption.resolution_reason,
+            "cancel_request_id": preemption.cancel_request_id,
+        }
+
+    @staticmethod
+    def _domain(record: WorkerJobPreemptionRecord) -> WorkerJobPreemption:
+        return WorkerJobPreemption(
+            id=record.id,
+            account_id=record.account_id,
+            preemptor_worker_job_id=record.preemptor_worker_job_id,
+            victim_worker_job_id=record.victim_worker_job_id,
+            status=WorkerJobPreemptionStatus(record.status),
+            created_at=record.created_at,
+            resolved_at=record.resolved_at,
+            resolution_reason=record.resolution_reason,
+            cancel_request_id=record.cancel_request_id,
         )
 
 

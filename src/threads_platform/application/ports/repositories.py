@@ -36,6 +36,7 @@ from threads_platform.domain.worker_jobs import (
     WorkerJob,
     WorkerJobAttempt,
     WorkerJobCancelRequest,
+    WorkerJobPreemption,
 )
 from threads_platform.domain.workers import (
     AccountWorkerAssignment,
@@ -359,7 +360,11 @@ class WorkerJobRepository(Protocol):
         worker: WorkerNode,
         now: datetime,
         limit: int = 50,
+        account_id: UUID | None = None,
+        browser_profile_only: bool = False,
     ) -> list[WorkerJob]: ...
+
+    async def list_running_browser_for_account(self, account_id: UUID) -> list[WorkerJob]: ...
 
     async def claim(
         self,
@@ -452,6 +457,28 @@ class WorkerJobCancelRequestRepository(Protocol):
     async def update(self, request: WorkerJobCancelRequest) -> None: ...
 
 
+class WorkerJobPreemptionRepository(Protocol):
+    async def add_if_absent(self, preemption: WorkerJobPreemption) -> WorkerJobPreemption: ...
+
+    async def get_for_pair(
+        self, preemptor_worker_job_id: UUID, victim_worker_job_id: UUID
+    ) -> WorkerJobPreemption | None: ...
+
+    async def list_waiting_for_account(
+        self, account_id: UUID, *, for_update: bool = False
+    ) -> list[WorkerJobPreemption]: ...
+
+    async def list_waiting_for_victim(
+        self, victim_worker_job_id: UUID, *, for_update: bool = False
+    ) -> list[WorkerJobPreemption]: ...
+
+    async def list_waiting_for_preemptor(
+        self, preemptor_worker_job_id: UUID, *, for_update: bool = False
+    ) -> list[WorkerJobPreemption]: ...
+
+    async def update(self, preemption: WorkerJobPreemption) -> None: ...
+
+
 class WorkerInterventionRepository(Protocol):
     async def add(self, intervention: WorkerIntervention) -> None: ...
 
@@ -487,6 +514,7 @@ class UnitOfWork(Protocol):
     worker_jobs: WorkerJobRepository
     worker_job_attempts: WorkerJobAttemptRepository
     worker_job_cancel_requests: WorkerJobCancelRequestRepository
+    worker_job_preemptions: WorkerJobPreemptionRepository
     worker_interventions: WorkerInterventionRepository
     account_execution_leases: AccountExecutionLeaseRepository
     command_route_decisions: CommandRouteDecisionRepository
