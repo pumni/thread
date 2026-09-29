@@ -722,7 +722,9 @@ class SQLAlchemyCommandRepository(CommandRepository):
             return None
         return self._domain(record)
 
-    async def get_next_ready_for_update(self, now: datetime) -> Command | None:
+    async def get_next_ready_for_update(
+        self, now: datetime, *, exclude_command_ids: frozenset[str] = frozenset()
+    ) -> Command | None:
         ready = or_(
             CommandRecord.status == CommandStatus.RECEIVED,
             and_(
@@ -745,10 +747,11 @@ class SQLAlchemyCommandRepository(CommandRepository):
                 ),
             ),
         )
+        selection = select(CommandRecord).where(ready)
+        if exclude_command_ids:
+            selection = selection.where(CommandRecord.command_id.not_in(exclude_command_ids))
         record = await self._session.scalar(
-            select(CommandRecord)
-            .where(ready)
-            .order_by(CommandRecord.received_at, CommandRecord.id)
+            selection.order_by(CommandRecord.received_at, CommandRecord.id)
             .with_for_update(skip_locked=True)
             .limit(1)
         )

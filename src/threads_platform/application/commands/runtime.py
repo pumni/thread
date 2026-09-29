@@ -225,13 +225,21 @@ class CommandRuntime:
             return claim_or_result
         return await self._execute_claim(claim_or_result)
 
-    async def process_next(self) -> CommandExecutionResult | None:
-        now = normalize_utc(self._clock.now())
+    async def process_next(
+        self,
+        *,
+        now: datetime | None = None,
+        exclude_command_ids: frozenset[str] = frozenset(),
+    ) -> CommandExecutionResult | None:
+        occurred_at = normalize_utc(now if now is not None else self._clock.now())
         async with self._unit_of_work_factory() as unit_of_work:
-            command = await unit_of_work.commands.get_next_ready_for_update(now)
+            command = await unit_of_work.commands.get_next_ready_for_update(
+                occurred_at,
+                exclude_command_ids=exclude_command_ids,
+            )
             if command is None:
                 return None
-            claim_or_result = await self._claim_locked(unit_of_work, command, now)
+            claim_or_result = await self._claim_locked(unit_of_work, command, occurred_at)
         if isinstance(claim_or_result, _WorkerJobEnqueued):
             if self._worker_job_service is not None:
                 self._worker_job_service.publish_available(

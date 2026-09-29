@@ -9,13 +9,13 @@ Completed:
 - TP-004A — durable command leases/checkpoints/recovery.
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
-Next implementation milestone:
-- **C1 — Distributed Worker Foundation (#21, #22, #23)**.
+Current authorized implementation checkpoint:
+- **C6-01/1 — PostgreSQL scheduler kernel for existing due work (#53)**.
 
 Not production-ready:
 - issue #3 live Meta OAuth/API validation remains open;
-- browser execution is planned but not implemented yet;
-- no C1+ implementation should be assumed from architecture docs alone.
+- browser capabilities remain bounded by their accepted capability contracts;
+- scheduler availability does not imply production activation.
 
 ## Product direction
 
@@ -61,6 +61,32 @@ uv run pyright
 uv run alembic check
 uv run pytest
 ~~~
+
+## Run the Control Plane scheduler
+
+Configure `THREADS_PLATFORM_DATABASE_URL` and run this separate process:
+
+~~~powershell
+uv run python -m threads_platform.scheduler
+~~~
+
+The poll interval is wakeup latency only; PostgreSQL `ScheduledActivity.due_at`,
+Command state and WorkerJob timing remain authoritative. The process consumes
+already-persisted occurrences and does not generate recurrence. Optional
+environment settings configure the poll interval and per-tick bounds:
+
+- `THREADS_PLATFORM_SCHEDULER_POLL_INTERVAL_SECONDS` (default 15; positive, maximum 3,600)
+- `THREADS_PLATFORM_SCHEDULER_ACTIVITY_BATCH_LIMIT` (default 50; 1–100)
+- `THREADS_PLATFORM_SCHEDULER_COMMAND_BATCH_LIMIT` (default 50; 1–100)
+- `THREADS_PLATFORM_SCHEDULER_RECOVERY_BATCH_LIMIT` (default 50; 1–100)
+
+WorkerJob recovery requires this explicit scheduler process; FastAPI no longer
+performs WorkerJob recovery in its lifespan. FastAPI retains worker presence
+expiry. The runtime composition is shared, but this repository has no concrete
+production `ThreadsAccessTokenProvider` available to the standalone process, so
+its LOCAL_API handler registry is unavailable and the process reports that
+condition at startup. Coordinator decision is required before standalone
+scheduler LOCAL_API execution can be enabled.
 
 ## Delivery workflow
 

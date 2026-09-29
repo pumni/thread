@@ -29,8 +29,7 @@ with explicit worker opt-in. It stages only worker-local jpg/jpeg/png/webp
 files through an operator-opened composer; it does not publish, submit, or
 remove staged content. Issue #27 is **CLOSED / COMPLETED** after all C5-01
 acceptance criteria were satisfied. Synthetic fixtures are not production
-evidence. Issue #45 established C5-02/1's durable foundation, and issue #47
-authorizes C5-02/2 materialization and durable priority propagation only.
+evidence. C5-02/#28 is CLOSED / COMPLETED after #45, #47, #49 and #51.
 LIKE/FOLLOW remain VERIFY. No additional browser mutation or publish/submit
 scope is authorized.
 
@@ -60,7 +59,7 @@ Each batch:
 | C3 | #25, #26 | Windows Worker Agent + browser adapter foundation | Review before Threads UI capability pack |
 | C4 | #8 | API-first Discovery + public-profile enrichment + Leads | Browser enrichment only after C3 |
 | C5 | #27, #28 | Approved browser capabilities + AccountActivityPlan | Review before broad activity scheduling |
-| C6 | #9, #10 | Durable scheduler + fleet operations/deployment | Operational readiness review |
+| C6 | #53, #9, #10 | Scheduler kernel + fleet operations/deployment | Operational readiness review |
 | D | #11 | E2E production certification | Requires issue #3 complete |
 
 ## 4. C1 — Distributed Worker Foundation
@@ -165,13 +164,14 @@ Issues:
   bounded account-affine WorkerJob path with explicit opt-in; it stages media
   only and never publishes or submits;
 - #27 is CLOSED / COMPLETED;
-- #45 established the durable `AccountActivityPlan`, versioned activity
-  template, immutable `ScheduledActivity` occurrence, and priority foundation;
-- #47 authorizes C5-02/2: materialize existing due occurrences into
-  deterministic Commands and propagate trusted activity priority to queued
-  WorkerJobs through `CommandRuntime`;
-- recurrence generation, a background runner, Command/WorkerJob cancellation,
-  and safe-boundary preemption under parent #28 remain outside this checkpoint.
+- #45, #47, #49 and #51 completed C5-02: durable plans/occurrences, deterministic
+  Command materialization and priority, safe-boundary cancellation, and trusted
+  HIGH preemption with browser-profile gating. Parent #28 is CLOSED / COMPLETED.
+- #53 authorizes C6-01/1: a bounded PostgreSQL scheduler kernel for already
+  persisted due occurrences, ready Commands through `CommandRuntime`, and
+  bounded existing WorkerJob recovery.
+- PostgreSQL due state is authoritative; the scheduler loop is wakeup-only.
+  Recurrence generation is deferred to C6-01/2.
 
 Browser capabilities must be explicit and independently reviewable.
 
@@ -182,10 +182,20 @@ LIKE/FOLLOW remain VERIFY unless explicitly retained at implementation review.
 ## 9. C6 — Scheduler and Operations
 
 Issues:
-- #9 durable scheduler/fleet orchestration;
+- #53 C6-01/1 PostgreSQL scheduler kernel for existing due work;
+- #9 later durable scheduler/fleet orchestration checkpoints;
 - #10 observability/security/Windows packaging/deployment.
 
 C6 turns explicit jobs/plans into durable operations and establishes deploy/update/recovery procedures.
+The #53 scheduler processes existing `ScheduledActivity` occurrences only. It
+uses explicit per-tick activity, Command and recovery limits (1–100), supports
+multiple concurrent instances through PostgreSQL row locking, and requires no
+local cursor. AccountActivityPlan recurrence, cron, catch-up and timezone rules
+remain in C6-01/2. The explicit scheduler owns WorkerJob recovery; FastAPI
+retains worker presence expiry but does not recover WorkerJobs in its lifespan.
+FastAPI and scheduler share one CommandRuntime composition. The repository has
+no concrete production `ThreadsAccessTokenProvider` for the standalone process,
+so enabling its LOCAL_API handlers requires a coordinator architecture decision.
 
 ## 10. D — Release
 

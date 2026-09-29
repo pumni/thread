@@ -35,9 +35,9 @@ checkpoints. PR #43's `threads.browser.media.local_upload` v1 is accepted and
 merged at `59f3d2cf5589b4bdb052b404d58babb0dda7a3e4`, DONE for its checkpoint,
 and available only through the reviewed, bounded, account-affine WorkerJob
 path with explicit worker opt-in. Issue #27 is CLOSED / COMPLETED; all four
-C5-01 capability acceptance criteria are satisfied. Issue #45 established the
-C5-02/1 activity foundation, and issue #47 authorizes C5-02/2 materialization
-and durable priority propagation only. Parent #28 remains open.
+C5-01 capability acceptance criteria are satisfied. C5-02/#28 is CLOSED /
+COMPLETED after #45, #47, #49 and #51. Issue #53 authorizes C6-01/1, the bounded
+PostgreSQL scheduler kernel for existing due occurrences. Parent #9 remains open.
 
 The coordinator accepted production UI evidence for
 `threads.browser.thread.open` on 2026-09-28, and PR #40 accepted and merged its
@@ -83,20 +83,18 @@ selection require `AMBIGUOUS_OUTCOME`; the file is never selected again.
 WorkerJobs are non-preemptible and use `RECONCILIATION_REQUIRED`. Video fails
 closed. The capability does not publish or submit, and Remove is not a
 rollback. Worker opt-in defaults off. Synthetic fixtures test the reviewed
-contracts but are not production evidence. Issue #45's C5-02/1 durable
-foundation is accepted; issue #47 authorizes existing due occurrence
-materialization into Commands and durable priority propagation. It does not
-authorize recurrence generation, a background runner, cancellation, or
-preemption. LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond
+contracts but are not production evidence. C5-02/#28 completed the durable
+activity foundation, occurrence materialization, trusted priority propagation,
+safe-boundary cancellation and HIGH preemption/profile gate. C6-01/1 (#53)
+consumes existing persisted occurrences with a bounded scheduler process;
+PostgreSQL remains due-state authority and recurrence generation is deferred
+to C6-01/2. WorkerJob recovery requires the explicit scheduler process;
+FastAPI no longer performs WorkerJob recovery in its lifespan and retains only
+worker presence expiry. The app and scheduler share CommandRuntime composition,
+but no concrete production `ThreadsAccessTokenProvider` is available to the
+standalone scheduler, so LOCAL_API handler enablement requires coordinator
+decision. LIKE/FOLLOW remain VERIFY. No browser mutation is authorized beyond
 this bounded staging capability, and publish/submit remains outside scope.
-
-Issue #45 authorized C5-02 Checkpoint 1 for the durable AccountActivityPlan,
-versioned template, ScheduledActivity occurrence, and priority foundation.
-Issue #47 separately authorizes C5-02 Checkpoint 2 for due occurrence to
-Command materialization and Command-to-WorkerJob priority propagation. It
-excludes recurrence generation, a background runner, cancellation, and
-preemption. Later C5-02 execution/preemption, C6 scheduling/operations, and
-production release work still require their own authorization.
 
 ## 3. Important merged checkpoints
 
@@ -284,10 +282,9 @@ Treat repository fixtures as documentation-contract fixtures unless explicitly m
    capability uses the bounded account-affine WorkerJob path with explicit
    worker opt-in.
 5. Keep LIKE/FOLLOW in VERIFY unless a separate product decision explicitly retains them.
-6. Keep issue #47 limited to C5-02/2: materialize existing due occurrences and
-   propagate trusted priority through the existing Command Runtime. Recurrence,
-   background runners, cancellation, and preemption still need separate
-   authorization.
+6. Track the exact #53 PR head and its PostgreSQL concurrency, restart,
+   worker-offline and recovery evidence. Do not close parent #9; later C6
+   checkpoints still require separate authorization.
 
 Do not guess production Threads selectors from synthetic fixtures. Any production UI contract must be based on reviewed observed UI evidence and must fail closed when the contract does not match.
 
@@ -323,7 +320,12 @@ and reports uncertain post-selection outcomes as `AMBIGUOUS_OUTCOME`. It is
 non-preemptible, uses reconciliation-required retry safety, and never publishes,
 submits, or removes the staged image. Worker opt-in defaults off. Issue #27 is
 CLOSED / COMPLETED after all C5-01 acceptance criteria were satisfied.
-Synthetic fixtures are not production evidence. Issue #45 established the
-C5-02/1 durable foundation; issue #47 authorizes only C5-02/2 materialization
-and durable priority propagation. LIKE/FOLLOW remain VERIFY. No additional
+Synthetic fixtures are not production evidence. C5-02/#28 is CLOSED /
+COMPLETED after #45, #47, #49 and #51. C6-01/1/#53 is the authorized bounded
+scheduler kernel for existing due occurrences; recurrence is deferred to
+C6-01/2. The explicit scheduler process owns bounded WorkerJob recovery;
+FastAPI lifespan retains worker presence expiry but no longer recovers jobs.
+The standalone scheduler has no repository-supported production
+`ThreadsAccessTokenProvider`; coordinator decision is required before LOCAL_API
+handler execution is available there. LIKE/FOLLOW remain VERIFY. No additional
 mutation or publish/submit scope is authorized.
