@@ -87,6 +87,7 @@ async def _run() -> None:
     runner_config = SchedulerRunnerConfig(
         poll_interval=timedelta(seconds=settings.scheduler_poll_interval_seconds),
         generation_limit=settings.scheduler_activity_generation_batch_limit,
+        conversation_sync_limit=settings.scheduler_conversation_sync_batch_limit,
         activity_limit=settings.scheduler_activity_batch_limit,
         command_limit=settings.scheduler_command_batch_limit,
         recovery_limit=settings.scheduler_recovery_batch_limit,

@@ -64,6 +64,7 @@ async def unit_of_work_factory() -> AsyncIterator[SQLAlchemyUnitOfWorkFactory]:
                 "lead_candidates, discovery_source_evidence, discovery_run_cursors, "
                 "discovery_runs, discovered_threads, discovered_authors, "
                 "discovery_search_queries, discovery_campaigns, "
+                "conversation_sync_dispatches, conversation_sync_schedules, "
                 "scheduled_activities, account_activity_recurrence_states, "
                 "account_activity_template_revisions, "
                 "account_activity_templates, account_activity_plans, "

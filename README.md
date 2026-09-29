@@ -81,6 +81,7 @@ interval and independent per-tick bounds:
 
 - `THREADS_PLATFORM_SCHEDULER_POLL_INTERVAL_SECONDS` (default 15; positive, maximum 3,600)
 - `THREADS_PLATFORM_SCHEDULER_ACTIVITY_GENERATION_BATCH_LIMIT` (default 50; 1–100)
+- `THREADS_PLATFORM_SCHEDULER_CONVERSATION_SYNC_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_ACTIVITY_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_COMMAND_BATCH_LIMIT` (default 50; 1–100)
 - `THREADS_PLATFORM_SCHEDULER_RECOVERY_BATCH_LIMIT` (default 50; 1–100)
@@ -92,6 +93,12 @@ production `ThreadsAccessTokenProvider` available to the standalone process, so
 its LOCAL_API handler registry is unavailable and the process reports that
 condition at startup. Coordinator decision is required before standalone
 scheduler LOCAL_API execution can be enabled.
+
+The scheduler dispatches only already-configured `threads.sync_conversation`
+schedules. It coalesces missed wall-clock intervals into one Command; the
+conversation handler's durable `SyncState` cursor catches up remote data.
+PAUSED schedules keep their due slot without dispatching, and DISABLED
+schedules are terminal. Discovery and mentions recurrence remain deferred.
 
 ## Delivery workflow
 

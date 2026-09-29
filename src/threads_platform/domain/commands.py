@@ -21,6 +21,17 @@ class CommandStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+TERMINAL_COMMAND_STATUSES = frozenset(
+    {
+        CommandStatus.SUCCEEDED,
+        CommandStatus.REJECTED,
+        CommandStatus.EXPIRED,
+        CommandStatus.FAILED_FINAL,
+        CommandStatus.CANCELLED,
+    }
+)
+
+
 class AttemptStatus(StrEnum):
     PROCESSING = "PROCESSING"
     SUCCEEDED = "SUCCEEDED"

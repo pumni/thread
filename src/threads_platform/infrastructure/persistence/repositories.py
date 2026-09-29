@@ -18,6 +18,8 @@ from threads_platform.application.ports.repositories import (
     CommandAttemptRepository,
     CommandRepository,
     CommandRouteDecisionRepository,
+    ConversationSyncDispatchRepository,
+    ConversationSyncScheduleRepository,
     DiscoveryRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
@@ -64,10 +66,17 @@ from threads_platform.domain.capabilities import (
     RouteTarget,
 )
 from threads_platform.domain.commands import (
+    TERMINAL_COMMAND_STATUSES,
     AttemptStatus,
     Command,
     CommandAttempt,
     CommandStatus,
+)
+from threads_platform.domain.conversation_sync import (
+    ConversationSyncDispatch,
+    ConversationSyncKind,
+    ConversationSyncSchedule,
+    ConversationSyncScheduleStatus,
 )
 from threads_platform.domain.discovery import (
     DiscoveredAuthor,
@@ -132,6 +141,8 @@ from threads_platform.infrastructure.persistence.models import (
     CommandAttemptRecord,
     CommandRecord,
     CommandRouteDecisionRecord,
+    ConversationSyncDispatchRecord,
+    ConversationSyncScheduleRecord,
     DiscoveredAuthorRecord,
     DiscoveredThreadRecord,
     DiscoveryCampaignRecord,
@@ -724,6 +735,212 @@ class SQLAlchemyScheduledActivityRepository(ScheduledActivityRepository):
             command_id=record.command_id,
             materialization_at=record.materialization_at,
             materialization_reason=record.materialization_reason,
+        )
+
+
+class SQLAlchemyConversationSyncScheduleRepository(ConversationSyncScheduleRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, schedule: ConversationSyncSchedule) -> None:
+        self._session.add(self._record(schedule))
+        await self._session.flush()
+
+    async def get(self, schedule_id: UUID) -> ConversationSyncSchedule | None:
+        record = await self._session.get(ConversationSyncScheduleRecord, schedule_id)
+        return self._domain(record) if record is not None else None
+
+    async def get_for_update(self, schedule_id: UUID) -> ConversationSyncSchedule | None:
+        record = await self._session.scalar(
+            select(ConversationSyncScheduleRecord)
+            .where(ConversationSyncScheduleRecord.id == schedule_id)
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def get_due_for_update(self, now: datetime, limit: int) -> list[ConversationSyncSchedule]:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("conversation sync schedule selection limit must be positive")
+        records = await self._session.scalars(
+            select(ConversationSyncScheduleRecord)
+            .where(
+                ConversationSyncScheduleRecord.status == ConversationSyncScheduleStatus.ACTIVE,
+                ConversationSyncScheduleRecord.next_due_at <= normalize_utc(now),
+                or_(
+                    ConversationSyncScheduleRecord.last_command_id.is_(None),
+                    exists(
+                        select(1).where(
+                            CommandRecord.command_id
+                            == ConversationSyncScheduleRecord.last_command_id,
+                            CommandRecord.status.in_(TERMINAL_COMMAND_STATUSES),
+                        )
+                    ),
+                ),
+                exists(
+                    select(1).where(
+                        PostRecord.account_id == ConversationSyncScheduleRecord.account_id,
+                        PostRecord.threads_post_id
+                        == ConversationSyncScheduleRecord.threads_post_id,
+                    )
+                ),
+            )
+            .order_by(
+                ConversationSyncScheduleRecord.next_due_at,
+                ConversationSyncScheduleRecord.id,
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True, of=ConversationSyncScheduleRecord)
+        )
+        return [self._domain(record) for record in records]
+
+    async def list_for_account(self, account_id: UUID) -> list[ConversationSyncSchedule]:
+        records = await self._session.scalars(
+            select(ConversationSyncScheduleRecord)
+            .where(ConversationSyncScheduleRecord.account_id == account_id)
+            .order_by(ConversationSyncScheduleRecord.created_at, ConversationSyncScheduleRecord.id)
+        )
+        return [self._domain(record) for record in records]
+
+    async def update(self, schedule: ConversationSyncSchedule) -> None:
+        record = await self._session.scalar(
+            select(ConversationSyncScheduleRecord)
+            .where(ConversationSyncScheduleRecord.id == schedule.id)
+            .with_for_update()
+        )
+        if record is None:
+            raise LookupError(f"conversation sync schedule not found: {schedule.id}")
+        if (
+            record.account_id != schedule.account_id
+            or record.threads_post_id != schedule.threads_post_id
+            or ConversationSyncKind(record.sync_kind) is not schedule.sync_kind
+            or record.anchor_at != schedule.anchor_at
+            or record.interval_seconds != schedule.interval_seconds
+            or record.created_at != schedule.created_at
+        ):
+            raise ValueError("conversation sync schedule configuration is immutable")
+        if schedule.revision < record.revision:
+            raise ValueError("conversation sync schedule revision cannot move backwards")
+        if (
+            ConversationSyncScheduleStatus(record.status) is ConversationSyncScheduleStatus.DISABLED
+            and schedule.status is not ConversationSyncScheduleStatus.DISABLED
+        ):
+            raise ValueError("disabled conversation sync schedules are terminal")
+        record.status = schedule.status
+        record.status_reason = schedule.status_reason
+        record.revision = schedule.revision
+        record.next_due_at = schedule.next_due_at
+        record.last_dispatched_due_at = schedule.last_dispatched_due_at
+        record.last_command_id = schedule.last_command_id
+        record.updated_at = schedule.updated_at
+        await self._session.flush()
+
+    @staticmethod
+    def _record(schedule: ConversationSyncSchedule) -> ConversationSyncScheduleRecord:
+        return ConversationSyncScheduleRecord(
+            id=schedule.id,
+            account_id=schedule.account_id,
+            threads_post_id=schedule.threads_post_id,
+            sync_kind=schedule.sync_kind,
+            anchor_at=schedule.anchor_at,
+            interval_seconds=schedule.interval_seconds,
+            created_at=schedule.created_at,
+            status=schedule.status,
+            status_reason=schedule.status_reason,
+            revision=schedule.revision,
+            next_due_at=schedule.next_due_at,
+            last_dispatched_due_at=schedule.last_dispatched_due_at,
+            last_command_id=schedule.last_command_id,
+            updated_at=schedule.updated_at,
+        )
+
+    @staticmethod
+    def _domain(record: ConversationSyncScheduleRecord) -> ConversationSyncSchedule:
+        return ConversationSyncSchedule(
+            id=record.id,
+            account_id=record.account_id,
+            threads_post_id=record.threads_post_id,
+            sync_kind=ConversationSyncKind(record.sync_kind),
+            anchor_at=record.anchor_at,
+            interval_seconds=record.interval_seconds,
+            created_at=record.created_at,
+            status=ConversationSyncScheduleStatus(record.status),
+            status_reason=record.status_reason,
+            revision=record.revision,
+            next_due_at=record.next_due_at,
+            last_dispatched_due_at=record.last_dispatched_due_at,
+            last_command_id=record.last_command_id,
+            updated_at=record.updated_at,
+        )
+
+
+class SQLAlchemyConversationSyncDispatchRepository(ConversationSyncDispatchRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_if_absent(self, dispatch: ConversationSyncDispatch) -> ConversationSyncDispatch:
+        await self._session.execute(
+            postgres_insert(ConversationSyncDispatchRecord)
+            .values(**self._values(dispatch))
+            .on_conflict_do_nothing(constraint="uq_conversation_sync_dispatches_schedule_due")
+        )
+        record = await self._session.scalar(
+            select(ConversationSyncDispatchRecord).where(
+                ConversationSyncDispatchRecord.schedule_id == dispatch.schedule_id,
+                ConversationSyncDispatchRecord.due_at == normalize_utc(dispatch.due_at),
+            )
+        )
+        if record is None:
+            raise RuntimeError("conversation sync dispatch disappeared after insert")
+        stored = self._domain(record)
+        if (
+            stored.schedule_revision != dispatch.schedule_revision
+            or stored.command_id != dispatch.command_id
+            or stored.created_at != dispatch.created_at
+        ):
+            raise RuntimeError("conversation sync dispatch identity conflicts with stored audit")
+        return stored
+
+    async def get_latest_for_schedule(self, schedule_id: UUID) -> ConversationSyncDispatch | None:
+        record = await self._session.scalar(
+            select(ConversationSyncDispatchRecord)
+            .where(ConversationSyncDispatchRecord.schedule_id == schedule_id)
+            .order_by(
+                ConversationSyncDispatchRecord.due_at.desc(),
+                ConversationSyncDispatchRecord.created_at.desc(),
+                ConversationSyncDispatchRecord.id.desc(),
+            )
+            .limit(1)
+        )
+        return self._domain(record) if record is not None else None
+
+    async def list_for_schedule(self, schedule_id: UUID) -> list[ConversationSyncDispatch]:
+        records = await self._session.scalars(
+            select(ConversationSyncDispatchRecord)
+            .where(ConversationSyncDispatchRecord.schedule_id == schedule_id)
+            .order_by(ConversationSyncDispatchRecord.due_at, ConversationSyncDispatchRecord.id)
+        )
+        return [self._domain(record) for record in records]
+
+    @staticmethod
+    def _values(dispatch: ConversationSyncDispatch) -> dict[str, object]:
+        return {
+            "id": dispatch.id,
+            "schedule_id": dispatch.schedule_id,
+            "schedule_revision": dispatch.schedule_revision,
+            "due_at": dispatch.due_at,
+            "command_id": dispatch.command_id,
+            "created_at": dispatch.created_at,
+        }
+
+    @staticmethod
+    def _domain(record: ConversationSyncDispatchRecord) -> ConversationSyncDispatch:
+        return ConversationSyncDispatch(
+            id=record.id,
+            schedule_id=record.schedule_id,
+            schedule_revision=record.schedule_revision,
+            due_at=record.due_at,
+            command_id=record.command_id,
+            created_at=record.created_at,
         )
 
 

@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     database_url: SecretStr | None = None
     scheduler_poll_interval_seconds: float = Field(default=15, gt=0, le=3_600)
     scheduler_activity_generation_batch_limit: int = Field(default=50, ge=1, le=100)
+    scheduler_conversation_sync_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_activity_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_command_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_recovery_batch_limit: int = Field(default=50, ge=1, le=100)

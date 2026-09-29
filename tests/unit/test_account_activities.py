@@ -51,7 +51,10 @@ def _template(
 
 def test_activity_plan_validates_state_transitions_and_revisions() -> None:
     plan = _plan()
-    start = datetime(2026, 9, 29, 12, tzinfo=UTC)
+    start = max(
+        datetime(2026, 9, 29, 12, tzinfo=UTC),
+        plan.updated_at + timedelta(microseconds=1),
+    )
 
     plan.transition(AccountActivityPlanStatus.PAUSED, start, reason="operator pause")
     assert plan.status is AccountActivityPlanStatus.PAUSED
@@ -300,7 +303,10 @@ def test_occurrence_keeps_immutable_plan_and_template_revision_snapshots() -> No
 
     plan.transition(
         AccountActivityPlanStatus.PAUSED,
-        datetime(2026, 9, 29, 13, tzinfo=UTC),
+        max(
+            datetime(2026, 9, 29, 13, tzinfo=UTC),
+            plan.updated_at + timedelta(microseconds=1),
+        ),
         reason="operator pause",
     )
     updated_template = _template(

@@ -187,6 +187,7 @@ LIKE/FOLLOW remain VERIFY unless explicitly retained at implementation review.
 Issues:
 - #53 C6-01/1 PostgreSQL scheduler kernel for existing due work;
 - #56 C6-01/2 deterministic AccountActivityPlan recurrence generation;
+- #58 C6-01/3 durable periodic `threads.sync_conversation` scheduling;
 - #9 later durable scheduler/fleet orchestration checkpoints;
 - #10 observability/security/Windows packaging/deployment.
 
@@ -205,6 +206,14 @@ instances through PostgreSQL locking. FastAPI retains worker presence expiry
 but does not recover WorkerJobs in its lifespan. FastAPI and scheduler share
 one CommandRuntime composition. The standalone scheduler's production
 `ThreadsAccessTokenProvider` remains a separate #55/#3 deployment dependency.
+Issue #58 adds a narrow conversation-sync schedule and immutable dispatch
+audit, not a generic scheduled-command framework. ACTIVE schedules dispatch
+one deterministic Command for the oldest due slot and coalesce overdue slots;
+PAUSED schedules retain the due time, and DISABLED schedules are terminal.
+The dispatch audit, Command, and schedule cursor update share one transaction.
+Each scheduler process has an independent 1–100 conversation-sync batch limit.
+The Command continues through CommandRuntime and the Capability Router, where
+the existing handler uses SyncState for remote cursor catch-up.
 
 ## 10. D — Release
 

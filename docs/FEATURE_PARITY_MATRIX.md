@@ -48,7 +48,7 @@ The legacy report is treated only as a requirements inventory. The new project u
 | Reply to comment | Reply-to-reply | HYBRID | Official API | Browser | DONE/API | P0 | relational parent mapping |
 | Crawl own post replies | Conversation sync | NATIVE_API | Official API | Browser enrichment | DONE/API | P0 | deterministic relational sync |
 | Deep comment tree | Flattened conversation + relational tree | NATIVE_API | Official API | Browser enrichment | DONE/API | P0 | no DOM indentation guessing |
-| Periodic comment crawl | Scheduled conversation sync | NATIVE_API | Scheduler + API | Browser if required | PLANNED | P1 | C6 |
+| Periodic comment crawl | Scheduled conversation sync | NATIVE_API | Scheduler + API | Browser if required | BLOCKED | P1 | Scheduler/SyncState path is implemented; production activation remains gated by #55/#3 |
 | Search public posts | Keyword/topic search | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | issue #3 live verification remains open |
 | Search topic/tag | Topic-tag discovery | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | search_mode TAG; issue #3 live verification remains open |
 | Public user lookup | Public profile lookup | NATIVE_API | Official API | none in C4 | DONE/API (docs contract) | P1 | response fields require issue #3 live verification |

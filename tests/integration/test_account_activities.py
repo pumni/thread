@@ -137,15 +137,23 @@ async def test_activity_plan_template_and_occurrence_persist_with_snapshots(
     async with unit_of_work_factory() as unit_of_work:
         current_plan = await unit_of_work.activity_plans.get_for_update(plan.id)
         assert current_plan is not None
+        pause_at = max(
+            datetime(2026, 9, 29, 13, tzinfo=UTC),
+            current_plan.updated_at + timedelta(microseconds=1),
+        )
+        disable_at = max(
+            datetime(2026, 9, 29, 14, tzinfo=UTC),
+            pause_at + timedelta(microseconds=1),
+        )
         current_plan.transition(
             AccountActivityPlanStatus.PAUSED,
-            datetime(2026, 9, 29, 13, tzinfo=UTC),
+            pause_at,
             reason="operator pause",
         )
         await unit_of_work.activity_plans.update(current_plan)
         current_plan.transition(
             AccountActivityPlanStatus.DISABLED,
-            datetime(2026, 9, 29, 14, tzinfo=UTC),
+            disable_at,
             reason="plan retired",
         )
         await unit_of_work.activity_plans.update(current_plan)
