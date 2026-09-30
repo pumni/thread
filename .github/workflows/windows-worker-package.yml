@@ -163,7 +163,7 @@ jobs:
         shell: pwsh
         run: |
           $releaseRoot = Join-Path $env:RUNNER_TEMP 'worker-release'
-          $archive = Get-ChildItem -LiteralPath $releaseRoot -Filter '*.zip' | Select-Object -Single
+          $archive = Get-ChildItem -LiteralPath $releaseRoot -Filter '*.zip' | Select-Object -First 1
           $digestFile = Join-Path $releaseRoot ($archive.Name + '.sha256')
           $expectedDigest = (Get-Content -Raw -LiteralPath $digestFile).Split(' ')[0]
           $actualDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive.FullName).Hash.ToLowerInvariant()
