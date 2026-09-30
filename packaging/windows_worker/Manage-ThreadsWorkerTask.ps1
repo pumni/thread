@@ -204,25 +204,38 @@ function New-WorkerTaskDefinition(
 }
 
 function Assert-TaskContract($Task, [string] $ExpectedUserSid) {
-    if ($Task.Principal.LogonType.ToString() -ne "Interactive" -or
-        $Task.Principal.RunLevel.ToString() -ne "Limited" -or
-        $Task.Settings.MultipleInstances.ToString() -ne "IgnoreNew" -or
-        $Task.Settings.AllowHardTerminate -ne $false -or
-        $Task.Settings.ExecutionTimeLimit -ne [TimeSpan]::Zero -or
-        $Task.Settings.StopIfGoingOnBatteries -ne $false -or
-        @($Task.Triggers).Count -ne 1 -or
-        $Task.Triggers[0].CimClass.CimClassName -ne "MSFT_TaskLogonTrigger") {
+    $script:failureStage = "VERIFY_LOGON_TYPE"
+    if ($Task.Principal.LogonType.ToString() -ne "Interactive") { throw "invalid task" }
+    $script:failureStage = "VERIFY_RUN_LEVEL"
+    if ($Task.Principal.RunLevel.ToString() -ne "Limited") { throw "invalid task" }
+    $script:failureStage = "VERIFY_INSTANCE_POLICY"
+    if ($Task.Settings.MultipleInstances.ToString() -ne "IgnoreNew") { throw "invalid task" }
+    $script:failureStage = "VERIFY_HARD_TERMINATE"
+    if ($Task.Settings.AllowHardTerminate -ne $false) { throw "invalid task" }
+    $script:failureStage = "VERIFY_EXECUTION_LIMIT"
+    if ($Task.Settings.ExecutionTimeLimit -ne [TimeSpan]::Zero) { throw "invalid task" }
+    $script:failureStage = "VERIFY_BATTERY_POLICY"
+    if ($Task.Settings.StopIfGoingOnBatteries -ne $false) { throw "invalid task" }
+    $script:failureStage = "VERIFY_TRIGGER_COUNT"
+    if (@($Task.Triggers).Count -ne 1) { throw "invalid task" }
+    $script:failureStage = "VERIFY_TRIGGER_TYPE"
+    if ($Task.Triggers[0].CimClass.CimClassName -ne "MSFT_TaskLogonTrigger") {
         throw "invalid task"
     }
+    $script:failureStage = "VERIFY_PRINCIPAL_IDENTITY"
     $principalSid = Convert-AccountToSid $Task.Principal.UserId
+    $script:failureStage = "VERIFY_TRIGGER_IDENTITY"
     $triggerSid = Convert-AccountToSid $Task.Triggers[0].UserId
+    $script:failureStage = "VERIFY_USER_SCOPE"
     if ($principalSid -ne $ExpectedUserSid -or $triggerSid -ne $ExpectedUserSid) {
         throw "invalid task"
     }
+    $script:failureStage = "VERIFY_ACTION_COUNT"
     if (@($Task.Actions).Count -ne 1 -or
         $Task.Actions[0].Arguments -notmatch '^--host-config "([^"\r\n]+)"$') {
         throw "invalid task"
     }
+    $script:failureStage = "VERIFY_RELEASE_PATH"
     $configPath = $Matches[1]
     $executablePath = [IO.Path]::GetFullPath($Task.Actions[0].Execute)
     $releasePath = [IO.Path]::GetFullPath((Split-Path -Parent $executablePath))
@@ -234,6 +247,7 @@ function Assert-TaskContract($Task, [string] $ExpectedUserSid) {
         throw "invalid task"
     }
     if (![IO.Path]::IsPathRooted($configPath)) { throw "invalid task" }
+    $script:failureStage = "VERIFY_TASK_CREDENTIALS"
     $taskXml = Export-ScheduledTask -TaskName $taskName
     if ($taskXml -match '<LogonType>Password</LogonType>|<Password>' -or
         $taskXml -match 'THREADS_WORKER_ENROLLMENT_CODE|access_token|session_token|private_key|proxy_credential|credential_ref') {
