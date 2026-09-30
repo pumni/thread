@@ -377,3 +377,7 @@ publish/submit scope is authorized.
 Issue #65 prepares only offline evidence tooling: a strict scrubbed `threads-live-evidence-v1` packet, a template classified `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE`, recursive secret validation, opaque-value fingerprinting, and a human runbook. No live API validation happened in the #65 PR, no real credentials were used, and the harness makes no network calls to Meta. The packet template is not evidence and changes no capability from documentation-contract to live-verified.
 
 Issue #3 remains OPEN. #55 remains blocked until a human-run Phase A packet is reviewed and accepted. Discovery/mentions scheduler policy under #9 remains blocked until Phase B polling/cursor evidence is reviewed and accepted. A later human operator must execute the live run with a dedicated Meta development app/account under the runbook; the coordinator independently accepts the evidence.
+
+## 13. Phase A scrubbed live evidence checkpoint #68
+
+Issue #68 commits reviewed scrubbed Phase A live evidence (`docs/evidence/threads-live-phase-a-2026-09-30.json`) observed by a human operator using a dedicated Meta development app and non-production test account. Authorization code exchange, long-lived token exchange, token refresh, debugger scopes (including `threads_read_replies`), and own profile shapes were verified. Phase B was not run. Issue #3 remains OPEN. Issue #55 awaits coordinator evidence acceptance. No discovery/mentions capability becomes live-verified.
