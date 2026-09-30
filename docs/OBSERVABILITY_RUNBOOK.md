@@ -1,9 +1,9 @@
 # Observability and readiness runbook (#72)
 
-This checkpoint adds structured lifecycle logs and an operational readiness
-snapshot. PostgreSQL remains the source of durable state. Metrics, dashboards,
-OpenTelemetry, distributed tracing, deployment probes, and the #62 CRM result
-transport are outside this checkpoint.
+This runbook records the structured lifecycle logs and readiness snapshot from
+#72 and the bounded metrics added in #89. PostgreSQL remains the source of
+durable state. Dashboards, OpenTelemetry, distributed tracing, and the #62 CRM
+result transport remain outside this checkpoint.
 
 ## Lifecycle correlation
 
@@ -63,10 +63,81 @@ Those four HTTP responses use `Cache-Control: no-store`. PostgreSQL retains
 enrollment/session token digests and configured credential references; it does
 not retain raw enrollment codes or session access tokens.
 
-This hardening adds no session revocation flow and does not change worker auth
-semantics. Metrics/tracing are not implemented in this checkpoint. Issue #3
+This #75 hardening added no session revocation flow and did not change worker
+auth semantics. It added no metrics or tracing; #89 separately adds bounded
+operational metrics, while distributed tracing remains deferred. Issue #3
 remains OPEN as the production/release gate; #62 remains a separate CRM result
 transport dependency.
+
+## Bounded operational metrics (#89)
+
+The HTTP Control Plane exposes Prometheus text at `GET /metrics` on the existing
+HTTP listener. The endpoint performs a short-lived, read-only PostgreSQL
+aggregate with the configured readiness timeout. It emits:
+
+- `threads_platform_workers{status=...}` — persisted count for every existing
+  `WorkerStatus`, including `DISABLED`;
+- `threads_platform_worker_jobs{status=...}` — persisted count for every
+  existing `WorkerJobStatus`;
+- `threads_platform_database_up` — `1` when both aggregates complete, otherwise
+  `0`;
+- `threads_platform_command_execution_duration_seconds` — process-local
+  histogram measured with monotonic time around actual `CommandRuntime`
+  processing methods (`process` and selected `process_next`). It does not infer
+  execution latency from persisted timestamps.
+
+If PostgreSQL is unavailable or times out, `/metrics` still returns a valid
+Prometheus response with `threads_platform_database_up 0`. Worker and WorkerJob
+status samples are omitted because their durable counts could not be read. The
+failure response contains no DSN or exception message. This diagnostic gauge
+does not replace or change `/ready`.
+
+The standalone scheduler owns a separate process-local registry and optional
+private listener at `GET /metrics`. It exports:
+
+- `threads_platform_scheduler_ticks_total{outcome=...}` with only `success` or
+  `error`;
+- `threads_platform_scheduler_tick_duration_seconds`;
+- `threads_platform_scheduler_worker_presences_expired_total`;
+- `threads_platform_scheduler_worker_job_lease_reclaims_total`;
+- `threads_platform_scheduler_stage_failures_total{stage=...}` with only
+  `worker_presence_expiry`, `activity_recurrence_generation`,
+  `conversation_sync_dispatch`, `activity_materialization`,
+  `command_processing`, `worker_job_recovery`, or `outbox_delivery`;
+- `threads_platform_command_execution_duration_seconds` for CommandRuntime
+  processing in this process. `process_next` records a sample only when a
+  command was selected.
+
+Presence-expiry and lease-reclaim counters consume the actual scheduler tick
+result fields `worker_presences_expired` and `worker_jobs_recovered`, including
+partial results from a tick that later reports a stage error. They do not run
+parallel recovery logic. Existing tick order, failure handling, and backoff are
+unchanged.
+
+Metric names have the `threads_platform_` prefix. Labels are limited to the
+Worker/WorkerJob status enums, scheduler outcome, and fixed scheduler stage.
+Command, correlation, Worker, WorkerJob, and account IDs; hostnames; profile or
+session identifiers; raw command/capability values; URLs; payloads; errors;
+DSNs; credentials; and request headers never enter the metric registry. No
+browser-session metric is exported: persisted `active_browser_sessions` is the
+last Worker report and may remain nonzero after scheduler-owned presence
+expiry. Reporting it as live capacity would require defining or duplicating
+freshness semantics, so it remains deferred.
+
+Scheduler metrics are disabled by default. Configure
+`THREADS_PLATFORM_SCHEDULER_METRICS_ENABLED`,
+`THREADS_PLATFORM_SCHEDULER_METRICS_HOST` (`127.0.0.1` or `0.0.0.0`), and
+`THREADS_PLATFORM_SCHEDULER_METRICS_PORT` (1–65535; default 9101). Committed
+Compose enables the listener on `0.0.0.0:9101` inside the private Compose
+network and publishes no scheduler metrics port to the host. The HTTP endpoint
+uses the normal HTTP listener.
+
+Gauges are re-read from PostgreSQL on every HTTP scrape and recover immediately
+after HTTP process recreation. Histograms and scheduler counters are process
+local and reset when their owning process restarts; they are never stored in
+PostgreSQL. Metrics are diagnostic only, not business state, a queue, or a
+readiness decision. No Prometheus server, collector, dashboard, alerting, or
+tracing is included. Issue #3 remains OPEN and #62 remains separate.
 
 ## Health and readiness
 

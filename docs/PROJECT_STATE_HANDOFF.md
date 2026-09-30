@@ -496,15 +496,37 @@ and no production release claim is made.
 
 ## 20. C6-02/8 Linux/Docker Control Plane deployment (#87)
 
-Issue #87 fixes the Control Plane process topology before metrics/tracing: a
+Issue #87 fixed the Control Plane process topology before metrics/tracing: a
 locked Python 3.14 non-root image supports an explicit one-shot migration job,
 FastAPI/Uvicorn HTTP container, and standalone scheduler container. HTTP and
 scheduler share PostgreSQL; PostgreSQL is separate durable state, and Windows
 Workers remain external. The internal/test Compose smoke uses a named PostgreSQL
 volume and proves liveness/readiness, HTTP and scheduler recreation, persisted
 Worker presence rediscovery, and fail-closed `/ready` during a database outage.
-It does not run Meta, CRM, or Worker calls. No new schema migration, production
-secret, metrics/tracing, Windows Worker container, or production release claim
-is included. #78 DRAINING and #84 interactive Worker behavior are unchanged. Phase
+It does not run Meta, CRM, or Worker calls. #87 added no new schema migration,
+production secret, metrics, tracing, Windows Worker container, or production
+release claim. Metrics are added in #89; tracing remains deferred. #78
+DRAINING and #84 interactive Worker behavior are unchanged. Phase
 B remains `PARTIAL_LIVE_EVIDENCE / NOT_READY`, #3 remains OPEN, and #62 remains a
 separate dependency. See `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.
+
+## 21. C6-02/9 bounded operational metrics (#89)
+
+Issue #89 adds bounded Prometheus-compatible metrics to the existing topology:
+the HTTP process serves `/metrics` alongside `/health` and `/ready`, while the
+standalone scheduler owns a separate process-local registry/listener on the
+private Compose network. HTTP Worker and WorkerJob status gauges and the
+database-up diagnostic are refreshed from read-only PostgreSQL aggregates.
+CommandRuntime durations use monotonic timing. Scheduler tick, stage-failure,
+presence-expiry, and WorkerJob-reclaim metrics use fixed vocabularies and actual
+tick results. No IDs, hosts, raw command/capability values, payloads, errors, or
+credentials become metric labels or values.
+
+Compose smoke verifies both metrics surfaces, the unpublished scheduler port,
+database-derived gauge rediscovery after HTTP restart, and reset of
+scheduler-local counters after scheduler recreation. Counters/histograms are
+not persisted. No migration, Worker telemetry change, collector, dashboard, or
+tracing is included. #3 remains OPEN, #62 remains separate, and no production
+release claim follows from this checkpoint. See
+`docs/OBSERVABILITY_RUNBOOK.md` and
+`docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.

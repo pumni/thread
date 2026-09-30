@@ -3,9 +3,14 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Response
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry
 from pydantic import BaseModel
 
 from threads_platform.application.commands.runtime import CommandRuntime
+from threads_platform.application.operational_metrics import (
+    OperationalMetricsProbe,
+    OperationalMetricsSnapshot,
+)
 from threads_platform.application.ports.threads import ThreadsAccessTokenProvider, ThreadsAPI
 from threads_platform.application.readiness import (
     DatabaseReadiness,
@@ -24,12 +29,16 @@ from threads_platform.infrastructure.persistence.database import (
     create_database_engine,
     create_session_factory,
 )
+from threads_platform.infrastructure.persistence.operational_metrics import (
+    PostgresOperationalMetricsProbe,
+)
 from threads_platform.infrastructure.persistence.readiness import (
     PostgresOperationalReadinessProbe,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 from threads_platform.infrastructure.threads_api.composition import compose_process_command_runtime
 from threads_platform.observability.logging import configure_logging
+from threads_platform.observability.metrics import ControlPlaneMetrics
 from threads_platform.transport.http.auth import BearerTokenAuthenticator, CommandAuthenticator
 from threads_platform.transport.http.commands import create_command_router
 from threads_platform.transport.http.worker_tls import WorkerTransportTLSMiddleware
@@ -63,6 +72,11 @@ class _DatabaseUnavailableReadinessProbe:
         return database_unavailable_snapshot()
 
 
+class _DatabaseUnavailableOperationalMetricsProbe:
+    async def snapshot(self) -> OperationalMetricsSnapshot:
+        raise RuntimeError("operational metrics database is unavailable")
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -75,6 +89,8 @@ def create_app(
     worker_session_service: WorkerSessionService | None = None,
     worker_notifications: WorkerNotificationHub | None = None,
     readiness_probe: OperationalReadinessProbe | None = None,
+    operational_metrics_probe: OperationalMetricsProbe | None = None,
+    metrics_registry: CollectorRegistry | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     configure_logging(resolved_settings.log_level)
@@ -91,6 +107,8 @@ def create_app(
     resolved_job_service = worker_job_service
     resolved_session_service = worker_session_service
     resolved_readiness_probe = readiness_probe
+    resolved_metrics_probe = operational_metrics_probe
+    metrics = ControlPlaneMetrics(registry=metrics_registry)
     notifications = worker_notifications or WorkerNotificationHub()
     if resolved_settings.database_url is not None and (
         resolved_readiness_probe is None
@@ -98,12 +116,18 @@ def create_app(
         or resolved_worker_service is None
         or resolved_job_service is None
         or resolved_session_service is None
+        or resolved_metrics_probe is None
     ):
         engine = create_database_engine(resolved_settings.database_url)
         session_factory = create_session_factory(engine)
         unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(session_factory)
         if resolved_readiness_probe is None:
             resolved_readiness_probe = PostgresOperationalReadinessProbe(
+                session_factory,
+                timeout_seconds=resolved_settings.readiness_timeout_seconds,
+            )
+        if resolved_metrics_probe is None:
+            resolved_metrics_probe = PostgresOperationalMetricsProbe(
                 session_factory,
                 timeout_seconds=resolved_settings.readiness_timeout_seconds,
             )
@@ -128,6 +152,11 @@ def create_app(
             resolved_session_service = WorkerSessionService(unit_of_work_factory)
     if resolved_readiness_probe is None:
         resolved_readiness_probe = _DatabaseUnavailableReadinessProbe()
+    if resolved_metrics_probe is None:
+        resolved_metrics_probe = _DatabaseUnavailableOperationalMetricsProbe()
+
+    if command_runtime is not None:
+        command_runtime.set_execution_duration_observer(metrics.observe_command_execution_duration)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
@@ -196,6 +225,18 @@ def create_app(
                 registering=snapshot.workers.registering,
                 upgrade_required=snapshot.workers.upgrade_required,
             ),
+        )
+
+    @application.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> Response:
+        snapshot: OperationalMetricsSnapshot | None
+        try:
+            snapshot = await resolved_metrics_probe.snapshot()
+        except Exception:
+            snapshot = None
+        return Response(
+            content=metrics.render(snapshot),
+            media_type=CONTENT_TYPE_LATEST,
         )
 
     return application

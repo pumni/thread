@@ -926,9 +926,55 @@ scheduler presence-expiry behavior; it adds no schema or business API.
 Compose is an offline internal/test topology with a disposable named PostgreSQL
 volume and trust authentication on its private network. It contains no real
 Threads or CRM credentials. Do not use this local authentication setup as a
-networked production database. The image is not pushed or signed. Metrics and
-tracing remain deferred to C6-02/9; #62 remains a separate CRM dependency; #3
-remains open as the production/release gate. See
+networked production database. The image is not pushed or signed. At the #87
+checkpoint, metrics and tracing were still deferred; #89 adds bounded metrics
+as described in section 31, while tracing remains deferred. #62 remains a
+separate CRM dependency; #3 remains open as the production/release gate. See
 `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for exact process, smoke, restart,
 and recovery commands. #78 DRAINING and #84 Windows Worker lifecycle semantics
 are unchanged.
+
+## 31. Bounded operational metrics (#89)
+
+The HTTP process exposes `GET /metrics` on its existing listener. It reads
+aggregate `worker_nodes.status` and `worker_jobs.status` counts from a short-lived
+read-only PostgreSQL session. The `threads_platform_workers{status}` gauge
+includes all `WorkerStatus` values, including `DISABLED`; the
+`threads_platform_worker_jobs{status}` gauge includes all `WorkerJobStatus`
+values. If either aggregate fails or times out, HTTP emits
+`threads_platform_database_up 0`, omits both persisted count families, and
+returns bounded Prometheus text. `/ready` is unchanged and remains the separate
+orchestrator readiness contract.
+
+The `threads_platform_command_execution_duration_seconds` histogram measures
+monotonic duration around existing `CommandRuntime` processing methods
+(`process` and selected `process_next`). Each process owns its local histogram
+and exposes it at its own metrics endpoint.
+
+The scheduler owns a separate `CollectorRegistry` and private listener. Its
+bounded metrics are `threads_platform_scheduler_ticks_total{outcome}` with
+`success|error`, `threads_platform_scheduler_tick_duration_seconds`,
+`threads_platform_scheduler_worker_presences_expired_total`,
+`threads_platform_scheduler_worker_job_lease_reclaims_total`, and
+`threads_platform_scheduler_stage_failures_total{stage}`. Stage labels use only
+the existing fixed tick-stage vocabulary. Presence and reclaim counters consume
+the actual `SchedulerTickResult` values, including the partial result on a
+failed tick; this adds no recovery behavior.
+
+All project metric names use `threads_platform_`. Labels are bounded to Worker
+status, WorkerJob status, tick outcome, or fixed stage. No business or machine
+identity, command/capability value, URL, payload, exception, DSN, credential, or
+request header enters the registry. No browser-session metric is added: the
+persisted `active_browser_sessions` value is a last Worker report that can stay
+nonzero after scheduler-owned presence expiry. Defining live freshness would
+require changing or duplicating that ownership contract; no Worker telemetry
+protocol is added.
+
+Scheduler metrics are disabled by default and bind to loopback by default. The
+listener accepts only `127.0.0.1` or `0.0.0.0` and ports 1–65535. Compose enables
+`0.0.0.0:9101` inside the private network without publishing that port to the
+host. PostgreSQL gauges are re-read after HTTP restart. Histograms and scheduler
+counters are process local, may reset at restart, and are never persisted.
+Metrics do not define business state or readiness. Tracing remains deferred;
+#3 remains open and #62 remains separate. See
+`docs/OBSERVABILITY_RUNBOOK.md` for the scrape and reset contract.

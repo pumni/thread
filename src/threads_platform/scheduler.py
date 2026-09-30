@@ -27,6 +27,8 @@ from threads_platform.infrastructure.persistence.database import (
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 from threads_platform.infrastructure.threads_api.composition import compose_process_command_runtime
 from threads_platform.observability.logging import configure_logging
+from threads_platform.observability.metrics import SchedulerMetrics
+from threads_platform.observability.metrics_server import start_scheduler_metrics_listener
 
 
 def install_shutdown_handlers(
@@ -66,6 +68,7 @@ async def run_scheduler() -> None:
     engine = create_database_engine(settings.database_url)
     http_client = None
     restore_handlers: Callable[[], None] | None = None
+    metrics_server: asyncio.AbstractServer | None = None
     try:
         unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
         worker_job_service = WorkerJobService(unit_of_work_factory, clock=clock)
@@ -75,6 +78,10 @@ async def run_scheduler() -> None:
             unit_of_work_factory,
             worker_job_service,
             clock=clock,
+        )
+        metrics = SchedulerMetrics()
+        composition.command_runtime.set_execution_duration_observer(
+            metrics.observe_command_execution_duration
         )
         http_client = composition.http_client
         if not composition.command_handler_registry:
@@ -92,6 +99,7 @@ async def run_scheduler() -> None:
             composition.command_runtime,
             worker_job_service,
             worker_control_service=worker_control_service,
+            metrics_observer=metrics,
         )
         runner_config = SchedulerRunnerConfig(
             poll_interval=timedelta(seconds=settings.scheduler_poll_interval_seconds),
@@ -103,7 +111,18 @@ async def run_scheduler() -> None:
             recovery_limit=settings.scheduler_recovery_batch_limit,
             outbox_delivery_limit=settings.scheduler_outbox_delivery_batch_limit,
         )
-        runner = SchedulerRunner(tick, runner_config, clock=clock)
+        runner = SchedulerRunner(
+            tick,
+            runner_config,
+            clock=clock,
+            metrics_observer=metrics,
+        )
+        if settings.scheduler_metrics_enabled:
+            metrics_server = await start_scheduler_metrics_listener(
+                settings.scheduler_metrics_host,
+                settings.scheduler_metrics_port,
+                metrics.registry,
+            )
         stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
         restore_handlers = install_shutdown_handlers(loop, stop_event)
@@ -114,10 +133,15 @@ async def run_scheduler() -> None:
                 restore_handlers()
         finally:
             try:
-                if http_client is not None:
-                    await http_client.aclose()
+                if metrics_server is not None:
+                    metrics_server.close()
+                    await metrics_server.wait_closed()
             finally:
-                await engine.dispose()
+                try:
+                    if http_client is not None:
+                        await http_client.aclose()
+                finally:
+                    await engine.dispose()
 
 
 def main() -> None:

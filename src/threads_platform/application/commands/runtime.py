@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -119,6 +120,8 @@ class CommandRuntime:
         event_id_factory: Callable[[], UUID] = uuid4,
         capability_router: CapabilityRouter | None = None,
         worker_job_service: WorkerJobService | None = None,
+        execution_duration_observer: Callable[[float], None] | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
         if (
             max_command_lifetime <= timedelta(0)
@@ -137,6 +140,8 @@ class CommandRuntime:
         self._event_id_factory = event_id_factory
         self._capability_router = capability_router or CapabilityRouter()
         self._worker_job_service = worker_job_service
+        self._execution_duration_observer = execution_duration_observer
+        self._monotonic = monotonic
         self._logger = structlog.get_logger(__name__)
 
     async def receive(self, raw_command: dict[str, object]) -> CommandReceiptV1:
@@ -229,22 +234,26 @@ class CommandRuntime:
             )
 
     async def process(self, command_id: str) -> CommandExecutionResult:
-        async with self._unit_of_work_factory() as unit_of_work:
-            command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
-            if command is None:
-                self._logger.info(
-                    "command_processing_rejected",
-                    command_id=command_id,
-                    error_code="COMMAND_NOT_FOUND",
-                )
-                raise CommandNotFound(command_id)
-            log_context = self._command_log_context(command)
-            with structlog.contextvars.bound_contextvars(**log_context):
-                self._logger.info("command_processing_started", status=command.status.value)
-                claim_or_result = await self._claim_locked(
-                    unit_of_work, command, normalize_utc(self._clock.now())
-                )
-        return await self._continue_processing(command, claim_or_result, log_context)
+        started_at = self._monotonic()
+        try:
+            async with self._unit_of_work_factory() as unit_of_work:
+                command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
+                if command is None:
+                    self._logger.info(
+                        "command_processing_rejected",
+                        command_id=command_id,
+                        error_code="COMMAND_NOT_FOUND",
+                    )
+                    raise CommandNotFound(command_id)
+                log_context = self._command_log_context(command)
+                with structlog.contextvars.bound_contextvars(**log_context):
+                    self._logger.info("command_processing_started", status=command.status.value)
+                    claim_or_result = await self._claim_locked(
+                        unit_of_work, command, normalize_utc(self._clock.now())
+                    )
+            return await self._continue_processing(command, claim_or_result, log_context)
+        finally:
+            self._observe_execution_duration(started_at)
 
     async def _continue_processing(
         self,
@@ -286,19 +295,44 @@ class CommandRuntime:
         now: datetime | None = None,
         exclude_command_ids: frozenset[str] = frozenset(),
     ) -> CommandExecutionResult | None:
-        occurred_at = normalize_utc(now if now is not None else self._clock.now())
-        async with self._unit_of_work_factory() as unit_of_work:
-            command = await unit_of_work.commands.get_next_ready_for_update(
-                occurred_at,
-                exclude_command_ids=exclude_command_ids,
+        started_at = self._monotonic()
+        observed = False
+        try:
+            occurred_at = normalize_utc(now if now is not None else self._clock.now())
+            async with self._unit_of_work_factory() as unit_of_work:
+                command = await unit_of_work.commands.get_next_ready_for_update(
+                    occurred_at,
+                    exclude_command_ids=exclude_command_ids,
+                )
+                if command is None:
+                    return None
+                observed = True
+                log_context = self._command_log_context(command)
+                with structlog.contextvars.bound_contextvars(**log_context):
+                    self._logger.info("command_processing_started", status=command.status.value)
+                    claim_or_result = await self._claim_locked(unit_of_work, command, occurred_at)
+            return await self._continue_processing(command, claim_or_result, log_context)
+        finally:
+            if observed:
+                self._observe_execution_duration(started_at)
+
+    def set_execution_duration_observer(
+        self,
+        observer: Callable[[float], None] | None,
+    ) -> None:
+        self._execution_duration_observer = observer
+
+    def _observe_execution_duration(self, started_at: float) -> None:
+        observer = self._execution_duration_observer
+        if observer is None:
+            return
+        try:
+            observer(max(0.0, self._monotonic() - started_at))
+        except Exception as error:
+            self._logger.warning(
+                "command_execution_metric_observation_failed",
+                error_type=type(error).__name__,
             )
-            if command is None:
-                return None
-            log_context = self._command_log_context(command)
-            with structlog.contextvars.bound_contextvars(**log_context):
-                self._logger.info("command_processing_started", status=command.status.value)
-                claim_or_result = await self._claim_locked(unit_of_work, command, occurred_at)
-        return await self._continue_processing(command, claim_or_result, log_context)
 
     async def _claim_locked(
         self,
