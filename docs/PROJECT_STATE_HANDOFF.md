@@ -477,3 +477,19 @@ registration, signing, downloader, or self-update is included. Phase A remains
 accepted; Phase B remains `PARTIAL_LIVE_EVIDENCE / NOT_READY` with
 `full_tp002_ready=false`. Issue #3 remains OPEN and #62 remains separate; no
 production release readiness is claimed.
+
+## 19. C6-02/7 interactive Windows Worker host (#84)
+
+Issue #84 is the sole authorized C6-02/7 checkpoint. Earlier #83 LocalService
+Windows Service hosting was superseded before merge and is not the deployment
+model for this headed browser Worker. The Worker stays headed and runs under a
+dedicated logged-in Windows user via Task Scheduler `Interactive` / `Limited`,
+with no saved password, `IgnoreNew`, unlimited duration, and
+`AllowHardTerminate=false`. Its current-user DPAPI identity remains bound to
+that same Windows user. Strict non-secret host config overrides only matching
+ordinary environment settings; enrollment remains process-environment-only.
+Install/update/rollback are tied to durable #78 DRAINING -> quiescent -> OFFLINE;
+abrupt session or OS loss is not drain completion. No migration, service,
+downloader, or self-updater is included. Phase A remains accepted; Phase B is
+`PARTIAL_LIVE_EVIDENCE / NOT_READY`; issue #3 remains OPEN, #62 remains separate,
+and no production release claim is made.

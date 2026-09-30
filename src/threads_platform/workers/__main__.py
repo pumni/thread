@@ -3,6 +3,7 @@ import importlib.metadata
 import os
 import signal
 import sys
+from pathlib import Path
 
 from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
 from threads_platform.infrastructure.worker_agent.identity import WorkerIdentityFileStore
@@ -28,6 +29,11 @@ from threads_platform.workers.feed_browse import (
     FEED_CAPABILITY_VERSION,
     BrowserFeedBrowseWorker,
 )
+from threads_platform.workers.host_config import (
+    WorkerHostConfig,
+    WorkerHostConfigError,
+    read_worker_host_config,
+)
 from threads_platform.workers.media_local_upload import (
     MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME,
     MEDIA_LOCAL_UPLOAD_CAPABILITY_VERSION,
@@ -48,25 +54,43 @@ from threads_platform.workers.thread_open import (
 )
 
 
-async def _run() -> None:
-    from pathlib import Path
-
-    control_plane_url = _required_environment("THREADS_WORKER_CONTROL_PLANE_URL")
-    configured_root = os.environ.get("THREADS_WORKER_DATA_ROOT")
+async def _run(host_config: WorkerHostConfig | None = None) -> None:
+    control_plane_url = configured_value(
+        host_config.control_plane_url if host_config is not None else None,
+        "THREADS_WORKER_CONTROL_PLANE_URL",
+    )
+    configured_root = configured_optional_value(
+        host_config.data_root if host_config is not None else None,
+        "THREADS_WORKER_DATA_ROOT",
+    )
     data_root = LocalDataRoot.from_environment(
         Path(configured_root) if configured_root is not None else None
     )
     data_root.prepare()
     identity_store = WorkerIdentityFileStore(data_root)
     worker_id = identity_store.load_or_create()
-    enabled_capabilities = enabled_browser_capabilities()
+    enabled_capabilities = enabled_browser_capabilities(host_config)
     config = WorkerAgentConfig(
         control_plane_url=control_plane_url,
-        display_name=os.environ.get("THREADS_WORKER_DISPLAY_NAME", "Windows Worker"),
-        agent_version=os.environ.get("THREADS_WORKER_AGENT_VERSION", "0.1.0"),
+        display_name=configured_value(
+            host_config.display_name if host_config is not None else None,
+            "THREADS_WORKER_DISPLAY_NAME",
+            "Windows Worker",
+        ),
+        agent_version=configured_value(
+            host_config.agent_version if host_config is not None else None,
+            "THREADS_WORKER_AGENT_VERSION",
+            "0.1.0",
+        ),
         enrollment_code=os.environ.get("THREADS_WORKER_ENROLLMENT_CODE"),
-        max_concurrent_jobs=_integer_environment("THREADS_WORKER_MAX_CONCURRENT_JOBS", 1),
-        max_browser_sessions=_integer_environment("THREADS_WORKER_MAX_BROWSER_SESSIONS", 1),
+        max_concurrent_jobs=configured_integer(
+            host_config.max_concurrent_jobs if host_config is not None else None,
+            "THREADS_WORKER_MAX_CONCURRENT_JOBS",
+        ),
+        max_browser_sessions=configured_integer(
+            host_config.max_browser_sessions if host_config is not None else None,
+            "THREADS_WORKER_MAX_BROWSER_SESSIONS",
+        ),
         capabilities=enabled_capabilities,
     )
     state_store = WorkerLocalStateStore(data_root, worker_id)
@@ -140,6 +164,22 @@ def _required_environment(name: str) -> str:
     return value
 
 
+def configured_value(config_value: str | None, name: str, default: str | None = None) -> str:
+    if config_value is not None:
+        return config_value
+    if default is not None and name not in os.environ:
+        return default
+    return _required_environment(name)
+
+
+def configured_optional_value(config_value: str | None, name: str) -> str | None:
+    return config_value if config_value is not None else os.environ.get(name)
+
+
+def configured_integer(config_value: int | None, name: str, default: int = 1) -> int:
+    return config_value if config_value is not None else _integer_environment(name, default)
+
+
 def _integer_environment(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None:
@@ -162,29 +202,61 @@ def _boolean_environment(name: str, default: bool) -> bool:
     raise RuntimeError(f"{name} must be a boolean value")
 
 
-def enabled_browser_capabilities() -> tuple[tuple[str, int], ...]:
+def enabled_browser_capabilities(
+    host_config: WorkerHostConfig | None = None,
+) -> tuple[tuple[str, int], ...]:
+    capability_overrides = {
+        "THREADS_WORKER_FEED_BROWSE_ENABLED": (
+            host_config.feed_browse_enabled if host_config is not None else None
+        ),
+        "THREADS_WORKER_THREAD_OPEN_ENABLED": (
+            host_config.thread_open_enabled if host_config is not None else None
+        ),
+        "THREADS_WORKER_PROFILE_OPEN_ENABLED": (
+            host_config.profile_open_enabled if host_config is not None else None
+        ),
+        "THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED": (
+            host_config.media_local_upload_enabled if host_config is not None else None
+        ),
+    }
     return tuple(
         capability
         for enabled, capability in (
             (
-                _boolean_environment("THREADS_WORKER_FEED_BROWSE_ENABLED", False),
+                _configured_boolean(
+                    capability_overrides["THREADS_WORKER_FEED_BROWSE_ENABLED"],
+                    "THREADS_WORKER_FEED_BROWSE_ENABLED",
+                ),
                 (FEED_CAPABILITY_NAME, FEED_CAPABILITY_VERSION),
             ),
             (
-                _boolean_environment("THREADS_WORKER_THREAD_OPEN_ENABLED", False),
+                _configured_boolean(
+                    capability_overrides["THREADS_WORKER_THREAD_OPEN_ENABLED"],
+                    "THREADS_WORKER_THREAD_OPEN_ENABLED",
+                ),
                 (THREAD_OPEN_CAPABILITY_NAME, THREAD_OPEN_CAPABILITY_VERSION),
             ),
             (
-                _boolean_environment("THREADS_WORKER_PROFILE_OPEN_ENABLED", False),
+                _configured_boolean(
+                    capability_overrides["THREADS_WORKER_PROFILE_OPEN_ENABLED"],
+                    "THREADS_WORKER_PROFILE_OPEN_ENABLED",
+                ),
                 (PROFILE_OPEN_CAPABILITY_NAME, PROFILE_OPEN_CAPABILITY_VERSION),
             ),
             (
-                _boolean_environment("THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED", False),
+                _configured_boolean(
+                    capability_overrides["THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED"],
+                    "THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED",
+                ),
                 (MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME, MEDIA_LOCAL_UPLOAD_CAPABILITY_VERSION),
             ),
         )
         if enabled
     )
+
+
+def _configured_boolean(config_value: bool | None, name: str) -> bool:
+    return config_value if config_value is not None else _boolean_environment(name, False)
 
 
 def main() -> int:
@@ -194,13 +266,28 @@ def main() -> int:
         return 0
     if arguments == ["--package-check"]:
         return run_package_check()
-    if arguments:
+    if len(arguments) == 2 and arguments[0] == "--validate-host-config":
+        try:
+            read_worker_host_config(Path(arguments[1]))
+        except WorkerHostConfigError:
+            print("THREADS_WORKER_HOST_CONFIG_INVALID", file=sys.stderr)
+            return 2
+        print("THREADS_WORKER_HOST_CONFIG_VALID")
+        return 0
+    host_config: WorkerHostConfig | None = None
+    if len(arguments) == 2 and arguments[0] == "--host-config":
+        try:
+            host_config = read_worker_host_config(Path(arguments[1]))
+        except WorkerHostConfigError:
+            print("THREADS_WORKER_HOST_CONFIG_INVALID", file=sys.stderr)
+            return 2
+    elif arguments:
         print("THREADS_WORKER_INVALID_ARGUMENTS", file=sys.stderr)
         return 2
     if os.name != "nt":
         raise RuntimeError("the persistent Worker Agent entrypoint requires Windows DPAPI")
     try:
-        asyncio.run(_run())
+        asyncio.run(_run(host_config))
     except RuntimeError as error:
         if str(error) == "THREADS_WORKER_CONTROL_PLANE_URL must be configured":
             print("THREADS_WORKER_CONFIGURATION_INVALID", file=sys.stderr)

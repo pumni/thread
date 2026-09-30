@@ -1,80 +1,120 @@
-# Worker package update and rollback runbook
+# Interactive Windows Worker install, update, and rollback
 
-This procedure is service-manager neutral. The Control Plane owns durable
-Worker status and WorkerJob leases. An update operator owns package replacement
-and service stop/start. DRAINING is not a process-kill instruction.
+The current host runs the headed browser Worker under a stable dedicated Windows user who is
+logged in interactively. It uses Task Scheduler, not a Windows service. The same Windows user
+owns the Worker's current-user DPAPI identity across all releases. Keep Worker data outside
+Program Files and preserve `%LOCALAPPDATA%\ThreadsOperations` through updates and rollback.
 
-## Update
+## First enrollment and task installation
 
-1. Request an admin drain with a bounded reason code, for example
-   `UPDATE_REQUESTED`.
-2. Confirm the Worker reports `DRAINING`.
-3. Poll drain status until `quiescent` is true. The status reports only worker
-   ID, status, active browser session count, RUNNING WorkerJob count, and the
-   derived quiescent flag. An expired RUNNING lease still blocks this step.
-4. Let the WorkerAgent close managed sessions, flush STOPPED reports, report
-   zero active sessions, and complete its worker-authenticated handshake.
-5. Confirm the Worker reports `OFFLINE` and verify that it has no RUNNING
-   WorkerJobs.
-6. Stop the service/process through the external service manager.
-7. Verify the new archive's SHA-256 against the exact workflow artifact record.
-8. Extract it to a new immutable release directory, for example
-   `C:\Program Files\ThreadsWorker\releases\<version>\`.
-9. Run that release's `threads-worker.exe --package-check` before switching the
-   external service configuration to it.
-10. Preserve the data-root permissions and existing
-    `%LOCALAPPDATA%\ThreadsOperations` contents. Durable Worker data must remain
-    outside every release directory.
-11. Switch the future service configuration to the new release directory and
-    start it externally using the existing identity store.
-12. Let the worker authenticate and send hello. Verify it reaches `ONLINE` or
-    `UPGRADE_REQUIRED`.
-13. Verify Control Plane health/readiness and worker assignments before
-    assigning new work.
+1. Log in as the dedicated Worker user. Do not use LocalSystem, LocalService, or
+   NetworkService.
+2. Download the unsigned internal/test ZIP through the approved channel and verify its SHA-256
+   against the exact Windows workflow artifact. Extract it into a new immutable release folder:
+   `C:\Program Files\ThreadsWorker\releases\<version>-<git-sha>\`.
+3. Run `threads-worker.exe --version` and `--package-check` from that release. Package check
+   uses temporary identity, current-user DPAPI, journal, and bundled Chromium state; it does not
+   contact the Control Plane or modify the durable Worker root.
+4. Create a UTF-8 `threads-worker-host-v1` JSON file at
+   `%LOCALAPPDATA%\ThreadsOperations\host\worker-host.json`. Its only allowed settings are
+   existing non-secret deployment values: `control_plane_url`, `data_root`, `display_name`,
+   `agent_version`, `max_concurrent_jobs`, `max_browser_sessions`, and explicit capability
+   booleans. Paths are absolute and bounded. Unknown fields, including enrollment codes,
+   tokens, credentials, account/profile identifiers, and private keys, are rejected. Present
+   host-config values take precedence over matching ordinary environment settings; omitted
+   fields fall back to those settings. Enrollment is always process-environment-only.
+5. Obtain a one-time enrollment code. Enter it at a secure prompt and keep it only in the
+   launching PowerShell process environment. A protected operator script can read a
+   `SecureString`, convert it briefly for the process environment, launch the executable, then
+   clear the environment and temporary unmanaged buffer in `finally`. Do not place the code in
+   a command, argument, config, script, profile, task definition, registry environment, or log.
+6. Launch `threads-worker.exe --host-config <absolute-config-path>` interactively. Verify the
+   Worker reaches ONLINE. Request durable drain, wait for DRAINING and quiescence, and let the
+   Worker finish the #78 session-close/report-flush/zero-capacity flow to OFFLINE. Clear the
+   enrollment environment state and verify the local identity marker says ENROLLED without
+   printing its UUID. Registration refuses a missing or PENDING identity.
+7. Register the task from the same logged-in user:
 
-Do not stop or replace the package before the worker confirms OFFLINE. If
-connectivity fails during finalization, leave it DRAINING and allow the Worker
-Agent to reconnect, authenticate, observe durable DRAINING, and resume the
-handshake. The server continues to reject new claims while local status may be
-stale.
+   ```powershell
+   .\packaging\windows_worker\Manage-ThreadsWorkerTask.ps1 `
+     -Operation Install `
+     -ReleaseDirectory 'C:\Program Files\ThreadsWorker\releases\<version>-<git-sha>' `
+     -HostConfigPath "$env:LOCALAPPDATA\ThreadsOperations\host\worker-host.json" `
+     -ExpectedProjectVersion '<version>' `
+     -ExpectedGitSha '<40-character-git-sha>'
+   ```
 
-## Abort or rollback
+   The manager verifies the manifest and release tree, then registers the bounded task
+   `ThreadsPlatformWorker`: current user, `Interactive` token, `Limited` run level, same-user
+   logon trigger, `IgnoreNew`, unlimited duration, and `AllowHardTerminate=false`. It stores no
+   password. Start it in the current session with
+   `Start-ScheduledTask -TaskName ThreadsPlatformWorker`, or let the next logon trigger start
+   it. `Inspect` reports a bounded task state only.
 
-An admin may abort a drain only to `OFFLINE`. Abort is recovery, not proof of
-quiescence, and does not rewrite browser sessions or WorkerJobs. A later normal
-hello or heartbeat may establish `ONLINE` under the existing presence rules.
-Do not replace software solely because an aborted worker reports OFFLINE; check
-drain status and verify no durable RUNNING jobs remain first.
+The production task action directly invokes the selected immutable release's
+`threads-worker.exe --host-config <absolute-path>`. No credentials are accepted by the manager.
+Durable identity, DPAPI key, profiles, journal, and media remain outside release directories.
+Do not move the identity to another Windows user: current-user DPAPI keys are bound to their
+original principal.
 
-If the replacement package fails, drain and stop it externally when possible,
-then point the service configuration back to the previous intact release.
-Preserve the same data root, `worker_id`, DPAPI identity store, private key, and
-previous package. Start the restored release, authenticate, send hello, and
-verify worker ID continuity and resulting status. Never regenerate identity or
-copy an old profile/data snapshot over newer durable state. No downloader,
-self-updater, installer, code signing, or service wrapper is provided by this
-checkpoint.
+## Planned update
 
-## Package trust and layout
+1. Request a Control Plane drain.
+2. Wait for durable DRAINING, `quiescent=true`, and WorkerAgent completion to OFFLINE. Any
+   RUNNING WorkerJob blocks quiescence even after its lease expires. Do not stop the task to
+   force drain.
+3. Confirm the task is no longer Running and verify no durable RUNNING jobs remain.
+4. Verify the new workflow ZIP SHA-256, extract to a new immutable version/SHA release
+   directory, then run `--version` and `--package-check` from that release.
+5. From the same dedicated user, update the task action:
 
-The expected application layout is:
+   ```powershell
+   .\packaging\windows_worker\Manage-ThreadsWorkerTask.ps1 `
+     -Operation Update `
+     -ReleaseDirectory 'C:\Program Files\ThreadsWorker\releases\<new-version>-<new-git-sha>' `
+     -ExpectedProjectVersion '<new-version>' `
+     -ExpectedGitSha '<new-40-character-git-sha>' `
+     -ConfirmDurableDrainOffline
+   ```
 
-```text
-C:\Program Files\ThreadsWorker\releases\<version>\
-  threads-worker.exe
-  _internal\
-  BUILD-MANIFEST.json
-%LOCALAPPDATA%\ThreadsOperations\
-  worker\
-  profiles\
-  journal\
-  media\
-```
+   The command requires explicit operator confirmation, refuses a Running task, retains the
+   existing host config, and never removes the previous release. Inspect settings/action, then
+   start the task or allow the next logon trigger. Verify hello reports the expected version
+   and the Worker reaches ONLINE or `UPGRADE_REQUIRED` as appropriate. Retain the previous
+   release until the replacement is verified and rollback is no longer needed.
 
-Download or copy the ZIP only through the operator's approved channel. The
-workflow ZIP and SHA-256 identify and detect changes to those exact bytes; the
-hash does not verify who published them. This is an unsigned internal/test
-artifact: no Authenticode signing, production auto-update channel, or service
-installation is implemented. Service registration and publisher-trust policy
-are separate later work. Do not configure a service until the package check
-passes and the data root is confirmed to remain outside the release tree.
+Do not call `Stop-ScheduledTask` as the planned update mechanism. The Worker must complete the
+durable #78 DRAINING -> quiescent -> OFFLINE handshake itself. DRAINING blocks new claims while
+already-running work reaches its existing safe terminal boundary.
+
+## Rollback and uninstall
+
+If a replacement release fails after it starts, drain it normally and wait for quiescence and
+OFFLINE. Verify the task is no longer Running, then run `-Operation Update` with the previous
+intact release and `-ConfirmDurableDrainOffline`. Keep the same config, data root, Windows user,
+Worker identity, and DPAPI key. Start the old release and verify hello/identity continuity.
+Never restore an old copy of profiles or journal over newer state, regenerate identity, or
+delete the previous release during a switch.
+
+To unregister the task, first complete durable drain to OFFLINE and verify it is not Running,
+then call `-Operation Uninstall -ConfirmDurableDrainOffline`. Uninstall removes only the task;
+release directories, config, identity, key, profiles, journal, and other Worker data remain.
+
+## Abrupt logoff or host loss
+
+Interactive user logoff, OS shutdown, crash, or user process termination can end the Worker
+abruptly. That is not proof of DRAINING completion or quiescence. Task Scheduler is configured
+not to hard-terminate the task during planned lifecycle operations, but it cannot guarantee
+graceful work completion when Windows destroys the interactive session. Existing durable
+WorkerJob lease recovery and scheduler-owned Worker presence expiry remain authoritative.
+Reconnect the same user and identity; do not treat an abrupt exit as OFFLINE quiescence proof.
+
+## Release trust and scope
+
+`BUILD-MANIFEST.json` validates package identity and SHA-256 detects changes to exact bytes;
+neither authenticates a publisher. This is an unsigned internal/test artifact without
+Authenticode signing, a production release channel, downloader, or self-updater. The current
+headed-browser/DPAPI architecture does not use a Windows service. A service wrapper can be
+reconsidered only after a separately reviewed and validated headless/browser-host design.
+Issue #3 remains open as the production release gate, metrics/tracing are not implemented, and
+#62 remains separate.
