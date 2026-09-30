@@ -433,3 +433,22 @@ This does not change session revocation behavior and does not implement
 metrics/tracing. Issue #3 remains OPEN as the production/release gate; #62
 remains separate. See `docs/OBSERVABILITY_RUNBOOK.md` for the precise repr and
 cache-control contract.
+
+## 16. TP-002 Phase B partial evidence checkpoint #74
+
+Issue #74 records reviewed scrubbed partial Phase B live evidence
+(`docs/evidence/threads-live-phase-b-partial-2026-09-30.json`). Phase A evidence
+remains accepted with `token_provider_ready_evidence=true`. Phase B session
+completed with status `PARTIAL_LIVE_EVIDENCE / NOT_READY`: canonical discovery
+endpoints (`/keyword_search`, `/profile_lookup`, `/profile_posts`,
+`/me/mentions`) failed with HTTP 500 (`Proxy-Status: http_request_error`) or
+remained blocked on the dedicated test app; canonical B05/B06 (`replies`,
+`conversation`) were verified (HTTP 200); collection pagination semantics
+(`after` parameter, `paging.cursors.after`, terminal page, repeated/cross-run
+stability, and `owner.id`) were corroborated on `/me/threads` outside the
+canonical B07–B13 endpoints. `polling_cursor_ready_evidence=false` and
+discovery/mentions recurring scheduling policy under #9 remains blocked.
+Opportunistic Phase C observations (`/me/threads` text container publish C01,
+published media retrieval C04, and publishing quota C08) were recorded as PASS
+but do not equal Phase C acceptance. Issue #3 remains OPEN;
+`full_tp002_ready=false`.
