@@ -89,7 +89,7 @@ Never record access tokens, app secrets, authorization codes or sensitive accoun
 
 The evidence model uses `threads-live-evidence-v1`, strict unknown-field rejection, recursive secret-sensitive scanning, and explicit `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE` classification for its checked-in matrix. Its fingerprint helper accepts opaque input through standard input and outputs only `sha256:<64 lowercase hex characters>`; fingerprints are comparison metadata, never authentication material. Validation is offline and does not call Meta.
 
-Issue #3 remains OPEN. No live API validation happened in the #65 PR. #55 remains blocked pending accepted Phase A evidence, and discovery/mentions scheduler policy remains blocked pending accepted Phase B cursor/polling evidence. The Postman collection alone is not runtime proof.
+Issue #3 remains OPEN. Issue #68 commits reviewed scrubbed Phase A live evidence. Phase B was not run. #55 awaits coordinator evidence acceptance, and discovery/mentions scheduler policy remains blocked pending accepted Phase B cursor/polling evidence. No discovery/mentions capability becomes live-verified. The Postman collection alone is not runtime proof.
 
 ## Official source links
 
