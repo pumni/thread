@@ -132,6 +132,16 @@ function Assert-ImmutableRelease([string] $Path) {
     return $manifest
 }
 
+function Test-PathAtOrUnderRoot([string] $Path, [string] $Root) {
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $fullRoot = [IO.Path]::GetFullPath($Root)
+    if ($fullPath.Equals($fullRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $rootPrefix = if ($fullRoot.EndsWith('\')) { $fullRoot } else { $fullRoot + '\' }
+    return $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Assert-EnrolledIdentity([string] $ConfigPath, [string] $ExecutablePath) {
     $fullConfigPath = [IO.Path]::GetFullPath($ConfigPath)
     $configFile = Get-Item -LiteralPath $fullConfigPath -Force
@@ -147,19 +157,38 @@ function Assert-EnrolledIdentity([string] $ConfigPath, [string] $ExecutablePath)
         throw "invalid host config"
     }
 
-    $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
-    if ([string]::IsNullOrWhiteSpace($localAppData)) { throw "identity unavailable" }
-    $dataRoot = if ($null -ne $config.data_root) {
-        [IO.Path]::GetFullPath([string] $config.data_root)
+    $runtimeWorkingDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($ExecutablePath))
+    if ($null -ne $config.data_root) {
+        $configuredDataRoot = [string] $config.data_root
+    } elseif ($null -ne [Environment]::GetEnvironmentVariable("THREADS_WORKER_DATA_ROOT")) {
+        $configuredDataRoot = [Environment]::GetEnvironmentVariable("THREADS_WORKER_DATA_ROOT")
     } else {
-        Join-Path $localAppData "ThreadsOperations"
+        $localAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA")
+        if ([string]::IsNullOrWhiteSpace($localAppData)) { throw "identity unavailable" }
+        $configuredDataRoot = Join-Path $localAppData "ThreadsOperations"
     }
-    $dataRoot = $dataRoot.TrimEnd('\')
-    $releasePrefix = [IO.Path]::GetFullPath($releaseRoot).TrimEnd('\') + '\'
-    if ($dataRoot.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase) -or
-        $fullConfigPath.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    if ([string]::IsNullOrWhiteSpace($configuredDataRoot)) { throw "invalid host config" }
+    try {
+        $dataRoot = [IO.Path]::GetFullPath($configuredDataRoot, $runtimeWorkingDirectory)
+    } catch {
         throw "invalid host config"
     }
+
+    $script:failureStage = "DATA_ROOT_POLICY"
+    $programFilesRoots = @(
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+    ) | Where-Object { ![string]::IsNullOrWhiteSpace($_) }
+    foreach ($programFilesRoot in $programFilesRoots) {
+        if (Test-PathAtOrUnderRoot $dataRoot $programFilesRoot) {
+            throw "invalid host config"
+        }
+    }
+    $releasePrefix = [IO.Path]::GetFullPath($releaseRoot).TrimEnd('\') + '\'
+    if ($fullConfigPath.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "invalid host config"
+    }
+    $script:failureStage = "IDENTITY_VALIDATION"
     $workerDirectory = Join-Path $dataRoot "worker"
     $markerPath = Join-Path $workerDirectory "worker_id"
     $workerItem = Get-Item -LiteralPath $workerDirectory -Force

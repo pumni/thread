@@ -17,12 +17,20 @@ $releaseRoot = Join-Path $programFiles "ThreadsWorker\releases"
 $testId = [guid]::NewGuid().ToString("N")
 $firstRelease = Join-Path $releaseRoot "task-smoke-$testId-a"
 $secondRelease = Join-Path $releaseRoot "task-smoke-$testId-b"
-$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+$testTempRoot = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+    [IO.Path]::GetTempPath()
+} else {
+    $env:RUNNER_TEMP
+}
+$localAppData = Join-Path $testTempRoot "worker-task-localappdata-$testId"
 $testDataRoot = Join-Path $localAppData "ThreadsOperations-TaskSmoke-$testId"
+$legacyDefaultDataRoot = Join-Path $localAppData "ThreadsOperations"
 $hostDirectory = Join-Path $testDataRoot "host"
 $hostConfigPath = Join-Path $hostDirectory "worker-host.json"
 $identityDirectory = Join-Path $testDataRoot "worker"
 $identityPath = Join-Path $identityDirectory "worker_id"
+$previousLocalAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA")
+$previousWorkerDataRoot = [Environment]::GetEnvironmentVariable("THREADS_WORKER_DATA_ROOT")
 $productionTaskOwned = $false
 
 function Assert-Condition([bool] $Condition, [string] $FailureCode) {
@@ -74,6 +82,14 @@ function Copy-TestRelease([string] $Destination) {
     Copy-Item -Path (Join-Path $packagePath "*") -Destination $Destination -Recurse -Force
 }
 
+function Write-TestHostConfig($Config) {
+    [IO.File]::WriteAllText(
+        $hostConfigPath,
+        ($Config | ConvertTo-Json -Compress),
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+
 function Assert-TaskSettings($Task, [string] $ExpectedUserSid) {
     Assert-Condition ($Task.Principal.LogonType.ToString() -eq "Interactive") "TASK_LOGON_TYPE_INVALID"
     Assert-Condition ($Task.Principal.RunLevel.ToString() -eq "Limited") "TASK_RUN_LEVEL_INVALID"
@@ -90,6 +106,9 @@ function Assert-TaskSettings($Task, [string] $ExpectedUserSid) {
 }
 
 try {
+    New-Item -ItemType Directory -Path $localAppData -Force | Out-Null
+    $env:LOCALAPPDATA = $localAppData
+    $env:THREADS_WORKER_DATA_ROOT = $testDataRoot
     Import-Module ScheduledTasks -ErrorAction Stop
     Assert-Condition (Test-Path -LiteralPath $packageExecutable -PathType Leaf) "PACKAGE_EXECUTABLE_MISSING"
     Assert-Condition (Test-Path -LiteralPath $manifestPath -PathType Leaf) "PACKAGE_MANIFEST_MISSING"
@@ -105,18 +124,49 @@ try {
     $hostConfig = [ordered]@{
         schema = "threads-worker-host-v1"
         control_plane_url = "https://control.example.invalid"
-        data_root = $testDataRoot
         display_name = "Task Scheduler smoke worker"
         max_concurrent_jobs = 1
         max_browser_sessions = 1
     }
-    [IO.File]::WriteAllText(
-        $hostConfigPath,
-        ($hostConfig | ConvertTo-Json -Compress),
-        [Text.UTF8Encoding]::new($false)
-    )
+    Write-TestHostConfig $hostConfig
+
+    $programFilesRoots = @(
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
+        [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+    ) | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    foreach ($programFilesRoot in $programFilesRoots) {
+        $hostConfig["data_root"] = Join-Path $programFilesRoot "ThreadsWorker-test-data-$testId"
+        Write-TestHostConfig $hostConfig
+        $programFilesResult = Invoke-TaskManager @(
+            "-Operation", "Install", "-ReleaseDirectory", $firstRelease,
+            "-HostConfigPath", $hostConfigPath
+        ) 2
+        Assert-Condition (
+            $programFilesResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_DATA_ROOT_POLICY"
+        ) "PROGRAM_FILES_DATA_ROOT_ACCEPTED"
+        Assert-Condition (!(Test-Path -LiteralPath $hostConfig["data_root"])) "PROGRAM_FILES_DATA_ROOT_CREATED"
+    }
+    $hostConfig.Remove("data_root") | Out-Null
+    Write-TestHostConfig $hostConfig
 
     $syntheticWorkerId = [guid]::NewGuid().ToString()
+    $legacyWorkerDirectory = Join-Path $legacyDefaultDataRoot "worker"
+    New-Item -ItemType Directory -Path $legacyWorkerDirectory -Force | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $legacyWorkerDirectory "worker_id"),
+        "$([guid]::NewGuid())`nENROLLED`n",
+        [Text.ASCIIEncoding]::new()
+    )
+    $mismatchResult = Invoke-TaskManager @(
+        "-Operation", "Install", "-ReleaseDirectory", $firstRelease,
+        "-HostConfigPath", $hostConfigPath
+    ) 2
+    Assert-Condition (
+        $mismatchResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_IDENTITY_VALIDATION"
+    ) "ENV_DATA_ROOT_MISMATCH_ACCEPTED"
+    Assert-Condition (!(Get-ScheduledTask -TaskName $productionTaskName -ErrorAction SilentlyContinue)) `
+        "ENV_DATA_ROOT_MISMATCH_REGISTERED_TASK"
+
     [IO.File]::WriteAllText(
         $identityPath,
         "$syntheticWorkerId`nPENDING`n",
@@ -184,7 +234,7 @@ try {
     Assert-Condition (Test-Path -LiteralPath (Join-Path $firstRelease "threads-worker.exe")) "UNINSTALL_REMOVED_RELEASE"
 
     $identityName = $currentIdentity.Name
-    $smokeOutput = Join-Path $env:RUNNER_TEMP "worker-task-output-$testId.txt"
+    $smokeOutput = Join-Path $testTempRoot "worker-task-output-$testId.txt"
     $commandArguments = '/d /c ""{0}" --package-check > "{1}" 2>&1"' -f `
         $packageExecutable, $smokeOutput
     $smokeAction = New-ScheduledTaskAction `
@@ -248,13 +298,23 @@ try {
             Remove-Item -LiteralPath $fullPath -Recurse -Force
         }
     }
-    $fullTestDataRoot = [IO.Path]::GetFullPath($testDataRoot)
-    $expectedDataPrefix = [IO.Path]::GetFullPath($localAppData).TrimEnd('\') + '\'
-    if ($fullTestDataRoot.StartsWith($expectedDataPrefix, [StringComparison]::OrdinalIgnoreCase) -and
-        $fullTestDataRoot -like '*ThreadsOperations-TaskSmoke-*' -and
-        (Test-Path -LiteralPath $fullTestDataRoot)) {
-        Remove-Item -LiteralPath $fullTestDataRoot -Recurse -Force
+    if ($null -eq $previousLocalAppData) {
+        Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue
+    } else {
+        $env:LOCALAPPDATA = $previousLocalAppData
     }
-    Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP "worker-task-output-$testId.txt") `
+    if ($null -eq $previousWorkerDataRoot) {
+        Remove-Item Env:THREADS_WORKER_DATA_ROOT -ErrorAction SilentlyContinue
+    } else {
+        $env:THREADS_WORKER_DATA_ROOT = $previousWorkerDataRoot
+    }
+    $fullTestLocalAppData = [IO.Path]::GetFullPath($localAppData)
+    $expectedTempPrefix = [IO.Path]::GetFullPath($testTempRoot).TrimEnd('\') + '\'
+    if ($fullTestLocalAppData.StartsWith($expectedTempPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+        $fullTestLocalAppData -like '*worker-task-localappdata-*' -and
+        (Test-Path -LiteralPath $fullTestLocalAppData)) {
+        Remove-Item -LiteralPath $fullTestLocalAppData -Recurse -Force
+    }
+    Remove-Item -LiteralPath (Join-Path $testTempRoot "worker-task-output-$testId.txt") `
         -Force -ErrorAction SilentlyContinue
 }

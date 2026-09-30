@@ -40,8 +40,10 @@ to a different Windows principal by this host.
 
 `THREADS_WORKER_DATA_ROOT` can override the default root for managed deployments and tests.
 The override is still treated as the security boundary: it must live outside Git worktrees, and
-profile resolution rejects paths that escape it. Non-Windows test environments use an injected
-fake data protector; the persistent entrypoint itself requires Windows DPAPI.
+profile resolution rejects paths that escape it. Task registration resolves this override using
+the same precedence as the Worker runtime and rejects effective roots in either Program Files
+directory, including paths outside the release subtree. Non-Windows test environments use an
+injected fake data protector; the persistent entrypoint itself requires Windows DPAPI.
 
 ## Windows x64 package and interactive host
 
