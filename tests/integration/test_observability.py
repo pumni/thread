@@ -396,6 +396,7 @@ async def test_expired_worker_job_recovery_emits_one_bounded_summary(
         account_id=account.id,
         assigned_worker_id=worker_id,
         account_affinity_required=True,
+        max_attempts=1,
     )
     assert await jobs.claim_next(worker_id) is not None
     recovery_time = clock.now() + timedelta(minutes=3)
@@ -409,7 +410,7 @@ async def test_expired_worker_job_recovery_emits_one_bounded_summary(
     assert recovered == 1
     assert len(recovery_events) == 1
     assert recovery_events[0]["recovered_count"] == 1
-    assert recovery_events[0]["status_counts"] == {"RUNNING": 1}
+    assert recovery_events[0]["status_counts"] == {"FAILED_FINAL": 1}
     assert str(queued.id) not in json.dumps(recovery_events)
 
 
