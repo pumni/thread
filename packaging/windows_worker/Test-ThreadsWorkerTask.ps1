@@ -149,6 +149,18 @@ try {
     $hostConfig.Remove("data_root") | Out-Null
     Write-TestHostConfig $hostConfig
 
+    $env:THREADS_WORKER_DATA_ROOT = Join-Path $programFiles "ThreadsWorker-env-data-$testId"
+    $environmentProgramFilesResult = Invoke-TaskManager @(
+        "-Operation", "Install", "-ReleaseDirectory", $firstRelease,
+        "-HostConfigPath", $hostConfigPath
+    ) 2
+    Assert-Condition (
+        $environmentProgramFilesResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_DATA_ROOT_POLICY"
+    ) "ENV_PROGRAM_FILES_DATA_ROOT_ACCEPTED"
+    Assert-Condition (!(Test-Path -LiteralPath $env:THREADS_WORKER_DATA_ROOT)) `
+        "ENV_PROGRAM_FILES_DATA_ROOT_CREATED"
+    $env:THREADS_WORKER_DATA_ROOT = $testDataRoot
+
     $syntheticWorkerId = [guid]::NewGuid().ToString()
     $legacyWorkerDirectory = Join-Path $legacyDefaultDataRoot "worker"
     New-Item -ItemType Directory -Path $legacyWorkerDirectory -Force | Out-Null
