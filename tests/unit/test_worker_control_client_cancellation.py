@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from threads_platform.domain.worker_jobs import WorkerJobStatus
+from threads_platform.domain.workers import WorkerStatus
 from threads_platform.workers.control_client import (
     HttpWorkerControlClient,
     WorkerControlClientError,
@@ -180,3 +181,47 @@ async def test_http_client_rejects_extra_pending_cancellation_metadata() -> None
             await client.renew_job(job_id, uuid4())
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_http_client_completes_drain_with_worker_authentication() -> None:
+    worker_id = uuid4()
+    requests: list[httpx.Request] = []
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/auth/challenges"):
+            return httpx.Response(
+                200,
+                json={"challenge_id": str(uuid4()), "nonce": "test-nonce"},
+            )
+        if request.url.path.endswith("/auth/sessions"):
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "worker-test-token",
+                    "expires_at": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+                },
+            )
+        if request.url.path == "/v1/workers/drain/complete":
+            if request.headers.get("Authorization") != "Bearer worker-test-token":
+                return httpx.Response(401, json={"detail": {"code": "WORKER_UNAUTHORIZED"}})
+            return httpx.Response(
+                200,
+                json={"worker_id": str(worker_id), "status": "OFFLINE"},
+            )
+        return httpx.Response(404, json={"detail": {"code": "NOT_FOUND"}})
+
+    client = HttpWorkerControlClient("https://control.test", transport=httpx.MockTransport(handle))
+    try:
+        await _authenticate_client(client, worker_id)
+        status = await client.complete_drain()
+    finally:
+        await client.aclose()
+
+    assert status is WorkerStatus.OFFLINE
+    completion_request = requests[-1]
+    assert completion_request.url.path == "/v1/workers/drain/complete"
+    assert completion_request.method == "POST"
+    assert completion_request.headers["Authorization"] == "Bearer worker-test-token"
+    assert json.loads(completion_request.read()) == {}

@@ -212,6 +212,17 @@ class HttpWorkerControlClient:
         )
         return None if response is None else _job_snapshot(response)
 
+    async def complete_drain(self) -> WorkerStatus:
+        response = await self._request(
+            "POST", "/v1/workers/drain/complete", json={}, authenticated=True
+        )
+        if response is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        try:
+            return WorkerStatus(_text_field(response, "status"))
+        except (ValueError, TypeError) as error:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+
     async def renew_job(self, job_id: UUID, lease_token: UUID) -> WorkerJobSnapshot:
         response = await self._request(
             "POST",

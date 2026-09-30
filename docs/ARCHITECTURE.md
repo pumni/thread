@@ -361,9 +361,22 @@ Protocol mismatch:
 - UPGRADE_REQUIRED
 
 DRAINING:
-- receives no new jobs;
-- active jobs finish/cancel at safe boundaries;
-- worker becomes safe to update/shutdown.
+- receives no new jobs after the row-locked status transition commits;
+- already-running WorkerJobs continue under their existing leases and state
+  transitions until their safe/terminal boundary;
+- does not imply cancellation, preemption, lease revocation, or process kill;
+- reaches OFFLINE through the authenticated worker completion handshake only
+  after stored active browser session count and durable RUNNING lease count are
+  both zero.
+
+Admin drain/abort requests serialize with job claims on the Worker row.
+Quiescence counts every `RUNNING` WorkerJob whose `lease_worker_id` matches,
+including expired leases. Presence expiry remains scheduler-owned and does not
+prove local process shutdown. Abort is recovery to OFFLINE, never an ONLINE
+shortcut. The WorkerAgent closes managed sessions, reports STOPPED and zero
+capacity, completes the handshake, and exits after OFFLINE confirmation; a
+network failure resumes from durable DRAINING after reconnect. See
+`docs/protocols/WORKER_PROTOCOL_V1.md` and `docs/WORKER_UPDATE_RUNBOOK.md`.
 
 ## 15. Strict-online semantics
 

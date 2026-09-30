@@ -18,6 +18,7 @@ from threads_platform.application.ports.worker_agent import (
     WorkerJobSnapshot,
 )
 from threads_platform.application.worker_protocol import is_worker_protocol_supported
+from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
 from threads_platform.domain.workers import (
     BrowserSessionState,
     NetworkProfile,
@@ -370,6 +371,11 @@ class _FakeControlClient:
         self.fail_heartbeat = False
         self.account_context_value: WorkerAccountContext | None = None
         self.reported_sessions: list[LocalSessionState] = []
+        self.heartbeat_session_counts: list[int] = []
+        self.next_job: WorkerJobSnapshot | None = None
+        self.drain_completion_count = 0
+        self.drain_completion_failures = 0
+        self.drain_nonquiescent_failures = 0
         self.expires_at = datetime(2026, 9, 25, 13, tzinfo=UTC)
         self.presence = WorkerAgentPresence(worker_id, WorkerStatus.ONLINE, True, 2, 0)
 
@@ -422,7 +428,7 @@ class _FakeControlClient:
         return self.presence
 
     async def heartbeat(self, active_browser_sessions: int) -> WorkerAgentPresence:
-        _ = active_browser_sessions
+        self.heartbeat_session_counts.append(active_browser_sessions)
         if self.fail_heartbeat:
             raise WorkerControlClientError("CONTROL_PLANE_UNAVAILABLE")
         return self.presence
@@ -433,7 +439,20 @@ class _FakeControlClient:
 
     async def claim_next(self) -> WorkerJobSnapshot | None:
         self.claim_count += 1
-        return None
+        job = self.next_job
+        self.next_job = None
+        return job
+
+    async def complete_drain(self) -> WorkerStatus:
+        self.drain_completion_count += 1
+        if self.drain_nonquiescent_failures:
+            self.drain_nonquiescent_failures -= 1
+            raise WorkerControlClientError("WORKER_DRAIN_NOT_QUIESCENT")
+        if self.drain_completion_failures:
+            self.drain_completion_failures -= 1
+            raise WorkerControlClientError("CONTROL_PLANE_UNAVAILABLE")
+        self.presence = WorkerAgentPresence(self.worker_id, WorkerStatus.OFFLINE, True, 2, 0)
+        return WorkerStatus.OFFLINE
 
     async def account_context(self, account_id: UUID) -> WorkerAccountContext:
         if self.account_context_value is None:
@@ -571,6 +590,143 @@ def test_worker_runtime_reports_session_transitions_and_shutdown(tmp_path: Path)
         assert client.reported_sessions[-1].state is BrowserSessionState.STOPPED
         assert state_store.active_session_count() == 0
         await agent.close()
+
+    asyncio.run(scenario())
+
+
+def test_worker_agent_finishes_current_handler_then_closes_sessions_and_completes_drain(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        root = LocalDataRoot(tmp_path / "worker-drain-data")
+        root.prepare()
+        identity_store = _FakeIdentityStore()
+        worker_id = identity_store.worker_id
+        account_id = uuid4()
+        context = WorkerAccountContext(account_id, worker_id, "profile-drain", None)
+        state_store = WorkerLocalStateStore(root, worker_id)
+        client = _FakeControlClient(worker_id)
+        client.account_context_value = context
+        client.drain_completion_failures = 1
+        client.drain_nonquiescent_failures = 1
+        client.next_job = WorkerJobSnapshot(
+            job_id=uuid4(),
+            capability_name="synthetic.echo",
+            capability_version=1,
+            status=WorkerJobStatus.RUNNING,
+            account_id=None,
+            assigned_worker_id=worker_id,
+            lease_worker_id=worker_id,
+            lease_token=uuid4(),
+            lease_expires_at=datetime(2026, 9, 25, 13, tzinfo=UTC),
+            retry_safety=WorkerJobRetrySafety.SAFE_TO_RETRY,
+            checkpoint=None,
+        )
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+        handler_completed = False
+        handler_cancelled = False
+        manager = LocalBrowserSessionManager(
+            worker_id, 1, state_store, LocalProfileDirectoryResolver(root, state_store)
+        )
+        agent: WorkerAgent
+        stop_event = asyncio.Event()
+
+        async def handle(_: WorkerJobSnapshot) -> None:
+            nonlocal handler_completed, handler_cancelled
+            try:
+                await agent.open_browser_session(account_id, manager)
+                handler_started.set()
+                await release_handler.wait()
+                handler_completed = True
+            except asyncio.CancelledError:
+                handler_cancelled = True
+                raise
+
+        now = datetime(2026, 9, 25, 12, tzinfo=UTC)
+        agent = WorkerAgent(
+            WorkerAgentConfig(
+                control_plane_url="https://control.test",
+                display_name="drain-test",
+                agent_version="0.1.0",
+                capabilities=(("synthetic.echo", 1),),
+                heartbeat_interval=timedelta(hours=1),
+                poll_interval=timedelta(milliseconds=1),
+                reconnect_initial_backoff=timedelta(milliseconds=1),
+                reconnect_max_backoff=timedelta(milliseconds=2),
+            ),
+            identity_store,
+            _FakeKeyStore(),
+            state_store,
+            WorkerProcessLock(root.child("worker", "agent.lock")),
+            client,
+            job_handler=handle,
+            clock=lambda: now,
+        )
+        run_task = asyncio.create_task(agent.run(stop_event))
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        client.presence = WorkerAgentPresence(worker_id, WorkerStatus.DRAINING, True, 2, 1)
+        stop_event.set()
+        release_handler.set()
+        await asyncio.wait_for(run_task, timeout=2)
+
+        assert handler_completed
+        assert not handler_cancelled
+        assert client.claim_count == 1
+        assert client.drain_completion_count == 3
+        assert client.authentication_count == 2
+        assert client.presence.status is WorkerStatus.OFFLINE
+        assert state_store.active_session_count() == 0
+        assert client.reported_sessions[-1].state is BrowserSessionState.STOPPED
+        assert (
+            sum(report.state is BrowserSessionState.STOPPED for report in client.reported_sessions)
+            == 1
+        )
+        assert client.heartbeat_session_counts[-1] == 0
+        assert agent.status is WorkerStatus.OFFLINE
+        assert client.closed
+
+    asyncio.run(scenario())
+
+
+def test_worker_agent_resumes_drain_finalization_after_network_failure(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        root = LocalDataRoot(tmp_path / "worker-drain-reconnect")
+        root.prepare()
+        identity_store = _FakeIdentityStore()
+        client = _FakeControlClient(identity_store.worker_id)
+        client.presence = WorkerAgentPresence(
+            identity_store.worker_id, WorkerStatus.DRAINING, True, 2, 0
+        )
+        client.drain_completion_failures = 1
+        now = datetime(2026, 9, 25, 12, tzinfo=UTC)
+        agent = WorkerAgent(
+            WorkerAgentConfig(
+                control_plane_url="https://control.test",
+                display_name="drain-reconnect-test",
+                agent_version="0.1.0",
+                poll_interval=timedelta(milliseconds=1),
+                reconnect_initial_backoff=timedelta(milliseconds=1),
+                reconnect_max_backoff=timedelta(milliseconds=2),
+            ),
+            identity_store,
+            _FakeKeyStore(),
+            WorkerLocalStateStore(root, identity_store.worker_id),
+            WorkerProcessLock(root.child("worker", "agent.lock")),
+            client,
+            clock=lambda: now,
+        )
+
+        await asyncio.wait_for(agent.run(asyncio.Event()), timeout=2)
+
+        assert client.drain_completion_count == 2
+        assert client.authentication_count == 2
+        assert client.presence.status is WorkerStatus.OFFLINE
+        assert client.claim_count == 0
+        assert client.heartbeat_session_counts == [0, 0]
+        assert client.closed
 
     asyncio.run(scenario())
 

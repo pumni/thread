@@ -452,3 +452,16 @@ Opportunistic Phase C observations (`/me/threads` text container publish C01,
 published media retrieval C04, and publishing quota C08) were recorded as PASS
 but do not equal Phase C acceptance. Issue #3 remains OPEN;
 `full_tp002_ready=false`.
+
+## 17. C6-02/5 durable Worker draining (#78)
+
+Issue #78 adds durable row-locked DRAINING and abort transitions, bounded admin
+drain status, and a worker-authenticated quiescence completion handshake.
+Existing RUNNING WorkerJobs continue normally and block quiescence even after
+lease expiry. The WorkerAgent closes managed sessions, reports STOPPED and zero
+capacity, completes the handshake, and resumes finalization after reconnect.
+Abort returns only to OFFLINE and does not claim quiescence. No migration,
+process kill, updater, or installer was added. See
+`docs/protocols/WORKER_PROTOCOL_V1.md` and `docs/WORKER_UPDATE_RUNBOOK.md`.
+Issue #3 remains OPEN and #62 remains separate; this checkpoint is not a
+production release claim.
