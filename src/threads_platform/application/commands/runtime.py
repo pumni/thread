@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -86,7 +86,7 @@ class CommandExecutionResult:
 @dataclass(frozen=True, slots=True)
 class _ExecutionClaim:
     command: Command
-    lease_token: UUID
+    lease_token: UUID = field(repr=False)
     attempt_number: int
     attempt_id: UUID
     account_coordination_generation: int | None

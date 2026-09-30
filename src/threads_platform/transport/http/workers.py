@@ -40,12 +40,12 @@ class CreateEnrollmentRequest(_WorkerRequest):
 
 
 class CreateEnrollmentResponse(BaseModel):
-    enrollment_code: str
+    enrollment_code: str = Field(repr=False)
     expires_at: AwareDatetime
 
 
 class EnrollWorkerRequest(_WorkerRequest):
-    enrollment_code: str = Field(min_length=1, max_length=256)
+    enrollment_code: str = Field(min_length=1, max_length=256, repr=False)
     worker_id: UUID
     display_name: str = Field(min_length=1, max_length=255)
     hostname: str = Field(min_length=1, max_length=255)
@@ -66,17 +66,17 @@ class CreateChallengeRequest(_WorkerRequest):
 
 class CreateChallengeResponse(BaseModel):
     challenge_id: UUID
-    nonce: str
+    nonce: str = Field(repr=False)
     expires_at: AwareDatetime
 
 
 class ExchangeChallengeRequest(_WorkerRequest):
     challenge_id: UUID
-    signature: str = Field(min_length=80, max_length=100)
+    signature: str = Field(min_length=80, max_length=100, repr=False)
 
 
 class ExchangeChallengeResponse(BaseModel):
-    access_token: str
+    access_token: str = Field(repr=False)
     token_type: str = "Bearer"
     expires_at: AwareDatetime
 
@@ -135,7 +135,7 @@ class WorkerNetworkProfileResponse(BaseModel):
     protocol: NetworkProtocol
     host: str | None
     port: int | None
-    credential_ref: str | None
+    credential_ref: str | None = Field(repr=False)
 
 
 class WorkerAccountContextResponse(BaseModel):
@@ -185,12 +185,12 @@ class WorkerJobResponse(BaseModel):
     attempt_count: int
     max_attempts: int
     retry_safety: WorkerJobRetrySafety
-    input_data: dict[str, object]
+    input_data: dict[str, object] = Field(repr=False)
     lease_worker_id: UUID | None
-    lease_token: UUID | None
+    lease_token: UUID | None = Field(repr=False)
     lease_expires_at: AwareDatetime | None
-    checkpoint: dict[str, object] | None
-    result: dict[str, object] | None
+    checkpoint: dict[str, object] | None = Field(repr=False)
+    result: dict[str, object] | None = Field(repr=False)
     error_code: str | None
     pending_cancel: WorkerJobCancelResponse | None = None
 
@@ -200,22 +200,22 @@ class WorkerJobReconcileResponse(BaseModel):
 
 
 class WorkerJobLeaseRequest(_WorkerRequest):
-    lease_token: UUID
+    lease_token: UUID = Field(repr=False)
 
 
 class WorkerJobCheckpointRequest(WorkerJobLeaseRequest):
-    checkpoint: dict[str, object]
+    checkpoint: dict[str, object] = Field(repr=False)
 
 
 class WorkerJobCancelRequest(_WorkerRequest):
-    lease_token: UUID
+    lease_token: UUID = Field(repr=False)
     cancel_request_id: UUID
     generation: int = Field(ge=1)
     checkpoint_phase: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,79}$")
 
 
 class WorkerJobCompleteRequest(WorkerJobLeaseRequest):
-    result: dict[str, object] = Field(default_factory=dict)
+    result: dict[str, object] = Field(default_factory=dict, repr=False)
 
 
 class WorkerJobFailRequest(WorkerJobLeaseRequest):
@@ -283,6 +283,7 @@ def create_worker_router(
     @router.post("/enrollments", response_model=CreateEnrollmentResponse)
     async def create_enrollment(
         request: CreateEnrollmentRequest,
+        response: Response,
         authorization: Annotated[str | None, Header()] = None,
     ) -> CreateEnrollmentResponse:
         if not admin_authenticator.is_authorized(authorization):
@@ -292,6 +293,7 @@ def create_worker_router(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         result = await require_service().create_enrollment(request.created_by)
+        response.headers["Cache-Control"] = "no-store"
         return CreateEnrollmentResponse(
             enrollment_code=result.code,
             expires_at=result.expires_at,
@@ -321,11 +323,14 @@ def create_worker_router(
         return EnrollWorkerResponse(worker_id=enrolled.worker_id)
 
     @router.post("/auth/challenges", response_model=CreateChallengeResponse)
-    async def create_challenge(request: CreateChallengeRequest) -> CreateChallengeResponse:
+    async def create_challenge(
+        request: CreateChallengeRequest, response: Response
+    ) -> CreateChallengeResponse:
         try:
             challenge = await require_service().create_challenge(request.worker_id)
         except WorkerControlError as error:
             raise _http_error(error) from error
+        response.headers["Cache-Control"] = "no-store"
         return CreateChallengeResponse(
             challenge_id=challenge.challenge_id,
             nonce=challenge.nonce,
@@ -333,7 +338,9 @@ def create_worker_router(
         )
 
     @router.post("/auth/sessions", response_model=ExchangeChallengeResponse)
-    async def exchange_challenge(request: ExchangeChallengeRequest) -> ExchangeChallengeResponse:
+    async def exchange_challenge(
+        request: ExchangeChallengeRequest, response: Response
+    ) -> ExchangeChallengeResponse:
         try:
             signature = _decode_base64(request.signature)
         except ValueError as error:
@@ -342,6 +349,7 @@ def create_worker_router(
             result = await require_service().exchange_challenge(request.challenge_id, signature)
         except WorkerControlError as error:
             raise _http_error(error) from error
+        response.headers["Cache-Control"] = "no-store"
         return ExchangeChallengeResponse(
             access_token=result.access_token,
             expires_at=result.expires_at,
@@ -414,6 +422,7 @@ def create_worker_router(
     @router.get("/accounts/{account_id}/context", response_model=WorkerAccountContextResponse)
     async def worker_account_context(
         account_id: UUID,
+        response: Response,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerAccountContextResponse:
         worker_id = await authenticated_worker(authorization)
@@ -421,6 +430,7 @@ def create_worker_router(
             context = await require_session_service().account_context(worker_id, account_id)
         except WorkerSessionControlError as error:
             raise _worker_session_error(error) from error
+        response.headers["Cache-Control"] = "no-store"
         network = context.network_profile
         return WorkerAccountContextResponse(
             account_id=context.account_id,

@@ -22,6 +22,7 @@ from threads_platform.domain.workers import (
     WorkerNode,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
+from threads_platform.infrastructure.security.worker_auth import challenge_message
 from threads_platform.workers.control_client import (
     HttpWorkerControlClient,
     WorkerControlClientError,
@@ -83,7 +84,7 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
         protocol=NetworkProtocol.SOCKS5,
         host="proxy.example.test",
         port=1080,
-        credential_ref="secret-store://account/proxy",
+        credential_ref="secret-store://SYNTHETIC_CREDENTIAL_REF_SENTINEL",
     )
     async with unit_of_work_factory() as unit_of_work:
         await unit_of_work.workers.add(WorkerNode(other_worker_id, "other", "other-host"))
@@ -118,7 +119,32 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
     assert context.profile_ref == profile.profile_ref
     assert context.network_profile is not None
     assert context.network_profile.protocol is NetworkProtocol.SOCKS5
-    assert context.network_profile.credential_ref == "secret-store://account/proxy"
+    assert context.network_profile.credential_ref == (
+        "secret-store://SYNTHETIC_CREDENTIAL_REF_SENTINEL"
+    )
+
+    challenge = await control.create_challenge(worker_id)
+    signature = identity.sign(challenge_message(challenge.challenge_id, challenge.nonce))
+    session = await control.exchange_challenge(challenge.challenge_id, signature)
+    async with httpx.AsyncClient(transport=transport, base_url="https://control.test") as worker:
+        context_response = await worker.get(
+            f"/v1/workers/accounts/{account.id}/context",
+            headers={"Authorization": f"Bearer {session.access_token}"},
+        )
+    assert context_response.status_code == 200
+    assert context_response.headers["Cache-Control"] == "no-store"
+    assert context_response.json() == {
+        "account_id": str(account.id),
+        "worker_id": str(worker_id),
+        "profile_ref": profile.profile_ref,
+        "network_profile": {
+            "id": str(network.id),
+            "protocol": NetworkProtocol.SOCKS5.value,
+            "host": "proxy.example.test",
+            "port": 1080,
+            "credential_ref": "secret-store://SYNTHETIC_CREDENTIAL_REF_SENTINEL",
+        },
+    }
     with pytest.raises(WorkerControlClientError) as mismatch:
         await client.account_context(other_account.id)
     assert mismatch.value.code == "ACCOUNT_WORKER_AFFINITY_MISMATCH"

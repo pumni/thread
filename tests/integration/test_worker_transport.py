@@ -123,15 +123,39 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
     identity = WorkerDeviceIdentity.generate()
 
     async with httpx.AsyncClient(transport=transport, base_url="https://worker.test") as client:
-        denied_admin = await client.post("/v1/workers/enrollments", json={})
+        admin_secret = "SYNTHETIC_WORKER_ADMIN_SENTINEL"
+        denied_admin = await client.post(
+            "/v1/workers/enrollments",
+            headers={"Authorization": f"Bearer {admin_secret}"},
+            json={},
+        )
         assert denied_admin.status_code == 401
+        assert admin_secret not in denied_admin.text
         created = await client.post(
             "/v1/workers/enrollments",
             headers={"Authorization": f"Bearer {admin_token}"},
             json={"created_by": "test-operator"},
         )
         assert created.status_code == 200
-        enrollment_code = created.json()["enrollment_code"]
+        assert created.headers["Cache-Control"] == "no-store"
+        created_body = created.json()
+        assert set(created_body) == {"enrollment_code", "expires_at"}
+        enrollment_code = created_body["enrollment_code"]
+
+        invalid_enrollment_secret = "SYNTHETIC_ENROLLMENT_CODE_SENTINEL"
+        invalid_enrollment = await client.post(
+            "/v1/workers/enroll",
+            json={
+                "enrollment_code": invalid_enrollment_secret,
+                "worker_id": str(worker_id),
+                "display_name": "Synthetic worker",
+                "hostname": "SYNTHETIC-HOST",
+                "platform": "windows",
+                "public_key": base64.b64encode(identity.public_key_bytes).decode("ascii"),
+            },
+        )
+        assert invalid_enrollment.status_code == 401
+        assert invalid_enrollment_secret not in invalid_enrollment.text
 
         enrollment_body = {
             "enrollment_code": enrollment_code,
@@ -163,8 +187,23 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
             "/v1/workers/auth/challenges", json={"worker_id": str(worker_id)}
         )
         assert challenge_response.status_code == 200
+        assert challenge_response.headers["Cache-Control"] == "no-store"
         challenge = challenge_response.json()
+        assert set(challenge) == {"challenge_id", "nonce", "expires_at"}
         signature = identity.sign(challenge_message(challenge["challenge_id"], challenge["nonce"]))
+
+        invalid_signature_secret = "SYNTHETIC_SIGNATURE_SECRET_SENTINEL" + "!" * 48
+        invalid_signature = await client.post(
+            "/v1/workers/auth/sessions",
+            json={
+                "challenge_id": str(uuid4()),
+                "signature": invalid_signature_secret,
+            },
+        )
+        assert invalid_signature.status_code == 422
+        assert invalid_signature.json() == {"detail": {"code": "INVALID_SIGNATURE"}}
+        assert invalid_signature_secret not in invalid_signature.text
+
         session_response = await client.post(
             "/v1/workers/auth/sessions",
             json={
@@ -173,7 +212,11 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
             },
         )
         assert session_response.status_code == 200
-        access_token = session_response.json()["access_token"]
+        assert session_response.headers["Cache-Control"] == "no-store"
+        session_body = session_response.json()
+        assert set(session_body) == {"access_token", "token_type", "expires_at"}
+        assert session_body["token_type"] == "Bearer"
+        access_token = session_body["access_token"]
 
         hello_body = {
             "protocol_version": 1,
@@ -181,8 +224,14 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
             "capabilities_schema_version": 1,
             "capabilities": [{"capability_name": "synthetic.echo", "capability_version": 1}],
         }
-        denied_hello = await client.post("/v1/workers/hello", json=hello_body)
+        session_secret = "SYNTHETIC_WORKER_SESSION_SENTINEL"
+        denied_hello = await client.post(
+            "/v1/workers/hello",
+            headers={"Authorization": f"Bearer {session_secret}"},
+            json=hello_body,
+        )
         assert denied_hello.status_code == 401
+        assert session_secret not in denied_hello.text
         hello = await client.post(
             "/v1/workers/hello",
             headers={"Authorization": f"Bearer {access_token}"},

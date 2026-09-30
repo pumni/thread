@@ -46,11 +46,11 @@ class WorkerJobSnapshot:
     account_id: UUID | None
     assigned_worker_id: UUID | None
     lease_worker_id: UUID | None
-    lease_token: UUID | None
+    lease_token: UUID | None = field(repr=False)
     lease_expires_at: datetime | None
     retry_safety: WorkerJobRetrySafety
-    checkpoint: dict[str, object] | None
-    input_data: dict[str, object] = field(default_factory=lambda: dict[str, object]())
+    checkpoint: dict[str, object] | None = field(repr=False)
+    input_data: dict[str, object] = field(default_factory=lambda: dict[str, object](), repr=False)
     pending_cancel: WorkerJobCancelSnapshot | None = None
 
 

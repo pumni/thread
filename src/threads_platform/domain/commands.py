@@ -79,7 +79,7 @@ class Command:
     correlation_id: str
     account_id: UUID
     command_type: str
-    payload: dict[str, object]
+    payload: dict[str, object] = field(repr=False)
     id: UUID = field(default_factory=uuid4)
     protocol_version: int = 1
     status: CommandStatus = CommandStatus.RECEIVED
@@ -90,11 +90,11 @@ class Command:
     validated_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
-    result: dict[str, object] | None = None
+    result: dict[str, object] | None = field(default=None, repr=False)
     error_code: str | None = None
-    execution_lease_token: UUID | None = None
+    execution_lease_token: UUID | None = field(default=None, repr=False)
     execution_lease_expires_at: datetime | None = None
-    checkpoint: dict[str, object] | None = None
+    checkpoint: dict[str, object] | None = field(default=None, repr=False)
     priority: int = 0
 
     def __post_init__(self) -> None:
