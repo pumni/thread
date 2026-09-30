@@ -79,7 +79,9 @@ function Assert-TaskSettings($Task, [string] $ExpectedUserSid) {
     Assert-Condition ($Task.Principal.RunLevel.ToString() -eq "Limited") "TASK_RUN_LEVEL_INVALID"
     Assert-Condition ($Task.Settings.MultipleInstances.ToString() -eq "IgnoreNew") "TASK_INSTANCE_POLICY_INVALID"
     Assert-Condition ($Task.Settings.AllowHardTerminate -eq $false) "TASK_HARD_TERMINATE_ENABLED"
-    Assert-Condition ($Task.Settings.ExecutionTimeLimit -eq [TimeSpan]::Zero) "TASK_LIMIT_INVALID"
+    $taskXml = [xml] (Export-ScheduledTask -TaskName $Task.TaskName)
+    $executionLimit = [string] $taskXml.Task.Settings.ExecutionTimeLimit
+    Assert-Condition ($executionLimit -eq "PT0S") "TASK_LIMIT_INVALID"
     Assert-Condition ($Task.Settings.StopIfGoingOnBatteries -eq $false) "TASK_BATTERY_STOP_ENABLED"
     Assert-Condition (@($Task.Triggers).Count -eq 1) "TASK_TRIGGER_COUNT_INVALID"
     Assert-Condition ($Task.Triggers[0].CimClass.CimClassName -eq "MSFT_TaskLogonTrigger") "TASK_TRIGGER_INVALID"

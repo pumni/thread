@@ -213,7 +213,14 @@ function Assert-TaskContract($Task, [string] $ExpectedUserSid) {
     $script:failureStage = "VERIFY_HARD_TERMINATE"
     if ($Task.Settings.AllowHardTerminate -ne $false) { throw "invalid task" }
     $script:failureStage = "VERIFY_EXECUTION_LIMIT"
-    if ($Task.Settings.ExecutionTimeLimit -ne [TimeSpan]::Zero) { throw "invalid task" }
+    $taskXmlText = Export-ScheduledTask -TaskName $taskName
+    try {
+        [xml] $taskXml = $taskXmlText
+    } catch {
+        throw "invalid task"
+    }
+    $executionLimit = [string] $taskXml.Task.Settings.ExecutionTimeLimit
+    if ($executionLimit -ne "PT0S") { throw "invalid task" }
     $script:failureStage = "VERIFY_BATTERY_POLICY"
     if ($Task.Settings.StopIfGoingOnBatteries -ne $false) { throw "invalid task" }
     $script:failureStage = "VERIFY_TRIGGER_COUNT"
@@ -248,9 +255,8 @@ function Assert-TaskContract($Task, [string] $ExpectedUserSid) {
     }
     if (![IO.Path]::IsPathRooted($configPath)) { throw "invalid task" }
     $script:failureStage = "VERIFY_TASK_CREDENTIALS"
-    $taskXml = Export-ScheduledTask -TaskName $taskName
-    if ($taskXml -match '<LogonType>Password</LogonType>|<Password>' -or
-        $taskXml -match 'THREADS_WORKER_ENROLLMENT_CODE|access_token|session_token|private_key|proxy_credential|credential_ref') {
+    if ($taskXmlText -match '<LogonType>Password</LogonType>|<Password>' -or
+        $taskXmlText -match 'THREADS_WORKER_ENROLLMENT_CODE|access_token|session_token|private_key|proxy_credential|credential_ref') {
         throw "invalid task"
     }
     return $configPath
