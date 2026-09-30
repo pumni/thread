@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+import structlog
 from pydantic import ValidationError
 
 from threads_platform.application.capability_router import CapabilityEvidence, CapabilityRouter
@@ -136,13 +137,23 @@ class CommandRuntime:
         self._event_id_factory = event_id_factory
         self._capability_router = capability_router or CapabilityRouter()
         self._worker_job_service = worker_job_service
+        self._logger = structlog.get_logger(__name__)
 
     async def receive(self, raw_command: dict[str, object]) -> CommandReceiptV1:
         try:
             header = CommandEnvelopeHeader.model_validate(raw_command)
         except ValidationError as error:
+            self._logger.info("command_rejected", error_code="INVALID_ENVELOPE")
             raise CommandInputError("INVALID_ENVELOPE") from error
 
+        with structlog.contextvars.bound_contextvars(**self._command_log_context(header)):
+            return await self._receive_validated(raw_command, header)
+
+    async def _receive_validated(
+        self,
+        raw_command: dict[str, object],
+        header: CommandEnvelopeHeader,
+    ) -> CommandReceiptV1:
         now = normalize_utc(self._clock.now())
         deadline = header.deadline_at or header.created_at + self._max_command_lifetime
         typed_command: CommandEnvelopeV1 | None = None
@@ -184,6 +195,7 @@ class CommandRuntime:
 
         async with self._unit_of_work_factory() as unit_of_work:
             if await unit_of_work.accounts.get(header.account_id) is None:
+                self._logger.info("command_rejected", error_code="UNKNOWN_ACCOUNT")
                 raise CommandInputError("UNKNOWN_ACCOUNT")
             inserted = await unit_of_work.commands.add_if_absent(command)
             if not inserted:
@@ -191,7 +203,9 @@ class CommandRuntime:
                 if existing is None:
                     raise RuntimeError("idempotency conflict row disappeared")
                 if not self._same_command(existing, command):
+                    self._logger.info("command_rejected", error_code="COMMAND_ID_CONFLICT")
                     raise IdempotencyConflict(command.command_id)
+                self._logger.info("command_duplicate", status=existing.status.value)
                 return CommandReceiptV1(
                     command_id=existing.command_id,
                     correlation_id=existing.correlation_id,
@@ -201,6 +215,13 @@ class CommandRuntime:
 
             if command.completed_at is not None:
                 await self._enqueue_result(unit_of_work, command, now)
+                self._logger.info(
+                    "command_rejected",
+                    status=command.status.value,
+                    error_code=command.error_code,
+                )
+            else:
+                self._logger.info("command_accepted", status=command.status.value)
             return CommandReceiptV1(
                 command_id=command.command_id,
                 correlation_id=command.correlation_id,
@@ -211,21 +232,53 @@ class CommandRuntime:
         async with self._unit_of_work_factory() as unit_of_work:
             command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
             if command is None:
-                raise CommandNotFound(command_id)
-            claim_or_result = await self._claim_locked(
-                unit_of_work, command, normalize_utc(self._clock.now())
-            )
-        if isinstance(claim_or_result, _WorkerJobEnqueued):
-            if self._worker_job_service is not None:
-                self._worker_job_service.publish_available(
-                    claim_or_result.job,
-                    claim_or_result.notification_worker_ids,
-                    now=claim_or_result.occurred_at,
+                self._logger.info(
+                    "command_processing_rejected",
+                    command_id=command_id,
+                    error_code="COMMAND_NOT_FOUND",
                 )
-            return claim_or_result.result
-        if isinstance(claim_or_result, CommandExecutionResult):
-            return claim_or_result
-        return await self._execute_claim(claim_or_result)
+                raise CommandNotFound(command_id)
+            log_context = self._command_log_context(command)
+            with structlog.contextvars.bound_contextvars(**log_context):
+                self._logger.info("command_processing_started", status=command.status.value)
+                claim_or_result = await self._claim_locked(
+                    unit_of_work, command, normalize_utc(self._clock.now())
+                )
+        return await self._continue_processing(command, claim_or_result, log_context)
+
+    async def _continue_processing(
+        self,
+        command: Command,
+        claim_or_result: _ExecutionClaim | _WorkerJobEnqueued | CommandExecutionResult,
+        log_context: dict[str, str],
+    ) -> CommandExecutionResult:
+        with structlog.contextvars.bound_contextvars(**log_context):
+            if isinstance(claim_or_result, _WorkerJobEnqueued):
+                self._logger.info(
+                    "command_waiting_for_worker",
+                    status=claim_or_result.result.status.value,
+                    worker_job_id=str(claim_or_result.job.id),
+                )
+                if self._worker_job_service is not None:
+                    self._worker_job_service.publish_available(
+                        claim_or_result.job,
+                        claim_or_result.notification_worker_ids,
+                        now=claim_or_result.occurred_at,
+                    )
+                return claim_or_result.result
+            if isinstance(claim_or_result, CommandExecutionResult):
+                self._logger.info(
+                    "command_processing_outcome",
+                    status=claim_or_result.status.value,
+                    error_code=command.error_code,
+                )
+                return claim_or_result
+            self._logger.info(
+                "command_execution_started",
+                status=claim_or_result.command.status.value,
+                attempt_number=claim_or_result.attempt_number,
+            )
+            return await self._execute_claim(claim_or_result)
 
     async def process_next(
         self,
@@ -241,18 +294,11 @@ class CommandRuntime:
             )
             if command is None:
                 return None
-            claim_or_result = await self._claim_locked(unit_of_work, command, occurred_at)
-        if isinstance(claim_or_result, _WorkerJobEnqueued):
-            if self._worker_job_service is not None:
-                self._worker_job_service.publish_available(
-                    claim_or_result.job,
-                    claim_or_result.notification_worker_ids,
-                    now=claim_or_result.occurred_at,
-                )
-            return claim_or_result.result
-        if isinstance(claim_or_result, CommandExecutionResult):
-            return claim_or_result
-        return await self._execute_claim(claim_or_result)
+            log_context = self._command_log_context(command)
+            with structlog.contextvars.bound_contextvars(**log_context):
+                self._logger.info("command_processing_started", status=command.status.value)
+                claim_or_result = await self._claim_locked(unit_of_work, command, occurred_at)
+        return await self._continue_processing(command, claim_or_result, log_context)
 
     async def _claim_locked(
         self,
@@ -407,6 +453,14 @@ class CommandRuntime:
             ),
         )
         decision = replace(decision, attempt_count=attempt_count, created_at=now)
+        self._logger.info(
+            "command_route_selected",
+            route_target=decision.target.value,
+            executor=decision.executor.value if decision.executor is not None else None,
+            capability_name=decision.capability_name,
+            status=command.status.value,
+            error_code=decision.reason_code,
+        )
 
         if decision.target is RouteTarget.UNSUPPORTED:
             await unit_of_work.command_route_decisions.add(decision)
@@ -584,21 +638,49 @@ class CommandRuntime:
                 handler, self._rebuild_envelope(command), context, claim
             )
         except ExecutionLeaseLost:
-            return await self._current_result(command.command_id)
+            result = await self._current_result(command.command_id)
+            self._log_execution_outcome(result)
+            return result
         except RetryableCommandError as error:
-            return await self._finish_failure(
+            result = await self._finish_failure(
                 claim, error.code, retryable=True, retry_after=error.retry_after
             )
+            self._log_execution_outcome(result, error_code=error.code)
+            return result
         except PermanentCommandError as error:
-            return await self._finish_failure(claim, error.code, retryable=False)
+            result = await self._finish_failure(claim, error.code, retryable=False)
+            self._log_execution_outcome(result, error_code=error.code)
+            return result
         except ThreadsCredentialError as error:
-            return await self._finish_failure(claim, error.code, retryable=error.retryable)
+            result = await self._finish_failure(claim, error.code, retryable=error.retryable)
+            self._log_execution_outcome(result, error_code=error.code)
+            return result
         except Exception:
-            return await self._finish_failure(claim, "UNEXPECTED_HANDLER_ERROR", retryable=True)
+            error_code = "UNEXPECTED_HANDLER_ERROR"
+            result = await self._finish_failure(claim, error_code, retryable=True)
+            self._log_execution_outcome(result, error_code=error_code)
+            return result
         try:
-            return await self._finish_success(claim, output)
+            result = await self._finish_success(claim, output)
         except _SyncCursorConflict:
-            return await self._finish_failure(claim, "SYNC_CURSOR_ADVANCED", retryable=True)
+            error_code = "SYNC_CURSOR_ADVANCED"
+            result = await self._finish_failure(claim, error_code, retryable=True)
+            self._log_execution_outcome(result, error_code=error_code)
+            return result
+        self._log_execution_outcome(result)
+        return result
+
+    def _log_execution_outcome(
+        self,
+        result: CommandExecutionResult,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        self._logger.info(
+            "command_execution_outcome",
+            status=result.status.value,
+            error_code=error_code,
+        )
 
     async def _execute_with_heartbeat(
         self,
@@ -788,6 +870,15 @@ class CommandRuntime:
         if command is None:
             raise CommandNotFound(command_id)
         return CommandExecutionResult(command_id, command.status, executed=False)
+
+    @staticmethod
+    def _command_log_context(command: Command | CommandEnvelopeHeader) -> dict[str, str]:
+        return {
+            "command_id": command.command_id,
+            "correlation_id": command.correlation_id,
+            "account_id": str(command.account_id),
+            "command_type": command.command_type,
+        }
 
     @staticmethod
     def _owns_claim(

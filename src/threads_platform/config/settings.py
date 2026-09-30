@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     log_level: LogLevel = "INFO"
     database_url: SecretStr | None = None
+    readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     scheduler_poll_interval_seconds: float = Field(default=15, gt=0, le=3_600)
     scheduler_presence_expiry_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_activity_generation_batch_limit: int = Field(default=50, ge=1, le=100)

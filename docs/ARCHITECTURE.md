@@ -813,3 +813,24 @@ Review rejects:
 - random background action loops;
 - unbounded local tasks;
 - new broker/cache without evidence and ADR.
+
+## 28. Structured observability and readiness (#72)
+
+Command, WorkerJob, and scheduler lifecycle logs use bounded correlation fields
+and pass through the central recursive redaction processor before JSON output.
+Correlation context is scoped to each asynchronous operation. Logs must never
+contain business payload/result/checkpoint data, credentials, lease tokens,
+raw request/response bodies, or unsafe exception arguments. Redaction protects
+known sensitive keys and token-like patterns; it cannot reliably identify an
+arbitrary high-entropy secret under a neutral field, so callers must not log
+untrusted or secret-bearing content. See `docs/OBSERVABILITY_RUNBOOK.md`.
+
+`GET /health` is process liveness and does not access PostgreSQL. `GET /ready`
+uses a bounded PostgreSQL probe and aggregate persisted `worker_nodes.status`
+counts. A database failure returns `NOT_READY` / `DOWN` with HTTP 503. An empty
+fleet is `READY` / `EMPTY`, all-online is `READY` / `HEALTHY`, and any
+non-disabled non-online worker makes the fleet `DEGRADED` while keeping HTTP
+200. Readiness does not expire presence or mutate state; scheduler-owned
+presence expiry remains authoritative. This checkpoint adds no metrics,
+tracing, schema, or audit table. Issue #3 remains the production/release gate;
+the #62 CRM result transport remains separate.

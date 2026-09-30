@@ -1,4 +1,4 @@
-# Project State Handoff — 2026-09-29
+# Project State Handoff — 2026-09-30
 
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
@@ -402,5 +402,19 @@ debugger validity/effective scopes (including `threads_read_replies`), and own
 profile behavior. #70 implements the metadata-only, environment-backed
 provider with operator-managed versioned rotation and no automatic refresh.
 No plaintext token is stored in PostgreSQL. Phase B is `NOT_RUN`; #3 remains
-OPEN and no production release readiness is claimed. #55 remains open pending
-coordinator acceptance of #70, and #62 remains a separate CRM transport gate.
+OPEN and no production release readiness is claimed. Parent #55 and #70 are
+closed; #62 remains a separate CRM transport dependency.
+
+## 14. C6-02/3 observability and readiness (#72)
+
+Issue #72 is authorized from `main@3e642bb84363d73094cdcde3cd26297b165b6da3`.
+It adds bounded Command/WorkerJob/scheduler lifecycle logs, scoped correlation
+context, recursive structured-log redaction, and `/ready`. `/health` remains
+process liveness and does not require PostgreSQL. `/ready` reports only
+aggregate persisted Worker states: DB failure is `NOT_READY` / `DOWN` / HTTP
+503, while fleet degradation is informational `DEGRADED` / HTTP 200. Readiness
+does not expire Worker presence or mutate PostgreSQL. No migration, metrics,
+distributed tracing, deployment work, DRAINING workflow, or #62 transport work
+is authorized in this checkpoint. #3 remains OPEN and no production release
+readiness is claimed. See `docs/OBSERVABILITY_RUNBOOK.md` for the log fields,
+redaction limitations, and endpoint contract.
