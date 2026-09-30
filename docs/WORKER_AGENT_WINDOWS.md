@@ -38,12 +38,13 @@ stored with a versioned envelope. Existing unreadable key material fails closed.
 Windows user across installs, updates, and rollback: current-user DPAPI identity cannot be moved
 to a different Windows principal by this host.
 
-`THREADS_WORKER_DATA_ROOT` can override the default root for managed deployments and tests.
-The override is still treated as the security boundary: it must live outside Git worktrees, and
-profile resolution rejects paths that escape it. Task registration resolves this override using
-the same precedence as the Worker runtime and rejects effective roots in either Program Files
-directory, including paths outside the release subtree. Non-Windows test environments use an
-injected fake data protector; the persistent entrypoint itself requires Windows DPAPI.
+`THREADS_WORKER_DATA_ROOT` can override the default root for manual console startup and tests.
+Persistent Task Scheduler registration requires
+an explicit absolute `data_root` in the host config and does not use process-environment fallback,
+so the saved task and installer cannot select different identity roots at later logon. The
+configured root must live outside Git worktrees and both Program Files directories; profile
+resolution rejects paths that escape it. Non-Windows test environments use an injected fake data
+protector; the persistent entrypoint itself requires Windows DPAPI.
 
 ## Windows x64 package and interactive host
 

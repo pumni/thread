@@ -149,18 +149,6 @@ try {
     $hostConfig.Remove("data_root") | Out-Null
     Write-TestHostConfig $hostConfig
 
-    $env:THREADS_WORKER_DATA_ROOT = Join-Path $programFiles "ThreadsWorker-env-data-$testId"
-    $environmentProgramFilesResult = Invoke-TaskManager @(
-        "-Operation", "Install", "-ReleaseDirectory", $firstRelease,
-        "-HostConfigPath", $hostConfigPath
-    ) 2
-    Assert-Condition (
-        $environmentProgramFilesResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_DATA_ROOT_POLICY"
-    ) "ENV_PROGRAM_FILES_DATA_ROOT_ACCEPTED"
-    Assert-Condition (!(Test-Path -LiteralPath $env:THREADS_WORKER_DATA_ROOT)) `
-        "ENV_PROGRAM_FILES_DATA_ROOT_CREATED"
-    $env:THREADS_WORKER_DATA_ROOT = $testDataRoot
-
     $syntheticWorkerId = [guid]::NewGuid().ToString()
     $legacyWorkerDirectory = Join-Path $legacyDefaultDataRoot "worker"
     New-Item -ItemType Directory -Path $legacyWorkerDirectory -Force | Out-Null
@@ -169,15 +157,24 @@ try {
         "$([guid]::NewGuid())`nENROLLED`n",
         [Text.ASCIIEncoding]::new()
     )
+    [IO.File]::WriteAllText(
+        $identityPath,
+        "$syntheticWorkerId`nENROLLED`n",
+        [Text.ASCIIEncoding]::new()
+    )
     $mismatchResult = Invoke-TaskManager @(
         "-Operation", "Install", "-ReleaseDirectory", $firstRelease,
         "-HostConfigPath", $hostConfigPath
     ) 2
     Assert-Condition (
-        $mismatchResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_IDENTITY_VALIDATION"
-    ) "ENV_DATA_ROOT_MISMATCH_ACCEPTED"
+        $mismatchResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_DATA_ROOT_CONFIG_REQUIRED"
+    ) "ENV_ONLY_ENROLLED_DATA_ROOT_ACCEPTED"
     Assert-Condition (!(Get-ScheduledTask -TaskName $productionTaskName -ErrorAction SilentlyContinue)) `
-        "ENV_DATA_ROOT_MISMATCH_REGISTERED_TASK"
+        "ENV_ONLY_DATA_ROOT_REGISTERED_TASK"
+
+    $hostConfig["data_root"] = $testDataRoot
+    Write-TestHostConfig $hostConfig
+    $env:THREADS_WORKER_DATA_ROOT = Join-Path $programFiles "ThreadsWorker-env-data-$testId"
 
     [IO.File]::WriteAllText(
         $identityPath,
@@ -227,6 +224,23 @@ try {
 
     $inspectResult = Invoke-TaskManager @("-Operation", "Inspect")
     Assert-Condition ($inspectResult -eq "THREADS_WORKER_TASK_READY") "TASK_INSPECT_RESULT_INVALID"
+
+    $hostConfig.Remove("data_root") | Out-Null
+    Write-TestHostConfig $hostConfig
+    $updateMissingDataRootResult = Invoke-TaskManager @(
+        "-Operation", "Update", "-ReleaseDirectory", $secondRelease,
+        "-ExpectedProjectVersion", $manifest.project_version, "-ExpectedGitSha", $manifest.git_sha,
+        "-ConfirmDurableDrainOffline"
+    ) 2
+    Assert-Condition (
+        $updateMissingDataRootResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_DATA_ROOT_CONFIG_REQUIRED"
+    ) "UPDATE_ACCEPTED_ENV_ONLY_DATA_ROOT"
+    $taskAfterRejectedUpdate = Get-ScheduledTask -TaskName $productionTaskName -ErrorAction Stop
+    Assert-Condition (
+        $taskAfterRejectedUpdate.Actions[0].Execute -eq (Join-Path $firstRelease "threads-worker.exe")
+    ) "UPDATE_CHANGED_TASK_WITHOUT_EXPLICIT_DATA_ROOT"
+    $hostConfig["data_root"] = $testDataRoot
+    Write-TestHostConfig $hostConfig
 
     $updateResult = Invoke-TaskManager @(
         "-Operation", "Update", "-ReleaseDirectory", $secondRelease,

@@ -54,8 +54,9 @@ Program Files and preserve `%LOCALAPPDATA%\ThreadsOperations` through updates an
 The production task action directly invokes the selected immutable release's
 `threads-worker.exe --host-config <absolute-path>`. No credentials are accepted by the manager.
 Durable identity, DPAPI key, profiles, journal, and media remain outside release directories.
-Task registration resolves the effective data root with the same host-config, environment, and
-`LOCALAPPDATA` precedence as runtime, and rejects any root under Program Files.
+Task registration requires an explicit absolute `data_root` in the host config and rejects roots
+under either Program Files directory. It does not use the installer's process environment as the
+persistent task's data-root source; the task reads the same saved host config at every logon.
 Do not move the identity to another Windows user: current-user DPAPI keys are bound to their
 original principal.
 

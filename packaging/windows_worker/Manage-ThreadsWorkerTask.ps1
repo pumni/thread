@@ -157,19 +157,14 @@ function Assert-EnrolledIdentity([string] $ConfigPath, [string] $ExecutablePath)
         throw "invalid host config"
     }
 
-    $runtimeWorkingDirectory = Split-Path -Parent ([IO.Path]::GetFullPath($ExecutablePath))
-    if ($null -ne $config.data_root) {
-        $configuredDataRoot = [string] $config.data_root
-    } elseif ($null -ne [Environment]::GetEnvironmentVariable("THREADS_WORKER_DATA_ROOT")) {
-        $configuredDataRoot = [Environment]::GetEnvironmentVariable("THREADS_WORKER_DATA_ROOT")
-    } else {
-        $localAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA")
-        if ([string]::IsNullOrWhiteSpace($localAppData)) { throw "identity unavailable" }
-        $configuredDataRoot = Join-Path $localAppData "ThreadsOperations"
+    if ($null -eq $config.data_root) {
+        $script:failureStage = "DATA_ROOT_CONFIG_REQUIRED"
+        throw "invalid host config"
     }
+    $configuredDataRoot = [string] $config.data_root
     if ([string]::IsNullOrWhiteSpace($configuredDataRoot)) { throw "invalid host config" }
     try {
-        $dataRoot = [IO.Path]::GetFullPath($configuredDataRoot, $runtimeWorkingDirectory)
+        $dataRoot = [IO.Path]::GetFullPath($configuredDataRoot)
     } catch {
         throw "invalid host config"
     }
