@@ -63,7 +63,11 @@ $releaseWriteMask = [int64](
 )
 $broadWriterSids = @("S-1-5-19", "S-1-5-11", "S-1-1-0", "S-1-5-32-545")
 foreach ($rule in $releaseAcl.Access) {
-    $ruleSid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+    try {
+        $ruleSid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        continue
+    }
     if (
         $ruleSid -in $broadWriterSids -and
         $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and

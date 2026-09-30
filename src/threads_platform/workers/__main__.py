@@ -194,12 +194,12 @@ async def _run_windows_service_check(
 
 
 def _windows_service(test_mode: bool) -> int:
+    runner = _run_windows_service_check if test_mode else _run_windows_service
     if os.name != "nt":
         print("THREADS_WORKER_WINDOWS_SERVICE_UNSUPPORTED", file=sys.stderr)
         return 2
     from threads_platform.workers.windows_service import run_windows_service
 
-    runner = _run_windows_service_check if test_mode else _run_windows_service
     return run_windows_service(runner)
 
 
