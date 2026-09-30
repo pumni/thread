@@ -654,6 +654,8 @@ async def test_missing_secret_command_failure_is_retryable_and_not_unexpected(
             OAuthCredentialMetadata(
                 account_id=account_id,
                 credential_ref=_REFERENCE,
+                token_type="Bearer",
+                granted_scopes=("threads_basic",),
                 expires_at=clock.now() + timedelta(days=1),
             )
         )
