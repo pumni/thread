@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Protocol
 
 import structlog
+from opentelemetry.trace import Tracer
 
 from threads_platform.application.account_activity_materialization import (
     materialize_due_account_activities,
@@ -30,6 +31,7 @@ from threads_platform.application.ports.repositories import UnitOfWorkFactory
 from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.domain.time import normalize_utc
+from threads_platform.observability.tracing import mark_span_failed, set_span_attribute, trace_span
 
 MAX_SCHEDULER_BATCH_SIZE = 100
 MAX_SCHEDULER_POLL_INTERVAL_SECONDS = 3_600
@@ -120,6 +122,19 @@ class SchedulerMetricsObserver(Protocol):
 SchedulerWait = Callable[[asyncio.Event, float], Awaitable[None]]
 
 
+async def _run_traced_stage[StageResult](
+    tracer: Tracer | None,
+    stage: SchedulerStage,
+    operation: Callable[[], Awaitable[StageResult]],
+) -> StageResult:
+    with trace_span(
+        tracer,
+        f"scheduler.stage.{stage.value}",
+        attributes={"process.role": "scheduler", "scheduler.stage": stage.value},
+    ):
+        return await operation()
+
+
 def validate_scheduler_limit(name: str, value: int) -> None:
     if type(value) is not int or not 1 <= value <= MAX_SCHEDULER_BATCH_SIZE:
         raise ValueError(f"{name} must be between 1 and {MAX_SCHEDULER_BATCH_SIZE}")
@@ -187,6 +202,7 @@ async def run_scheduler_tick(
     recovery_limit: int,
     outbox_delivery_limit: int = 50,
     metrics_observer: SchedulerMetricsObserver | None = None,
+    tracer: Tracer | None = None,
 ) -> SchedulerTickResult:
     """Process a bounded snapshot of durable work without retaining tick state."""
     validate_scheduler_limit("activity_limit", activity_limit)
@@ -214,9 +230,13 @@ async def run_scheduler_tick(
 
     try:
         try:
-            worker_presences_expired = await resolved_worker_control_service.expire_presence(
-                now=occurred_at,
-                limit=presence_expiry_limit,
+            worker_presences_expired = await _run_traced_stage(
+                tracer,
+                SchedulerStage.WORKER_PRESENCE_EXPIRY,
+                lambda: resolved_worker_control_service.expire_presence(
+                    now=occurred_at,
+                    limit=presence_expiry_limit,
+                ),
             )
         except Exception as caught:
             if error is None:
@@ -229,10 +249,14 @@ async def run_scheduler_tick(
             _observe_stage_failure(metrics_observer, SchedulerStage.WORKER_PRESENCE_EXPIRY)
 
         try:
-            activities = await generate_due_account_activity_occurrences(
-                unit_of_work_factory,
-                now=occurred_at,
-                limit=generation_limit,
+            activities = await _run_traced_stage(
+                tracer,
+                SchedulerStage.ACTIVITY_RECURRENCE_GENERATION,
+                lambda: generate_due_account_activity_occurrences(
+                    unit_of_work_factory,
+                    now=occurred_at,
+                    limit=generation_limit,
+                ),
             )
             activity_occurrences_generated = len(activities)
         except Exception as caught:
@@ -246,10 +270,14 @@ async def run_scheduler_tick(
             _observe_stage_failure(metrics_observer, SchedulerStage.ACTIVITY_RECURRENCE_GENERATION)
 
         try:
-            conversation_sync_commands = await dispatch_due_conversation_syncs(
-                unit_of_work_factory,
-                now=occurred_at,
-                limit=conversation_sync_limit,
+            conversation_sync_commands = await _run_traced_stage(
+                tracer,
+                SchedulerStage.CONVERSATION_SYNC_DISPATCH,
+                lambda: dispatch_due_conversation_syncs(
+                    unit_of_work_factory,
+                    now=occurred_at,
+                    limit=conversation_sync_limit,
+                ),
             )
             conversation_syncs_dispatched = len(conversation_sync_commands)
         except Exception as caught:
@@ -263,10 +291,14 @@ async def run_scheduler_tick(
             _observe_stage_failure(metrics_observer, SchedulerStage.CONVERSATION_SYNC_DISPATCH)
 
         try:
-            activities = await materialize_due_account_activities(
-                unit_of_work_factory,
-                now=occurred_at,
-                limit=activity_limit,
+            activities = await _run_traced_stage(
+                tracer,
+                SchedulerStage.ACTIVITY_MATERIALIZATION,
+                lambda: materialize_due_account_activities(
+                    unit_of_work_factory,
+                    now=occurred_at,
+                    limit=activity_limit,
+                ),
             )
             activities_materialized = len(activities)
         except Exception as caught:
@@ -280,37 +312,50 @@ async def run_scheduler_tick(
             _observe_stage_failure(metrics_observer, SchedulerStage.ACTIVITY_MATERIALIZATION)
 
         attempted_command_ids: set[str] = set()
-        for _ in range(command_limit):
-            try:
-                result = await command_runtime.process_next(
-                    now=occurred_at,
-                    exclude_command_ids=frozenset(attempted_command_ids),
-                )
-            except Exception as caught:
-                if error is None:
-                    error = caught
-                logger.error(
-                    "scheduler_tick_stage_failed",
-                    stage=SchedulerStage.COMMAND_PROCESSING.value,
-                    error_type=type(caught).__name__,
-                )
-                _observe_stage_failure(metrics_observer, SchedulerStage.COMMAND_PROCESSING)
-                break
-            if result is None:
-                break
-            if result.command_id in attempted_command_ids:
-                logger.error(
-                    "scheduler_reselected_command_within_tick",
-                    command_id=result.command_id,
-                )
-                break
-            attempted_command_ids.add(result.command_id)
-            commands_processed = len(attempted_command_ids)
+        with trace_span(
+            tracer,
+            f"scheduler.stage.{SchedulerStage.COMMAND_PROCESSING.value}",
+            attributes={
+                "process.role": "scheduler",
+                "scheduler.stage": SchedulerStage.COMMAND_PROCESSING.value,
+            },
+        ) as command_span:
+            for _ in range(command_limit):
+                try:
+                    result = await command_runtime.process_next(
+                        now=occurred_at,
+                        exclude_command_ids=frozenset(attempted_command_ids),
+                    )
+                except Exception as caught:
+                    mark_span_failed(command_span)
+                    if error is None:
+                        error = caught
+                    logger.error(
+                        "scheduler_tick_stage_failed",
+                        stage=SchedulerStage.COMMAND_PROCESSING.value,
+                        error_type=type(caught).__name__,
+                    )
+                    _observe_stage_failure(metrics_observer, SchedulerStage.COMMAND_PROCESSING)
+                    break
+                if result is None:
+                    break
+                if result.command_id in attempted_command_ids:
+                    logger.error(
+                        "scheduler_reselected_command_within_tick",
+                        command_id=result.command_id,
+                    )
+                    break
+                attempted_command_ids.add(result.command_id)
+                commands_processed = len(attempted_command_ids)
 
         try:
-            worker_jobs_recovered = await worker_job_service.recover_expired(
-                limit=recovery_limit,
-                now=occurred_at,
+            worker_jobs_recovered = await _run_traced_stage(
+                tracer,
+                SchedulerStage.WORKER_JOB_RECOVERY,
+                lambda: worker_job_service.recover_expired(
+                    limit=recovery_limit,
+                    now=occurred_at,
+                ),
             )
         except Exception as caught:
             if error is None:
@@ -324,9 +369,13 @@ async def run_scheduler_tick(
 
         if outbox_delivery_worker is not None:
             try:
-                delivery_result = await deliver_due_outbox(
-                    outbox_delivery_worker,
-                    limit=outbox_delivery_limit,
+                delivery_result = await _run_traced_stage(
+                    tracer,
+                    SchedulerStage.OUTBOX_DELIVERY,
+                    lambda: deliver_due_outbox(
+                        outbox_delivery_worker,
+                        limit=outbox_delivery_limit,
+                    ),
                 )
                 outbox_deliveries_attempted = delivery_result.attempted
                 outbox_deliveries_succeeded = delivery_result.succeeded
@@ -402,6 +451,7 @@ class SchedulerRunner:
         wait_for_stop: SchedulerWait = _wait_for_stop,
         metrics_observer: SchedulerMetricsObserver | None = None,
         monotonic: Callable[[], float] = time.perf_counter,
+        tracer: Tracer | None = None,
     ) -> None:
         self._tick = tick
         self._config = config or SchedulerRunnerConfig()
@@ -409,6 +459,7 @@ class SchedulerRunner:
         self._wait_for_stop = wait_for_stop
         self._metrics_observer = metrics_observer
         self._monotonic = monotonic
+        self._tracer = tracer
         self._logger = structlog.get_logger(__name__)
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -416,16 +467,22 @@ class SchedulerRunner:
         while not stop_event.is_set():
             started_at = self._monotonic()
             try:
-                result = await self._tick(
-                    now=normalize_utc(self._clock.now()),
-                    presence_expiry_limit=self._config.presence_expiry_limit,
-                    generation_limit=self._config.generation_limit,
-                    conversation_sync_limit=self._config.conversation_sync_limit,
-                    activity_limit=self._config.activity_limit,
-                    command_limit=self._config.command_limit,
-                    recovery_limit=self._config.recovery_limit,
-                    outbox_delivery_limit=self._config.outbox_delivery_limit,
-                )
+                with trace_span(
+                    self._tracer,
+                    "scheduler.tick",
+                    attributes={"process.role": "scheduler"},
+                ) as span:
+                    result = await self._tick(
+                        now=normalize_utc(self._clock.now()),
+                        presence_expiry_limit=self._config.presence_expiry_limit,
+                        generation_limit=self._config.generation_limit,
+                        conversation_sync_limit=self._config.conversation_sync_limit,
+                        activity_limit=self._config.activity_limit,
+                        command_limit=self._config.command_limit,
+                        recovery_limit=self._config.recovery_limit,
+                        outbox_delivery_limit=self._config.outbox_delivery_limit,
+                    )
+                    set_span_attribute(span, "scheduler.outcome", "success")
             except Exception as error:
                 _observe_tick(
                     self._metrics_observer,

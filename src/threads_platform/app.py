@@ -39,6 +39,12 @@ from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWork
 from threads_platform.infrastructure.threads_api.composition import compose_process_command_runtime
 from threads_platform.observability.logging import configure_logging
 from threads_platform.observability.metrics import ControlPlaneMetrics
+from threads_platform.observability.tracing import (
+    HTTP_SERVICE_NAME,
+    HTTPRequestTracingMiddleware,
+    ProcessTracing,
+    create_process_tracing,
+)
 from threads_platform.transport.http.auth import BearerTokenAuthenticator, CommandAuthenticator
 from threads_platform.transport.http.commands import create_command_router
 from threads_platform.transport.http.worker_tls import WorkerTransportTLSMiddleware
@@ -91,9 +97,22 @@ def create_app(
     readiness_probe: OperationalReadinessProbe | None = None,
     operational_metrics_probe: OperationalMetricsProbe | None = None,
     metrics_registry: CollectorRegistry | None = None,
+    tracing_runtime: ProcessTracing | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
-    configure_logging(resolved_settings.log_level)
+    tracing_log_enabled = (
+        tracing_runtime.enabled
+        if tracing_runtime is not None
+        else resolved_settings.tracing_enabled
+    )
+    if tracing_log_enabled:
+        configure_logging(resolved_settings.log_level, tracing_enabled=True)
+    else:
+        configure_logging(resolved_settings.log_level)
+    tracing = tracing_runtime or create_process_tracing(
+        resolved_settings.tracing_enabled,
+        HTTP_SERVICE_NAME,
+    )
     if (
         resolved_settings.threads_token_provider_mode == "environment"
         and resolved_settings.database_url is None
@@ -157,6 +176,7 @@ def create_app(
 
     if command_runtime is not None:
         command_runtime.set_execution_duration_observer(metrics.observe_command_execution_duration)
+        command_runtime.set_tracer(tracing.tracer, process_role="http")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
@@ -164,11 +184,14 @@ def create_app(
             yield
         finally:
             try:
-                if http_client is not None:
-                    await http_client.aclose()
+                tracing.shutdown()
             finally:
-                if engine is not None:
-                    await engine.dispose()
+                try:
+                    if http_client is not None:
+                        await http_client.aclose()
+                finally:
+                    if engine is not None:
+                        await engine.dispose()
 
     application = FastAPI(
         title="Threads Operations Platform",
@@ -186,6 +209,7 @@ def create_app(
         WorkerTransportTLSMiddleware,
         required=resolved_settings.worker_tls_required,
     )
+    application.add_middleware(HTTPRequestTracingMiddleware, tracing=tracing)
     application.include_router(
         create_worker_router(
             resolved_worker_service,

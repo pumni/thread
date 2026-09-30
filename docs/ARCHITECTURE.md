@@ -928,7 +928,8 @@ volume and trust authentication on its private network. It contains no real
 Threads or CRM credentials. Do not use this local authentication setup as a
 networked production database. The image is not pushed or signed. At the #87
 checkpoint, metrics and tracing were still deferred; #89 adds bounded metrics
-as described in section 31, while tracing remains deferred. #62 remains a
+as described in section 31. #91 separately adds bounded opt-in tracing as
+described in section 32. #62 remains a
 separate CRM dependency; #3 remains open as the production/release gate. See
 `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for exact process, smoke, restart,
 and recovery commands. #78 DRAINING and #84 Windows Worker lifecycle semantics
@@ -975,6 +976,56 @@ listener accepts only `127.0.0.1` or `0.0.0.0` and ports 1–65535. Compose enab
 `0.0.0.0:9101` inside the private network without publishing that port to the
 host. PostgreSQL gauges are re-read after HTTP restart. Histograms and scheduler
 counters are process local, may reset at restart, and are never persisted.
-Metrics do not define business state or readiness. Tracing remains deferred;
-#3 remains open and #62 remains separate. See
+Metrics do not define business state or readiness. Tracing was deferred at the
+#89 checkpoint; #91 adds optional tracing in section 32. #3 remains open and
+#62 remains separate. See
 `docs/OBSERVABILITY_RUNBOOK.md` for the scrape and reset contract.
+
+## 32. Bounded OpenTelemetry tracing (#91)
+
+Tracing is disabled by default with `THREADS_PLATFORM_TRACING_ENABLED=false`.
+When enabled, the HTTP Control Plane and standalone scheduler each construct
+their own `TracerProvider`, fixed `service.name` resource, OTLP/HTTP exporter,
+and process shutdown lifecycle. The global OpenTelemetry provider is not
+replaced. No collector is included in Compose, and the existing process and
+metrics-listener boundaries do not change. Exporter endpoint and authentication
+are environment-only through `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_ENDPOINT`, and the corresponding standard `*_HEADERS`
+settings. Configured endpoints must be HTTP(S), include a hostname, and contain
+no user information, query, or fragment. Values are never logged. Compose pins
+tracing to disabled and publishes no OTLP port.
+
+The HTTP process emits `http.server.request` for application routes, with
+`process.role`, a bounded HTTP method, a FastAPI route template (or
+`unmatched`), and response status. `/health`, `/ready`, and `/metrics` are
+excluded. The command runtime adds `command.receive`, `command.process`, and
+`command.process_next` spans; the last is created only after a ready Command is
+selected. Command spans add only the bounded `process.role` and terminal
+`command.status` vocabulary.
+
+The scheduler emits `scheduler.tick` and child spans named
+`scheduler.stage.<stage>` for its existing fixed stages. The optional
+`outbox_delivery` child exists only when an outbox worker is configured. Stage
+attributes use only `process.role` and the fixed `scheduler.stage` vocabulary;
+tick outcome is `success` when the tick returns. Failures set OTel status to
+ERROR and the constant `error.type=exception`; exception messages, stack
+traces, and events are not exported. Stage order, retry/backoff, partial
+results, and scheduler semantics are unchanged.
+
+Inbound HTTP accepts W3C `traceparent` for remote parent context. Vendor
+`tracestate` and baggage are not propagated. Child spans stay in the process
+context. Worker HTTP/WebSocket contracts do not carry trace context. No trace
+IDs are written to PostgreSQL, Commands, WorkerJobs, or Worker records.
+Structured logs add lowercase fixed-width `trace_id` and `span_id` only while
+an active recording span is current; those fields are diagnostic correlation,
+not durable keys.
+
+The exporter uses a 64-span bounded queue, batches at most 64 spans, limits one
+OTLP/HTTP request to 1 MiB with a two-second request timeout, and attempts a
+bounded flush on normal process shutdown. Export/setup/shutdown failures are
+fail-open and logged with only fixed phase/service information. No SQLAlchemy
+or outbound Threads/Meta HTTP auto-instrumentation is installed; no SQL, URLs,
+headers, payloads, IDs, or exception messages are span data. #89 metrics and
+`/ready` semantics are unchanged. OpenTelemetry collection, dashboards, and
+alerts are not deployed. #3 remains OPEN, #62 remains separate, and this
+checkpoint makes no production release claim.

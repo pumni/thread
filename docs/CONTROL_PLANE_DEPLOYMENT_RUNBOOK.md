@@ -69,6 +69,30 @@ scheduler binds inside its container, but Compose publishes no host port for
 host and port settings are `THREADS_PLATFORM_SCHEDULER_METRICS_HOST` and
 `THREADS_PLATFORM_SCHEDULER_METRICS_PORT`.
 
+## Tracing process ownership (#91)
+
+Tracing is disabled in committed Compose through
+`THREADS_PLATFORM_TRACING_ENABLED=false`; neither process constructs an
+exporter or opens an OTLP connection. To enable it in another deployment, set
+`THREADS_PLATFORM_TRACING_ENABLED=true` independently for the HTTP and
+scheduler process environments. Each creates its own bounded provider/export
+lifecycle and uses an environment-configured OTLP/HTTP endpoint. Configure
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`, with
+authentication only in the corresponding standard OpenTelemetry header
+environment variables. Do not put these values in image layers, committed
+Compose, application settings files, command lines, or logs.
+
+The generic endpoint receives `/v1/traces`; the trace-specific endpoint is used
+as supplied. Configured endpoint user information, query strings, fragments,
+unsupported schemes, missing hosts, and whitespace are rejected without
+printing the value. The default endpoint is the standard local OTLP/HTTP
+endpoint if tracing is enabled without an override. This repository does not
+deploy a collector, publish an OTLP port, or instrument SQLAlchemy or outbound
+Threads/Meta HTTP calls. HTTP and scheduler trace providers remain separate;
+they do not alter `/health`, `/ready`, `/metrics`, scheduler durability, or the
+Windows Worker protocol. See `docs/OBSERVABILITY_RUNBOOK.md` for span privacy,
+W3C propagation, correlation, and failure semantics.
+
 Scrape the two process owners separately:
 
 ```powershell
@@ -188,8 +212,8 @@ switching releases. Abrupt loss is not drain completion.
 ## Scope and release status
 
 There is no schema migration, Windows Worker container, Kubernetes/deployment
-template, registry publication, signing, or tracing in this checkpoint.
-Bounded metrics are described in `docs/OBSERVABILITY_RUNBOOK.md`; distributed
-tracing remains deferred. #62 remains a separate CRM transport dependency. Phase B remains
+template, registry publication, signing, or collector in this #87 checkpoint.
+Bounded metrics are described in `docs/OBSERVABILITY_RUNBOOK.md`; #91 later adds
+opt-in tracing without changing this topology. #62 remains a separate CRM transport dependency. Phase B remains
 `PARTIAL_LIVE_EVIDENCE / NOT_READY`, and #3 remains OPEN as the production/release
 gate. This internal/test image and smoke do not make a production release claim.

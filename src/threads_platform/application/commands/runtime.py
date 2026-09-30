@@ -1,12 +1,14 @@
 import asyncio
 import time
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 import structlog
+from opentelemetry.trace import Tracer
 from pydantic import ValidationError
 
 from threads_platform.application.capability_router import CapabilityEvidence, CapabilityRouter
@@ -51,6 +53,7 @@ from threads_platform.domain.commands import (
 )
 from threads_platform.domain.time import normalize_utc
 from threads_platform.domain.worker_jobs import WorkerJob, WorkerJobRetrySafety
+from threads_platform.observability.tracing import set_span_attribute, trace_span
 
 KNOWN_COMMAND_TYPES = frozenset(
     {
@@ -142,9 +145,19 @@ class CommandRuntime:
         self._worker_job_service = worker_job_service
         self._execution_duration_observer = execution_duration_observer
         self._monotonic = monotonic
+        self._tracer: Tracer | None = None
+        self._tracing_role: str = "http"
         self._logger = structlog.get_logger(__name__)
 
     async def receive(self, raw_command: dict[str, object]) -> CommandReceiptV1:
+        with trace_span(
+            self._tracer,
+            "command.receive",
+            attributes={"process.role": self._tracing_role},
+        ):
+            return await self._receive_command(raw_command)
+
+    async def _receive_command(self, raw_command: dict[str, object]) -> CommandReceiptV1:
         try:
             header = CommandEnvelopeHeader.model_validate(raw_command)
         except ValidationError as error:
@@ -236,22 +249,29 @@ class CommandRuntime:
     async def process(self, command_id: str) -> CommandExecutionResult:
         started_at = self._monotonic()
         try:
-            async with self._unit_of_work_factory() as unit_of_work:
-                command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
-                if command is None:
-                    self._logger.info(
-                        "command_processing_rejected",
-                        command_id=command_id,
-                        error_code="COMMAND_NOT_FOUND",
-                    )
-                    raise CommandNotFound(command_id)
-                log_context = self._command_log_context(command)
-                with structlog.contextvars.bound_contextvars(**log_context):
-                    self._logger.info("command_processing_started", status=command.status.value)
-                    claim_or_result = await self._claim_locked(
-                        unit_of_work, command, normalize_utc(self._clock.now())
-                    )
-            return await self._continue_processing(command, claim_or_result, log_context)
+            with trace_span(
+                self._tracer,
+                "command.process",
+                attributes={"process.role": self._tracing_role},
+            ) as span:
+                async with self._unit_of_work_factory() as unit_of_work:
+                    command = await unit_of_work.commands.get_by_command_id_for_update(command_id)
+                    if command is None:
+                        self._logger.info(
+                            "command_processing_rejected",
+                            command_id=command_id,
+                            error_code="COMMAND_NOT_FOUND",
+                        )
+                        raise CommandNotFound(command_id)
+                    log_context = self._command_log_context(command)
+                    with structlog.contextvars.bound_contextvars(**log_context):
+                        self._logger.info("command_processing_started", status=command.status.value)
+                        claim_or_result = await self._claim_locked(
+                            unit_of_work, command, normalize_utc(self._clock.now())
+                        )
+                result = await self._continue_processing(command, claim_or_result, log_context)
+                set_span_attribute(span, "command.status", result.status.value)
+                return result
         finally:
             self._observe_execution_duration(started_at)
 
@@ -298,23 +318,41 @@ class CommandRuntime:
         started_at = self._monotonic()
         observed = False
         try:
-            occurred_at = normalize_utc(now if now is not None else self._clock.now())
-            async with self._unit_of_work_factory() as unit_of_work:
-                command = await unit_of_work.commands.get_next_ready_for_update(
-                    occurred_at,
-                    exclude_command_ids=exclude_command_ids,
-                )
-                if command is None:
-                    return None
-                observed = True
-                log_context = self._command_log_context(command)
-                with structlog.contextvars.bound_contextvars(**log_context):
-                    self._logger.info("command_processing_started", status=command.status.value)
-                    claim_or_result = await self._claim_locked(unit_of_work, command, occurred_at)
-            return await self._continue_processing(command, claim_or_result, log_context)
+            with ExitStack() as span_stack:
+                occurred_at = normalize_utc(now if now is not None else self._clock.now())
+                async with self._unit_of_work_factory() as unit_of_work:
+                    command = await unit_of_work.commands.get_next_ready_for_update(
+                        occurred_at,
+                        exclude_command_ids=exclude_command_ids,
+                    )
+                    if command is None:
+                        return None
+                    observed = True
+                    span = span_stack.enter_context(
+                        trace_span(
+                            self._tracer,
+                            "command.process_next",
+                            attributes={"process.role": self._tracing_role},
+                        )
+                    )
+                    log_context = self._command_log_context(command)
+                    with structlog.contextvars.bound_contextvars(**log_context):
+                        self._logger.info("command_processing_started", status=command.status.value)
+                        claim_or_result = await self._claim_locked(
+                            unit_of_work, command, occurred_at
+                        )
+                result = await self._continue_processing(command, claim_or_result, log_context)
+                set_span_attribute(span, "command.status", result.status.value)
+                return result
         finally:
             if observed:
                 self._observe_execution_duration(started_at)
+
+    def set_tracer(self, tracer: Tracer | None, *, process_role: str) -> None:
+        if process_role not in {"http", "scheduler"}:
+            raise ValueError("unsupported tracing process role")
+        self._tracer = tracer
+        self._tracing_role = process_role
 
     def set_execution_duration_observer(
         self,
