@@ -1,8 +1,11 @@
 import hashlib
+import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
+
+import structlog
 
 from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.clock import Clock, SystemClock
@@ -77,6 +80,15 @@ class WorkerPresence:
     active_browser_sessions: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerDrainStatus:
+    worker_id: UUID
+    status: WorkerStatus
+    active_browser_sessions: int
+    running_worker_jobs: int
+    quiescent: bool
+
+
 class WorkerControlService:
     def __init__(
         self,
@@ -96,6 +108,7 @@ class WorkerControlService:
         self._session_ttl = session_ttl
         self._presence_ttl = presence_ttl
         self._capability_router = capability_router or CapabilityRouter()
+        self._logger = structlog.get_logger(__name__)
 
     async def create_enrollment(self, created_by: str = "operator") -> EnrollmentIssued:
         now = normalize_utc(self._clock.now())
@@ -429,6 +442,118 @@ class WorkerControlService:
             active_browser_sessions=(
                 worker.active_browser_sessions if worker.protocol_version == 2 else None
             ),
+        )
+
+    async def request_drain(self, worker_id: UUID, reason_code: str) -> bool:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", reason_code):
+            raise WorkerControlError("INVALID_DRAIN_REASON_CODE")
+        now = normalize_utc(self._clock.now())
+        async with self._unit_of_work_factory() as unit_of_work:
+            worker = await unit_of_work.workers.get_for_update(worker_id)
+            if worker is None:
+                raise WorkerControlError("WORKER_NOT_FOUND")
+            if worker.status is WorkerStatus.DRAINING:
+                return False
+            if worker.status not in {WorkerStatus.ONLINE, WorkerStatus.DEGRADED}:
+                raise WorkerControlError("WORKER_DRAIN_NOT_ALLOWED")
+            worker.status = WorkerStatus.DRAINING
+            worker.updated_at = now
+            active_browser_sessions = worker.active_browser_sessions
+            running_job_count = await unit_of_work.worker_jobs.count_running_for_worker(worker_id)
+            await unit_of_work.workers.update(worker)
+            await unit_of_work.worker_security.add_audit_event(
+                WorkerAuditEvent(
+                    event_type="worker.drain.requested",
+                    worker_id=worker_id,
+                    detail_code=reason_code,
+                    created_at=now,
+                )
+            )
+        self._logger.info(
+            "worker_drain_requested",
+            worker_id=str(worker_id),
+            status=WorkerStatus.DRAINING.value,
+            reason_code=reason_code,
+            active_browser_sessions=active_browser_sessions,
+            running_job_count=running_job_count,
+        )
+        return True
+
+    async def drain_status(self, worker_id: UUID) -> WorkerDrainStatus:
+        async with self._unit_of_work_factory() as unit_of_work:
+            worker = await unit_of_work.workers.get(worker_id)
+            if worker is None:
+                raise WorkerControlError("WORKER_NOT_FOUND")
+            running_jobs = await unit_of_work.worker_jobs.count_running_for_worker(worker_id)
+            active_sessions = worker.active_browser_sessions
+            return WorkerDrainStatus(
+                worker_id=worker_id,
+                status=worker.status,
+                active_browser_sessions=active_sessions,
+                running_worker_jobs=running_jobs,
+                quiescent=(
+                    worker.status is WorkerStatus.DRAINING
+                    and active_sessions == 0
+                    and running_jobs == 0
+                ),
+            )
+
+    async def complete_drain(self, worker_id: UUID) -> None:
+        now = normalize_utc(self._clock.now())
+        async with self._unit_of_work_factory() as unit_of_work:
+            worker = await unit_of_work.workers.get_for_update(worker_id)
+            if worker is None:
+                raise WorkerControlError("WORKER_NOT_FOUND")
+            if worker.status is not WorkerStatus.DRAINING:
+                raise WorkerControlError("WORKER_NOT_DRAINING")
+            running_jobs = await unit_of_work.worker_jobs.count_running_for_worker(worker_id)
+            if worker.active_browser_sessions != 0 or running_jobs != 0:
+                raise WorkerControlError("WORKER_DRAIN_NOT_QUIESCENT")
+            worker.status = WorkerStatus.OFFLINE
+            worker.updated_at = now
+            await unit_of_work.workers.update(worker)
+            await unit_of_work.worker_security.add_audit_event(
+                WorkerAuditEvent(
+                    event_type="worker.drain.completed",
+                    worker_id=worker_id,
+                    created_at=now,
+                )
+            )
+            active_browser_sessions = worker.active_browser_sessions
+        self._logger.info(
+            "worker_drain_completed",
+            worker_id=str(worker_id),
+            status=WorkerStatus.OFFLINE.value,
+            active_browser_sessions=active_browser_sessions,
+            running_job_count=running_jobs,
+        )
+
+    async def abort_drain(self, worker_id: UUID) -> None:
+        now = normalize_utc(self._clock.now())
+        async with self._unit_of_work_factory() as unit_of_work:
+            worker = await unit_of_work.workers.get_for_update(worker_id)
+            if worker is None:
+                raise WorkerControlError("WORKER_NOT_FOUND")
+            if worker.status is not WorkerStatus.DRAINING:
+                raise WorkerControlError("WORKER_NOT_DRAINING")
+            running_jobs = await unit_of_work.worker_jobs.count_running_for_worker(worker_id)
+            active_browser_sessions = worker.active_browser_sessions
+            worker.status = WorkerStatus.OFFLINE
+            worker.updated_at = now
+            await unit_of_work.workers.update(worker)
+            await unit_of_work.worker_security.add_audit_event(
+                WorkerAuditEvent(
+                    event_type="worker.drain.aborted",
+                    worker_id=worker_id,
+                    created_at=now,
+                )
+            )
+        self._logger.info(
+            "worker_drain_aborted",
+            worker_id=str(worker_id),
+            status=WorkerStatus.OFFLINE.value,
+            active_browser_sessions=active_browser_sessions,
+            running_job_count=running_jobs,
         )
 
     async def expire_presence(self, *, now: datetime, limit: int) -> int:

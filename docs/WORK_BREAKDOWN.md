@@ -317,3 +317,15 @@ observations. The #68 Phase A packet is accepted; #55 and #70 are closed. Phase
 B is `NOT_RUN`, discovery and mentions scheduling remain gated, and #3 remains
 open as the production/release gate. Issue #72 is authorized for observability
 and readiness only; metrics/tracing and #62 remain out of scope.
+
+## C6-02/5 — Durable Worker draining (#78)
+
+Issue #78 adds row-locked admin drain/status/abort operations and the
+authenticated worker quiescence completion handshake. DRAINING blocks new
+claims while preserving already-running WorkerJob leases and their normal
+terminal operations. Readiness does not own presence expiry. The WorkerAgent
+closes managed sessions and resumes finalization after reconnect; no process
+kill, task cancellation, updater, migration, or package installer is included.
+The service-manager-neutral update and rollback procedure is in
+`docs/WORKER_UPDATE_RUNBOOK.md`. Issue #3 remains OPEN, #62 remains separate,
+and no production release claim follows from this checkpoint.

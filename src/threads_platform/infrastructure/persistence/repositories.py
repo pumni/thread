@@ -2992,6 +2992,17 @@ class SQLAlchemyWorkerJobRepository(WorkerJobRepository):
         )
         return self._domain(record) if record is not None else None
 
+    async def count_running_for_worker(self, worker_id: UUID) -> int:
+        count = await self._session.scalar(
+            select(func.count())
+            .select_from(WorkerJobRecord)
+            .where(
+                WorkerJobRecord.status == WorkerJobStatus.RUNNING,
+                WorkerJobRecord.lease_worker_id == worker_id,
+            )
+        )
+        return int(count or 0)
+
     async def update(self, job: WorkerJob) -> None:
         record = await self._session.get(WorkerJobRecord, job.id)
         if record is None:

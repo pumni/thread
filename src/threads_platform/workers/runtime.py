@@ -229,21 +229,45 @@ class WorkerAgent:
             self._process_lock.acquire()
             await self._initialize()
             backoff = self._config.reconnect_initial_backoff
-            while not stop_event.is_set():
+            drain_finalization_pending = False
+            while not stop_event.is_set() or drain_finalization_pending:
                 try:
                     if not self._connected:
                         await self.connect_once()
                         backoff = self._config.reconnect_initial_backoff
-                    if self.status in {WorkerStatus.DRAINING, WorkerStatus.DISABLED}:
+                    if self._has_status(WorkerStatus.DRAINING):
+                        drain_finalization_pending = True
+                    if drain_finalization_pending:
+                        if await self._finalize_drain():
+                            break
+                        if not self._has_status(WorkerStatus.DRAINING):
+                            drain_finalization_pending = False
+                            continue
+                        await asyncio.sleep(self._config.poll_interval.total_seconds())
+                        continue
+                    if stop_event.is_set():
                         break
-                    await self.tick()
-                    if self.status in {WorkerStatus.DRAINING, WorkerStatus.DISABLED}:
+                    if self.status is WorkerStatus.DISABLED:
                         break
+                    job = await self.tick()
+                    if self._has_status(WorkerStatus.DRAINING):
+                        drain_finalization_pending = True
+                        continue
+                    if self._has_status(WorkerStatus.DISABLED):
+                        break
+                    if job is not None:
+                        presence = await self.heartbeat_once()
+                        if presence.status is WorkerStatus.DRAINING:
+                            drain_finalization_pending = True
+                            continue
                     await _wait_or_stop(stop_event, self._config.poll_interval.total_seconds())
                 except WorkerControlClientError:
                     self._connected = False
                     self._presence = None
-                    await _wait_or_stop(stop_event, backoff.total_seconds())
+                    if drain_finalization_pending:
+                        await asyncio.sleep(backoff.total_seconds())
+                    else:
+                        await _wait_or_stop(stop_event, backoff.total_seconds())
                     backoff = min(backoff * 2, self._config.reconnect_max_backoff)
         finally:
             try:
@@ -252,6 +276,36 @@ class WorkerAgent:
                 self._connected = False
                 self._process_lock.release()
                 await self._control_client.aclose()
+
+    def _has_status(self, status: WorkerStatus) -> bool:
+        return self.status is status
+
+    async def _finalize_drain(self) -> bool:
+        if self._worker_id is None:
+            raise WorkerControlClientError("WORKER_IDENTITY_UNAVAILABLE")
+        for account_id in tuple(self._session_managers):
+            await self.close_browser_session(account_id)
+        await self.flush_session_reports()
+        presence = await self.heartbeat_once()
+        if presence.status is not WorkerStatus.DRAINING:
+            return presence.status is WorkerStatus.OFFLINE
+        try:
+            status = await self._control_client.complete_drain()
+        except WorkerControlClientError as error:
+            if error.code == "WORKER_DRAIN_NOT_QUIESCENT":
+                return False
+            raise
+        if status is not WorkerStatus.OFFLINE:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        previous = self._presence
+        self._presence = WorkerAgentPresence(
+            worker_id=self._worker_id,
+            status=WorkerStatus.OFFLINE,
+            protocol_compatible=previous.protocol_compatible if previous else True,
+            max_browser_sessions=self._config.max_browser_sessions,
+            active_browser_sessions=0,
+        )
+        return True
 
     async def close(self) -> None:
         try:

@@ -302,10 +302,46 @@ If Control Plane connection is lost:
 
 ## 15. DRAINING
 
-DRAINING worker:
-- cannot claim new jobs;
-- existing jobs may finish or cancel at safe boundaries;
-- reports when safe for shutdown/update.
+DRAINING is a durable `WorkerNode.status` written by the Control Plane. It means
+no new WorkerJob claim is allowed; it does not cancel, preempt, revoke, or kill
+work already running. A handler continues to its existing safe/terminal
+boundary and retains its normal renew, checkpoint, completion, failure,
+cancellation-acknowledgement, and intervention paths.
+
+Admin routes:
+
+- `POST /v1/workers/{worker_id}/drain` accepts only a bounded `reason_code`.
+  ONLINE and DEGRADED transition under the Worker row lock; repeated DRAINING is
+  idempotent. Other statuses are rejected without rewrite. The first transition
+  records `worker.drain.requested`; after commit, `worker.drain` is published as
+  advisory WSS data.
+- `GET /v1/workers/{worker_id}/drain` returns only worker ID/status, aggregate
+  active browser session and RUNNING job counts, and the derived `quiescent`
+  flag. Every durable RUNNING job leased to the worker counts, including an
+  expired lease. Expiry by itself is not proof that a handler stopped.
+- `POST /v1/workers/{worker_id}/drain/abort` is recovery only and changes
+  DRAINING to OFFLINE. It does not claim quiescence or mutate sessions/jobs.
+
+The authenticated worker completes through
+`POST /v1/workers/drain/complete`. Completion locks the Worker row and requires
+DRAINING, zero active browser sessions, and zero RUNNING jobs. Success changes
+only Worker status to OFFLINE and adds `worker.drain.completed`; failure returns
+`WORKER_DRAIN_NOT_QUIESCENT` without mutation. Worker row locking serializes
+claim and drain: if drain commits first, a new claim fails; if claim commits
+first, its RUNNING job remains valid and blocks quiescence until it reaches its
+existing terminal boundary. Repeated completion after OFFLINE returns the
+bounded `WORKER_NOT_DRAINING` error and does not resurrect the worker.
+
+The WorkerAgent never cancels a current handler for drain. After it observes
+durable DRAINING, it stops claiming, waits for the awaited handler to finish,
+closes managed sessions through the regular close path, flushes STOPPED reports,
+reports zero active sessions while still DRAINING, and requests completion. It
+exits only after OFFLINE is confirmed. If finalization loses connectivity, it
+reconnects, authenticates, observes durable status through hello, and resumes
+finalization. The server remains authoritative for claim eligibility throughout.
+
+See [`../WORKER_UPDATE_RUNBOOK.md`](../WORKER_UPDATE_RUNBOOK.md) for the
+service-manager-neutral package replacement and rollback procedure.
 
 ## 16. Version compatibility
 

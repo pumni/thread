@@ -13,6 +13,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 from threads_platform.application.worker_control import (
     WorkerControlError,
     WorkerControlService,
+    WorkerDrainStatus,
     WorkerPresence,
 )
 from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
@@ -27,6 +28,7 @@ from threads_platform.domain.workers import (
     NetworkProtocol,
     WorkerAccountSession,
     WorkerCapability,
+    WorkerStatus,
 )
 from threads_platform.transport.http.auth import CommandAuthenticator
 
@@ -128,6 +130,23 @@ class WorkerPresenceResponse(BaseModel):
     protocol_compatible: bool
     max_browser_sessions: int | None = None
     active_browser_sessions: int | None = None
+
+
+class WorkerDrainRequest(_WorkerRequest):
+    reason_code: str = Field(pattern=r"^[A-Z][A-Z0-9_]{0,79}$")
+
+
+class WorkerDrainStatusResponse(BaseModel):
+    worker_id: UUID
+    status: WorkerStatus
+    active_browser_sessions: int
+    running_worker_jobs: int
+    quiescent: bool
+
+
+class WorkerDrainTransitionResponse(BaseModel):
+    worker_id: UUID
+    status: WorkerStatus
 
 
 class WorkerNetworkProfileResponse(BaseModel):
@@ -268,6 +287,14 @@ def create_worker_router(
             )
         return session_service
 
+    def require_admin(authorization: str | None) -> None:
+        if not admin_authenticator.is_authorized(authorization):
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "WORKER_ADMIN_UNAUTHORIZED"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     async def authenticated_worker(authorization: str | None) -> UUID:
         control = require_service()
         token = _bearer_token(authorization)
@@ -279,6 +306,59 @@ def create_worker_router(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return worker_id
+
+    @router.post("/{worker_id}/drain", response_model=WorkerDrainStatusResponse)
+    async def request_worker_drain(
+        worker_id: UUID,
+        request: WorkerDrainRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerDrainStatusResponse:
+        require_admin(authorization)
+        control = require_service()
+        try:
+            changed = await control.request_drain(worker_id, request.reason_code)
+            if changed:
+                notifications.publish(
+                    worker_id,
+                    {"type": "worker.drain", "reason_code": request.reason_code},
+                )
+            return _drain_status_response(await control.drain_status(worker_id))
+        except WorkerControlError as error:
+            raise _http_error(error) from error
+
+    @router.get("/{worker_id}/drain", response_model=WorkerDrainStatusResponse)
+    async def get_worker_drain_status(
+        worker_id: UUID,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerDrainStatusResponse:
+        require_admin(authorization)
+        try:
+            return _drain_status_response(await require_service().drain_status(worker_id))
+        except WorkerControlError as error:
+            raise _http_error(error) from error
+
+    @router.post("/drain/complete", response_model=WorkerDrainTransitionResponse)
+    async def complete_worker_drain(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerDrainTransitionResponse:
+        worker_id = await authenticated_worker(authorization)
+        try:
+            await require_service().complete_drain(worker_id)
+        except WorkerControlError as error:
+            raise _http_error(error) from error
+        return WorkerDrainTransitionResponse(worker_id=worker_id, status=WorkerStatus.OFFLINE)
+
+    @router.post("/{worker_id}/drain/abort", response_model=WorkerDrainTransitionResponse)
+    async def abort_worker_drain(
+        worker_id: UUID,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerDrainTransitionResponse:
+        require_admin(authorization)
+        try:
+            await require_service().abort_drain(worker_id)
+        except WorkerControlError as error:
+            raise _http_error(error) from error
+        return WorkerDrainTransitionResponse(worker_id=worker_id, status=WorkerStatus.OFFLINE)
 
     @router.post("/enrollments", response_model=CreateEnrollmentResponse)
     async def create_enrollment(
@@ -843,9 +923,27 @@ def _http_error(error: WorkerControlError) -> HTTPException:
         status_code = 422
     elif error.code in {"WORKER_NOT_FOUND", "WORKER_NOT_AUTHENTICATABLE"}:
         status_code = 404
+    elif error.code == "INVALID_DRAIN_REASON_CODE":
+        status_code = 422
+    elif error.code in {
+        "WORKER_DRAIN_NOT_ALLOWED",
+        "WORKER_DRAIN_NOT_QUIESCENT",
+        "WORKER_NOT_DRAINING",
+    }:
+        status_code = 409
     else:
         status_code = 401
     return HTTPException(status_code=status_code, detail={"code": error.code})
+
+
+def _drain_status_response(status: WorkerDrainStatus) -> WorkerDrainStatusResponse:
+    return WorkerDrainStatusResponse(
+        worker_id=status.worker_id,
+        status=status.status,
+        active_browser_sessions=status.active_browser_sessions,
+        running_worker_jobs=status.running_worker_jobs,
+        quiescent=status.quiescent,
+    )
 
 
 def _worker_job_error(error: WorkerJobControlError) -> HTTPException:
