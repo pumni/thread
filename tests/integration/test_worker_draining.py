@@ -189,6 +189,8 @@ async def test_running_job_remains_valid_through_drain_and_blocks_completion(
     job_before_drain_completion = await jobs.get(queued.id)
     attempts_before_drain_completion = await jobs.attempts(queued.id)
     await control.complete_drain(worker_id)
+    with pytest.raises(WorkerControlError, match="WORKER_NOT_DRAINING"):
+        await control.complete_drain(worker_id)
 
     async with unit_of_work_factory() as unit_of_work:
         worker = await unit_of_work.workers.get(worker_id)
@@ -491,3 +493,10 @@ async def test_drain_http_auth_boundaries_status_and_advisory(
             )
             assert completed.status_code == 200
             assert completed.json() == {"worker_id": str(worker_id), "status": "OFFLINE"}
+            repeated_completion = await client.post(
+                "/v1/workers/drain/complete",
+                headers={"Authorization": f"Bearer {worker_token}"},
+                json={},
+            )
+            assert repeated_completion.status_code == 409
+            assert repeated_completion.json() == {"detail": {"code": "WORKER_NOT_DRAINING"}}

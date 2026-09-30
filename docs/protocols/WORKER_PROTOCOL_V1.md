@@ -329,7 +329,8 @@ only Worker status to OFFLINE and adds `worker.drain.completed`; failure returns
 `WORKER_DRAIN_NOT_QUIESCENT` without mutation. Worker row locking serializes
 claim and drain: if drain commits first, a new claim fails; if claim commits
 first, its RUNNING job remains valid and blocks quiescence until it reaches its
-existing terminal boundary.
+existing terminal boundary. Repeated completion after OFFLINE returns the
+bounded `WORKER_NOT_DRAINING` error and does not resurrect the worker.
 
 The WorkerAgent never cancels a current handler for drain. After it observes
 durable DRAINING, it stops claiming, waits for the awaited handler to finish,
