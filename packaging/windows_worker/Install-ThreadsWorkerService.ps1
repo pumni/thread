@@ -255,12 +255,34 @@ foreach ($entry in $allowedEnvironment) {
 }
 
 $imagePath = '"{0}" {1}' -f $executablePath, $serviceMode
+$serviceArguments = @(
+    $serviceName,
+    "binPath=",
+    $imagePath,
+    "start=",
+    "auto",
+    "obj=",
+    $serviceAccount
+)
 if ($isUpdate) {
-    & sc.exe config $serviceName "binPath= $imagePath" "obj= $serviceAccount" "start= auto" | Out-Null
+    $registrationOutput = @(& sc.exe config @serviceArguments 2>&1)
 } else {
-    & sc.exe create $serviceName "binPath= $imagePath" "start= auto" "obj= $serviceAccount" | Out-Null
+    $registrationOutput = @(& sc.exe create @serviceArguments 2>&1)
 }
-if ($LASTEXITCODE -ne 0) { throw "SCM service registration failed." }
+$registrationExitCode = $LASTEXITCODE
+if ($registrationExitCode -ne 0) {
+    $scmErrorCode = $null
+    foreach ($line in $registrationOutput) {
+        if ("$line" -match '^\[SC\]\s+\w+\s+FAILED\s+(\d+)$') {
+            $scmErrorCode = $Matches[1]
+            break
+        }
+    }
+    if ($scmErrorCode) {
+        throw "SCM service registration failed (SCM error $scmErrorCode)."
+    }
+    throw "SCM service registration failed (sc.exe exit code $registrationExitCode)."
+}
 & sc.exe description $serviceName "Threads Operations Worker Agent" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "SCM service description update failed." }
 
