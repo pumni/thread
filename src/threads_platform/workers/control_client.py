@@ -2,7 +2,7 @@ import base64
 import os
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import cast
 from urllib.parse import urlsplit
@@ -27,7 +27,7 @@ from threads_platform.workers.key_store import WorkerDeviceIdentity
 @dataclass(frozen=True, slots=True)
 class _Challenge:
     challenge_id: UUID
-    nonce: str
+    nonce: str = field(repr=False)
 
 
 class HttpWorkerControlClient:

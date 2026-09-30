@@ -418,3 +418,18 @@ distributed tracing, deployment work, DRAINING workflow, or #62 transport work
 is authorized in this checkpoint. #3 remains OPEN and no production release
 readiness is claimed. See `docs/OBSERVABILITY_RUNBOOK.md` for the log fields,
 redaction limitations, and endpoint contract.
+
+## 15. C6-02/4 sensitive representations and worker response cache controls (#75)
+
+Issue #75 adds defense-in-depth `repr()` hiding for Command and WorkerJob
+documents/leases and worker authentication material. Pydantic representations
+hide credential fields while existing JSON/wire fields remain unchanged.
+Enrollment, challenge, session-token, and assigned account-context responses
+carry `Cache-Control: no-store`. PostgreSQL continues to store digests and
+credential references, not raw enrollment codes or session access tokens. No
+migration or auth redesign was introduced.
+
+This does not change session revocation behavior and does not implement
+metrics/tracing. Issue #3 remains OPEN as the production/release gate; #62
+remains separate. See `docs/OBSERVABILITY_RUNBOOK.md` for the precise repr and
+cache-control contract.

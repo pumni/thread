@@ -1,6 +1,6 @@
 import hashlib
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -38,7 +38,7 @@ MAX_PRESENCE_EXPIRY_BATCH_SIZE = 100
 
 @dataclass(frozen=True, slots=True)
 class EnrollmentIssued:
-    code: str
+    code: str = field(repr=False)
     expires_at: datetime
 
 
@@ -50,13 +50,13 @@ class EnrolledWorker:
 @dataclass(frozen=True, slots=True)
 class AuthChallenge:
     challenge_id: UUID
-    nonce: str
+    nonce: str = field(repr=False)
     expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
 class WorkerAccessSession:
-    access_token: str
+    access_token: str = field(repr=False)
     expires_at: datetime
 
 

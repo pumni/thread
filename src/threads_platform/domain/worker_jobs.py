@@ -177,7 +177,7 @@ class WorkerJob:
     capability_name: str
     capability_version: int
     operation_class: OperationClass = OperationClass.READ
-    input_data: dict[str, object] = field(default_factory=lambda: dict[str, object]())
+    input_data: dict[str, object] = field(default_factory=lambda: dict[str, object](), repr=False)
     id: UUID = field(default_factory=uuid4)
     command_id: str | None = None
     account_id: UUID | None = None
@@ -193,11 +193,11 @@ class WorkerJob:
     retry_safety: WorkerJobRetrySafety = WorkerJobRetrySafety.SAFE_TO_RETRY
     retry_authorized_by_operator: bool = False
     lease_worker_id: UUID | None = None
-    lease_token: UUID | None = None
+    lease_token: UUID | None = field(default=None, repr=False)
     lease_expires_at: datetime | None = None
     account_coordination_generation: int | None = None
-    checkpoint: dict[str, object] | None = None
-    result: dict[str, object] | None = None
+    checkpoint: dict[str, object] | None = field(default=None, repr=False)
+    result: dict[str, object] | None = field(default=None, repr=False)
     error_code: str | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
@@ -482,7 +482,7 @@ class WorkerJobAttempt:
     worker_job_id: UUID
     attempt_number: int
     worker_id: UUID
-    lease_token: UUID
+    lease_token: UUID = field(repr=False)
     id: UUID = field(default_factory=uuid4)
     status: WorkerJobAttemptStatus = WorkerJobAttemptStatus.RUNNING
     started_at: datetime = field(default_factory=utc_now)

@@ -46,6 +46,28 @@ patterns. Callers must keep secret-bearing and business payload data out of log
 events. Exception text is sanitized after normal stack formatting, but callers
 should still avoid raising exceptions that include sensitive data.
 
+## Sensitive representations and worker auth responses (#75)
+
+`repr()` hides Command payload/result/checkpoint and execution lease values,
+WorkerJob documents and lease values, worker enrollment/session digests,
+challenge nonces, issued enrollment/session credentials, and worker network
+credential references. This is defense in depth for accidental debugging; it
+does not make logging whole request, response, domain, or execution objects
+appropriate. Continue to keep all secret-bearing and business payload data out
+of log events.
+
+The worker wire contract is unchanged. Authorized enrollment, challenge, and
+session exchange responses still contain the values their clients need, and
+assigned account context still carries its configured network `credential_ref`.
+Those four HTTP responses use `Cache-Control: no-store`. PostgreSQL retains
+enrollment/session token digests and configured credential references; it does
+not retain raw enrollment codes or session access tokens.
+
+This hardening adds no session revocation flow and does not change worker auth
+semantics. Metrics/tracing are not implemented in this checkpoint. Issue #3
+remains OPEN as the production/release gate; #62 remains a separate CRM result
+transport dependency.
+
 ## Health and readiness
 
 `GET /health` is process liveness. It returns `{"status":"ok"}` without

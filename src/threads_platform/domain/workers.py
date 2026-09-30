@@ -177,7 +177,7 @@ class AccountWorkerAssignment:
 
 @dataclass(slots=True)
 class WorkerEnrollment:
-    token_digest: str
+    token_digest: str = field(repr=False)
     expires_at: datetime
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=utc_now)
@@ -195,7 +195,7 @@ class WorkerEnrollment:
 @dataclass(slots=True)
 class WorkerAuthChallenge:
     worker_id: UUID
-    nonce: str
+    nonce: str = field(repr=False)
     expires_at: datetime
     id: UUID = field(default_factory=uuid4)
     issued_at: datetime = field(default_factory=utc_now)
@@ -212,7 +212,7 @@ class WorkerAuthChallenge:
 @dataclass(slots=True)
 class WorkerSession:
     worker_id: UUID
-    token_digest: str
+    token_digest: str = field(repr=False)
     expires_at: datetime
     id: UUID = field(default_factory=uuid4)
     issued_at: datetime = field(default_factory=utc_now)
