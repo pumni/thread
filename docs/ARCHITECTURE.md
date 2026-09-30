@@ -894,3 +894,41 @@ available for rollback. A Task Scheduler task cannot promise graceful completion
 after abrupt logoff, OS shutdown, crash, or user termination; durable lease
 recovery and Worker presence expiry remain authoritative. Issue #3 remains open,
 #62 remains separate, and the unsigned package is not a production release claim.
+
+## 30. Linux/Docker Control Plane deployment boundary (#87)
+
+The Control Plane deployment uses one immutable Linux image for three separate
+roles: a one-shot Alembic migration job, the FastAPI/Uvicorn HTTP process, and
+the standalone scheduler. HTTP and scheduler are independent containers sharing
+the same PostgreSQL database; scheduler loops stay outside FastAPI lifespan.
+The database is a separate durable service in Compose and remains external to
+the application image. Windows browser Workers stay on their interactive
+Windows hosts and are never containerized here.
+
+The runtime image is built from locked Python 3.14 dependencies, runs as a
+non-root user, and copies only the installed shared Python project plus
+Alembic configuration/revisions. It does not contain source-control metadata,
+environment files, tests, local databases, Worker durable state, browser
+profiles, Windows onedir artifacts, or Playwright browser binaries. The
+Playwright Python dependency remains in the shared lock; image build does not
+install a browser. There are no secret build arguments, embedded database
+credentials, privileged containers, Docker socket mounts, host networking, or
+database process inside the application image.
+
+Migration is explicit and one-shot before application startup; replicas do not
+run migrations from FastAPI or scheduler startup. `/health` remains process
+liveness and `/ready` remains the #72 bounded PostgreSQL/fleet probe. A database
+outage produces `/ready` `NOT_READY` / `DOWN` / HTTP 503 without making memory
+authoritative. Scheduler restarts rediscover durable rows and leases from
+PostgreSQL. The Compose restart smoke uses existing Worker persistence and
+scheduler presence-expiry behavior; it adds no schema or business API.
+
+Compose is an offline internal/test topology with a disposable named PostgreSQL
+volume and trust authentication on its private network. It contains no real
+Threads or CRM credentials. Do not use this local authentication setup as a
+networked production database. The image is not pushed or signed. Metrics and
+tracing remain deferred to C6-02/9; #62 remains a separate CRM dependency; #3
+remains open as the production/release gate. See
+`docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for exact process, smoke, restart,
+and recovery commands. #78 DRAINING and #84 Windows Worker lifecycle semantics
+are unchanged.

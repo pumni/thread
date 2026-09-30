@@ -10,7 +10,7 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-02/7 — Interactive Windows Worker host and scheduled-task lifecycle (#84)**.
+- **C6-02/8 — Linux/Docker Control Plane deployment and restart/recovery smoke (#87)**.
 
 Not production-ready:
 - issue #3 remains open as the production/release gate;
@@ -130,6 +130,28 @@ Structured logs carry bounded lifecycle correlation fields and centrally redact
 known credential patterns. See the
 [observability runbook](docs/OBSERVABILITY_RUNBOOK.md) for fields, limitations,
 and readiness semantics. Metrics and distributed tracing are not part of #72.
+
+## Linux/Docker Control Plane smoke (#87)
+
+The internal/test Docker image runs as a non-root user. PostgreSQL is a separate
+durable service; the FastAPI/Uvicorn HTTP process and standalone scheduler run in
+separate containers against the same database. A one-shot migration job runs
+before either application process. Windows Workers remain external. Build and
+rehearse restart/recovery with:
+
+```powershell
+uv run --locked python scripts/control_plane_compose_smoke.py
+```
+
+The smoke verifies image contents, liveness/readiness, HTTP and scheduler
+recreation over the same PostgreSQL volume, scheduler rediscovery of persisted
+Worker presence, and fail-closed readiness during a database outage. It removes
+its temporary volume on completion. See the
+[Control Plane deployment and recovery runbook](docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md)
+for process commands, manual teardown, and recovery boundaries. The image is
+not published or signed; this work adds no metrics/tracing, #62 transport
+behavior, or production release claim. #3 remains open and Phase B remains
+`PARTIAL_LIVE_EVIDENCE / NOT_READY`.
 
 The scheduler dispatches only already-configured `threads.sync_conversation`
 schedules. It coalesces missed wall-clock intervals into one Command; the

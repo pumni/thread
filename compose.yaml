@@ -1,18 +1,15 @@
-services:
-  api:
-    build: .
-    command:
-      - sh
-      - -c
-      - alembic upgrade head && uvicorn threads_platform.app:app --host 0.0.0.0 --port 8000
-    environment:
-      THREADS_PLATFORM_DATABASE_URL: postgresql+asyncpg://threads_platform@postgres:5432/threads_platform
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - 127.0.0.1:8000:8000
+x-control-plane-runtime: &control-plane-runtime
+  image: ${THREADS_PLATFORM_IMAGE:-threads-platform-control-plane:internal}
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    THREADS_PLATFORM_DATABASE_URL: postgresql+asyncpg://threads_platform@postgres:5432/threads_platform
+    THREADS_PLATFORM_THREADS_TOKEN_PROVIDER_MODE: disabled
+    THREADS_PLATFORM_HTTP_HOST: ${THREADS_PLATFORM_HTTP_HOST:-0.0.0.0}
+    THREADS_PLATFORM_HTTP_PORT: ${THREADS_PLATFORM_CONTAINER_PORT:-8000}
 
+services:
   postgres:
     image: postgres:17-alpine
     environment:
@@ -23,11 +20,49 @@ services:
       test: ["CMD-SHELL", "pg_isready -U threads_platform -d threads_platform"]
       interval: 5s
       timeout: 5s
-      retries: 5
-    ports:
-      - 127.0.0.1:5432:5432
+      retries: 12
+    restart: unless-stopped
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+  migrate:
+    <<: *control-plane-runtime
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  http:
+    <<: *control-plane-runtime
+    ports:
+      - "127.0.0.1:${THREADS_PLATFORM_SMOKE_HTTP_PORT:-8000}:${THREADS_PLATFORM_CONTAINER_PORT:-8000}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          urllib.request.urlopen(
+          f"http://127.0.0.1:{os.environ.get('THREADS_PLATFORM_HTTP_PORT', '8000')}/health",
+          timeout=2).read()
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *control-plane-runtime
+    command: ["python", "-m", "threads_platform.scheduler"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:
