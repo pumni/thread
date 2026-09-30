@@ -6,6 +6,12 @@ reconciles durable WorkerJobs after reconnect. By default it advertises no busin
 An explicitly provisioned worker can opt in to `threads.browser.feed.browse` v1 by setting
 `THREADS_WORKER_FEED_BROWSE_ENABLED=true`; that enables only the reviewed read-only feed workflow.
 
+The console command is `threads-worker`. `threads-worker --version` prints only the installed
+project version and does not create Worker data or contact a service. The packaged
+`threads-worker.exe --package-check` uses a temporary data root to exercise Worker identity,
+current-user DPAPI, the SQLite journal, and the bundled Chromium launch on `about:blank`. It does
+not read or change the configured durable data root, Control Plane configuration, or network.
+
 By default local state lives below `%LOCALAPPDATA%/ThreadsOperations`:
 
 - `worker/` stores the stable worker UUID, DPAPI-protected device key, and process lock;
@@ -33,3 +39,16 @@ stored with a versioned envelope. Existing unreadable key material fails closed.
 The override is still treated as the security boundary: it must live outside Git worktrees, and
 profile resolution rejects paths that escape it. Non-Windows test environments use an injected
 fake data protector; the persistent entrypoint itself requires Windows DPAPI.
+
+## Windows x64 package
+
+The internal package is built as a PyInstaller `onedir` bundle from the locked project
+dependencies. It contains the Worker executable, PyInstaller runtime, Playwright 1.63.0,
+Playwright's matching Chromium, and `BUILD-MANIFEST.json`. Firefox and WebKit are not installed
+or bundled. Use the exact-head Windows package workflow to obtain the ZIP, SHA-256 file, and
+manifest; see `docs/WORKER_UPDATE_RUNBOOK.md` for installation and update steps.
+
+The archive is unsigned and intended only as an internal/test artifact. Its SHA-256 identifies
+the bytes but does not authenticate the publisher. It has no Authenticode signature, production
+release channel, service registration, downloader, or self-updater. Production signing and
+service-install policy require a later decision.

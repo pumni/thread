@@ -10,14 +10,16 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-02/3 — Structured log redaction, correlation and readiness (#72)**.
+- **C6-02/6 — Reproducible Windows Worker package and smoke artifact (#81)**.
 
 Not production-ready:
-- issue #3 live Meta OAuth/API validation remains open;
+- issue #3 remains open as the production/release gate;
 - browser capabilities remain bounded by their accepted capability contracts;
-- scheduler availability does not imply production activation.
+- scheduler availability does not imply production activation;
 - #62 remains a separate CRM result transport dependency;
-- metrics and distributed tracing are not implemented.
+- metrics and distributed tracing are not implemented;
+- the Windows x64 Worker bundle is an unsigned internal/test artifact, with no
+  service installation, signing, or auto-update channel.
 
 ## Product direction
 
@@ -113,8 +115,10 @@ for metadata administration and rotation.
 
 Phase A is accepted from the scrubbed
 [`#68 evidence packet`](docs/evidence/threads-live-phase-a-2026-09-30.json).
-Phase B is `NOT_RUN`, #3 remains OPEN, and no production release readiness is
-claimed. The separate CRM result transport dependency #62 remains unresolved;
+Phase B is `PARTIAL_LIVE_EVIDENCE / NOT_READY` from the reviewed scrubbed
+[`#74 evidence packet`](docs/evidence/threads-live-phase-b-partial-2026-09-30.json);
+`full_tp002_ready=false`. Issue #3 remains OPEN, and no production release
+readiness is claimed. The separate CRM result transport dependency #62 remains unresolved;
 the scheduler still reports `CRM_RESULT_SINK_UNAVAILABLE` for that stage.
 
 The Control Plane exposes `/health` for process liveness and `/ready` for

@@ -465,3 +465,15 @@ process kill, updater, or installer was added. See
 `docs/protocols/WORKER_PROTOCOL_V1.md` and `docs/WORKER_UPDATE_RUNBOOK.md`.
 Issue #3 remains OPEN and #62 remains separate; this checkpoint is not a
 production release claim.
+
+## 18. C6-02/6 Windows Worker package (#81)
+
+Issue #81 authorizes a reproducible-on-CI Windows x64 PyInstaller onedir package
+with a console entry point, locked Playwright 1.63.0 and matching Chromium. The
+package is an unsigned internal/test artifact with a safe build manifest,
+normalized ZIP serialization, SHA-256 digest, and a packaged-runtime smoke
+check. Durable Worker data stays outside the release directory. No service
+registration, signing, downloader, or self-update is included. Phase A remains
+accepted; Phase B remains `PARTIAL_LIVE_EVIDENCE / NOT_READY` with
+`full_tp002_ready=false`. Issue #3 remains OPEN and #62 remains separate; no
+production release readiness is claimed.

@@ -1,6 +1,8 @@
 import asyncio
+import importlib.metadata
 import os
 import signal
+import sys
 
 from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
 from threads_platform.infrastructure.worker_agent.identity import WorkerIdentityFileStore
@@ -31,6 +33,7 @@ from threads_platform.workers.media_local_upload import (
     MEDIA_LOCAL_UPLOAD_CAPABILITY_VERSION,
     BrowserLocalMediaUploadWorker,
 )
+from threads_platform.workers.package_check import run_package_check
 from threads_platform.workers.profile_open import (
     PROFILE_OPEN_CAPABILITY_NAME,
     PROFILE_OPEN_CAPABILITY_VERSION,
@@ -48,6 +51,7 @@ from threads_platform.workers.thread_open import (
 async def _run() -> None:
     from pathlib import Path
 
+    control_plane_url = _required_environment("THREADS_WORKER_CONTROL_PLANE_URL")
     configured_root = os.environ.get("THREADS_WORKER_DATA_ROOT")
     data_root = LocalDataRoot.from_environment(
         Path(configured_root) if configured_root is not None else None
@@ -57,7 +61,7 @@ async def _run() -> None:
     worker_id = identity_store.load_or_create()
     enabled_capabilities = enabled_browser_capabilities()
     config = WorkerAgentConfig(
-        control_plane_url=_required_environment("THREADS_WORKER_CONTROL_PLANE_URL"),
+        control_plane_url=control_plane_url,
         display_name=os.environ.get("THREADS_WORKER_DISPLAY_NAME", "Windows Worker"),
         agent_version=os.environ.get("THREADS_WORKER_AGENT_VERSION", "0.1.0"),
         enrollment_code=os.environ.get("THREADS_WORKER_ENROLLMENT_CODE"),
@@ -183,11 +187,27 @@ def enabled_browser_capabilities() -> tuple[tuple[str, int], ...]:
     )
 
 
-def main() -> None:
+def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments == ["--version"]:
+        print(importlib.metadata.version("threads-platform"))
+        return 0
+    if arguments == ["--package-check"]:
+        return run_package_check()
+    if arguments:
+        print("THREADS_WORKER_INVALID_ARGUMENTS", file=sys.stderr)
+        return 2
     if os.name != "nt":
         raise RuntimeError("the persistent Worker Agent entrypoint requires Windows DPAPI")
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except RuntimeError as error:
+        if str(error) == "THREADS_WORKER_CONTROL_PLANE_URL must be configured":
+            print("THREADS_WORKER_CONFIGURATION_INVALID", file=sys.stderr)
+            return 2
+        raise
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

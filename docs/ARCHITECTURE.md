@@ -847,3 +847,23 @@ non-disabled non-online worker makes the fleet `DEGRADED` while keeping HTTP
 presence expiry remains authoritative. This checkpoint adds no metrics,
 tracing, schema, or audit table. Issue #3 remains the production/release gate;
 the #62 CRM result transport remains separate.
+
+## 29. Windows Worker package boundary
+
+The Windows x64 package is a PyInstaller `onedir` application built from the
+locked Python dependencies with the matching Playwright 1.63.0 Chromium only.
+The executable and its `BUILD-MANIFEST.json` live in an immutable release
+directory. Durable Worker identity, DPAPI-protected private key, profiles,
+SQLite journal, media staging, and recovery data remain under
+`%LOCALAPPDATA%\ThreadsOperations` or the explicitly configured
+`THREADS_WORKER_DATA_ROOT`; package staging never copies that root.
+
+`--version` is metadata-only. `--package-check` uses an isolated temporary data
+root, tests identity persistence and DPAPI protect/unprotect, initializes the
+local journal, and opens bundled Chromium on `about:blank`. It does not call the
+Control Plane, Threads/Meta, or external URLs. The workflow creates a safe
+manifest, stable ZIP serialization, and a SHA-256 digest. The manifest's
+required build-clock timestamp means separate CI builds can have different
+archive hashes. The artifact is unsigned and internal/test only; a hash is not
+publisher authentication. No service registration, signing, downloader, or
+self-update is included.
