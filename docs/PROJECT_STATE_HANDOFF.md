@@ -94,10 +94,13 @@ draining and WorkerJob recovery. C6-01/4 (#60) moves bounded Worker presence
 expiry to that scheduler. PostgreSQL `worker_nodes.presence_expires_at` remains
 authoritative and polling is wakeup latency only. FastAPI performs neither
 presence expiry nor WorkerJob recovery in its lifespan. The app and scheduler
-share CommandRuntime composition. The standalone production
-`ThreadsAccessTokenProvider` dependency remains separately gated by #55/#3;
-neither scheduler checkpoint implements token storage or loading. Parent #9
-remains open.
+share the production Threads API provider composition. C6-02/1a (#70) adds the
+opt-in environment-backed provider on the existing metadata-only
+`oauth_credentials` table; token values are not stored in PostgreSQL, and
+runtime refresh is disabled. Operator-managed versioned rotation is documented
+in `docs/THREADS_CREDENTIAL_OPERATIONS.md`. Phase A is accepted; Phase B is
+`NOT_RUN`, #3 remains OPEN, and no production release readiness is claimed.
+Parent #9 remains open.
 
 C6-01/2 (#56) implements only `NONE` and deterministic `FIXED_INTERVAL`
 recurrence on immutable `AccountActivityTemplate` revisions. PostgreSQL
@@ -119,8 +122,9 @@ dispatch audit, and cursor advancement commit together. Scheduler order is
 generation, conversation dispatch, materialization, Command draining, and
 WorkerJob recovery, each with an independent bounded limit. Discovery and
 mentions recurrence remain deferred pending #3 time-window/cursor semantics.
-Production LOCAL_API execution still depends on #55/#3. This checkpoint does
-not close parent #9.
+Production LOCAL_API execution uses the shared opt-in provider from #70 when
+environment mode is enabled; #3 remains a production/release gate. This
+checkpoint does not close parent #9.
 
 C6-01/5 (#63) adds bounded, sequential outbox delivery as the final scheduler
 tick stage. PostgreSQL IntegrationDelivery due/retry state and fenced leases
@@ -208,14 +212,19 @@ This is not an engineering blocker.
 
 This remains OPEN and is a production/release gate.
 
-Still requires a dedicated development app/account to verify:
-- effective OAuth scopes;
-- token exchange/refresh lifecycle;
+Accepted Phase A evidence is recorded in
+`docs/evidence/threads-live-phase-a-2026-09-30.json`. It verifies code and
+long-lived token exchange, refresh with reset expiry, debugger validity and
+effective scopes, and own-profile behavior. Phase B is `NOT_RUN`.
+
+Remaining live verification includes:
 - real quota behavior;
 - representative error bodies/status/headers;
+- text/image/video publishing and media retrieval;
 - media processing;
 - reply/conversation behavior;
 - moderation permissions;
+- public discovery/profile/mentions behavior and required scopes;
 - reconciliation options for ambiguous published containers;
 - whether pagination cursors are suitable for durable polling semantics.
 
@@ -367,17 +376,31 @@ expiry as the first scheduler tick stage. Presence controls new-work eligibility
 only and does not affect running WorkerJob leases, attempts, or preemption.
 The explicit scheduler process owns both presence expiry and bounded WorkerJob
 recovery; FastAPI lifespan performs neither. Polling is wakeup latency only.
-The standalone scheduler has no repository-supported
-production `ThreadsAccessTokenProvider`; its deployment dependency is tracked
-separately by #55/#3. LIKE/FOLLOW remain VERIFY. No additional mutation or
-publish/submit scope is authorized.
+The standalone scheduler uses the same opt-in provider composition as FastAPI.
+LIKE/FOLLOW remain VERIFY. No additional mutation or publish/submit scope is
+authorized.
 
 ## 12. TP-002 evidence harness checkpoint #65
 
-Issue #65 prepares only offline evidence tooling: a strict scrubbed `threads-live-evidence-v1` packet, a template classified `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE`, recursive secret validation, opaque-value fingerprinting, and a human runbook. No live API validation happened in the #65 PR, no real credentials were used, and the harness makes no network calls to Meta. The packet template is not evidence and changes no capability from documentation-contract to live-verified.
+Issue #65 prepared only offline evidence tooling: a strict scrubbed
+`threads-live-evidence-v1` packet, a template classified
+`TEMPLATE_ONLY_NOT_LIVE_EVIDENCE`, recursive secret validation, opaque-value
+fingerprinting, and a human runbook. No live API validation happened in the
+#65 PR and the harness makes no network calls to Meta.
 
-Issue #3 remains OPEN. #55 remains blocked until a human-run Phase A packet is reviewed and accepted. Discovery/mentions scheduler policy under #9 remains blocked until Phase B polling/cursor evidence is reviewed and accepted. A later human operator must execute the live run with a dedicated Meta development app/account under the runbook; the coordinator independently accepts the evidence.
+The #68 Phase A packet is accepted and authorized #70. Phase B is `NOT_RUN`,
+so discovery/mentions scheduler policy under #9 remains blocked. Issue #3 stays
+OPEN as a production/release gate. The separate #62 CRM transport dependency
+also remains open.
 
 ## 13. Phase A scrubbed live evidence checkpoint #68
 
-Issue #68 commits reviewed scrubbed Phase A live evidence (`docs/evidence/threads-live-phase-a-2026-09-30.json`) observed by a human operator using a dedicated Meta development app and non-production test account. Authorization code exchange, long-lived token exchange, token refresh, debugger scopes (including `threads_read_replies`), and own profile shapes were verified. Phase B was not run. Issue #3 remains OPEN. Issue #55 awaits coordinator evidence acceptance. No discovery/mentions capability becomes live-verified.
+Issue #68's accepted scrubbed Phase A evidence is recorded in
+`docs/evidence/threads-live-phase-a-2026-09-30.json`. It establishes
+authorization/code exchange, long-lived exchange, refresh with reset expiry,
+debugger validity/effective scopes (including `threads_read_replies`), and own
+profile behavior. #70 implements the metadata-only, environment-backed
+provider with operator-managed versioned rotation and no automatic refresh.
+No plaintext token is stored in PostgreSQL. Phase B is `NOT_RUN`; #3 remains
+OPEN and no production release readiness is claimed. #55 remains open pending
+coordinator acceptance of #70, and #62 remains a separate CRM transport gate.

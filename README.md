@@ -101,12 +101,19 @@ standalone scheduler currently has no production `CRMResultSink`, reports
 `CRM_RESULT_SINK_UNAVAILABLE`, and skips only this stage until #62 is resolved.
 
 WorkerJob recovery and Worker presence expiry require this explicit scheduler
-process; FastAPI performs neither wakeup in its lifespan. The runtime
-composition is shared, but this repository has no concrete
-production `ThreadsAccessTokenProvider` available to the standalone process, so
-its LOCAL_API handler registry is unavailable and the process reports that
-condition at startup. Coordinator decision is required before standalone
-scheduler LOCAL_API execution can be enabled.
+process; FastAPI performs neither wakeup in its lifespan. FastAPI and scheduler
+share the production Threads API provider composition. Token execution remains
+opt-in through `THREADS_PLATFORM_THREADS_TOKEN_PROVIDER_MODE=environment`; its
+default is `disabled`. The mode uses PostgreSQL credential metadata and strict
+versioned `env://THREADS_PLATFORM_THREADS_TOKEN_...` references. See the
+[Threads credential operations guide](docs/THREADS_CREDENTIAL_OPERATIONS.md)
+for metadata administration and rotation.
+
+Phase A is accepted from the scrubbed
+[`#68 evidence packet`](docs/evidence/threads-live-phase-a-2026-09-30.json).
+Phase B is `NOT_RUN`, #3 remains OPEN, and no production release readiness is
+claimed. The separate CRM result transport dependency #62 remains unresolved;
+the scheduler still reports `CRM_RESULT_SINK_UNAVAILABLE` for that stage.
 
 The scheduler dispatches only already-configured `threads.sync_conversation`
 schedules. It coalesces missed wall-clock intervals into one Command; the

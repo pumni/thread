@@ -18,6 +18,9 @@ dependencies = [
     "uvicorn[standard]>=0.34,<1",
 ]
 
+[project.scripts]
+threads-credential-admin = "threads_platform.tools.credential_admin:main"
+
 [build-system]
 requires = ["uv_build==0.12.7"]
 build-backend = "uv_build"

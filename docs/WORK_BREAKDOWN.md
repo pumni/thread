@@ -209,9 +209,11 @@ and support concurrent scheduler
 instances through PostgreSQL locking. Presence expiry uses authoritative
 `worker_nodes.presence_expires_at`, ordered bounded PostgreSQL row locking, and
 changes only new-work eligibility; FastAPI owns neither presence expiry nor
-WorkerJob recovery in its lifespan. FastAPI and scheduler share
-one CommandRuntime composition. The standalone scheduler's production
-`ThreadsAccessTokenProvider` remains a separate #55/#3 deployment dependency.
+WorkerJob recovery in its lifespan. FastAPI and scheduler share one production
+Threads API provider composition. C6-02/1a (#70) uses the existing non-secret
+`oauth_credentials` metadata and strict, versioned environment references. It
+does not store token values in PostgreSQL or refresh them at runtime. Runtime
+use remains opt-in and #3 stays the production/release gate.
 Issue #58 adds a narrow conversation-sync schedule and immutable dispatch
 audit, not a generic scheduled-command framework. ACTIVE schedules dispatch
 one deterministic Command for the oldest due slot and coalesce overdue slots;
@@ -247,7 +249,13 @@ Must be resolved/accepted before final release security sign-off.
 Does not block safe documentation-contract implementation.
 Does block production activation.
 
-Issue #65 is the authorized tooling-only checkpoint under #3. It prepares the offline packet/runbook/validator and contains no live evidence. Keep #3 OPEN, #55 blocked pending accepted Phase A evidence, and discovery/mentions scheduling blocked pending accepted Phase B polling/cursor evidence.
+Issue #65 prepared the offline packet/runbook/validator. Accepted Phase A live
+evidence is recorded in
+`docs/evidence/threads-live-phase-a-2026-09-30.json`; it authorized #70, but
+#55 remains open pending acceptance of that implementation. Phase B is
+`NOT_RUN`, so discovery/mentions scheduling remains blocked. Keep #3 OPEN as
+the production/release gate, and keep #62 as a separate CRM transport
+dependency. No production release claim follows from #70.
 
 ## 12. Stop conditions
 
@@ -294,4 +302,10 @@ Every checkpoint PR must report:
 
 ## 15. TP-002 evidence harness (#65)
 
-The #65 checkpoint adds an offline strict evidence packet validator, recursive secret checks, stdin-only opaque fingerprinting, a template-only matrix, and a human runbook. It does not call Meta, handle real credentials, fabricate live observations, or mark capabilities live-verified. The later human/operator run remains under #3; #55 and discovery/mentions scheduling stay externally blocked until the coordinator accepts their relevant scrubbed evidence.
+The #65 checkpoint added an offline strict evidence packet validator,
+recursive secret checks, stdin-only opaque fingerprinting, a template-only
+matrix, and a human runbook. It did not call Meta or fabricate live
+observations. The #68 Phase A packet is accepted and #70 is authorized; #55
+remains open pending acceptance of #70. Phase B is `NOT_RUN`, discovery and
+mentions scheduling remain gated, and #3 remains open as the production/release
+gate.

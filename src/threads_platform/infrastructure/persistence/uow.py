@@ -21,6 +21,7 @@ from threads_platform.application.ports.repositories import (
     DiscoveryRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
+    OAuthCredentialRepository,
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
@@ -52,6 +53,7 @@ from threads_platform.infrastructure.persistence.repositories import (
     SQLAlchemyDiscoveryRepository,
     SQLAlchemyIntegrationDeliveryRepository,
     SQLAlchemyNetworkProfileRepository,
+    SQLAlchemyOAuthCredentialRepository,
     SQLAlchemyOutboxEventRepository,
     SQLAlchemyPostRepository,
     SQLAlchemyReplyRepository,
@@ -73,6 +75,9 @@ class SQLAlchemyUnitOfWork:
     def __init__(self, session_factory: Callable[[], AsyncSession]) -> None:
         self._session = session_factory()
         self.accounts: AccountRepository = SQLAlchemyAccountRepository(self._session)
+        self.oauth_credentials: OAuthCredentialRepository = SQLAlchemyOAuthCredentialRepository(
+            self._session
+        )
         self.activity_plans: AccountActivityPlanRepository = (
             SQLAlchemyAccountActivityPlanRepository(self._session)
         )

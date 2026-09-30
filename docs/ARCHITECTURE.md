@@ -632,14 +632,26 @@ WorkerJob lease, cancel a job, acknowledge preemption, release account/browser
 coordination, terminate a browser process, or change an Attempt outcome. The
 FastAPI lifespan performs neither Worker presence expiry nor WorkerJob
 recovery; both wakeups require the explicit scheduler process. FastAPI
-and the scheduler use one CommandRuntime composition helper for the UnitOfWork,
+and the scheduler use one process composition helper for the UnitOfWork,
 WorkerJobService, CapabilityRouter, Threads API gateway, token provider and
-handler registry. This repository has no concrete production
-`ThreadsAccessTokenProvider` available to the standalone scheduler, so its
-LOCAL_API handlers are unavailable until that process dependency is resolved;
-the scheduler reports this explicitly and still processes routes supported by
-the configured composition. Presence expiry has an independent per-tick limit
-of 1–100 Workers, default 50.
+handler registry. Production Threads API execution is opt-in through
+`THREADS_PLATFORM_THREADS_TOKEN_PROVIDER_MODE=environment` (default
+`disabled`). Environment mode requires PostgreSQL and resolves only versioned
+`env://THREADS_PLATFORM_THREADS_TOKEN_[A-Z0-9_]+` references. The existing
+`oauth_credentials` table stores reference, token type, scopes, expiry and
+status; it has no plaintext access-token or refresh-token column. The provider
+requires an active, unexpired Bearer credential with `threads_basic`; it does
+not refresh tokens. Operators bind, rotate and revoke metadata through the
+metadata-only administration CLI. See
+`docs/THREADS_CREDENTIAL_OPERATIONS.md` for deployment and rotation order.
+
+Accepted Phase A live evidence is recorded at
+`docs/evidence/threads-live-phase-a-2026-09-30.json`. Phase B is `NOT_RUN`, and
+#3 remains OPEN as a production/release gate. This composition does not claim
+production release readiness. The CRM result transport remains a separate #62
+dependency; scheduler LOCAL_API availability does not change its
+`CRM_RESULT_SINK_UNAVAILABLE` report. Presence expiry has an independent
+per-tick limit of 1–100 Workers, default 50.
 
 The outbox pump is a sequential final tick stage with its own batch limit of
 1–100 deliveries (default 50). PostgreSQL `IntegrationDelivery` due/retry state
@@ -710,9 +722,10 @@ allows 1–100 schedules per tick.
 The Command still passes through `CommandRuntime` and the Capability Router
 to the LOCAL_API conversation handler. The handler reads and advances the
 existing `SyncState` cursor, so coalescing dispatch history never collapses
-remote cursor catch-up. Production token loading remains gated by #55/#3;
-when the standalone process has no LOCAL_API dependency, its Command remains
-durable and the outstanding-command gate prevents an overlapping dispatch.
+remote cursor catch-up. #70 provides a shared, opt-in environment-backed token
+provider for FastAPI and the standalone process; #3 remains the production
+gate. When provider mode is disabled, its Command remains durable and the
+outstanding-command gate prevents an overlapping dispatch.
 Discovery and mentions recurrence remain deferred because #3 has not
 established the required live time-window/cursor semantics.
 

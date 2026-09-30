@@ -5,6 +5,7 @@ from pydantic import AnyHttpUrl, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+ThreadsTokenProviderMode = Literal["disabled", "environment"]
 
 
 class Settings(BaseSettings):
@@ -28,6 +29,7 @@ class Settings(BaseSettings):
     worker_admin_token: SecretStr | None = None
     worker_tls_required: bool = True
     threads_api_base_url: AnyHttpUrl = AnyHttpUrl("https://graph.threads.net/v1.0/")
+    threads_token_provider_mode: ThreadsTokenProviderMode = "disabled"
 
 
 @lru_cache(maxsize=1)

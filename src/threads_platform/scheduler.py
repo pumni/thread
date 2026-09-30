@@ -11,7 +11,6 @@ from typing import Any
 import structlog
 
 from threads_platform.application.clock import SystemClock
-from threads_platform.application.commands.composition import compose_command_runtime
 from threads_platform.application.scheduler import (
     SchedulerRunner,
     SchedulerRunnerConfig,
@@ -26,6 +25,7 @@ from threads_platform.infrastructure.persistence.database import (
     create_session_factory,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
+from threads_platform.infrastructure.threads_api.composition import compose_process_command_runtime
 from threads_platform.observability.logging import configure_logging
 
 
@@ -56,7 +56,7 @@ def install_shutdown_handlers(
     return restore
 
 
-async def _run() -> None:
+async def run_scheduler() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     if settings.database_url is None:
@@ -64,56 +64,64 @@ async def _run() -> None:
 
     clock = SystemClock()
     engine = create_database_engine(settings.database_url)
-    unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
-    worker_job_service = WorkerJobService(unit_of_work_factory, clock=clock)
-    worker_control_service = WorkerControlService(unit_of_work_factory, clock=clock)
-    composition = compose_command_runtime(
-        unit_of_work_factory,
-        worker_job_service,
-        threads_api_gateway=None,
-        threads_access_token_provider=None,
-        clock=clock,
-    )
-    if not composition.command_handler_registry:
-        structlog.get_logger(__name__).error(
-            "scheduler_local_api_handlers_unavailable",
-            error_code="THREADS_ACCESS_TOKEN_PROVIDER_UNAVAILABLE",
-        )
-    structlog.get_logger(__name__).error(
-        "scheduler_outbox_delivery_unavailable",
-        error_code="CRM_RESULT_SINK_UNAVAILABLE",
-    )
-    command_runtime = composition.command_runtime
-    tick: SchedulerTick = partial(
-        run_scheduler_tick,
-        unit_of_work_factory,
-        command_runtime,
-        worker_job_service,
-        worker_control_service=worker_control_service,
-    )
-    runner_config = SchedulerRunnerConfig(
-        poll_interval=timedelta(seconds=settings.scheduler_poll_interval_seconds),
-        presence_expiry_limit=settings.scheduler_presence_expiry_batch_limit,
-        generation_limit=settings.scheduler_activity_generation_batch_limit,
-        conversation_sync_limit=settings.scheduler_conversation_sync_batch_limit,
-        activity_limit=settings.scheduler_activity_batch_limit,
-        command_limit=settings.scheduler_command_batch_limit,
-        recovery_limit=settings.scheduler_recovery_batch_limit,
-        outbox_delivery_limit=settings.scheduler_outbox_delivery_batch_limit,
-    )
-    runner = SchedulerRunner(tick, runner_config, clock=clock)
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    restore_handlers = install_shutdown_handlers(loop, stop_event)
+    http_client = None
+    restore_handlers: Callable[[], None] | None = None
     try:
+        unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
+        worker_job_service = WorkerJobService(unit_of_work_factory, clock=clock)
+        worker_control_service = WorkerControlService(unit_of_work_factory, clock=clock)
+        composition = compose_process_command_runtime(
+            settings,
+            unit_of_work_factory,
+            worker_job_service,
+            clock=clock,
+        )
+        http_client = composition.http_client
+        if not composition.command_handler_registry:
+            structlog.get_logger(__name__).error(
+                "scheduler_local_api_handlers_unavailable",
+                error_code="THREADS_ACCESS_TOKEN_PROVIDER_UNAVAILABLE",
+            )
+        structlog.get_logger(__name__).error(
+            "scheduler_outbox_delivery_unavailable",
+            error_code="CRM_RESULT_SINK_UNAVAILABLE",
+        )
+        tick: SchedulerTick = partial(
+            run_scheduler_tick,
+            unit_of_work_factory,
+            composition.command_runtime,
+            worker_job_service,
+            worker_control_service=worker_control_service,
+        )
+        runner_config = SchedulerRunnerConfig(
+            poll_interval=timedelta(seconds=settings.scheduler_poll_interval_seconds),
+            presence_expiry_limit=settings.scheduler_presence_expiry_batch_limit,
+            generation_limit=settings.scheduler_activity_generation_batch_limit,
+            conversation_sync_limit=settings.scheduler_conversation_sync_batch_limit,
+            activity_limit=settings.scheduler_activity_batch_limit,
+            command_limit=settings.scheduler_command_batch_limit,
+            recovery_limit=settings.scheduler_recovery_batch_limit,
+            outbox_delivery_limit=settings.scheduler_outbox_delivery_batch_limit,
+        )
+        runner = SchedulerRunner(tick, runner_config, clock=clock)
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        restore_handlers = install_shutdown_handlers(loop, stop_event)
         await runner.run(stop_event)
     finally:
-        restore_handlers()
-        await engine.dispose()
+        try:
+            if restore_handlers is not None:
+                restore_handlers()
+        finally:
+            try:
+                if http_client is not None:
+                    await http_client.aclose()
+            finally:
+                await engine.dispose()
 
 
 def main() -> None:
-    asyncio.run(_run())
+    asyncio.run(run_scheduler())
 
 
 if __name__ == "__main__":

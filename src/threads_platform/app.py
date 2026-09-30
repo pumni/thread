@@ -1,11 +1,9 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from threads_platform.application.commands.composition import compose_command_runtime
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.ports.threads import ThreadsAccessTokenProvider, ThreadsAPI
 from threads_platform.application.worker_control import WorkerControlService
@@ -18,7 +16,7 @@ from threads_platform.infrastructure.persistence.database import (
     create_session_factory,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
-from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
+from threads_platform.infrastructure.threads_api.composition import compose_process_command_runtime
 from threads_platform.observability.logging import configure_logging
 from threads_platform.transport.http.auth import BearerTokenAuthenticator, CommandAuthenticator
 from threads_platform.transport.http.commands import create_command_router
@@ -44,6 +42,13 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     configure_logging(resolved_settings.log_level)
+    if (
+        resolved_settings.threads_token_provider_mode == "environment"
+        and resolved_settings.database_url is None
+    ):
+        raise RuntimeError(
+            "THREADS_PLATFORM_DATABASE_URL must be configured for environment token mode"
+        )
     engine = None
     http_client = None
     resolved_worker_service = worker_control_service
@@ -65,22 +70,15 @@ def create_app(
                 notifications=notifications,
             )
         if command_runtime is None:
-            api = None
-            if threads_access_token_provider is not None:
-                api = threads_api_gateway
-                if api is None:
-                    http_client = httpx.AsyncClient(
-                        base_url=str(resolved_settings.threads_api_base_url),
-                        timeout=httpx.Timeout(15.0),
-                        follow_redirects=False,
-                    )
-                    api = HttpThreadsAPI(http_client)
-            command_runtime = compose_command_runtime(
+            process_composition = compose_process_command_runtime(
+                resolved_settings,
                 unit_of_work_factory,
                 resolved_job_service,
-                threads_api_gateway=api,
+                threads_api_gateway=threads_api_gateway,
                 threads_access_token_provider=threads_access_token_provider,
-            ).command_runtime
+            )
+            http_client = process_composition.http_client
+            command_runtime = process_composition.command_runtime
         if resolved_worker_service is None:
             resolved_worker_service = WorkerControlService(unit_of_work_factory)
         if resolved_session_service is None:
@@ -91,10 +89,12 @@ def create_app(
         try:
             yield
         finally:
-            if http_client is not None:
-                await http_client.aclose()
-            if engine is not None:
-                await engine.dispose()
+            try:
+                if http_client is not None:
+                    await http_client.aclose()
+            finally:
+                if engine is not None:
+                    await engine.dispose()
 
     application = FastAPI(
         title="Threads Operations Platform",
