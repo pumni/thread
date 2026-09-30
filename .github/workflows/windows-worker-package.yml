@@ -147,8 +147,14 @@ jobs:
           if ($normalExitCode -eq 0 -or $normalOutput -notmatch 'THREADS_WORKER_CONFIGURATION_INVALID') {
             throw 'Normal startup without Control Plane configuration did not fail safely'
           }
+          $serviceCheckOutput = (& $executable --windows-service-check 2>&1 | Out-String).Trim()
+          $serviceCheckExitCode = $LASTEXITCODE
+          if ($serviceCheckExitCode -ne 2 -or $serviceCheckOutput -notmatch 'THREADS_WORKER_SERVICE_REQUIRES_SCM') {
+            throw 'SCM diagnostic mode accepted a normal process launch'
+          }
           Write-Output "PACKAGED_VERSION_OK $versionOutput"
           Write-Output 'PACKAGED_RUNTIME_CHECK_OK'
+          Write-Output 'SERVICE_CHECK_REQUIRES_SCM_OK'
           Write-Output 'MISSING_CONTROL_PLANE_CONFIG_FAILS_CLOSED'
           exit 0
 
@@ -158,6 +164,135 @@ jobs:
           uv run --locked python packaging/windows_worker/build_package.py archive
           --package-root "$env:RUNNER_TEMP\worker-stage\threads-worker-windows-x64"
           --output-root "$env:RUNNER_TEMP\worker-release"
+
+      - name: Install and verify real LocalService SCM lifecycle
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'worker-stage\threads-worker-windows-x64'
+          $releaseDirectory = Join-Path $env:ProgramFiles ('ThreadsWorker\releases\' + (git rev-parse HEAD).Trim())
+          if (Test-Path -LiteralPath $releaseDirectory) { throw 'Immutable release path already exists' }
+          New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+          Copy-Item -Path (Join-Path $packageRoot '*') -Destination $releaseDirectory -Recurse -Force
+
+          $packageAcl = Get-Acl -LiteralPath $releaseDirectory
+          foreach ($rule in $packageAcl.Access) {
+            $ruleSid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            if ($ruleSid -eq 'S-1-5-19' -and $rule.AccessControlType -eq 'Allow' -and
+                $rule.FileSystemRights.ToString() -match 'Write|Modify|FullControl|Delete') {
+              throw 'LocalService can write the immutable release package'
+            }
+          }
+
+          $installer = Join-Path $env:GITHUB_WORKSPACE 'packaging\windows_worker\Install-ThreadsWorkerService.ps1'
+          & $installer -ReleaseDirectory $releaseDirectory -WindowsServiceCheck
+          if ($LASTEXITCODE -ne 0) { throw 'SCM service-check installation failed' }
+          $serviceName = 'ThreadsOperationsWorker'
+          $serviceRegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+          $serviceEnvironment = @((Get-ItemProperty -LiteralPath $serviceRegistryPath -Name Environment).Environment)
+          if ($serviceEnvironment.Count -ne 1 -or
+              $serviceEnvironment[0] -notmatch '^THREADS_WORKER_SERVICE_CHECK_ROOT=') {
+            throw 'SCM service environment contains unexpected or secret-capable entries'
+          }
+          $serviceDataRoot = $serviceEnvironment[0].Substring('THREADS_WORKER_SERVICE_CHECK_ROOT='.Length)
+          if (!(Test-Path -LiteralPath $serviceDataRoot -PathType Container)) {
+            throw 'Isolated LocalService data root was not created'
+          }
+
+          $dataAcl = Get-Acl -LiteralPath $serviceDataRoot
+          if (!$dataAcl.AreAccessRulesProtected) { throw 'Service data ACL still inherits broad parent access' }
+          $rulesBySid = @{}
+          foreach ($rule in $dataAcl.Access) {
+            $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            if (!$rulesBySid.ContainsKey($sid)) { $rulesBySid[$sid] = @() }
+            $rulesBySid[$sid] += $rule
+          }
+          $allowedSids = @('S-1-5-19', 'S-1-5-18', 'S-1-5-32-544')
+          if (Compare-Object @($rulesBySid.Keys | Sort-Object) @($allowedSids | Sort-Object)) {
+            throw 'Service data ACL contains a broad or missing principal'
+          }
+          foreach ($sid in $allowedSids) {
+            if (!$rulesBySid.ContainsKey($sid)) { throw 'A required service data ACL principal is missing' }
+          }
+          $localServiceRights = ($rulesBySid['S-1-5-19'] | ForEach-Object { $_.FileSystemRights.ToString() }) -join ';'
+          $systemRights = ($rulesBySid['S-1-5-18'] | ForEach-Object { $_.FileSystemRights.ToString() }) -join ';'
+          $adminRights = ($rulesBySid['S-1-5-32-544'] | ForEach-Object { $_.FileSystemRights.ToString() }) -join ';'
+          if ($localServiceRights -notmatch 'Modify' -or $systemRights -notmatch 'FullControl' -or
+              $adminRights -notmatch 'FullControl') {
+            throw 'Service data ACL grants do not match the required service contract'
+          }
+
+          $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
+          if ($service.StartName -ne 'NT AUTHORITY\LocalService') {
+            throw 'SCM service is not installed under LocalService'
+          }
+          if ($service.PathName -notmatch [regex]::Escape('"' + (Join-Path $releaseDirectory 'threads-worker.exe') + '" --windows-service-check')) {
+            throw 'SCM ImagePath does not point to the immutable packaged service-check mode'
+          }
+          if ($serviceEnvironment -match 'ENROLLMENT|TOKEN|SECRET|PASSWORD|PRIVATE_KEY') {
+            throw 'SCM service environment contains a forbidden secret setting'
+          }
+
+          $serviceKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            "SYSTEM\CurrentControlSet\Services\$serviceName", $true
+          )
+          try {
+            $imagePath = [string] $serviceKey.GetValue('ImagePath', '')
+            if ($imagePath -notmatch '(?i)threads-worker\.exe" --windows-service-check$') {
+              throw 'SCM registry ImagePath is not service-check mode'
+            }
+          } finally { $serviceKey.Dispose() }
+
+          function Wait-WorkerServiceState([string] $ExpectedState) {
+            $deadline = [DateTime]::UtcNow.AddMinutes(2)
+            do {
+              $current = Get-Service -Name $serviceName
+              if ($current.Status.ToString() -eq $ExpectedState) { return }
+              Start-Sleep -Seconds 1
+            } while ([DateTime]::UtcNow -lt $deadline)
+            throw "SCM service did not reach $ExpectedState"
+          }
+
+          & sc.exe start $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'SCM service start failed' }
+          Wait-WorkerServiceState 'Running'
+          $identityPath = Join-Path $serviceDataRoot 'worker\worker_id'
+          $workerId = (Get-Content -LiteralPath $identityPath | Select-Object -First 1).Trim()
+          if ($workerId -notmatch '^[0-9a-fA-F-]{36}$') { throw 'LocalService identity was not created' }
+          $keyPath = Join-Path $serviceDataRoot ('worker\' + $workerId + '.device-key.dpapi')
+          $journalPath = Join-Path $serviceDataRoot 'journal\worker-state.sqlite3'
+          if (!(Test-Path -LiteralPath $keyPath -PathType Leaf) -or
+              !(Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+            throw 'LocalService DPAPI key or local journal was not created'
+          }
+          $identityHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $identityPath).Hash
+          $keyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $keyPath).Hash
+
+          & sc.exe stop $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'SCM service stop request failed' }
+          Wait-WorkerServiceState 'Stopped'
+          & sc.exe start $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'SCM service restart failed' }
+          Wait-WorkerServiceState 'Running'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $identityPath).Hash -ne $identityHash -or
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $keyPath).Hash -ne $keyHash) {
+            throw 'LocalService identity or DPAPI key changed across restart'
+          }
+
+          $uninstaller = Join-Path $env:GITHUB_WORKSPACE 'packaging\windows_worker\Uninstall-ThreadsWorkerService.ps1'
+          & $uninstaller -StopWaitSeconds 120
+          if ($LASTEXITCODE -ne 0) { throw 'SCM service uninstall failed' }
+          $deleteDeadline = [DateTime]::UtcNow.AddSeconds(30)
+          do {
+            $remainingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if (!$remainingService) { break }
+            Start-Sleep -Seconds 1
+          } while ([DateTime]::UtcNow -lt $deleteDeadline)
+          if ($remainingService) { throw 'SCM service remains registered after uninstall' }
+          if (!(Test-Path -LiteralPath $identityPath) -or !(Test-Path -LiteralPath $keyPath) -or
+              !(Test-Path -LiteralPath $journalPath)) {
+            throw 'Service uninstall deleted durable Worker data'
+          }
+          Write-Output 'WINDOWS_REAL_SCM_LOCALSERVICE_OK'
 
       - name: Verify archive digest
         shell: pwsh

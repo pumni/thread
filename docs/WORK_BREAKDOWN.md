@@ -342,3 +342,19 @@ internal/test artifact. Worker identity, private key, profiles, journal and
 media remain in the external data root. There is no service installation,
 signing, downloader, or self-update. #78 DRAINING semantics are unchanged; #3
 remains OPEN and #62 remains separate.
+
+## C6-02/7 — Native Windows SCM service (#83)
+
+The packaged executable hosts a native SCM service through `ctypes`, runs under
+`NT AUTHORITY\LocalService`, and stores durable state at
+`%ProgramData%\ThreadsOperations` with a protected ACL. Current-user DPAPI
+identity continuity depends on keeping that account and data root unchanged.
+SCM STOP/SHUTDOWN requests authenticated self-drain through the existing #78
+DRAINING transition, lets current work finish, waits for session/job quiescence,
+and reports STOPPED only after OFFLINE confirmation. Enrollment uses an ACL-
+protected bootstrap file, not CLI or service environment. Exact-head Windows CI
+must exercise a real LocalService SCM launch, stop, restart, DPAPI identity
+continuity, and uninstall. No migration, wrapper binary, process kill, updater,
+or signing is included. #78 semantics remain unchanged; #3 remains OPEN, #62
+remains separate, Phase A remains accepted, Phase B remains partial evidence /
+NOT_READY, and this is not a production release claim.

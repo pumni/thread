@@ -479,6 +479,7 @@ async def test_drain_http_auth_boundaries_status_and_advisory(
                 f"/v1/workers/{other_worker_id}/drain/abort",
             )
             assert unauthenticated_abort.status_code == 401
+
             aborted_other_drain = await client.post(
                 f"/v1/workers/{other_worker_id}/drain/abort",
                 headers={"Authorization": f"Bearer {admin_token}"},
@@ -500,3 +501,57 @@ async def test_drain_http_auth_boundaries_status_and_advisory(
             )
             assert repeated_completion.status_code == 409
             assert repeated_completion.json() == {"detail": {"code": "WORKER_NOT_DRAINING"}}
+
+
+async def test_worker_service_stop_self_drain_is_worker_scoped_and_idempotent(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> None:
+    admin_token = "SYNTHETIC_WORKER_ADMIN_TOKEN"
+    control = WorkerControlService(unit_of_work_factory)
+    worker_id, worker_token = await _authenticated_worker(control)
+    other_worker_id, _ = await _authenticated_worker(control)
+    notifications = WorkerNotificationHub()
+    app = create_app(
+        Settings(
+            database_url=None,
+            worker_admin_token=SecretStr(admin_token),
+            worker_tls_required=True,
+        ),
+        worker_control_service=control,
+        worker_notifications=notifications,
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with notifications.subscribe(worker_id) as events:
+        async with httpx.AsyncClient(transport=transport, base_url="https://worker.test") as client:
+            unauthenticated = await client.post("/v1/workers/drain/request-self")
+            assert unauthenticated.status_code == 401
+
+            admin_cannot_self_drain = await client.post(
+                "/v1/workers/drain/request-self",
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            assert admin_cannot_self_drain.status_code == 401
+
+            worker_headers = {"Authorization": f"Bearer {worker_token}"}
+            requested = await client.post("/v1/workers/drain/request-self", headers=worker_headers)
+            assert requested.status_code == 200
+            assert requested.json() == {"worker_id": str(worker_id), "status": "DRAINING"}
+            assert await asyncio.wait_for(events.get(), timeout=1) == {
+                "type": "worker.drain",
+                "reason_code": "SERVICE_STOP_REQUESTED",
+            }
+
+            repeated = await client.post("/v1/workers/drain/request-self", headers=worker_headers)
+            assert repeated.status_code == 200
+            assert events.empty()
+
+    assert (await control.drain_status(worker_id)).status is WorkerStatus.DRAINING
+    assert (await control.drain_status(other_worker_id)).status is WorkerStatus.ONLINE
+    requested_audits = [
+        event
+        for event in await control.audit_events(worker_id)
+        if event.event_type == "worker.drain.requested"
+    ]
+    assert len(requested_audits) == 1
+    assert requested_audits[0].detail_code == "SERVICE_STOP_REQUESTED"

@@ -477,3 +477,21 @@ registration, signing, downloader, or self-update is included. Phase A remains
 accepted; Phase B remains `PARTIAL_LIVE_EVIDENCE / NOT_READY` with
 `full_tp002_ready=false`. Issue #3 remains OPEN and #62 remains separate; no
 production release readiness is claimed.
+
+## 19. C6-02/7 native Windows SCM service (#83)
+
+Issue #83 adds a native SCM host inside `threads-worker.exe`, service mode under
+`NT AUTHORITY\LocalService`, and durable service data in
+`%ProgramData%\ThreadsOperations`. Current-user DPAPI semantics are preserved;
+the same service account and data root are required for identity continuity.
+SCM STOP/SHUTDOWN use worker-authenticated self-drain and the existing #78
+quiescence path. Current WorkerJob handlers are not cancelled, and connectivity
+failure keeps the service STOP_PENDING with no new claims until it reconnects.
+First enrollment uses an ACL-protected bootstrap file which is unlinked after
+successful enrollment. Exact-head Windows CI must install and exercise a real
+LocalService SCM service across stop/restart/uninstall and prove identity/key
+continuity. No migration, third-party service wrapper, update downloader,
+self-updater, or signing is included. #78 semantics remain unchanged. Phase A
+remains accepted; Phase B remains partial live evidence / NOT_READY; #3 remains
+OPEN; #62 remains separate; and this checkpoint makes no production release
+claim.

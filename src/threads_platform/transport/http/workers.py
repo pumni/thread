@@ -337,6 +337,27 @@ def create_worker_router(
         except WorkerControlError as error:
             raise _http_error(error) from error
 
+    @router.post("/drain/request-self", response_model=WorkerDrainTransitionResponse)
+    async def request_worker_self_drain(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> WorkerDrainTransitionResponse:
+        worker_id = await authenticated_worker(authorization)
+        reason_code = "SERVICE_STOP_REQUESTED"
+        control = require_service()
+        try:
+            changed = await control.request_drain(worker_id, reason_code)
+            if changed:
+                notifications.publish(
+                    worker_id,
+                    {"type": "worker.drain", "reason_code": reason_code},
+                )
+            status = await control.drain_status(worker_id)
+        except WorkerControlError as error:
+            raise _http_error(error) from error
+        if status.status is not WorkerStatus.DRAINING:
+            raise HTTPException(status_code=409, detail={"code": "WORKER_DRAIN_NOT_ALLOWED"})
+        return WorkerDrainTransitionResponse(worker_id=worker_id, status=status.status)
+
     @router.post("/drain/complete", response_model=WorkerDrainTransitionResponse)
     async def complete_worker_drain(
         authorization: Annotated[str | None, Header()] = None,

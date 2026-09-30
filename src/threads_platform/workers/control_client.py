@@ -212,6 +212,17 @@ class HttpWorkerControlClient:
         )
         return None if response is None else _job_snapshot(response)
 
+    async def request_self_drain(self) -> WorkerStatus:
+        if self._worker_id is None:
+            raise WorkerControlClientError("WORKER_IDENTITY_UNAVAILABLE")
+        response = await self._request("POST", "/v1/workers/drain/request-self", authenticated=True)
+        if response is None or _uuid_field(response, "worker_id") != self._worker_id:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        try:
+            return WorkerStatus(_text_field(response, "status"))
+        except (ValueError, TypeError) as error:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+
     async def complete_drain(self) -> WorkerStatus:
         response = await self._request(
             "POST", "/v1/workers/drain/complete", json={}, authenticated=True

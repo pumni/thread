@@ -365,6 +365,7 @@ class _FakeControlClient:
     def __init__(self, worker_id: UUID) -> None:
         self.worker_id = worker_id
         self.authentication_count = 0
+        self.enrollment_codes: list[str | None] = []
         self.reconcile_count = 0
         self.claim_count = 0
         self.closed = False
@@ -373,6 +374,8 @@ class _FakeControlClient:
         self.reported_sessions: list[LocalSessionState] = []
         self.heartbeat_session_counts: list[int] = []
         self.next_job: WorkerJobSnapshot | None = None
+        self.drain_request_count = 0
+        self.drain_request_failures = 0
         self.drain_completion_count = 0
         self.drain_completion_failures = 0
         self.drain_nonquiescent_failures = 0
@@ -395,6 +398,7 @@ class _FakeControlClient:
         max_concurrent_jobs: int,
         max_browser_sessions: int,
     ) -> None:
+        self.enrollment_codes.append(enrollment_code)
         _ = (
             worker_id,
             identity,
@@ -443,6 +447,14 @@ class _FakeControlClient:
         self.next_job = None
         return job
 
+    async def request_self_drain(self) -> WorkerStatus:
+        self.drain_request_count += 1
+        if self.drain_request_failures:
+            self.drain_request_failures -= 1
+            raise WorkerControlClientError("CONTROL_PLANE_UNAVAILABLE")
+        self.presence = WorkerAgentPresence(self.worker_id, WorkerStatus.DRAINING, True, 2, 0)
+        return WorkerStatus.DRAINING
+
     async def complete_drain(self) -> WorkerStatus:
         self.drain_completion_count += 1
         if self.drain_nonquiescent_failures:
@@ -465,6 +477,20 @@ class _FakeControlClient:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _FakeEnrollmentBootstrap:
+    def __init__(self, code: str | None) -> None:
+        self.code = code
+        self.read_count = 0
+        self.remove_count = 0
+
+    def read_code(self) -> str | None:
+        self.read_count += 1
+        return self.code
+
+    def remove_after_success(self) -> None:
+        self.remove_count += 1
 
 
 def test_worker_runtime_reauthenticates_reconciles_and_never_claims_offline(
@@ -542,6 +568,40 @@ def test_worker_runtime_reauthenticates_reconciles_and_never_claims_offline(
         assert processed == []
         await agent.close()
         assert client.closed
+
+    asyncio.run(scenario())
+
+
+def test_worker_agent_uses_bootstrap_only_for_pending_enrollment_and_unlinks_after_auth(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        root = LocalDataRoot(tmp_path / "worker-enrollment-bootstrap")
+        root.prepare()
+        identity_store = _FakeIdentityStore()
+        client = _FakeControlClient(identity_store.worker_id)
+        bootstrap = _FakeEnrollmentBootstrap("SYNTHETIC_ENROLLMENT_CODE_V1")
+        agent = WorkerAgent(
+            WorkerAgentConfig(
+                control_plane_url="https://control.test",
+                display_name="bootstrap-enrollment",
+                agent_version="0.1.0",
+            ),
+            identity_store,
+            _FakeKeyStore(),
+            WorkerLocalStateStore(root, identity_store.worker_id),
+            WorkerProcessLock(root.child("worker", "agent.lock")),
+            client,
+            enrollment_bootstrap=bootstrap,
+        )
+
+        await agent.connect_once()
+
+        assert client.enrollment_codes == ["SYNTHETIC_ENROLLMENT_CODE_V1"]
+        assert bootstrap.read_count == 1
+        assert bootstrap.remove_count == 1
+        assert identity_store.pending is False
+        await agent.close()
 
     asyncio.run(scenario())
 
@@ -727,6 +787,167 @@ def test_worker_agent_resumes_drain_finalization_after_network_failure(
         assert client.claim_count == 0
         assert client.heartbeat_session_counts == [0, 0]
         assert client.closed
+
+    asyncio.run(scenario())
+
+
+def test_worker_agent_service_stop_before_claim_requests_drain_without_claiming(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        root = LocalDataRoot(tmp_path / "worker-service-stop-before-claim")
+        root.prepare()
+        identity_store = _FakeIdentityStore()
+        client = _FakeControlClient(identity_store.worker_id)
+        agent = WorkerAgent(
+            WorkerAgentConfig(
+                control_plane_url="https://control.test",
+                display_name="service-stop-before-claim",
+                agent_version="0.1.0",
+                capabilities=(("synthetic.echo", 1),),
+            ),
+            identity_store,
+            _FakeKeyStore(),
+            WorkerLocalStateStore(root, identity_store.worker_id),
+            WorkerProcessLock(root.child("worker", "agent.lock")),
+            client,
+            job_handler=lambda _: asyncio.sleep(0),
+            clock=lambda: datetime(2026, 9, 25, 12, tzinfo=UTC),
+        )
+
+        await asyncio.wait_for(
+            agent.run(
+                asyncio.Event(),
+                drain_on_stop=True,
+                local_stop_requested=lambda: True,
+            ),
+            timeout=2,
+        )
+
+        assert client.drain_request_count == 1
+        assert client.claim_count == 0
+        assert client.drain_completion_count == 1
+        assert client.presence.status is WorkerStatus.OFFLINE
+
+    asyncio.run(scenario())
+
+
+def test_worker_agent_service_stop_waits_for_handler_then_drains_before_next_claim(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        root = LocalDataRoot(tmp_path / "worker-service-stop-in-handler")
+        root.prepare()
+        identity_store = _FakeIdentityStore()
+        client = _FakeControlClient(identity_store.worker_id)
+        client.next_job = WorkerJobSnapshot(
+            job_id=uuid4(),
+            capability_name="synthetic.echo",
+            capability_version=1,
+            status=WorkerJobStatus.RUNNING,
+            account_id=None,
+            assigned_worker_id=identity_store.worker_id,
+            lease_worker_id=identity_store.worker_id,
+            lease_token=uuid4(),
+            lease_expires_at=datetime(2026, 9, 25, 13, tzinfo=UTC),
+            retry_safety=WorkerJobRetrySafety.SAFE_TO_RETRY,
+            checkpoint=None,
+        )
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+        handler_cancelled = False
+        handler_finished = False
+        local_stop = False
+
+        async def handle(_: WorkerJobSnapshot) -> None:
+            nonlocal handler_cancelled, handler_finished
+            try:
+                handler_started.set()
+                await release_handler.wait()
+                handler_finished = True
+            except asyncio.CancelledError:
+                handler_cancelled = True
+                raise
+
+        agent = WorkerAgent(
+            WorkerAgentConfig(
+                control_plane_url="https://control.test",
+                display_name="service-stop-in-handler",
+                agent_version="0.1.0",
+                capabilities=(("synthetic.echo", 1),),
+                poll_interval=timedelta(milliseconds=1),
+            ),
+            identity_store,
+            _FakeKeyStore(),
+            WorkerLocalStateStore(root, identity_store.worker_id),
+            WorkerProcessLock(root.child("worker", "agent.lock")),
+            client,
+            job_handler=handle,
+        )
+        run_task = asyncio.create_task(
+            agent.run(
+                asyncio.Event(),
+                drain_on_stop=True,
+                local_stop_requested=lambda: local_stop,
+            )
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+        local_stop = True
+        release_handler.set()
+        await asyncio.wait_for(run_task, timeout=2)
+
+        assert handler_finished
+        assert not handler_cancelled
+        assert client.claim_count == 1
+        assert client.drain_request_count == 1
+        assert client.drain_completion_count == 1
+        assert client.presence.status is WorkerStatus.OFFLINE
+
+    asyncio.run(scenario())
+
+
+def test_worker_agent_service_stop_reconnects_without_claiming_after_network_failure(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        root = LocalDataRoot(tmp_path / "worker-service-stop-network-failure")
+        root.prepare()
+        identity_store = _FakeIdentityStore()
+        client = _FakeControlClient(identity_store.worker_id)
+        client.drain_request_failures = 1
+        agent = WorkerAgent(
+            WorkerAgentConfig(
+                control_plane_url="https://control.test",
+                display_name="service-stop-network-failure",
+                agent_version="0.1.0",
+                capabilities=(("synthetic.echo", 1),),
+                poll_interval=timedelta(milliseconds=1),
+                reconnect_initial_backoff=timedelta(milliseconds=1),
+                reconnect_max_backoff=timedelta(milliseconds=2),
+            ),
+            identity_store,
+            _FakeKeyStore(),
+            WorkerLocalStateStore(root, identity_store.worker_id),
+            WorkerProcessLock(root.child("worker", "agent.lock")),
+            client,
+            job_handler=lambda _: asyncio.sleep(0),
+            clock=lambda: datetime(2026, 9, 25, 12, tzinfo=UTC),
+        )
+
+        await asyncio.wait_for(
+            agent.run(
+                asyncio.Event(),
+                drain_on_stop=True,
+                local_stop_requested=lambda: True,
+            ),
+            timeout=2,
+        )
+
+        assert client.authentication_count == 2
+        assert client.drain_request_count == 2
+        assert client.claim_count == 0
+        assert client.drain_completion_count == 1
+        assert client.presence.status is WorkerStatus.OFFLINE
 
     asyncio.run(scenario())
 

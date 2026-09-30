@@ -865,5 +865,29 @@ Control Plane, Threads/Meta, or external URLs. The workflow creates a safe
 manifest, stable ZIP serialization, and a SHA-256 digest. The manifest's
 required build-clock timestamp means separate CI builds can have different
 archive hashes. The artifact is unsigned and internal/test only; a hash is not
-publisher authentication. No service registration, signing, downloader, or
-self-update is included.
+publisher authentication.
+
+The packaged executable hosts its native SCM implementation through the narrow
+Windows APIs in `ctypes`. Production service mode runs as
+`NT AUTHORITY\LocalService`, stores durable state only in
+`%ProgramData%\ThreadsOperations`, and uses current-user DPAPI under the same
+service identity. The installer grants LocalService Modify and SYSTEM/Admins
+FullControl on the data root, while leaving the immutable release tree
+non-writable to LocalService. Bootstrap enrollment is a protected one-time
+file, never an argument or service environment value.
+
+SCM STOP/SHUTDOWN requests authenticated durable self-drain with
+`SERVICE_STOP_REQUESTED`. It reuses the existing DRAINING transition and
+quiescence handshake: no new claims, no handler cancellation, regular session
+close/report flush, OFFLINE confirmation, then SCM STOPPED. Network failure
+keeps the service STOP_PENDING and reconnecting without claims or an
+application force timeout. `--windows-service-check` is test-only; exact-head
+Windows CI installs it under LocalService through SCM, verifies DPAPI identity
+continuity across stop/restart, then uninstalls without deleting data.
+
+Built-in `sc.exe` plus the PowerShell ACL/registry installer scripts provide
+install/update/rollback. No WinSW, NSSM, third-party wrapper, signing,
+downloader, or self-update is included. The existing #78 DRAINING semantics are
+unchanged; #3 remains OPEN, #62 remains separate, Phase A remains accepted,
+Phase B remains partial live evidence / NOT_READY, and this is not a production
+release claim.

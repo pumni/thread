@@ -340,6 +340,17 @@ exits only after OFFLINE is confirmed. If finalization loses connectivity, it
 reconnects, authenticates, observes durable status through hello, and resumes
 finalization. The server remains authoritative for claim eligibility throughout.
 
+The native Windows SCM host uses the worker-authenticated
+`POST /v1/workers/drain/request-self` route when SCM sends STOP or SHUTDOWN. The
+route acts only on the authenticated Worker and uses the fixed
+`SERVICE_STOP_REQUESTED` reason through the same row-locked transition as admin
+drain. Repeated requests are idempotent. The service stops new local claims
+immediately, never cancels the currently awaited handler, and then follows the
+same session-close, report-flush, zero-heartbeat, and OFFLINE completion path.
+While the Control Plane is unavailable, the service stays SCM STOP_PENDING,
+does not claim work, reconnects, and resumes the durable handshake. It has no
+application force timeout or process-kill path.
+
 See [`../WORKER_UPDATE_RUNBOOK.md`](../WORKER_UPDATE_RUNBOOK.md) for the
 service-manager-neutral package replacement and rollback procedure.
 

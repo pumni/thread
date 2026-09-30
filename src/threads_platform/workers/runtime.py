@@ -1,7 +1,7 @@
 import asyncio
 import socket
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID
@@ -11,6 +11,7 @@ from threads_platform.application.ports.worker_agent import (
     WorkerAgentPresence,
     WorkerControlClient,
     WorkerControlClientError,
+    WorkerEnrollmentBootstrap,
     WorkerIdentityStore,
     WorkerJobHandler,
     WorkerJobSnapshot,
@@ -70,6 +71,7 @@ class WorkerAgent:
         *,
         job_handler: WorkerJobHandler | None = None,
         reconcile_handler: WorkerReconcileHandler | None = None,
+        enrollment_bootstrap: WorkerEnrollmentBootstrap | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._config = config
@@ -80,6 +82,7 @@ class WorkerAgent:
         self._control_client = control_client
         self._job_handler = job_handler
         self._reconcile_handler = reconcile_handler
+        self._enrollment_bootstrap = enrollment_bootstrap
         self._clock = clock or (lambda: datetime.now(UTC))
         self._worker_id: UUID | None = None
         self._identity = None
@@ -110,20 +113,35 @@ class WorkerAgent:
             and self._job_handler is not None
         )
 
+    async def initialize(self) -> None:
+        await self._initialize()
+
     async def connect_once(self) -> WorkerAgentPresence:
         await self._initialize()
         if self._worker_id is None or self._identity is None:
             raise RuntimeError("worker identity was not initialized")
+        enrollment_pending = self._identity_store.enrollment_pending()
+        enrollment_code = self._config.enrollment_code
+        bootstrap_code_used = False
+        if (
+            enrollment_pending
+            and enrollment_code is None
+            and self._enrollment_bootstrap is not None
+        ):
+            enrollment_code = self._enrollment_bootstrap.read_code()
+            bootstrap_code_used = enrollment_code is not None
         await self._control_client.authenticate(
             self._worker_id,
             self._identity,
-            enrollment_pending=self._identity_store.enrollment_pending(),
-            enrollment_code=self._config.enrollment_code,
+            enrollment_pending=enrollment_pending,
+            enrollment_code=enrollment_code,
             display_name=self._config.display_name,
             hostname=self._config.hostname,
             max_concurrent_jobs=self._config.max_concurrent_jobs,
             max_browser_sessions=self._config.max_browser_sessions,
         )
+        if bootstrap_code_used and self._enrollment_bootstrap is not None:
+            self._enrollment_bootstrap.remove_after_success()
         self._identity_store.mark_enrolled()
         presence = await self._control_client.hello(
             self._worker_id,
@@ -160,7 +178,9 @@ class WorkerAgent:
         await self.flush_session_reports()
         return presence
 
-    async def tick(self) -> WorkerJobSnapshot | None:
+    async def tick(
+        self, *, stop_requested: Callable[[], bool] | None = None
+    ) -> WorkerJobSnapshot | None:
         if not self._connected:
             return None
         now = self._clock()
@@ -171,7 +191,7 @@ class WorkerAgent:
             presence = await self.heartbeat_once()
             if presence.status is not WorkerStatus.ONLINE:
                 return None
-        if not self.may_claim:
+        if not self.may_claim or (stop_requested is not None and stop_requested()):
             return None
         job = await self._control_client.claim_next()
         if job is None:
@@ -224,18 +244,47 @@ class WorkerAgent:
         await self.flush_session_reports()
         return session
 
-    async def run(self, stop_event: asyncio.Event) -> None:
+    async def run(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        drain_on_stop: bool = False,
+        local_stop_requested: Callable[[], bool] | None = None,
+    ) -> None:
         try:
-            self._process_lock.acquire()
+            if not self._process_lock.held:
+                self._process_lock.acquire()
             await self._initialize()
             backoff = self._config.reconnect_initial_backoff
             drain_finalization_pending = False
-            while not stop_event.is_set() or drain_finalization_pending:
+            local_stop_pending = False
+
+            def service_stop_requested() -> bool:
+                return drain_on_stop and (
+                    stop_event.is_set()
+                    or (local_stop_requested is not None and local_stop_requested())
+                )
+
+            while (
+                not stop_event.is_set()
+                or drain_finalization_pending
+                or local_stop_pending
+                or service_stop_requested()
+            ):
                 try:
+                    if service_stop_requested():
+                        local_stop_pending = True
                     if not self._connected:
                         await self.connect_once()
                         backoff = self._config.reconnect_initial_backoff
                     if self._has_status(WorkerStatus.DRAINING):
+                        drain_finalization_pending = True
+                    if local_stop_pending and not drain_finalization_pending:
+                        status = await self._control_client.request_self_drain()
+                        if status is not WorkerStatus.DRAINING:
+                            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+                        if self._presence is not None:
+                            self._presence = replace(self._presence, status=status)
                         drain_finalization_pending = True
                     if drain_finalization_pending:
                         if await self._finalize_drain():
@@ -249,7 +298,11 @@ class WorkerAgent:
                         break
                     if self.status is WorkerStatus.DISABLED:
                         break
-                    job = await self.tick()
+                    job = await self.tick(stop_requested=service_stop_requested)
+                    if service_stop_requested():
+                        local_stop_pending = True
+                    if local_stop_pending:
+                        continue
                     if self._has_status(WorkerStatus.DRAINING):
                         drain_finalization_pending = True
                         continue
@@ -264,7 +317,7 @@ class WorkerAgent:
                 except WorkerControlClientError:
                     self._connected = False
                     self._presence = None
-                    if drain_finalization_pending:
+                    if drain_finalization_pending or local_stop_pending or service_stop_requested():
                         await asyncio.sleep(backoff.total_seconds())
                     else:
                         await _wait_or_stop(stop_event, backoff.total_seconds())

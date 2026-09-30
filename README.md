@@ -10,7 +10,7 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-02/6 — Reproducible Windows Worker package and smoke artifact (#81)**.
+- **C6-02/7 — Native Windows SCM service and self-draining stop (#83)**.
 
 Not production-ready:
 - issue #3 remains open as the production/release gate;
@@ -18,8 +18,8 @@ Not production-ready:
 - scheduler availability does not imply production activation;
 - #62 remains a separate CRM result transport dependency;
 - metrics and distributed tracing are not implemented;
-- the Windows x64 Worker bundle is an unsigned internal/test artifact, with no
-  service installation, signing, or auto-update channel.
+- the Windows x64 Worker bundle is an unsigned internal/test artifact; its
+  native LocalService SCM host has no signing or auto-update channel.
 
 ## Product direction
 
