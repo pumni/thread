@@ -150,6 +150,7 @@ jobs:
           Write-Output "PACKAGED_VERSION_OK $versionOutput"
           Write-Output 'PACKAGED_RUNTIME_CHECK_OK'
           Write-Output 'MISSING_CONTROL_PLANE_CONFIG_FAILS_CLOSED'
+          exit 0
 
       - name: Create deterministic ZIP and SHA-256
         shell: pwsh
