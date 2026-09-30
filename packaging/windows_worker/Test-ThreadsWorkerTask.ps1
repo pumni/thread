@@ -49,8 +49,18 @@ function Invoke-TaskManager([string[]] $Arguments, [int] $ExpectedExitCode = 0) 
     } else {
         "UNKNOWN"
     }
+    $failureMatch = [regex]::Match(
+        $joined,
+        "THREADS_WORKER_TASK_OPERATION_REJECTED_([A-Z_]+)"
+    )
+    $failureStage = if ($failureMatch.Success) {
+        $failureMatch.Groups[1].Value
+    } else {
+        "NO_SAFE_CODE"
+    }
     Assert-Condition ($exitCode -eq $ExpectedExitCode) `
-        ("TASK_MANAGER_{0}_EXIT_{1}_EXPECTED_{2}" -f $operationName, $exitCode, $ExpectedExitCode)
+        ("TASK_MANAGER_{0}_EXIT_{1}_EXPECTED_{2}_{3}" -f `
+            $operationName, $exitCode, $ExpectedExitCode, $failureStage)
     if ($ExpectedExitCode -eq 0 -and
         ($joined -match [regex]::Escape([Security.Principal.WindowsIdentity]::GetCurrent().Name) -or
             $joined -match [regex]::Escape([Security.Principal.WindowsIdentity]::GetCurrent().User.Value))) {
@@ -115,7 +125,9 @@ try {
         "-HostConfigPath", $hostConfigPath, "-ExpectedProjectVersion", $manifest.project_version,
         "-ExpectedGitSha", $manifest.git_sha
     ) 2
-    Assert-Condition ($pendingResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED") "PENDING_IDENTITY_ACCEPTED"
+    Assert-Condition (
+        $pendingResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_IDENTITY_VALIDATION"
+    ) "PENDING_IDENTITY_ACCEPTED"
     Assert-Condition ($pendingResult -notmatch [regex]::Escape($syntheticWorkerId)) "PENDING_IDENTITY_LEAKED"
 
     Remove-Item -LiteralPath $identityPath -Force
@@ -123,7 +135,9 @@ try {
         "-Operation", "Install", "-ReleaseDirectory", $firstRelease,
         "-HostConfigPath", $hostConfigPath
     ) 2
-    Assert-Condition ($missingResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED") "MISSING_IDENTITY_ACCEPTED"
+    Assert-Condition (
+        $missingResult -eq "THREADS_WORKER_TASK_OPERATION_REJECTED_IDENTITY_VALIDATION"
+    ) "MISSING_IDENTITY_ACCEPTED"
 
     [IO.File]::WriteAllText(
         $identityPath,

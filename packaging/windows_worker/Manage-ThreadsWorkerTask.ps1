@@ -242,8 +242,11 @@ function Assert-TaskContract($Task, [string] $ExpectedUserSid) {
     return $configPath
 }
 
+$failureStage = "INITIALIZE"
 try {
+    $failureStage = "LOAD_TASK_SCHEDULER"
     Import-Module ScheduledTasks -ErrorAction Stop
+    $failureStage = "READ_TASK"
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($Operation -eq "Inspect") {
         if ($null -eq $task) {
@@ -266,6 +269,7 @@ try {
         exit 0
     }
 
+    $failureStage = "VALIDATE_PRINCIPAL"
     $identity = Get-CurrentInteractiveIdentity
     $currentUserSid = $identity.User.Value
     if ($Operation -eq "Uninstall") {
@@ -282,25 +286,32 @@ try {
     }
 
     if ([string]::IsNullOrWhiteSpace($ReleaseDirectory)) { throw "release required" }
+    $failureStage = "RELEASE_VALIDATION"
     $manifest = Assert-ImmutableRelease $ReleaseDirectory
     $fullReleasePath = [IO.Path]::GetFullPath($ReleaseDirectory)
     $executablePath = Join-Path $fullReleasePath "threads-worker.exe"
     if ($Operation -eq "Install") {
         if ($null -ne $task) { throw "task already registered" }
         if ([string]::IsNullOrWhiteSpace($HostConfigPath)) { throw "host config required" }
+        $failureStage = "IDENTITY_VALIDATION"
         $fullConfigPath = Assert-EnrolledIdentity $HostConfigPath $executablePath
     } else {
         if (!$ConfirmDurableDrainOffline) { throw "drain confirmation required" }
         if ($null -eq $task) { throw "task is not registered" }
         if ($task.State.ToString() -eq "Running") { throw "task is running" }
+        $failureStage = "EXISTING_TASK_VALIDATION"
         $existingConfigPath = Assert-TaskContract $task $currentUserSid
+        $failureStage = "IDENTITY_VALIDATION"
         $fullConfigPath = Assert-EnrolledIdentity $existingConfigPath $executablePath
         if (![string]::IsNullOrWhiteSpace($HostConfigPath)) { throw "host config cannot change" }
     }
 
+    $failureStage = "BUILD_TASK"
     $definition = New-WorkerTaskDefinition `
         $identity $executablePath $fullConfigPath $fullReleasePath
+    $failureStage = "REGISTER_TASK"
     Register-ScheduledTask -TaskName $taskName -InputObject $definition -Force | Out-Null
+    $failureStage = "VERIFY_TASK"
     $registeredTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
     $null = Assert-TaskContract $registeredTask $currentUserSid
     if ($Operation -eq "Install") {
@@ -309,6 +320,8 @@ try {
         Write-Output "THREADS_WORKER_TASK_UPDATED"
     }
 } catch {
-    [Console]::Error.WriteLine("THREADS_WORKER_TASK_OPERATION_REJECTED")
+    [Console]::Error.WriteLine(
+        ("THREADS_WORKER_TASK_OPERATION_REJECTED_{0}" -f $failureStage)
+    )
     exit 2
 }
