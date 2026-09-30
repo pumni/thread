@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -172,3 +173,24 @@ class ThreadsAPI(Protocol):
 
 class ThreadsAccessTokenProvider(Protocol):
     async def get_access_token(self, account_id: UUID) -> SecretStr: ...
+
+
+class ThreadsCredentialErrorCode(StrEnum):
+    NOT_CONFIGURED = "THREADS_CREDENTIAL_NOT_CONFIGURED"
+    EXPIRED = "THREADS_CREDENTIAL_EXPIRED"
+    REAUTHORIZATION_REQUIRED = "THREADS_REAUTHORIZATION_REQUIRED"
+    SECRET_UNAVAILABLE = "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
+    INVALID = "THREADS_CREDENTIAL_INVALID"
+
+
+class ThreadsCredentialError(Exception):
+    """A sanitized, command-safe failure from the production credential boundary."""
+
+    def __init__(self, code: ThreadsCredentialErrorCode) -> None:
+        super().__init__(code.value)
+        self.code = code.value
+        self.retryable = code is ThreadsCredentialErrorCode.SECRET_UNAVAILABLE
+
+
+class ThreadsCredentialSecretResolver(Protocol):
+    async def resolve(self, credential_ref: str) -> SecretStr: ...

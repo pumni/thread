@@ -31,6 +31,7 @@ from threads_platform.application.errors import (
     RetryableCommandError,
 )
 from threads_platform.application.ports.repositories import UnitOfWork, UnitOfWorkFactory
+from threads_platform.application.ports.threads import ThreadsCredentialError
 from threads_platform.application.retry import RetryPolicy
 from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.application.worker_protocol import is_worker_protocol_supported
@@ -590,6 +591,8 @@ class CommandRuntime:
             )
         except PermanentCommandError as error:
             return await self._finish_failure(claim, error.code, retryable=False)
+        except ThreadsCredentialError as error:
+            return await self._finish_failure(claim, error.code, retryable=error.retryable)
         except Exception:
             return await self._finish_failure(claim, "UNEXPECTED_HANDLER_ERROR", retryable=True)
         try:

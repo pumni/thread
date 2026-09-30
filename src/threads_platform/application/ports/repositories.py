@@ -14,7 +14,7 @@ from threads_platform.domain.account_execution import (
     AccountExecutionLease,
     AccountExecutionOwnerType,
 )
-from threads_platform.domain.accounts import ThreadsAccount
+from threads_platform.domain.accounts import OAuthCredentialMetadata, ThreadsAccount
 from threads_platform.domain.capabilities import CapabilityRouteDecision, OperationClass
 from threads_platform.domain.commands import Command, CommandAttempt
 from threads_platform.domain.conversation_sync import (
@@ -65,6 +65,16 @@ class AccountRepository(Protocol):
     async def get_for_update(self, account_id: UUID) -> ThreadsAccount | None: ...
 
     async def update(self, account: ThreadsAccount) -> None: ...
+
+
+class OAuthCredentialRepository(Protocol):
+    async def add(self, credential: OAuthCredentialMetadata) -> None: ...
+
+    async def get(self, account_id: UUID) -> OAuthCredentialMetadata | None: ...
+
+    async def get_for_update(self, account_id: UUID) -> OAuthCredentialMetadata | None: ...
+
+    async def update(self, credential: OAuthCredentialMetadata) -> None: ...
 
 
 class AccountActivityPlanRepository(Protocol):
@@ -553,6 +563,7 @@ class WorkerInterventionRepository(Protocol):
 
 class UnitOfWork(Protocol):
     accounts: AccountRepository
+    oauth_credentials: OAuthCredentialRepository
     activity_plans: AccountActivityPlanRepository
     activity_templates: AccountActivityTemplateRepository
     activity_recurrence_states: AccountActivityRecurrenceStateRepository

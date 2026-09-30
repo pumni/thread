@@ -24,6 +24,7 @@ from threads_platform.application.ports.repositories import (
     DiscoveryRepository,
     IntegrationDeliveryRepository,
     NetworkProfileRepository,
+    OAuthCredentialRepository,
     OutboxEventRepository,
     PostRepository,
     ReplyRepository,
@@ -57,6 +58,8 @@ from threads_platform.domain.account_execution import (
 from threads_platform.domain.accounts import (
     AccountExecutionMode,
     AccountStatus,
+    CredentialStatus,
+    OAuthCredentialMetadata,
     ThreadsAccount,
 )
 from threads_platform.domain.capabilities import (
@@ -155,6 +158,7 @@ from threads_platform.infrastructure.persistence.models import (
     LeadCandidateRecord,
     LeadCandidateTransitionRecord,
     NetworkProfileRecord,
+    OAuthCredentialRecord,
     OutboxEventRecord,
     PostRecord,
     ReplyRecord,
@@ -238,6 +242,73 @@ class SQLAlchemyAccountRepository(AccountRepository):
         record.execution_mode = account.execution_mode
         record.updated_at = account.updated_at
         await self._session.flush()
+
+
+class SQLAlchemyOAuthCredentialRepository(OAuthCredentialRepository):
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, credential: OAuthCredentialMetadata) -> None:
+        self._session.add(self._record(credential))
+        await self._session.flush()
+
+    async def get(self, account_id: UUID) -> OAuthCredentialMetadata | None:
+        record = await self._session.scalar(
+            select(OAuthCredentialRecord).where(OAuthCredentialRecord.account_id == account_id)
+        )
+        return self._domain(record) if record is not None else None
+
+    async def get_for_update(self, account_id: UUID) -> OAuthCredentialMetadata | None:
+        record = await self._session.scalar(
+            select(OAuthCredentialRecord)
+            .where(OAuthCredentialRecord.account_id == account_id)
+            .with_for_update()
+        )
+        return self._domain(record) if record is not None else None
+
+    async def update(self, credential: OAuthCredentialMetadata) -> None:
+        record = await self._session.scalar(
+            select(OAuthCredentialRecord)
+            .where(OAuthCredentialRecord.account_id == credential.account_id)
+            .with_for_update()
+        )
+        if record is None:
+            raise LookupError("OAuth credential metadata not found")
+        if record.id != credential.id:
+            raise ValueError("OAuth credential identity is immutable")
+        record.credential_ref = credential.credential_ref
+        record.token_type = credential.token_type
+        record.granted_scopes = list(credential.granted_scopes)
+        record.expires_at = credential.expires_at
+        record.status = credential.status
+        record.updated_at = credential.updated_at
+        await self._session.flush()
+
+    @staticmethod
+    def _record(credential: OAuthCredentialMetadata) -> OAuthCredentialRecord:
+        return OAuthCredentialRecord(
+            id=credential.id,
+            account_id=credential.account_id,
+            credential_ref=credential.credential_ref,
+            token_type=credential.token_type,
+            granted_scopes=list(credential.granted_scopes),
+            expires_at=credential.expires_at,
+            status=credential.status,
+            updated_at=credential.updated_at,
+        )
+
+    @staticmethod
+    def _domain(record: OAuthCredentialRecord) -> OAuthCredentialMetadata:
+        return OAuthCredentialMetadata(
+            id=record.id,
+            account_id=record.account_id,
+            credential_ref=record.credential_ref,
+            token_type=record.token_type,
+            granted_scopes=tuple(record.granted_scopes),
+            expires_at=record.expires_at,
+            status=CredentialStatus(record.status),
+            updated_at=record.updated_at,
+        )
 
 
 class SQLAlchemyAccountActivityPlanRepository(AccountActivityPlanRepository):

@@ -79,7 +79,11 @@ Use one case per matrix row in the packet. Record only observations from the aut
 3. Token debugger/effective scopes (`A04`) and expiry/validity (`A05`): record scope names and safe validity/expiry metadata only.
 4. Own profile (`A06`): record status and returned field names/shape. Do not copy the profile ID, username, biography, or media URL.
 
-Phase A evidence is a prerequisite for coordinator consideration of `TOKEN_PROVIDER_READY_EVIDENCE` and later #55 work. It does not authorize implementation or production activation by itself.
+The accepted Phase A packet is recorded in
+`docs/evidence/threads-live-phase-a-2026-09-30.json` and authorized the #70
+provider checkpoint. Phase A evidence does not authorize production activation;
+#3 remains the release gate. Use these steps only for an explicitly requested
+revalidation.
 
 ### Phase B — polling and cursor critical path (`B01`–`B13`)
 
@@ -119,7 +123,11 @@ The independent reviewer checks:
 
 Submit the reviewed scrubbed packet for #3 coordinator review using the authorized repository process. The coordinator independently checks source freshness, Phase A/B/C coverage, safe failure evidence, readiness rationale, and whether any external behavior contradicts the current contract. The packet's readiness booleans are review classifications, not auto-derived success flags.
 
-Coordinator acceptance of Phase A may unblock a separate #55 decision. Acceptance of Phase B may support a separately authorized discovery/mentions scheduling decision under #9. Only completion and acceptance of the full #3 gate can close the live validation gate or support `FULL_TP002_READY`. This #65 tooling checkpoint leaves #3 OPEN, #55 blocked, and discovery/mentions scheduler policy blocked.
+Phase A is accepted. Phase B is `NOT_RUN`, so discovery/mentions scheduler
+policy remains blocked. #70 is authorized to implement the production token
+provider; #55 remains open pending acceptance of that implementation. Issue #3
+remains OPEN and blocks production activation until the full live validation
+gate is complete. The #65 tooling checkpoint itself made no live API calls.
 
 ## Validator threat model and limits
 
