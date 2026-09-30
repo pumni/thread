@@ -10,7 +10,7 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-02/6 — Reproducible Windows Worker package and smoke artifact (#81)**.
+- **C6-02/7 — Interactive Windows Worker host and scheduled-task lifecycle (#84)**.
 
 Not production-ready:
 - issue #3 remains open as the production/release gate;
@@ -19,7 +19,9 @@ Not production-ready:
 - #62 remains a separate CRM result transport dependency;
 - metrics and distributed tracing are not implemented;
 - the Windows x64 Worker bundle is an unsigned internal/test artifact, with no
-  service installation, signing, or auto-update channel.
+  Windows service, signing, or auto-update channel. The current headed browser
+  Worker runs under a dedicated logged-in Windows user through Task Scheduler;
+  planned updates require durable DRAINING to OFFLINE first.
 
 ## Product direction
 

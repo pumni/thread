@@ -848,7 +848,7 @@ presence expiry remains authoritative. This checkpoint adds no metrics,
 tracing, schema, or audit table. Issue #3 remains the production/release gate;
 the #62 CRM result transport remains separate.
 
-## 29. Windows Worker package boundary
+## 29. Windows Worker package and interactive host boundary
 
 The Windows x64 package is a PyInstaller `onedir` application built from the
 locked Python dependencies with the matching Playwright 1.63.0 Chromium only.
@@ -867,3 +867,30 @@ required build-clock timestamp means separate CI builds can have different
 archive hashes. The artifact is unsigned and internal/test only; a hash is not
 publisher authentication. No service registration, signing, downloader, or
 self-update is included.
+
+The current browser Worker stays headed and runs under a dedicated logged-in
+Windows user through the built-in Task Scheduler API. Its stable task uses that
+user's `Interactive` token and `Limited` run level, starts at the same user's
+logon, ignores duplicate instances, has unlimited duration, and sets
+`AllowHardTerminate=false`. It stores no Windows password. Windows Services run
+outside the interactive desktop; using a service principal would also change the
+current-user DPAPI context that protects the Worker device key. A service host
+is therefore not an authorized deployment model for this headed Worker. It can
+be reconsidered only after a separately validated headless/browser-host design.
+
+The executable accepts a strict, non-secret `threads-worker-host-v1` JSON file
+through `--host-config`. It allows only bounded existing deployment settings;
+host values take precedence over their matching ordinary environment settings,
+while omitted fields fall back to environment configuration. Enrollment remains
+environment-only and is never part of the host config or scheduled task.
+First enrollment and task registration happen interactively under the same
+dedicated Windows user. Current-user DPAPI identity must remain with that same
+principal; do not copy the identity to another user.
+
+Planned release changes require durable #78 DRAINING, quiescence, and Worker
+completion to OFFLINE before switching the task action. Task registration,
+update, and uninstall preserve the host config and data root; old releases remain
+available for rollback. A Task Scheduler task cannot promise graceful completion
+after abrupt logoff, OS shutdown, crash, or user termination; durable lease
+recovery and Worker presence expiry remain authoritative. Issue #3 remains open,
+#62 remains separate, and the unsigned package is not a production release claim.

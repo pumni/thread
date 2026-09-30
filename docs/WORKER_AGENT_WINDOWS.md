@@ -28,19 +28,25 @@ binary to be provisioned on the worker. Browser sessions use the assigned accoun
 profile and NetworkProfile. Routes that reference proxy credentials fail closed because this
 entrypoint has no production proxy-secret provider.
 
-For a first enrollment, provide the one-time C1 enrollment code through
-`THREADS_WORKER_ENROLLMENT_CODE` using the deployment's protected configuration mechanism. The
-agent consumes it once, records only a local enrollment-state marker, and never persists or
-logs the code. The device key is generated locally, serialized as PKCS#8, protected with
+For a first enrollment, log in as the dedicated Worker user and provide the one-time C1
+enrollment code only in the launching process environment as
+`THREADS_WORKER_ENROLLMENT_CODE`. The agent consumes it once, records only a local
+enrollment-state marker, and never persists or logs the code. Clear the environment variable
+after enrollment. The device key is generated locally, serialized as PKCS#8, protected with
 current-user Windows DPAPI `CryptProtectData` using worker-specific optional entropy, and
-stored with a versioned envelope. Existing unreadable key material fails closed.
+stored with a versioned envelope. Existing unreadable key material fails closed. Keep the same
+Windows user across installs, updates, and rollback: current-user DPAPI identity cannot be moved
+to a different Windows principal by this host.
 
-`THREADS_WORKER_DATA_ROOT` can override the default root for managed deployments and tests.
-The override is still treated as the security boundary: it must live outside Git worktrees, and
-profile resolution rejects paths that escape it. Non-Windows test environments use an injected
-fake data protector; the persistent entrypoint itself requires Windows DPAPI.
+`THREADS_WORKER_DATA_ROOT` can override the default root for manual console startup and tests.
+Persistent Task Scheduler registration requires
+an explicit absolute `data_root` in the host config and does not use process-environment fallback,
+so the saved task and installer cannot select different identity roots at later logon. The
+configured root must live outside Git worktrees and both Program Files directories; profile
+resolution rejects paths that escape it. Non-Windows test environments use an injected fake data
+protector; the persistent entrypoint itself requires Windows DPAPI.
 
-## Windows x64 package
+## Windows x64 package and interactive host
 
 The internal package is built as a PyInstaller `onedir` bundle from the locked project
 dependencies. It contains the Worker executable, PyInstaller runtime, Playwright 1.63.0,
@@ -50,5 +56,26 @@ manifest; see `docs/WORKER_UPDATE_RUNBOOK.md` for installation and update steps.
 
 The archive is unsigned and intended only as an internal/test artifact. Its SHA-256 identifies
 the bytes but does not authenticate the publisher. It has no Authenticode signature, production
-release channel, service registration, downloader, or self-updater. Production signing and
-service-install policy require a later decision.
+release channel, downloader, or self-updater.
+
+The production browser Worker remains headed. Run it under a stable dedicated Windows user who
+logs in interactively. The supported host is a Task Scheduler task named
+`ThreadsPlatformWorker`, configured with that user's `Interactive` token and `Limited` run
+level. It starts at that user's logon, ignores duplicate starts, has no execution time limit,
+and has `AllowHardTerminate=false`. No password is stored. Do not run this headed browser Worker
+as a Windows service: services run outside the interactive desktop, and a service account would
+also change the current-user DPAPI security principal.
+
+Use a strict non-secret `threads-worker-host-v1` JSON file and launch the release executable as
+`threads-worker.exe --host-config <absolute-path>`. Its allowlisted fields are the existing
+Control Plane URL, data root, display name, agent version, capacities, and capability flags.
+Present host-config values take precedence over the matching ordinary environment settings;
+omitted values fall back to those settings. `THREADS_WORKER_ENROLLMENT_CODE` remains
+environment-only and is never accepted in the file or task definition. See the runbook for
+first enrollment, task registration, update, and rollback.
+
+The default durable root remains `%LOCALAPPDATA%\ThreadsOperations`, owned by the same user as
+the task. Keep identity, DPAPI key, profiles, journal, and media outside every immutable release
+directory. Abrupt logoff, shutdown, crash, or user termination is not a graceful drain; existing
+WorkerJob lease recovery and presence expiry remain authoritative. Issue #3 remains open and
+this unsigned artifact is not a production release claim; #62 remains separate.

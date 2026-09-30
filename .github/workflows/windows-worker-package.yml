@@ -11,6 +11,7 @@ on:
       - "src/threads_platform/infrastructure/worker_agent/**"
       - "src/threads_platform/infrastructure/browser/**"
       - "tests/unit/test_worker_package.py"
+      - "tests/unit/test_worker_host_config.py"
       - "README.md"
       - "docs/ARCHITECTURE.md"
       - "docs/PROJECT_STATE_HANDOFF.md"
@@ -28,6 +29,7 @@ on:
       - "src/threads_platform/infrastructure/worker_agent/**"
       - "src/threads_platform/infrastructure/browser/**"
       - "tests/unit/test_worker_package.py"
+      - "tests/unit/test_worker_host_config.py"
   workflow_dispatch:
 
 permissions:
@@ -151,6 +153,12 @@ jobs:
           Write-Output 'PACKAGED_RUNTIME_CHECK_OK'
           Write-Output 'MISSING_CONTROL_PLANE_CONFIG_FAILS_CLOSED'
           exit 0
+
+      - name: Validate interactive Task Scheduler lifecycle
+        shell: pwsh
+        run: >-
+          ./packaging/windows_worker/Test-ThreadsWorkerTask.ps1
+          -PackageRoot "$env:RUNNER_TEMP\worker-stage\threads-worker-windows-x64"
 
       - name: Create deterministic ZIP and SHA-256
         shell: pwsh

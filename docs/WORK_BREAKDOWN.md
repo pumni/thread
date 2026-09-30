@@ -326,7 +326,7 @@ claims while preserving already-running WorkerJob leases and their normal
 terminal operations. Readiness does not own presence expiry. The WorkerAgent
 closes managed sessions and resumes finalization after reconnect; no process
 kill, task cancellation, updater, migration, or package installer is included.
-The service-manager-neutral update and rollback procedure is in
+The interactive Windows Worker update and rollback procedure is in
 `docs/WORKER_UPDATE_RUNBOOK.md`. Issue #3 remains OPEN, #62 remains separate,
 and no production release claim follows from this checkpoint.
 
@@ -342,3 +342,18 @@ internal/test artifact. Worker identity, private key, profiles, journal and
 media remain in the external data root. There is no service installation,
 signing, downloader, or self-update. #78 DRAINING semantics are unchanged; #3
 remains OPEN and #62 remains separate.
+
+## C6-02/7 — Interactive Windows Worker host (#84)
+
+Issue #84 is the sole authorized C6-02/7 design. The headed browser Worker runs
+under a dedicated logged-in Windows user via Task Scheduler with an Interactive
+token, Limited run level, same-user logon trigger, IgnoreNew, unlimited duration,
+and AllowHardTerminate disabled. Current-user DPAPI identity stays with that
+principal. A strict non-secret host config and bounded PowerShell lifecycle tool
+support registration, inspection, update, and uninstall; first enrollment is
+interactive and environment-only. Planned updates/rollback require durable #78
+DRAINING -> quiescent -> OFFLINE; the task is not force-stopped. #83's
+LocalService Windows Service design was superseded before merge. Abrupt session
+loss remains lease/presence recovery, not drain completion. No migration, service,
+self-updater, metrics/tracing, or #62 behavior is included. Issue #3 remains OPEN
+and no production release claim follows from this checkpoint.
