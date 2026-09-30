@@ -90,17 +90,23 @@ Never record access tokens, app secrets, authorization codes or sensitive accoun
 The evidence model uses `threads-live-evidence-v1`, strict unknown-field rejection, recursive secret-sensitive scanning, and explicit `TEMPLATE_ONLY_NOT_LIVE_EVIDENCE` classification for its checked-in matrix. Its fingerprint helper accepts opaque input through standard input and outputs only `sha256:<64 lowercase hex characters>`; fingerprints are comparison metadata, never authentication material. Validation is offline and does not call Meta.
 
 Issue #68's accepted scrubbed Phase A evidence is recorded in
-`docs/evidence/threads-live-phase-a-2026-09-30.json`. It verifies token
-exchange/refresh observations, validity and effective scopes, and own-profile
-behavior. That evidence authorized #70; #55 remains open pending acceptance of
-the provider implementation. Phase B is `NOT_RUN`, so discovery/mentions
-scheduler policy remains blocked pending accepted cursor/polling evidence. No
-discovery/mentions capability becomes live-verified. Issue #3 remains OPEN as
-a production/release gate, and the Postman collection alone is not runtime
-proof.
+`docs/evidence/threads-live-phase-a-2026-09-30.json` and established token
+provider readiness (`token_provider_ready_evidence=true`). Issue #74 records
+partial Phase B live evidence in
+`docs/evidence/threads-live-phase-b-partial-2026-09-30.json`
+(`PARTIAL_LIVE_EVIDENCE / NOT_READY`). Canonical discovery endpoints failed or
+were blocked on the test app with HTTP 500, while B05/B06 were verified and
+collection pagination semantics were corroborated on `/me/threads`.
+`polling_cursor_ready_evidence=false`, so discovery/mentions scheduler policy
+under #9 remains blocked. Opportunistic Phase C observations (C01, C04, C08)
+were recorded but do not equal Phase C acceptance. No discovery/mentions
+capability becomes live-verified. Issue #3 remains OPEN as a production/release
+gate, and the Postman collection alone is not runtime proof.
 
 ## Official source links
 
+- https://developers.facebook.com/docs/threads/changelog
+- https://developers.facebook.com/documentation/threads/keyword-search
 - https://www.postman.com/meta/threads/overview
 - https://www.postman.com/meta/threads/collection/dht3nzz/threads-api
 - https://www.postman.com/meta/threads/folder/34203612-e0373e84-de6b-46f1-b90d-3fea76ba6782
