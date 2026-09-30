@@ -231,6 +231,15 @@ no delivery loop. The standalone scheduler reports `CRM_RESULT_SINK_UNAVAILABLE`
 and skips only this stage until the separately authorized production transport
 dependency #62 is resolved. No migration or generic event bus is added.
 
+C6-02/3 (#72) adds scoped correlation to bounded Command, WorkerJob, and
+scheduler lifecycle logs; recursive redaction before JSON rendering; and
+aggregate PostgreSQL/Worker readiness at `/ready`. `/health` remains process
+liveness. Database failure returns HTTP 503, while fleet degradation remains
+diagnostic HTTP 200. Readiness does not own presence expiry. This checkpoint
+does not add metrics or tracing. Issue #3 remains the production/release gate,
+and #62 remains a separate CRM transport dependency. See
+`docs/OBSERVABILITY_RUNBOOK.md`.
+
 ## 10. D — Release
 
 Issue #11.
@@ -251,10 +260,9 @@ Does block production activation.
 
 Issue #65 prepared the offline packet/runbook/validator. Accepted Phase A live
 evidence is recorded in
-`docs/evidence/threads-live-phase-a-2026-09-30.json`; it authorized #70, but
-#55 remains open pending acceptance of that implementation. Phase B is
-`NOT_RUN`, so discovery/mentions scheduling remains blocked. Keep #3 OPEN as
-the production/release gate, and keep #62 as a separate CRM transport
+`docs/evidence/threads-live-phase-a-2026-09-30.json`; #55 and #70 are closed.
+Phase B is `NOT_RUN`, so discovery/mentions scheduling remains blocked. Keep #3
+OPEN as the production/release gate, and keep #62 as a separate CRM transport
 dependency. No production release claim follows from #70.
 
 ## 12. Stop conditions
@@ -305,7 +313,7 @@ Every checkpoint PR must report:
 The #65 checkpoint added an offline strict evidence packet validator,
 recursive secret checks, stdin-only opaque fingerprinting, a template-only
 matrix, and a human runbook. It did not call Meta or fabricate live
-observations. The #68 Phase A packet is accepted and #70 is authorized; #55
-remains open pending acceptance of #70. Phase B is `NOT_RUN`, discovery and
-mentions scheduling remain gated, and #3 remains open as the production/release
-gate.
+observations. The #68 Phase A packet is accepted; #55 and #70 are closed. Phase
+B is `NOT_RUN`, discovery and mentions scheduling remain gated, and #3 remains
+open as the production/release gate. Issue #72 is authorized for observability
+and readiness only; metrics/tracing and #62 remain out of scope.

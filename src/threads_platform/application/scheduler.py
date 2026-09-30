@@ -141,17 +141,6 @@ async def run_scheduler_tick(
     outbox_deliveries_succeeded = 0
     error: Exception | None = None
 
-    logger.info(
-        "scheduler_tick_started",
-        now=occurred_at.isoformat(),
-        presence_expiry_limit=presence_expiry_limit,
-        generation_limit=generation_limit,
-        conversation_sync_limit=conversation_sync_limit,
-        activity_limit=activity_limit,
-        command_limit=command_limit,
-        recovery_limit=recovery_limit,
-        outbox_delivery_limit=outbox_delivery_limit,
-    )
     try:
         try:
             worker_presences_expired = await resolved_worker_control_service.expire_presence(
@@ -347,7 +336,7 @@ class SchedulerRunner:
                     MAX_SCHEDULER_ERROR_BACKOFF_SECONDS,
                 )
                 self._logger.error(
-                    "scheduler_tick_failed",
+                    "scheduler_backoff_scheduled",
                     error_type=type(error).__name__,
                     consecutive_failures=failures,
                     retry_delay_seconds=delay,

@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
+import structlog
+
 from threads_platform.application.browser_capabilities import (
     BROWSER_CAPABILITY_CONTRACTS,
     BrowserCapabilityStatus,
@@ -93,6 +95,7 @@ class WorkerJobService:
         self._result_delivery_lifetime = result_delivery_lifetime
         self._crm_destination = crm_destination
         self._capability_router = capability_router or CapabilityRouter()
+        self._logger = structlog.get_logger(__name__)
 
     async def enqueue(
         self,
@@ -250,6 +253,13 @@ class WorkerJobService:
                     capability_name, capability_version
                 )
             )
+        self._log_lifecycle(
+            "worker_job_enqueued",
+            job,
+            worker_id=assigned_worker_id,
+            correlation_id=command.correlation_id if command is not None else None,
+            command_type=command.command_type if command is not None else None,
+        )
         return job, notification_worker_ids
 
     def publish_available(
@@ -333,6 +343,8 @@ class WorkerJobService:
                         coordination_generation,
                         now,
                     )
+        if job is not None:
+            self._log_lifecycle("worker_job_claimed", job, worker_id=worker_id)
         return job
 
     async def renew(self, job_id: UUID, worker_id: UUID, lease_token: UUID) -> WorkerJob:
@@ -380,6 +392,12 @@ class WorkerJobService:
             request = await self._request_cancel_in_transaction(
                 unit_of_work, job, reason_code=reason_code, now=occurred_at
             )
+        self._log_lifecycle(
+            "worker_job_cancel_requested",
+            job,
+            worker_id=job.lease_worker_id or job.assigned_worker_id,
+            error_code=reason_code,
+        )
         return request
 
     async def _request_cancel_in_transaction(
@@ -535,6 +553,12 @@ class WorkerJobService:
                 unit_of_work, job.id, now, "CANCEL_ACKNOWLEDGED"
             )
             await self._release_account_coordination(unit_of_work, job, generation_fence, now)
+        self._log_lifecycle(
+            "worker_job_cancelled",
+            job,
+            worker_id=worker_id,
+            error_code=request.reason_code,
+        )
         return job
 
     async def complete(
@@ -567,6 +591,7 @@ class WorkerJobService:
                 result=result,
             )
             await self._release_account_coordination(unit_of_work, job, generation, now)
+        self._log_lifecycle("worker_job_completed", job, worker_id=worker_id)
         return job
 
     async def fail(
@@ -627,6 +652,12 @@ class WorkerJobService:
                     error_code=error_code,
                 )
             await self._release_account_coordination(unit_of_work, job, generation, now)
+        self._log_lifecycle(
+            "worker_job_failure_transition",
+            job,
+            worker_id=worker_id,
+            error_code=error_code,
+        )
         return job
 
     async def request_intervention(
@@ -678,6 +709,12 @@ class WorkerJobService:
             await unit_of_work.worker_jobs.update(job)
             await self._set_command_waiting_intervention(unit_of_work, job, now)
             await self._release_account_coordination(unit_of_work, job, generation, now)
+        self._log_lifecycle(
+            "worker_job_intervention_requested",
+            job,
+            worker_id=worker_id,
+            error_code=detail_code,
+        )
         return job
 
     async def resolve_intervention(
@@ -736,6 +773,12 @@ class WorkerJobService:
                     worker_id,
                     {"type": "job.available", "job_id": str(job.id)},
                 )
+        self._log_lifecycle(
+            "worker_job_intervention_resolved",
+            job,
+            worker_id=job.lease_worker_id or job.assigned_worker_id,
+            error_code=job.error_code,
+        )
         return job
 
     async def reconcile(self, worker_id: UUID) -> WorkerJobReconciliation:
@@ -752,6 +795,7 @@ class WorkerJobService:
     async def recover_expired(self, limit: int = 50, *, now: datetime | None = None) -> int:
         occurred_at = normalize_utc(now if now is not None else self._clock.now())
         recovered = 0
+        recovered_status_counts: dict[str, int] = {}
         async with self._unit_of_work_factory() as unit_of_work:
             jobs = await unit_of_work.worker_jobs.list_expired_for_update(occurred_at, limit)
             for job in jobs:
@@ -836,6 +880,15 @@ class WorkerJobService:
                         unit_of_work, job.id, occurred_at
                     )
                 recovered += 1
+                recovered_status_counts[job.status.value] = (
+                    recovered_status_counts.get(job.status.value, 0) + 1
+                )
+        if recovered:
+            self._logger.info(
+                "worker_job_expired_lease_recovery",
+                recovered_count=recovered,
+                status_counts=recovered_status_counts,
+            )
         return recovered
 
     async def get(self, job_id: UUID) -> WorkerJob:
@@ -863,6 +916,33 @@ class WorkerJobService:
             and worker.presence_expires_at is not None
             and worker.presence_expires_at > now
         )
+
+    def _log_lifecycle(
+        self,
+        event: str,
+        job: WorkerJob,
+        *,
+        worker_id: UUID | None = None,
+        correlation_id: str | None = None,
+        command_type: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        fields: dict[str, object] = {
+            "worker_job_id": str(job.id),
+            "command_id": job.command_id,
+            "account_id": str(job.account_id) if job.account_id is not None else None,
+            "worker_id": str(worker_id) if worker_id is not None else None,
+            "capability_name": job.capability_name,
+            "status": job.status.value,
+        }
+        if correlation_id is not None:
+            fields["correlation_id"] = correlation_id
+        if command_type is not None:
+            fields["command_type"] = command_type
+        resolved_error_code = error_code if error_code is not None else job.error_code
+        if resolved_error_code is not None:
+            fields["error_code"] = resolved_error_code
+        self._logger.info(event, **fields)
 
     @staticmethod
     async def _locked_job(unit_of_work: UnitOfWork, job_id: UUID) -> WorkerJob:

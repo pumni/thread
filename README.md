@@ -10,12 +10,14 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-01/4 — Scheduler-owned bounded Worker presence expiry (#60)**.
+- **C6-02/3 — Structured log redaction, correlation and readiness (#72)**.
 
 Not production-ready:
 - issue #3 live Meta OAuth/API validation remains open;
 - browser capabilities remain bounded by their accepted capability contracts;
 - scheduler availability does not imply production activation.
+- #62 remains a separate CRM result transport dependency;
+- metrics and distributed tracing are not implemented.
 
 ## Product direction
 
@@ -114,6 +116,14 @@ Phase A is accepted from the scrubbed
 Phase B is `NOT_RUN`, #3 remains OPEN, and no production release readiness is
 claimed. The separate CRM result transport dependency #62 remains unresolved;
 the scheduler still reports `CRM_RESULT_SINK_UNAVAILABLE` for that stage.
+
+The Control Plane exposes `/health` for process liveness and `/ready` for
+bounded PostgreSQL and persisted Worker-fleet readiness. Database failure makes
+`/ready` return 503; fleet degradation is diagnostic and returns HTTP 200.
+Structured logs carry bounded lifecycle correlation fields and centrally redact
+known credential patterns. See the
+[observability runbook](docs/OBSERVABILITY_RUNBOOK.md) for fields, limitations,
+and readiness semantics. Metrics and distributed tracing are not part of #72.
 
 The scheduler dispatches only already-configured `threads.sync_conversation`
 schedules. It coalesces missed wall-clock intervals into one Command; the
