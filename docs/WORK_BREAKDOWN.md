@@ -357,3 +357,22 @@ LocalService Windows Service design was superseded before merge. Abrupt session
 loss remains lease/presence recovery, not drain completion. No migration, service,
 self-updater, metrics/tracing, or #62 behavior is included. Issue #3 remains OPEN
 and no production release claim follows from this checkpoint.
+
+## C6-02/8 — Linux/Docker Control Plane deployment (#87)
+
+The Control Plane uses a locked Python 3.14 Linux image with a non-root runtime
+user. PostgreSQL is a separate durable service; FastAPI/Uvicorn and the existing
+standalone scheduler run as independent containers against the same database.
+Alembic runs through a one-shot migration role before application startup. The
+image contains no local secrets, test databases, Worker durable data, Windows
+package payload, or Playwright browser binaries. Windows Workers remain an
+external fleet.
+
+The exact-head Compose smoke verifies image contents, `/health` and `/ready`,
+HTTP/scheduler container recreation over the same PostgreSQL volume, scheduler
+rediscovery of persisted Worker presence, and database outage/readiness recovery.
+It uses no Meta, CRM, or live Worker calls and adds no API or schema. See
+`docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for exact commands and restart/loss
+recovery limits. Metrics/tracing remain deferred to C6-02/9; #62 remains
+separate; #3 remains OPEN and no production release claim follows from this
+checkpoint. Existing #78 DRAINING and #84 Windows Worker semantics are unchanged.

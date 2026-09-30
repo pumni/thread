@@ -493,3 +493,18 @@ abrupt session or OS loss is not drain completion. No migration, service,
 downloader, or self-updater is included. Phase A remains accepted; Phase B is
 `PARTIAL_LIVE_EVIDENCE / NOT_READY`; issue #3 remains OPEN, #62 remains separate,
 and no production release claim is made.
+
+## 20. C6-02/8 Linux/Docker Control Plane deployment (#87)
+
+Issue #87 fixes the Control Plane process topology before metrics/tracing: a
+locked Python 3.14 non-root image supports an explicit one-shot migration job,
+FastAPI/Uvicorn HTTP container, and standalone scheduler container. HTTP and
+scheduler share PostgreSQL; PostgreSQL is separate durable state, and Windows
+Workers remain external. The internal/test Compose smoke uses a named PostgreSQL
+volume and proves liveness/readiness, HTTP and scheduler recreation, persisted
+Worker presence rediscovery, and fail-closed `/ready` during a database outage.
+It does not run Meta, CRM, or Worker calls. No new schema migration, production
+secret, metrics/tracing, Windows Worker container, or production release claim
+is included. #78 DRAINING and #84 interactive Worker behavior are unchanged. Phase
+B remains `PARTIAL_LIVE_EVIDENCE / NOT_READY`, #3 remains OPEN, and #62 remains a
+separate dependency. See `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.

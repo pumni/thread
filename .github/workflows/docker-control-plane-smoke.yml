@@ -1,0 +1,39 @@
+name: Docker Control Plane smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose-restart-smoke:
+    name: Exact-head Docker and PostgreSQL restart smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      THREADS_PLATFORM_SMOKE_PROJECT_NAME: threads-cp-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      COMPOSE_PROJECT_NAME: threads-cp-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      THREADS_PLATFORM_IMAGE: threads-control-plane:smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      THREADS_PLATFORM_SMOKE_HTTP_PORT: "18000"
+    steps:
+      - name: Check out exact PR head without persisted credentials
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.7"
+
+      - name: Build image and run Compose restart/recovery smoke
+        run: uv run --no-project --python 3.14 python scripts/control_plane_compose_smoke.py
+
+      - name: Remove smoke containers and PostgreSQL volume
+        if: always()
+        run: docker compose down --volumes --remove-orphans

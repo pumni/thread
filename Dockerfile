@@ -1,6 +1,6 @@
 FROM ghcr.io/astral-sh/uv:0.12.7 AS uv
 
-FROM python:3.14.7-slim
+FROM python:3.14.7-slim AS build
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,10 +14,28 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY src ./src
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev --no-editable
 
-ENV PATH="/app/.venv/bin:$PATH"
+FROM python:3.14.7-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/app \
+    PATH="/app/.venv/bin:$PATH" \
+    THREADS_PLATFORM_HTTP_HOST=0.0.0.0 \
+    THREADS_PLATFORM_HTTP_PORT=8000
+
+RUN groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --home-dir /home/app --create-home --shell /usr/sbin/nologin app
+
+WORKDIR /app
+
+COPY --from=build --chown=app:app /app/.venv /app/.venv
+COPY --chown=app:app alembic.ini ./alembic.ini
+COPY --chown=app:app migrations ./migrations
+
+USER app
 
 EXPOSE 8000
 
-CMD ["uvicorn", "threads_platform.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "exec uvicorn threads_platform.app:app --host \"${THREADS_PLATFORM_HTTP_HOST:-0.0.0.0}\" --port \"${THREADS_PLATFORM_HTTP_PORT:-8000}\""]
