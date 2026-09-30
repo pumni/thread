@@ -1,0 +1,182 @@
+name: Windows Worker package
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-worker-package.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "packaging/windows_worker/**"
+      - "src/threads_platform/workers/**"
+      - "src/threads_platform/infrastructure/worker_agent/**"
+      - "src/threads_platform/infrastructure/browser/**"
+      - "tests/unit/test_worker_package.py"
+      - "README.md"
+      - "docs/ARCHITECTURE.md"
+      - "docs/PROJECT_STATE_HANDOFF.md"
+      - "docs/WORKER_AGENT_WINDOWS.md"
+      - "docs/WORKER_UPDATE_RUNBOOK.md"
+      - "docs/WORK_BREAKDOWN.md"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-worker-package.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "packaging/windows_worker/**"
+      - "src/threads_platform/workers/**"
+      - "src/threads_platform/infrastructure/worker_agent/**"
+      - "src/threads_platform/infrastructure/browser/**"
+      - "tests/unit/test_worker_package.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Windows x64 Worker package and smoke
+    runs-on: windows-latest
+    env:
+      PYTHONHASHSEED: "1"
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked --group packaging
+
+      - name: Install only locked Playwright Chromium
+        shell: pwsh
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+        run: uv run --locked playwright install chromium
+
+      - name: Set stable PE build timestamp
+        shell: pwsh
+        run: |
+          $commitEpoch = (git show -s --format=%ct HEAD).Trim()
+          if ($commitEpoch -notmatch '^\d+$') { throw 'Git build timestamp is unavailable' }
+          "SOURCE_DATE_EPOCH=$commitEpoch" >> $env:GITHUB_ENV
+
+      - name: Build PyInstaller onedir bundle
+        shell: pwsh
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
+          PYTHONHASHSEED: "1"
+        run: >-
+          uv run --locked pyinstaller --clean --noconfirm
+          --distpath "$env:RUNNER_TEMP\worker-dist"
+          --workpath "$env:RUNNER_TEMP\worker-pyinstaller-work"
+          packaging/windows_worker/threads-worker.spec
+
+      - name: Stage bundle and safe manifest
+        shell: pwsh
+        run: >-
+          uv run --locked python packaging/windows_worker/build_package.py stage
+          --dist-root "$env:RUNNER_TEMP\worker-dist"
+          --output-root "$env:RUNNER_TEMP\worker-stage"
+
+      - name: Run packaged executable smoke checks
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'worker-stage\threads-worker-windows-x64'
+          $executable = Join-Path $packageRoot 'threads-worker.exe'
+          $manifestPath = Join-Path $packageRoot 'BUILD-MANIFEST.json'
+          if (!(Test-Path -LiteralPath $executable) -or !(Test-Path -LiteralPath $manifestPath)) {
+            throw 'Packaged executable or manifest is missing'
+          }
+          $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $expectedFields = @(
+            'artifact_schema', 'project_version', 'git_sha', 'python_version',
+            'playwright_version', 'pyinstaller_version', 'target_os', 'target_arch',
+            'browser', 'created_at_utc'
+          ) | Sort-Object
+          $actualFields = @($manifest.PSObject.Properties.Name | Sort-Object)
+          if (Compare-Object $expectedFields $actualFields) { throw 'Manifest fields are invalid' }
+          if ($manifest.git_sha -ne (git rev-parse HEAD).Trim()) {
+            throw 'Manifest Git SHA does not match the checked-out source'
+          }
+          if ($manifest.target_os -ne 'windows' -or $manifest.target_arch -ne 'x64' -or
+              $manifest.browser -ne 'chromium') {
+            throw 'Manifest target does not match the package'
+          }
+
+          $versionOutput = (& $executable --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -ne $manifest.project_version) {
+            throw 'Packaged --version check failed'
+          }
+          $configuredDataRoot = Join-Path $env:RUNNER_TEMP 'configured-worker-data'
+          New-Item -ItemType Directory -Path $configuredDataRoot | Out-Null
+          $sentinelPath = Join-Path $configuredDataRoot 'operator-data-sentinel.txt'
+          Set-Content -NoNewline -LiteralPath $sentinelPath -Value 'preserve'
+          $beforeDataPaths = @(
+            Get-ChildItem -Force -Recurse -LiteralPath $configuredDataRoot |
+              ForEach-Object { $_.FullName } | Sort-Object
+          )
+          $env:THREADS_WORKER_DATA_ROOT = $configuredDataRoot
+          $packageCheckOutput = (& $executable --package-check).Trim()
+          if ($LASTEXITCODE -ne 0 -or $packageCheckOutput -ne 'WORKER_PACKAGE_CHECK_OK') {
+            throw 'Packaged --package-check failed'
+          }
+          $afterDataPaths = @(
+            Get-ChildItem -Force -Recurse -LiteralPath $configuredDataRoot |
+              ForEach-Object { $_.FullName } | Sort-Object
+          )
+          if (Compare-Object $beforeDataPaths $afterDataPaths) {
+            throw 'Package check modified the configured Worker data root'
+          }
+          if ((Get-Content -Raw -LiteralPath $sentinelPath) -ne 'preserve') {
+            throw 'Package check changed existing Worker data'
+          }
+
+          Remove-Item Env:THREADS_WORKER_CONTROL_PLANE_URL -ErrorAction SilentlyContinue
+          Remove-Item Env:THREADS_WORKER_DATA_ROOT -ErrorAction SilentlyContinue
+          $normalOutput = (& $executable 2>&1 | Out-String).Trim()
+          $normalExitCode = $LASTEXITCODE
+          if ($normalExitCode -eq 0 -or $normalOutput -notmatch 'THREADS_WORKER_CONFIGURATION_INVALID') {
+            throw 'Normal startup without Control Plane configuration did not fail safely'
+          }
+          Write-Output "PACKAGED_VERSION_OK $versionOutput"
+          Write-Output 'PACKAGED_RUNTIME_CHECK_OK'
+          Write-Output 'MISSING_CONTROL_PLANE_CONFIG_FAILS_CLOSED'
+
+      - name: Create deterministic ZIP and SHA-256
+        shell: pwsh
+        run: >-
+          uv run --locked python packaging/windows_worker/build_package.py archive
+          --package-root "$env:RUNNER_TEMP\worker-stage\threads-worker-windows-x64"
+          --output-root "$env:RUNNER_TEMP\worker-release"
+
+      - name: Verify archive digest
+        shell: pwsh
+        run: |
+          $releaseRoot = Join-Path $env:RUNNER_TEMP 'worker-release'
+          $archive = Get-ChildItem -LiteralPath $releaseRoot -Filter '*.zip' | Select-Object -Single
+          $digestFile = Join-Path $releaseRoot ($archive.Name + '.sha256')
+          $expectedDigest = (Get-Content -Raw -LiteralPath $digestFile).Split(' ')[0]
+          $actualDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive.FullName).Hash.ToLowerInvariant()
+          if ($actualDigest -ne $expectedDigest) { throw 'ZIP SHA-256 verification failed' }
+          Write-Output "VERIFIED_SHA256 $actualDigest"
+
+      - name: Upload unsigned internal/test artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-worker-package-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/worker-release/*.zip
+            ${{ runner.temp }}/worker-release/*.zip.sha256
+            ${{ runner.temp }}/worker-release/BUILD-MANIFEST.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

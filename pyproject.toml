@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 threads-credential-admin = "threads_platform.tools.credential_admin:main"
+threads-worker = "threads_platform.workers.__main__:main"
 
 [build-system]
 requires = ["uv_build==0.12.7"]
@@ -32,6 +33,7 @@ dev = [
     "pytest-asyncio>=0.25,<2",
     "ruff>=0.9,<1",
 ]
+packaging = ["pyinstaller==6.22.3"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

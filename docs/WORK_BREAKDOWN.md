@@ -329,3 +329,16 @@ kill, task cancellation, updater, migration, or package installer is included.
 The service-manager-neutral update and rollback procedure is in
 `docs/WORKER_UPDATE_RUNBOOK.md`. Issue #3 remains OPEN, #62 remains separate,
 and no production release claim follows from this checkpoint.
+
+## C6-02/6 — Reproducible Windows Worker package (#81)
+
+The Windows x64 Worker has a `threads-worker` console entry point and a pinned
+PyInstaller onedir build. The locked Playwright 1.63.0 runtime bundles only its
+matching Chromium. `--version` is metadata-only; `--package-check` validates
+temporary identity/DPAPI/journal state and bundled Chromium on `about:blank`
+without Control Plane or external navigation. An exact-head Windows workflow
+creates a safe manifest, normalized ZIP, SHA-256 digest, and unsigned
+internal/test artifact. Worker identity, private key, profiles, journal and
+media remain in the external data root. There is no service installation,
+signing, downloader, or self-update. #78 DRAINING semantics are unchanged; #3
+remains OPEN and #62 remains separate.
