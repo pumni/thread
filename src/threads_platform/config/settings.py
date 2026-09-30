@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 ThreadsTokenProviderMode = Literal["disabled", "environment"]
+SchedulerMetricsHost = Literal["127.0.0.1", "0.0.0.0"]
 
 
 class Settings(BaseSettings):
@@ -26,6 +27,9 @@ class Settings(BaseSettings):
     scheduler_command_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_recovery_batch_limit: int = Field(default=50, ge=1, le=100)
     scheduler_outbox_delivery_batch_limit: int = Field(default=50, ge=1, le=100)
+    scheduler_metrics_enabled: bool = False
+    scheduler_metrics_host: SchedulerMetricsHost = "127.0.0.1"
+    scheduler_metrics_port: int = Field(default=9101, ge=1, le=65_535)
     crm_ingress_token: SecretStr | None = None
     worker_admin_token: SecretStr | None = None
     worker_tls_required: bool = True

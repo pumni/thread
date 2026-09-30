@@ -6,6 +6,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Protocol
 
 import structlog
@@ -33,6 +34,21 @@ from threads_platform.domain.time import normalize_utc
 MAX_SCHEDULER_BATCH_SIZE = 100
 MAX_SCHEDULER_POLL_INTERVAL_SECONDS = 3_600
 MAX_SCHEDULER_ERROR_BACKOFF_SECONDS = 3_600
+
+
+class SchedulerTickOutcome(StrEnum):
+    SUCCESS = "success"
+    ERROR = "error"
+
+
+class SchedulerStage(StrEnum):
+    WORKER_PRESENCE_EXPIRY = "worker_presence_expiry"
+    ACTIVITY_RECURRENCE_GENERATION = "activity_recurrence_generation"
+    CONVERSATION_SYNC_DISPATCH = "conversation_sync_dispatch"
+    ACTIVITY_MATERIALIZATION = "activity_materialization"
+    COMMAND_PROCESSING = "command_processing"
+    WORKER_JOB_RECOVERY = "worker_job_recovery"
+    OUTBOX_DELIVERY = "outbox_delivery"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,12 +109,66 @@ class SchedulerTick(Protocol):
     ) -> SchedulerTickResult: ...
 
 
+class SchedulerMetricsObserver(Protocol):
+    def observe_tick(self, outcome: SchedulerTickOutcome, duration_seconds: float) -> None: ...
+
+    def observe_tick_result(self, result: SchedulerTickResult) -> None: ...
+
+    def observe_stage_failure(self, stage: SchedulerStage) -> None: ...
+
+
 SchedulerWait = Callable[[asyncio.Event, float], Awaitable[None]]
 
 
 def validate_scheduler_limit(name: str, value: int) -> None:
     if type(value) is not int or not 1 <= value <= MAX_SCHEDULER_BATCH_SIZE:
         raise ValueError(f"{name} must be between 1 and {MAX_SCHEDULER_BATCH_SIZE}")
+
+
+def _observe_stage_failure(
+    observer: SchedulerMetricsObserver | None,
+    stage: SchedulerStage,
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer.observe_stage_failure(stage)
+    except Exception as error:
+        structlog.get_logger(__name__).warning(
+            "scheduler_metrics_observation_failed",
+            error_type=type(error).__name__,
+        )
+
+
+def _observe_tick_result(
+    observer: SchedulerMetricsObserver | None,
+    result: SchedulerTickResult,
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer.observe_tick_result(result)
+    except Exception as error:
+        structlog.get_logger(__name__).warning(
+            "scheduler_metrics_observation_failed",
+            error_type=type(error).__name__,
+        )
+
+
+def _observe_tick(
+    observer: SchedulerMetricsObserver | None,
+    outcome: SchedulerTickOutcome,
+    duration_seconds: float,
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer.observe_tick(outcome, duration_seconds)
+    except Exception as error:
+        structlog.get_logger(__name__).warning(
+            "scheduler_metrics_observation_failed",
+            error_type=type(error).__name__,
+        )
 
 
 async def run_scheduler_tick(
@@ -116,6 +186,7 @@ async def run_scheduler_tick(
     command_limit: int,
     recovery_limit: int,
     outbox_delivery_limit: int = 50,
+    metrics_observer: SchedulerMetricsObserver | None = None,
 ) -> SchedulerTickResult:
     """Process a bounded snapshot of durable work without retaining tick state."""
     validate_scheduler_limit("activity_limit", activity_limit)
@@ -152,9 +223,10 @@ async def run_scheduler_tick(
                 error = caught
             logger.error(
                 "scheduler_tick_stage_failed",
-                stage="worker_presence_expiry",
+                stage=SchedulerStage.WORKER_PRESENCE_EXPIRY.value,
                 error_type=type(caught).__name__,
             )
+            _observe_stage_failure(metrics_observer, SchedulerStage.WORKER_PRESENCE_EXPIRY)
 
         try:
             activities = await generate_due_account_activity_occurrences(
@@ -168,9 +240,10 @@ async def run_scheduler_tick(
                 error = caught
             logger.error(
                 "scheduler_tick_stage_failed",
-                stage="activity_recurrence_generation",
+                stage=SchedulerStage.ACTIVITY_RECURRENCE_GENERATION.value,
                 error_type=type(caught).__name__,
             )
+            _observe_stage_failure(metrics_observer, SchedulerStage.ACTIVITY_RECURRENCE_GENERATION)
 
         try:
             conversation_sync_commands = await dispatch_due_conversation_syncs(
@@ -184,9 +257,10 @@ async def run_scheduler_tick(
                 error = caught
             logger.error(
                 "scheduler_tick_stage_failed",
-                stage="conversation_sync_dispatch",
+                stage=SchedulerStage.CONVERSATION_SYNC_DISPATCH.value,
                 error_type=type(caught).__name__,
             )
+            _observe_stage_failure(metrics_observer, SchedulerStage.CONVERSATION_SYNC_DISPATCH)
 
         try:
             activities = await materialize_due_account_activities(
@@ -200,9 +274,10 @@ async def run_scheduler_tick(
                 error = caught
             logger.error(
                 "scheduler_tick_stage_failed",
-                stage="activity_materialization",
+                stage=SchedulerStage.ACTIVITY_MATERIALIZATION.value,
                 error_type=type(caught).__name__,
             )
+            _observe_stage_failure(metrics_observer, SchedulerStage.ACTIVITY_MATERIALIZATION)
 
         attempted_command_ids: set[str] = set()
         for _ in range(command_limit):
@@ -216,9 +291,10 @@ async def run_scheduler_tick(
                     error = caught
                 logger.error(
                     "scheduler_tick_stage_failed",
-                    stage="command_processing",
+                    stage=SchedulerStage.COMMAND_PROCESSING.value,
                     error_type=type(caught).__name__,
                 )
+                _observe_stage_failure(metrics_observer, SchedulerStage.COMMAND_PROCESSING)
                 break
             if result is None:
                 break
@@ -241,9 +317,10 @@ async def run_scheduler_tick(
                 error = caught
             logger.error(
                 "scheduler_tick_stage_failed",
-                stage="worker_job_recovery",
+                stage=SchedulerStage.WORKER_JOB_RECOVERY.value,
                 error_type=type(caught).__name__,
             )
+            _observe_stage_failure(metrics_observer, SchedulerStage.WORKER_JOB_RECOVERY)
 
         if outbox_delivery_worker is not None:
             try:
@@ -258,10 +335,11 @@ async def run_scheduler_tick(
                     error = caught
                 logger.error(
                     "scheduler_tick_stage_failed",
-                    stage="outbox_delivery",
+                    stage=SchedulerStage.OUTBOX_DELIVERY.value,
                     error_type=type(caught).__name__,
                     outbox_deliveries_attempted=outbox_deliveries_attempted,
                 )
+                _observe_stage_failure(metrics_observer, SchedulerStage.OUTBOX_DELIVERY)
 
         if error is not None:
             raise error
@@ -276,6 +354,20 @@ async def run_scheduler_tick(
             outbox_deliveries_succeeded=outbox_deliveries_succeeded,
         )
     finally:
+        if error is not None:
+            _observe_tick_result(
+                metrics_observer,
+                SchedulerTickResult(
+                    worker_presences_expired=worker_presences_expired,
+                    activity_occurrences_generated=activity_occurrences_generated,
+                    conversation_syncs_dispatched=conversation_syncs_dispatched,
+                    activities_materialized=activities_materialized,
+                    commands_processed=commands_processed,
+                    worker_jobs_recovered=worker_jobs_recovered,
+                    outbox_deliveries_attempted=outbox_deliveries_attempted,
+                    outbox_deliveries_succeeded=outbox_deliveries_succeeded,
+                ),
+            )
         logger.info(
             "scheduler_tick_finished",
             worker_presences_expired=worker_presences_expired,
@@ -308,18 +400,23 @@ class SchedulerRunner:
         *,
         clock: Clock | None = None,
         wait_for_stop: SchedulerWait = _wait_for_stop,
+        metrics_observer: SchedulerMetricsObserver | None = None,
+        monotonic: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._tick = tick
         self._config = config or SchedulerRunnerConfig()
         self._clock = clock or SystemClock()
         self._wait_for_stop = wait_for_stop
+        self._metrics_observer = metrics_observer
+        self._monotonic = monotonic
         self._logger = structlog.get_logger(__name__)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         failures = 0
         while not stop_event.is_set():
+            started_at = self._monotonic()
             try:
-                await self._tick(
+                result = await self._tick(
                     now=normalize_utc(self._clock.now()),
                     presence_expiry_limit=self._config.presence_expiry_limit,
                     generation_limit=self._config.generation_limit,
@@ -330,6 +427,11 @@ class SchedulerRunner:
                     outbox_delivery_limit=self._config.outbox_delivery_limit,
                 )
             except Exception as error:
+                _observe_tick(
+                    self._metrics_observer,
+                    SchedulerTickOutcome.ERROR,
+                    max(0.0, self._monotonic() - started_at),
+                )
                 failures += 1
                 delay = min(
                     self._config.poll_interval.total_seconds() * 2 ** min(failures, 12),
@@ -342,6 +444,12 @@ class SchedulerRunner:
                     retry_delay_seconds=delay,
                 )
             else:
+                _observe_tick(
+                    self._metrics_observer,
+                    SchedulerTickOutcome.SUCCESS,
+                    max(0.0, self._monotonic() - started_at),
+                )
+                _observe_tick_result(self._metrics_observer, result)
                 failures = 0
                 delay = self._config.poll_interval.total_seconds()
 

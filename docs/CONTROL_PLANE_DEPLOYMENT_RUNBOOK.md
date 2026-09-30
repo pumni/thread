@@ -54,6 +54,35 @@ The scheduler runs independently as:
 python -m threads_platform.scheduler
 ```
 
+## Metrics scrape boundaries (#89)
+
+The HTTP process serves Prometheus text at `/metrics` on the configured HTTP
+port. It reads Worker and WorkerJob counts from PostgreSQL for each scrape; when
+PostgreSQL is unavailable it reports `threads_platform_database_up 0` and omits
+the persisted count samples. `/ready` keeps its separate #72 status and HTTP
+behavior.
+
+Compose enables the scheduler's independent metrics listener at
+`scheduler:9101/metrics` for containers on the private Compose network. The
+scheduler binds inside its container, but Compose publishes no host port for
+9101. The listener is disabled by default outside this topology; its bounded
+host and port settings are `THREADS_PLATFORM_SCHEDULER_METRICS_HOST` and
+`THREADS_PLATFORM_SCHEDULER_METRICS_PORT`.
+
+Scrape the two process owners separately:
+
+```powershell
+curl.exe http://127.0.0.1:8000/metrics
+docker compose exec -T http python -c "from urllib.request import urlopen; print(urlopen('http://scheduler:9101/metrics').read().decode())"
+```
+
+The extended Compose smoke checks both surfaces, verifies that scheduler port
+9101 is not published, and checks PostgreSQL-derived gauges after HTTP
+recreation. It also confirms that the scheduler's process-local tick counters
+start over after scheduler recreation. HTTP gauges rediscover durable rows from
+PostgreSQL; neither process restores counters from database state. Scraping
+requires no Meta, CRM, or Windows Worker connection.
+
 Both application roles receive the same `THREADS_PLATFORM_DATABASE_URL` from
 the Compose service configuration. For a real deployment, provide database
 credentials and any approved Threads token-reference environment through the
@@ -159,8 +188,8 @@ switching releases. Abrupt loss is not drain completion.
 ## Scope and release status
 
 There is no schema migration, Windows Worker container, Kubernetes/deployment
-template, registry publication, signing, metrics, or tracing in this
-checkpoint. Metrics/tracing are deferred to C6-02/9 after this process topology
-is accepted. #62 remains a separate CRM transport dependency. Phase B remains
+template, registry publication, signing, or tracing in this checkpoint.
+Bounded metrics are described in `docs/OBSERVABILITY_RUNBOOK.md`; distributed
+tracing remains deferred. #62 remains a separate CRM transport dependency. Phase B remains
 `PARTIAL_LIVE_EVIDENCE / NOT_READY`, and #3 remains OPEN as the production/release
 gate. This internal/test image and smoke do not make a production release claim.

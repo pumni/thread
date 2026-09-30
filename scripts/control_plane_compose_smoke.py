@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -182,6 +183,85 @@ def _get_json(path: str) -> tuple[int | None, dict[str, object] | None]:
         return None, None
 
 
+def _get_metrics() -> tuple[int | None, str | None, str | None]:
+    port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/metrics", timeout=3) as response:
+            return (
+                response.status,
+                response.read().decode("utf-8"),
+                response.headers.get("Content-Type"),
+            )
+    except HTTPError as error:
+        return (
+            error.code,
+            error.read().decode("utf-8", "replace"),
+            error.headers.get("Content-Type"),
+        )
+    except TimeoutError, URLError, OSError, UnicodeDecodeError:
+        return None, None, None
+
+
+def _wait_http_metrics(timeout: int = 30) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, body, content_type = _get_metrics()
+        if status == 200 and body is not None and content_type is not None:
+            if not content_type.startswith("text/plain"):
+                raise SmokeFailure("HTTP metrics content type is invalid")
+            return body, content_type
+        time.sleep(1)
+    raise SmokeFailure("HTTP /metrics did not become available")
+
+
+def _metric_value(payload: str, sample: str) -> float | None:
+    match = re.search(rf"^{re.escape(sample)} ([0-9]+(?:\.[0-9]+)?)$", payload, re.MULTILINE)
+    return float(match.group(1)) if match is not None else None
+
+
+def _scheduler_metrics_from_http_container() -> str:
+    fetch = (
+        "from urllib.request import urlopen; "
+        "print(urlopen('http://scheduler:9101/metrics', timeout=3)"
+        ".read().decode('utf-8'))"
+    )
+    return _compose("exec", "-T", "http", "python", "-c", fetch)
+
+
+def _wait_scheduler_tick_count(minimum: int, timeout: int = 30) -> float:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            payload = _scheduler_metrics_from_http_container()
+        except SmokeFailure:
+            time.sleep(1)
+            continue
+        values = re.findall(
+            r'^threads_platform_scheduler_ticks_total\{outcome="(?:success|error)"\} '
+            r"([0-9]+(?:\.[0-9]+)?)$",
+            payload,
+            re.MULTILINE,
+        )
+        count = sum(float(value) for value in values)
+        if count >= minimum:
+            return count
+        time.sleep(0.5)
+    raise SmokeFailure("scheduler metrics did not report the expected tick count")
+
+
+def _assert_scheduler_metrics_are_private() -> None:
+    config = _json_object(_compose("config", "--format", "json").encode("utf-8"))
+    services = config.get("services") if config is not None else None
+    if not isinstance(services, dict):
+        raise SmokeFailure("Compose service configuration could not be inspected")
+    scheduler = services.get("scheduler")
+    if not isinstance(scheduler, dict):
+        raise SmokeFailure("scheduler service is missing from Compose configuration")
+    ports = scheduler.get("ports")
+    if ports not in (None, []):
+        raise SmokeFailure("scheduler metrics must not publish a host port")
+
+
 def _wait_for(
     path: str,
     expected: Callable[[int | None, dict[str, object] | None], bool],
@@ -271,6 +351,9 @@ def _run_smoke() -> None:
     _compose("up", "--force-recreate", "migrate", timeout=240)
     _compose("up", "--detach", "http", "scheduler", timeout=180)
     _expect_live()
+    initial_metrics, _ = _wait_http_metrics()
+    if _metric_value(initial_metrics, "threads_platform_database_up") != 1.0:
+        raise SmokeFailure("HTTP metrics did not report PostgreSQL as available")
     ready = _expect_database_ready()
     if (
         ready.get("overall") != "READY"
@@ -284,6 +367,9 @@ def _run_smoke() -> None:
     postgres_id = _compose("ps", "-q", "postgres")
     if not http_id or not scheduler_id or http_id == scheduler_id or not postgres_id:
         raise SmokeFailure("HTTP, scheduler, and PostgreSQL process boundaries are invalid")
+    _assert_scheduler_metrics_are_private()
+    scheduler_ticks_before_restart = _wait_scheduler_tick_count(20)
+    print("PASS HTTP and private scheduler metrics listeners")
 
     preserved_worker_id = uuid4()
     _database_operation("seed-offline", preserved_worker_id)
@@ -294,6 +380,19 @@ def _run_smoke() -> None:
     _compose("up", "--detach", "--force-recreate", "--no-deps", "http", "scheduler")
     _expect_live()
     _expect_database_ready()
+    restarted_metrics, _ = _wait_http_metrics()
+    if (
+        _metric_value(restarted_metrics, "threads_platform_database_up") != 1.0
+        or _metric_value(
+            restarted_metrics,
+            'threads_platform_workers{status="OFFLINE"}',
+        )
+        != 2.0
+    ):
+        raise SmokeFailure("HTTP metrics did not rediscover PostgreSQL state after restart")
+    scheduler_ticks_after_restart = _wait_scheduler_tick_count(1)
+    if scheduler_ticks_after_restart >= scheduler_ticks_before_restart:
+        raise SmokeFailure("scheduler process-local metrics did not reset after restart")
     _database_operation("verify-offline", preserved_worker_id)
     _database_operation("wait-expired", recovered_worker_id)
     restarted_ready = _expect_database_ready()
@@ -311,6 +410,17 @@ def _run_smoke() -> None:
 
     _compose("stop", "scheduler")
     _compose("stop", "postgres")
+    metrics_status, unavailable_metrics, metrics_content_type = _get_metrics()
+    if (
+        metrics_status != 200
+        or unavailable_metrics is None
+        or metrics_content_type is None
+        or not metrics_content_type.startswith("text/plain")
+        or _metric_value(unavailable_metrics, "threads_platform_database_up") != 0.0
+        or re.search(r"^threads_platform_workers\{", unavailable_metrics, re.MULTILINE)
+        or re.search(r"^threads_platform_worker_jobs\{", unavailable_metrics, re.MULTILINE)
+    ):
+        raise SmokeFailure("database outage metrics response was not bounded")
     live = _get_json("/health")
     if live != (200, {"status": "ok"}):
         raise SmokeFailure("/health did not remain live during database outage")
@@ -351,6 +461,7 @@ def main() -> int:
     os.environ.setdefault(
         "THREADS_PLATFORM_IMAGE", f"threads-control-plane:smoke-{uuid4().hex[:10]}"
     )
+    os.environ.setdefault("THREADS_PLATFORM_SCHEDULER_POLL_INTERVAL_SECONDS", "0.25")
     if "THREADS_PLATFORM_SMOKE_HTTP_PORT" not in os.environ:
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))

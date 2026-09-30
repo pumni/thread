@@ -373,6 +373,23 @@ HTTP/scheduler container recreation over the same PostgreSQL volume, scheduler
 rediscovery of persisted Worker presence, and database outage/readiness recovery.
 It uses no Meta, CRM, or live Worker calls and adds no API or schema. See
 `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for exact commands and restart/loss
-recovery limits. Metrics/tracing remain deferred to C6-02/9; #62 remains
-separate; #3 remains OPEN and no production release claim follows from this
-checkpoint. Existing #78 DRAINING and #84 Windows Worker semantics are unchanged.
+recovery limits. The #87 checkpoint added no metrics or tracing; #89 adds
+bounded metrics and tracing remains deferred. #62 remains separate; #3 remains
+OPEN and no production release claim follows from this checkpoint. Existing
+#78 DRAINING and #84 Windows Worker semantics are unchanged.
+
+## C6-02/9 — Bounded operational metrics (#89)
+
+The HTTP process exposes PostgreSQL-derived aggregate gauges for every Worker
+and WorkerJob status, a diagnostic database-up gauge, and a monotonic
+CommandRuntime processing histogram. The standalone scheduler owns its own
+registry and configurable private metrics listener, with bounded tick outcome,
+duration, fixed-stage failure, presence-expiry, and lease-reclaim metrics.
+Cardinality is limited to existing status enums and fixed scheduler vocabularies;
+no identity labels or payloads are exported. HTTP count gauges are refreshed
+from PostgreSQL; counters and histograms reset on the owning process restart and
+are not persisted. No migration, collector stack, Worker telemetry protocol,
+or tracing is included. The extended #87 Compose smoke checks both scrape
+surfaces and restart behavior. #3 remains OPEN, #62 remains separate, and no
+production release claim follows from this checkpoint. See
+`docs/OBSERVABILITY_RUNBOOK.md` for exact metric semantics.
