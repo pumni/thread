@@ -309,7 +309,7 @@ async def test_each_commit_order_preserves_claim_and_drain_invariants(
     jobs = WorkerJobService(unit_of_work_factory, clock=clock)
 
     drain_first_worker = await _add_worker(unit_of_work_factory, now=clock.now())
-    drain_first_job = await jobs.enqueue("synthetic.echo", 1)
+    drain_first_job = await jobs.enqueue("synthetic.echo", 1, assigned_worker_id=drain_first_worker)
     await control.request_drain(drain_first_worker, "UPDATE_REQUESTED")
     with pytest.raises(WorkerJobControlError, match="WORKER_NOT_ELIGIBLE"):
         await jobs.claim_next(drain_first_worker)
@@ -319,7 +319,7 @@ async def test_each_commit_order_preserves_claim_and_drain_invariants(
     assert drain_first_stored.status is WorkerJobStatus.QUEUED
 
     claim_first_worker = await _add_worker(unit_of_work_factory, now=clock.now())
-    claim_first_job = await jobs.enqueue("synthetic.echo", 1)
+    claim_first_job = await jobs.enqueue("synthetic.echo", 1, assigned_worker_id=claim_first_worker)
     claimed = await jobs.claim_next(claim_first_worker)
     assert claimed is not None and claimed.id == claim_first_job.id
     await control.request_drain(claim_first_worker, "UPDATE_REQUESTED")
