@@ -35,6 +35,10 @@
 | A-17 | **BLOCKER** | Normal Worker shutdown starts with admin-authenticated `request_drain`; Worker device auth can complete drain but cannot initiate it. Disabling legacy admin bearer means tray Quit without a human session cannot request graceful drain. Controller Quit also needs a clearly authorized human policy. | DX-05 freezes explicit node lifecycle authorization. Simple v1 proposal: prompt for appropriately authorized Operator login if absent; an alternative device-authenticated **self-only** Worker drain endpoint requires separate security review. No hidden global admin bearer in Rust, false OFFLINE or promise to intercept forced OS shutdown. | DX-02 #96, DX-05 #99, DX-07 #101, DX-13 #107 |
 | A-18 | **MAJOR** | Supported Linux/Docker Controller cannot use the Windows current-user DPAPI/private-CA wizard. The plan promises common HTTPS/Worker/Operator protocol but only describes Windows provisioning and local Controller UI fingerprint. | Define Linux/IT HTTPS ingress, non-DPAPI root-key custody and a locally authenticated CLI/out-of-band fingerprint method using the same verified Worker/Operator API; prove Windows Worker/Console interoperability or explicitly document a temporary feature gap. | DX-05 #99, DX-06 #100, DX-08 #102, DX-13 #107 |
 
+### A-03 additional network-route prerequisite
+
+The accepted `NetworkProfile` is account-scoped and the Worker currently lacks a production proxy-secret provider. A **pending** browser profile has no `account_id`, so DX-09 must decide the network route **before** launching a browser for login. A clearly labeled `DIRECT`-only MVP is valid only if the operator did not require a configured account proxy; if a proxy is required, block onboarding until a reviewed pre-account route/secret design exists. Never silently sign in directly and switch network route after the session is created. Test unknown/protected proxy credentials fail closed and existing provisioned Account/NetworkProfile workflows remain unaffected.
+
 ## 3. Explicit product decisions already settled
 
 - A single **customer-visible** Windows Desktop app and setup; internal process sidecars remain allowed.
