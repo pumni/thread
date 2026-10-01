@@ -20,7 +20,7 @@ Một installer Windows và một ứng dụng **Threads Desktop** (Tauri 2 + Ru
 4. [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md): tiêu chí nghiệm thu, kiểm thử tiêu cực, regression, ma trận Windows/Linux/CI và ba máy.
 5. [WINDOWS_REHEARSAL.md](WINDOWS_REHEARSAL.md): first-run, data root, process startup/shutdown, reboot, packaging, runbook và checklist bằng chứng.
 6. [ISSUE_MAP.md](ISSUE_MAP.md): mapping epic #94 và 14 issue #95–#108, thứ tự, phụ thuộc và hard gates.
-7. [PREIMPLEMENTATION_AUDIT.md](PREIMPLEMENTATION_AUDIT.md): 16 phát hiện và việc cần sửa trước khi nghiệm thu implementation.
+7. [PREIMPLEMENTATION_AUDIT.md](PREIMPLEMENTATION_AUDIT.md): 18 phát hiện và việc cần sửa trước khi nghiệm thu implementation.
 8. [SESSION_HANDOFF.md](SESSION_HANDOFF.md): tài liệu **bàn giao một phiên mới** — nguồn sự thật, quyết định đã chốt, blocker và bước kế tiếp.
 
 ## Thứ tự ưu tiên
