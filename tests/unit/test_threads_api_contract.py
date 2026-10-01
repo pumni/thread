@@ -1,11 +1,16 @@
 from datetime import timedelta
 from urllib.parse import parse_qs
 
-import httpx
+import httpx2
 import pytest
 from pydantic import SecretStr
 
-from threads_platform.application.ports.threads import MediaContainerRequest, ThreadsAPIError
+from threads_platform.application.ports.threads import (
+    MediaContainerRequest,
+    ThreadsAPIError,
+    ThreadsContractError,
+    ThreadsTransportError,
+)
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 
 # documentation-contract fixture: shapes follow Meta's collection examples. Values are synthetic;
@@ -24,22 +29,22 @@ DOCUMENTATION_QUOTA_FIXTURE = {
 
 @pytest.mark.asyncio
 async def test_documented_container_publish_media_and_quota_contract() -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def respond(request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
         if request.url.path.endswith("/me/threads_publishing_limit"):
-            return httpx.Response(200, json=DOCUMENTATION_QUOTA_FIXTURE)
+            return httpx2.Response(200, json=DOCUMENTATION_QUOTA_FIXTURE)
         if request.url.path.endswith("/me/threads_publish"):
-            return httpx.Response(200, json={"id": "media-doc-example"})
+            return httpx2.Response(200, json={"id": "media-doc-example"})
         if request.url.path.endswith("/me/threads"):
-            return httpx.Response(200, json={"id": "container-doc-example"})
+            return httpx2.Response(200, json={"id": "container-doc-example"})
         if request.url.path.endswith("/container-doc-example"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"id": "container-doc-example", "status": "FINISHED"},
             )
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "id": "media-doc-example",
@@ -49,9 +54,9 @@ async def test_documented_container_publish_media_and_quota_contract() -> None:
             },
         )
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         api = HttpThreadsAPI(client)
         token = SecretStr("test-placeholder")
@@ -70,6 +75,8 @@ async def test_documented_container_publish_media_and_quota_contract() -> None:
     assert status.status == "FINISHED"
     assert media.media_id == "media-doc-example"
     assert len(requests) == 5
+    assert [request.method for request in requests] == ["GET", "POST", "GET", "POST", "GET"]
+    assert all(request.content == b"" for request in requests)
     assert all(
         request.headers["Authorization"] == "Bearer test-placeholder" for request in requests
     )
@@ -78,8 +85,8 @@ async def test_documented_container_publish_media_and_quota_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_documented_reply_page_maps_nested_ids_and_cursor() -> None:
-    async def respond(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
             200,
             json={
                 "data": [
@@ -98,9 +105,9 @@ async def test_documented_reply_page_maps_nested_ids_and_cursor() -> None:
             },
         )
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         page = await HttpThreadsAPI(client).get_conversation(
             SecretStr("test-placeholder"), "root-doc-example", "resume-doc"
@@ -116,13 +123,13 @@ async def test_documented_reply_page_maps_nested_ids_and_cursor() -> None:
 async def test_documented_image_video_and_carousel_request_fields() -> None:
     posted_forms: list[dict[str, list[str]]] = []
 
-    async def respond(request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
         posted_forms.append(parse_qs(request.url.query.decode()))
-        return httpx.Response(200, json={"id": f"container-doc-{len(posted_forms)}"})
+        return httpx2.Response(200, json={"id": f"container-doc-{len(posted_forms)}"})
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         api = HttpThreadsAPI(client)
         token = SecretStr("test-placeholder")
@@ -165,13 +172,13 @@ async def test_documented_image_video_and_carousel_request_fields() -> None:
 async def test_documented_moderation_mutation_responses() -> None:
     paths_and_forms: list[tuple[str, dict[str, list[str]]]] = []
 
-    async def respond(request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
         paths_and_forms.append((request.url.path, parse_qs(request.url.query.decode())))
-        return httpx.Response(200, json={"success": True})
+        return httpx2.Response(200, json={"success": True})
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         api = HttpThreadsAPI(client)
         token = SecretStr("test-placeholder")
@@ -198,12 +205,12 @@ async def test_documented_moderation_mutation_responses() -> None:
 async def test_http_statuses_map_to_sanitized_typed_errors(
     status_code: int, expected_code: str, retry_after: timedelta | None
 ) -> None:
-    async def respond(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code, headers={"Retry-After": "3"})
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status_code, headers={"Retry-After": "3"})
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         with pytest.raises(ThreadsAPIError) as captured:
             await HttpThreadsAPI(client).get_publishing_quota(SecretStr("test-placeholder"))
@@ -211,3 +218,58 @@ async def test_http_statuses_map_to_sanitized_typed_errors(
     assert captured.value.code == expected_code
     assert captured.value.retry_after == retry_after
     assert "test-placeholder" not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_publish_timeout_is_sanitized_without_retaining_request_secrets() -> None:
+    token = "SYNTHETIC_BEARER_TOKEN"
+    secret_url = (
+        "https://"
+        + "SYNTHETIC_USER:SYNTHETIC_PASSWORD"
+        + "@graph.threads.invalid/SYNTHETIC_URL_PATH?access_token=SYNTHETIC_URL_TOKEN"
+    )
+    requests: list[httpx2.Request] = []
+
+    async def timeout(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        raise httpx2.ReadTimeout(secret_url, request=request)
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/",
+        transport=httpx2.MockTransport(timeout),
+    ) as client:
+        with pytest.raises(ThreadsTransportError) as captured:
+            await HttpThreadsAPI(client).publish_container(
+                SecretStr(token), "container-doc-example"
+            )
+
+    assert captured.value.code == "THREADS_TRANSPORT_FAILURE"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path.endswith("/me/threads_publish")
+    assert requests[0].url.params["creation_id"] == "container-doc-example"
+    assert requests[0].headers["Authorization"] == f"Bearer {token}"
+    assert requests[0].content == b""
+    assert token not in str(requests[0].url)
+    rendered_error = f"{captured.value!s} {captured.value!r}"
+    for secret in (token, "SYNTHETIC_PASSWORD", "SYNTHETIC_URL_PATH", "SYNTHETIC_URL_TOKEN"):
+        assert secret not in rendered_error
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_remains_a_sanitized_contract_error() -> None:
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, content=b"not-json")
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/",
+        transport=httpx2.MockTransport(respond),
+    ) as client:
+        with pytest.raises(ThreadsContractError) as captured:
+            await HttpThreadsAPI(client).get_publishing_quota(SecretStr("SYNTHETIC_TOKEN"))
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "SYNTHETIC_TOKEN" not in repr(captured.value)

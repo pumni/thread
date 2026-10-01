@@ -61,6 +61,9 @@ jobs:
       - name: Report locked dependency tree
         run: uv tree --locked --all-groups
 
+      - name: Check Threads API HTTPX2 TLS and proxy behavior
+        run: uv run --locked pytest tests/unit/test_threads_httpx2_transport.py
+
       - name: Install only locked Playwright Chromium
         shell: pwsh
         env:

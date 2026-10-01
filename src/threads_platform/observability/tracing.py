@@ -28,6 +28,8 @@ _FLUSH_TIMEOUT_MILLIS = 2_500
 _SHUTDOWN_HARD_TIMEOUT_SECONDS = 3.0
 _SENSITIVE_TRANSPORT_LOGGER_PREFIXES = (
     "opentelemetry",
+    "httpx2",
+    "httpcore2",
     "urllib3",
     "requests",
     "http.client",

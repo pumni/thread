@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-import httpx
+import httpx2
 import pytest
 from pydantic import SecretStr
 
@@ -29,17 +29,17 @@ DISCOVERY_PAGE_FIXTURE = {
 
 @pytest.mark.asyncio
 async def test_keyword_search_supports_documented_modes_order_windows_and_cursor() -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def respond(request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
-        return httpx.Response(200, json=DISCOVERY_PAGE_FIXTURE)
+        return httpx2.Response(200, json=DISCOVERY_PAGE_FIXTURE)
 
     since = datetime(2026, 1, 1, tzinfo=UTC)
     until = datetime(2026, 2, 1, tzinfo=UTC)
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         api = HttpThreadsAPI(client)
         pages = [
@@ -87,14 +87,14 @@ async def test_keyword_search_supports_documented_modes_order_windows_and_cursor
 
 @pytest.mark.asyncio
 async def test_profile_lookup_posts_and_mentions_map_documented_shapes() -> None:
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def respond(request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
         if request.url.path.endswith("/profile_lookup"):
             # Synthetic shape based on Meta's documented profile fields. Its public-lookup
             # response body is not shown in the current official collection.
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "id": "author-doc-1",
@@ -104,11 +104,11 @@ async def test_profile_lookup_posts_and_mentions_map_documented_shapes() -> None
                     "threads_profile_picture_url": "https://cdn.example/profile.jpg",
                 },
             )
-        return httpx.Response(200, json=DISCOVERY_PAGE_FIXTURE)
+        return httpx2.Response(200, json=DISCOVERY_PAGE_FIXTURE)
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         api = HttpThreadsAPI(client)
         profile = await api.get_public_profile(SecretStr("docs-placeholder"), "sample")
@@ -154,12 +154,12 @@ async def test_profile_lookup_posts_and_mentions_map_documented_shapes() -> None
     ],
 )
 async def test_malformed_discovery_page_fails_closed(response_body: object) -> None:
-    async def respond(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=response_body)
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=response_body)
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         with pytest.raises(ThreadsContractError) as error:
             await HttpThreadsAPI(client).get_mentions(
@@ -175,12 +175,12 @@ async def test_malformed_discovery_page_fails_closed(response_body: object) -> N
 
 @pytest.mark.asyncio
 async def test_public_profile_missing_minimum_identity_fails_closed() -> None:
-    async def respond(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"username": "sample"})
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"username": "sample"})
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         base_url="https://graph.threads.net/v1.0/",
-        transport=httpx.MockTransport(respond),
+        transport=httpx2.MockTransport(respond),
     ) as client:
         with pytest.raises(ThreadsContractError):
             await HttpThreadsAPI(client).get_public_profile(SecretStr("docs-placeholder"), "sample")

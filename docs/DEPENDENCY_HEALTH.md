@@ -17,15 +17,25 @@ and retain a focused regression check.
 
 ## Audit findings (2026-10-01)
 
-The locked tree contains production, `dev`, and `packaging` groups. The only
-upstream deprecation found in current use is Starlette's `TestClient` fallback
-to `httpx`: Starlette still supports that fallback, but recommends `httpx2`.
-`httpx2` is therefore a dev-only dependency for FastAPI/Starlette tests. The
-production `httpx` dependency remains because the Threads API and Worker
-Control Plane adapters use it. The `httpx2` migration guide describes it as a
-fork of HTTPX 0.28.1 with the same public API; its project metadata and release
-notes include Python 3.14 support. This does not constitute a runtime-client
-migration.
+The locked tree contains production, `dev`, and `packaging` groups. The
+Threads API adapter now uses `httpx2` at runtime, while the Worker Control
+Plane still uses `httpx` until its separate migration slice is reviewed.
+Both packages remain production dependencies during that transition.
+
+The Threads API client explicitly keeps certificate verification enabled,
+uses the operating-system trust store by default instead of HTTPX's bundled
+`certifi` store, and honors `SSL_CERT_FILE`, `SSL_CERT_DIR`, and the standard
+proxy environment variables through `trust_env=True`. Its 15-second timeout
+and redirect-disabled behavior are unchanged. HTTPX2 changes the default
+User-Agent from `python-httpx/...` to `python-httpx2/...`; the Threads API
+adapter has no contract that depends on that library-generated value. Do not
+remove `httpx` until the Worker Control Plane migration is separately accepted
+and the remaining runtime dependency tree is checked.
+
+The HTTPX2 migration guide describes it as a fork of HTTPX 0.28.1 with a
+largely compatible API; its project metadata and release notes include Python
+3.14 support. Package classes remain distinct, so each adapter and its
+transport fixtures must use only its own package's classes.
 
 Run `uv tree --outdated` separately to check for newer available package
 versions. This is release freshness information, not evidence of deprecation,
