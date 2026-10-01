@@ -20,6 +20,11 @@ _X509_ASN_ENCODING = 0x00000001
 _PKCS_7_ASN_ENCODING = 0x00010000
 _CERT_ENCODING = _X509_ASN_ENCODING | _PKCS_7_ASN_ENCODING
 
+_win_dll: Any = getattr(ctypes, "WinDLL", None)
+_get_last_error: Any = getattr(ctypes, "get_last_error", None)
+if _win_dll is None or _get_last_error is None:
+    raise SystemExit("Windows CryptoAPI is available only on Windows")
+
 
 class _CertContext(ctypes.Structure):
     _fields_ = [
@@ -31,9 +36,9 @@ class _CertContext(ctypes.Structure):
     ]
 
 
-_crypt32 = ctypes.WinDLL("Crypt32.dll", use_last_error=True)
+_crypt32: Any = _win_dll("Crypt32.dll", use_last_error=True)
 
-_cert_open_store = _crypt32.CertOpenStore
+_cert_open_store: Any = _crypt32.CertOpenStore
 _cert_open_store.argtypes = [
     ctypes.c_void_p,
     wintypes.DWORD,
@@ -43,19 +48,19 @@ _cert_open_store.argtypes = [
 ]
 _cert_open_store.restype = ctypes.c_void_p
 
-_cert_close_store = _crypt32.CertCloseStore
+_cert_close_store: Any = _crypt32.CertCloseStore
 _cert_close_store.argtypes = [ctypes.c_void_p, wintypes.DWORD]
 _cert_close_store.restype = wintypes.BOOL
 
-_cert_enum_certificates = _crypt32.CertEnumCertificatesInStore
+_cert_enum_certificates: Any = _crypt32.CertEnumCertificatesInStore
 _cert_enum_certificates.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CertContext)]
 _cert_enum_certificates.restype = ctypes.POINTER(_CertContext)
 
-_cert_free_context = _crypt32.CertFreeCertificateContext
+_cert_free_context: Any = _crypt32.CertFreeCertificateContext
 _cert_free_context.argtypes = [ctypes.POINTER(_CertContext)]
 _cert_free_context.restype = wintypes.BOOL
 
-_cert_add_encoded_certificate = _crypt32.CertAddEncodedCertificateToStore
+_cert_add_encoded_certificate: Any = _crypt32.CertAddEncodedCertificateToStore
 _cert_add_encoded_certificate.argtypes = [
     ctypes.c_void_p,
     wintypes.DWORD,
@@ -66,7 +71,7 @@ _cert_add_encoded_certificate.argtypes = [
 ]
 _cert_add_encoded_certificate.restype = wintypes.BOOL
 
-_cert_delete_certificate = _crypt32.CertDeleteCertificateFromStore
+_cert_delete_certificate: Any = _crypt32.CertDeleteCertificateFromStore
 _cert_delete_certificate.argtypes = [ctypes.POINTER(_CertContext)]
 _cert_delete_certificate.restype = wintypes.BOOL
 
@@ -83,7 +88,7 @@ class _WinCryptError(RuntimeError):
 
 
 def _raise_wincrypt_error(action: str) -> None:
-    raise _WinCryptError(action, ctypes.get_last_error())
+    raise _WinCryptError(action, int(_get_last_error()))
 
 
 def _open_root_store(scope: str, *, read_only: bool) -> int:

@@ -68,7 +68,8 @@ jobs:
       - name: Check Threads API HTTPX2 TLS and proxy behavior
         run: uv run --locked pytest tests/unit/test_threads_httpx2_transport.py
 
-      - name: Check Worker Control Plane HTTPX2 TLS and proxy behavior (root-store gate runs separately)
+      # The OS-root store mutation is a separate release gate; see docs/WINDOWS_CURRENTUSER_ROOT_CA_VALIDATION.md.
+      - name: Check Worker Control Plane HTTPX2 TLS and proxy behavior (CurrentUser root is release-gated)
         run: >-
           uv run --locked pytest
           tests/unit/test_worker_control_client_httpx2.py
@@ -264,40 +265,3 @@ jobs:
           uv run --locked pytest -q --tb=short `
             tests/unit/test_browser_adapter.py `
             --basetemp $baseTemp
-
-  currentuser-root-trust:
-    name: Windows CurrentUser root HTTPS trust
-    runs-on: windows-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - name: Check out exact source without persisted credentials
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          version: "0.12.7"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      - name: Install locked dependencies
-        run: uv sync --locked
-
-      - name: Record isolated Windows test context
-        shell: pwsh
-        run: |
-          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-          $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          Write-Output "WINDOWS_ROOT_STORE_CONTEXT elevated=$elevated interactive=$([Environment]::UserInteractive)"
-
-      - name: Verify CurrentUser root trust round trip with bounded store operations
-        run: >-
-          uv run --locked pytest -s -q --tb=short
-          tests/unit/test_worker_control_client_httpx2.py
-          -k windows_current_user_root_ca

@@ -30,6 +30,8 @@ Feed browsing also requires the pinned Playwright package and its matching Chrom
 binary to be provisioned on the worker. Browser sessions use the assigned account's managed
 profile and NetworkProfile. Routes that reference proxy credentials fail closed because this
 entrypoint has no production proxy-secret provider.
+End-to-end validation of a CA installed only in `CurrentUser\Root` remains a release gate; see
+the [Windows CurrentUser root CA validation procedure](WINDOWS_CURRENTUSER_ROOT_CA_VALIDATION.md).
 
 For a first enrollment, log in as the dedicated Worker user and provide the one-time C1
 enrollment code only in the launching process environment as
