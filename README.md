@@ -9,8 +9,10 @@ Completed:
 - TP-004A — durable command leases/checkpoints/recovery.
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
-Current authorized implementation checkpoint:
-- **C6-02/10 — bounded OpenTelemetry tracing for Control Plane and scheduler (#91)**.
+Most recent accepted backend implementation checkpoint at the Desktop planning baseline:
+- **C6-02/10 — bounded OpenTelemetry tracing (#91, merged in PR #92).** Check current GitHub main/issue status for any later changes.
+
+**Proposed next initiative, not yet merged/authorized:** [Desktop v1 planning PR #93](https://github.com/pumni/thread/pull/93), [Epic #94](https://github.com/pumni/thread/issues/94), implementation issues #95–#108. While #93 is unmerged, read its branch's [fresh-session handoff](https://github.com/pumni/thread/blob/plan/desktop-windows-v1-20261001/docs/desktop/SESSION_HANDOFF.md) and [audit](https://github.com/pumni/thread/blob/plan/desktop-windows-v1-20261001/docs/desktop/PREIMPLEMENTATION_AUDIT.md) before authorizing any Desktop code. Planning docs/issue creation do not constitute separate coordinator acceptance.
 
 Not production-ready:
 - issue #3 remains open as the production/release gate;
