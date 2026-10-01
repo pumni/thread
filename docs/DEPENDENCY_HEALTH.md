@@ -20,7 +20,7 @@ and retain a focused regression check.
 
 ## Audit findings (2026-10-01)
 
-The locked tree contains production, `dev`, and `packaging` groups. The
+The locked tree contains production, `dev`, and `packaging` groups.
 The Threads API and Worker Control Plane adapters use `httpx2` at runtime. No
 first-party runtime module imports legacy `httpx`, so its direct requirement is
 no longer in the project's runtime dependencies. It remains a direct `dev`
