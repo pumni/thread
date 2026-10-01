@@ -29,6 +29,11 @@ from threads_platform.infrastructure.threads_api.composition import compose_proc
 from threads_platform.observability.logging import configure_logging
 from threads_platform.observability.metrics import SchedulerMetrics
 from threads_platform.observability.metrics_server import start_scheduler_metrics_listener
+from threads_platform.observability.tracing import (
+    SCHEDULER_SERVICE_NAME,
+    ProcessTracing,
+    create_process_tracing,
+)
 
 
 def install_shutdown_handlers(
@@ -60,7 +65,10 @@ def install_shutdown_handlers(
 
 async def run_scheduler() -> None:
     settings = get_settings()
-    configure_logging(settings.log_level)
+    if settings.tracing_enabled:
+        configure_logging(settings.log_level, tracing_enabled=True)
+    else:
+        configure_logging(settings.log_level)
     if settings.database_url is None:
         raise RuntimeError("THREADS_PLATFORM_DATABASE_URL must be configured")
 
@@ -69,7 +77,9 @@ async def run_scheduler() -> None:
     http_client = None
     restore_handlers: Callable[[], None] | None = None
     metrics_server: asyncio.AbstractServer | None = None
+    tracing: ProcessTracing | None = None
     try:
+        tracing = create_process_tracing(settings.tracing_enabled, SCHEDULER_SERVICE_NAME)
         unit_of_work_factory = SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
         worker_job_service = WorkerJobService(unit_of_work_factory, clock=clock)
         worker_control_service = WorkerControlService(unit_of_work_factory, clock=clock)
@@ -83,6 +93,7 @@ async def run_scheduler() -> None:
         composition.command_runtime.set_execution_duration_observer(
             metrics.observe_command_execution_duration
         )
+        composition.command_runtime.set_tracer(tracing.tracer, process_role="scheduler")
         http_client = composition.http_client
         if not composition.command_handler_registry:
             structlog.get_logger(__name__).error(
@@ -100,6 +111,7 @@ async def run_scheduler() -> None:
             worker_job_service,
             worker_control_service=worker_control_service,
             metrics_observer=metrics,
+            tracer=tracing.tracer,
         )
         runner_config = SchedulerRunnerConfig(
             poll_interval=timedelta(seconds=settings.scheduler_poll_interval_seconds),
@@ -116,6 +128,7 @@ async def run_scheduler() -> None:
             runner_config,
             clock=clock,
             metrics_observer=metrics,
+            tracer=tracing.tracer,
         )
         if settings.scheduler_metrics_enabled:
             metrics_server = await start_scheduler_metrics_listener(
@@ -133,15 +146,19 @@ async def run_scheduler() -> None:
                 restore_handlers()
         finally:
             try:
-                if metrics_server is not None:
-                    metrics_server.close()
-                    await metrics_server.wait_closed()
+                if tracing is not None:
+                    tracing.shutdown()
             finally:
                 try:
-                    if http_client is not None:
-                        await http_client.aclose()
+                    if metrics_server is not None:
+                        metrics_server.close()
+                        await metrics_server.wait_closed()
                 finally:
-                    await engine.dispose()
+                    try:
+                        if http_client is not None:
+                            await http_client.aclose()
+                    finally:
+                        await engine.dispose()
 
 
 def main() -> None:

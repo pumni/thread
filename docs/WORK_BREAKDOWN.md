@@ -374,7 +374,7 @@ rediscovery of persisted Worker presence, and database outage/readiness recovery
 It uses no Meta, CRM, or live Worker calls and adds no API or schema. See
 `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for exact commands and restart/loss
 recovery limits. The #87 checkpoint added no metrics or tracing; #89 adds
-bounded metrics and tracing remains deferred. #62 remains separate; #3 remains
+bounded metrics and tracing remained deferred at that checkpoint. #62 remains separate; #3 remains
 OPEN and no production release claim follows from this checkpoint. Existing
 #78 DRAINING and #84 Windows Worker semantics are unchanged.
 
@@ -393,3 +393,27 @@ or tracing is included. The extended #87 Compose smoke checks both scrape
 surfaces and restart behavior. #3 remains OPEN, #62 remains separate, and no
 production release claim follows from this checkpoint. See
 `docs/OBSERVABILITY_RUNBOOK.md` for exact metric semantics.
+
+## C6-02/10 — Bounded OpenTelemetry tracing (#91)
+
+Issue #91 authorizes tracing only for the existing FastAPI/Uvicorn HTTP process
+and standalone scheduler process. Tracing is disabled by default and each
+process owns its provider/exporter lifecycle. The HTTP side includes bounded
+request spans plus Command receive/process spans; the scheduler includes one
+tick span and children for its existing fixed stages. Only fixed process role,
+route template, method/status, Command status, scheduler outcome/stage, and a
+constant generic error type are exported. Incoming W3C `traceparent` is
+accepted; `tracestate`, baggage, Worker protocol propagation, and durable trace
+context are excluded. Active trace/span IDs may correlate structured logs.
+
+The OTLP/HTTP exporter uses environment-only endpoint and header configuration,
+a bounded queue and request timeout, and fail-open process shutdown. Provider
+flush/close runs in a daemon thread with a three-second hard wait bound, and
+SDK plus urllib3/requests/http.client diagnostic messages are redacted to a
+fixed event. Compose
+keeps tracing disabled, with no collector or OTLP port. No SQLAlchemy/database
+or Threads/Meta HTTP auto-instrumentation, collector, schema migration, metrics
+change, or production release claim is included. #3 remains OPEN and #62
+remains separate. This authorized checkpoint still requires coordinator review
+and acceptance. See `docs/OBSERVABILITY_RUNBOOK.md` and
+`docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md` for operations details.

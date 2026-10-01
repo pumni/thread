@@ -1,9 +1,9 @@
 # Observability and readiness runbook (#72)
 
 This runbook records the structured lifecycle logs and readiness snapshot from
-#72 and the bounded metrics added in #89. PostgreSQL remains the source of
-durable state. Dashboards, OpenTelemetry, distributed tracing, and the #62 CRM
-result transport remain outside this checkpoint.
+#72, bounded metrics from #89, and bounded opt-in OpenTelemetry tracing from
+#91. PostgreSQL remains the source of durable state. No collector, dashboards,
+or #62 CRM result transport is deployed by these checkpoints.
 
 ## Lifecycle correlation
 
@@ -65,7 +65,7 @@ not retain raw enrollment codes or session access tokens.
 
 This #75 hardening added no session revocation flow and did not change worker
 auth semantics. It added no metrics or tracing; #89 separately adds bounded
-operational metrics, while distributed tracing remains deferred. Issue #3
+operational metrics, and #91 later adds opt-in tracing. Issue #3
 remains OPEN as the production/release gate; #62 remains a separate CRM result
 transport dependency.
 
@@ -137,7 +137,72 @@ after HTTP process recreation. Histograms and scheduler counters are process
 local and reset when their owning process restarts; they are never stored in
 PostgreSQL. Metrics are diagnostic only, not business state, a queue, or a
 readiness decision. No Prometheus server, collector, dashboard, alerting, or
-tracing is included. Issue #3 remains OPEN and #62 remains separate.
+tracing collector is included. Issue #3 remains OPEN and #62 remains separate.
+
+## Bounded OpenTelemetry tracing (#91)
+
+`THREADS_PLATFORM_TRACING_ENABLED` defaults to `false` independently in the
+HTTP and scheduler processes. When disabled, the process creates no tracer
+provider or exporter and makes no exporter connection. When enabled, that
+process creates its own provider, a fixed `service.name` resource
+(`threads-platform-http` or `threads-platform-scheduler`), and an OTLP/HTTP
+exporter. No global tracer provider is installed. The checked-in Compose
+topology explicitly keeps tracing disabled, adds no collector service, and
+publishes no OTLP port.
+
+Configure the endpoint with `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or the standard
+fallback `OTEL_EXPORTER_OTLP_ENDPOINT`. If neither is set, the OTLP/HTTP
+exporter uses its standard localhost endpoint. Authentication may be supplied
+through `OTEL_EXPORTER_OTLP_TRACES_HEADERS` or `OTEL_EXPORTER_OTLP_HEADERS`.
+These values are environment-only and are never logged or placed in span
+resources. Configured endpoints are rejected if the scheme is not HTTP(S), the
+host is missing, or user information, query, fragment, or whitespace appears.
+The trace-specific endpoint is used as supplied; the generic base endpoint
+gets `/v1/traces` appended.
+
+HTTP spans are named `http.server.request`; they contain only `process.role`,
+an allowlisted method (or `OTHER`), a registered route template (or
+`unmatched`), and response status. `/health`, `/ready`, and `/metrics` are not
+traced. `command.receive`, `command.process`, and selected
+`command.process_next` spans are children of the active HTTP or scheduler
+context and add only bounded process role and Command status. No Command,
+account, Worker, or correlation ID, raw command type, payload, result, URL,
+header, or database field is exported.
+
+Each scheduler tick has one `scheduler.tick` span and child spans named
+`scheduler.stage.<stage>` for the existing fixed stages. The optional
+`scheduler.stage.outbox_delivery` span exists only when that stage is
+configured. Attributes use only `process.role`, fixed `scheduler.stage`, and
+`scheduler.outcome=success` on a returned tick. A failed operation sets OTel
+status `ERROR` and the constant `error.type=exception`; it does not record an
+exception event, message, or stack. Tick order, partial completion, backoff,
+metrics, and durable scheduler behavior are unchanged.
+
+Inbound propagation accepts the W3C `traceparent` header. The optional vendor
+`tracestate` header and baggage are ignored. Child spans use only same-process
+context. Worker HTTP and WebSocket protocols remain unchanged, and trace IDs
+are never written to PostgreSQL or durable Command, WorkerJob, or Worker state.
+
+Structured logs receive lowercase 32-character `trace_id` and 16-character
+`span_id` fields only inside an active recording span. They are diagnostic
+correlation only. The normal redaction processor still runs after exception
+formatting and after trace fields are added. OpenTelemetry SDK and HTTP
+transport records from `urllib3`, `requests`, and `http.client` are reduced to
+a fixed event before handlers render them, so endpoint paths, headers,
+responses, and exception values cannot leak through dependency logs.
+
+The exporter queue holds at most 64 spans, exports batches of at most 64, limits
+an OTLP request to 1 MiB, and sets a two-second request timeout. Process
+shutdown runs flush and provider close in a daemon cleanup thread and waits at
+most three seconds. The SDK's own atexit shutdown hook is disabled so it cannot
+add an unbounded synchronous shutdown path. Exporter setup, export, flush, or
+shutdown failure is fail-open for Commands, scheduler ticks, readiness,
+metrics, and WorkerJob semantics; failures produce only fixed phase/service
+logs. Queue contents and trace data are process-local and may be lost on
+exporter failure or process restart. The locked application does not
+install SQLAlchemy/database or outbound Threads/Meta HTTP auto-instrumentation.
+No OTel collector, tracing port, dashboard, or alerting service is deployed.
+Issue #3 remains OPEN and #62 remains separate.
 
 ## Health and readiness
 

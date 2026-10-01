@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     scheduler_metrics_enabled: bool = False
     scheduler_metrics_host: SchedulerMetricsHost = "127.0.0.1"
     scheduler_metrics_port: int = Field(default=9101, ge=1, le=65_535)
+    tracing_enabled: bool = False
     crm_ingress_token: SecretStr | None = None
     worker_admin_token: SecretStr | None = None
     worker_tls_required: bool = True

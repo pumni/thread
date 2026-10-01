@@ -1,6 +1,7 @@
 x-control-plane-environment: &control-plane-environment
   THREADS_PLATFORM_DATABASE_URL: postgresql+asyncpg://threads_platform@postgres:5432/threads_platform
   THREADS_PLATFORM_THREADS_TOKEN_PROVIDER_MODE: disabled
+  THREADS_PLATFORM_TRACING_ENABLED: "false"
   THREADS_PLATFORM_HTTP_HOST: ${THREADS_PLATFORM_HTTP_HOST:-0.0.0.0}
   THREADS_PLATFORM_HTTP_PORT: ${THREADS_PLATFORM_CONTAINER_PORT:-8000}
 

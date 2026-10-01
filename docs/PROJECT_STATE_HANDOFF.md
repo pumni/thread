@@ -505,7 +505,8 @@ volume and proves liveness/readiness, HTTP and scheduler recreation, persisted
 Worker presence rediscovery, and fail-closed `/ready` during a database outage.
 It does not run Meta, CRM, or Worker calls. #87 added no new schema migration,
 production secret, metrics, tracing, Windows Worker container, or production
-release claim. Metrics are added in #89; tracing remains deferred. #78
+release claim. Metrics are added in #89; at that checkpoint tracing remained
+deferred. #78
 DRAINING and #84 interactive Worker behavior are unchanged. Phase
 B remains `PARTIAL_LIVE_EVIDENCE / NOT_READY`, #3 remains OPEN, and #62 remains a
 separate dependency. See `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.
@@ -528,5 +529,30 @@ scheduler-local counters after scheduler recreation. Counters/histograms are
 not persisted. No migration, Worker telemetry change, collector, dashboard, or
 tracing is included. #3 remains OPEN, #62 remains separate, and no production
 release claim follows from this checkpoint. See
+`docs/OBSERVABILITY_RUNBOOK.md` and
+`docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.
+
+## 22. C6-02/10 bounded OpenTelemetry tracing (#91)
+
+Issue #91 authorizes optional tracing for the existing HTTP Control Plane and
+standalone scheduler processes. Each process owns a separate provider, fixed
+service identity, bounded OTLP/HTTP exporter, and hard-bounded process shutdown.
+Tracing is disabled by default, and committed Compose keeps it disabled with
+no collector or OTLP port. Inbound `traceparent` establishes HTTP request
+context; `tracestate`, baggage, Worker protocol propagation, and persisted
+trace context are excluded. HTTP, Command, scheduler tick, and existing fixed
+scheduler-stage spans use only bounded role, route/method/status, Command
+status, scheduler outcome/stage, and generic error-type attributes. Trace/span
+IDs are added to structured logs only during an active recording span.
+Exporter SDK and HTTP transport diagnostics are reduced to a fixed log event;
+shutdown waits at most three seconds and disables the SDK's synchronous atexit
+shutdown hook.
+
+No SQLAlchemy/database or outbound Threads/Meta HTTP auto-instrumentation is
+included. Exporter failure is fail-open; `/health`, `/ready`, #89 metrics,
+scheduler durability, and Worker protocol behavior remain unchanged. No schema
+migration, collector, dashboard, or production release claim is included. The
+#91 checkpoint is authorized but remains subject to coordinator review and
+acceptance. Issue #3 remains OPEN and #62 remains separate. See
 `docs/OBSERVABILITY_RUNBOOK.md` and
 `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.

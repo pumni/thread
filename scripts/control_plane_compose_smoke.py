@@ -262,6 +262,32 @@ def _assert_scheduler_metrics_are_private() -> None:
         raise SmokeFailure("scheduler metrics must not publish a host port")
 
 
+def _assert_tracing_is_disabled_and_private() -> None:
+    config = _json_object(_compose("config", "--format", "json").encode("utf-8"))
+    services = config.get("services") if config is not None else None
+    if not isinstance(services, dict):
+        raise SmokeFailure("Compose service configuration could not be inspected")
+    for name in ("http", "scheduler"):
+        service = services.get(name)
+        environment = service.get("environment") if isinstance(service, dict) else None
+        if not isinstance(environment, dict):
+            raise SmokeFailure(f"{name} service environment could not be inspected")
+        if environment.get("THREADS_PLATFORM_TRACING_ENABLED") not in ("false", False):
+            raise SmokeFailure(f"{name} tracing must remain disabled in the Compose smoke")
+    if any(
+        any(token in name.casefold() for token in ("opentelemetry", "jaeger", "tempo", "zipkin"))
+        for name in services
+    ):
+        raise SmokeFailure("Compose smoke must not add a tracing collector service")
+    for name, service in services.items():
+        ports = service.get("ports") if isinstance(service, dict) else None
+        if not isinstance(ports, list):
+            continue
+        for port in ports:
+            if isinstance(port, dict) and port.get("target") in (4317, 4318):
+                raise SmokeFailure(f"{name} must not publish an OTLP port")
+
+
 def _wait_for(
     path: str,
     expected: Callable[[int | None, dict[str, object] | None], bool],
@@ -368,6 +394,7 @@ def _run_smoke() -> None:
     if not http_id or not scheduler_id or http_id == scheduler_id or not postgres_id:
         raise SmokeFailure("HTTP, scheduler, and PostgreSQL process boundaries are invalid")
     _assert_scheduler_metrics_are_private()
+    _assert_tracing_is_disabled_and_private()
     scheduler_ticks_before_restart = _wait_scheduler_tick_count(20)
     print("PASS HTTP and private scheduler metrics listeners")
 

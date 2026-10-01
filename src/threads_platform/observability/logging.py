@@ -41,6 +41,26 @@ def sanitize_log_event(
     return cast(EventDict, _sanitize_mapping(cast(Mapping[object, Any], event_dict)))
 
 
+def add_trace_context(
+    _: Any,
+    __: str,
+    event_dict: EventDict,
+) -> EventDict:
+    """Copy bounded trace IDs from the active recording span into the log event."""
+    from opentelemetry import trace
+
+    correlated = dict(event_dict)
+    span = trace.get_current_span()
+    span_context = span.get_span_context()
+    if span.is_recording() and span_context.is_valid:
+        correlated["trace_id"] = f"{span_context.trace_id:032x}"
+        correlated["span_id"] = f"{span_context.span_id:016x}"
+    else:
+        correlated.pop("trace_id", None)
+        correlated.pop("span_id", None)
+    return cast(EventDict, correlated)
+
+
 def _sanitize_mapping(value: Mapping[object, Any]) -> dict[object, Any]:
     sanitized: dict[object, Any] = {}
     for key, item in value.items():
@@ -71,18 +91,24 @@ def _sanitize_value(value: Any) -> Any:
     return value
 
 
-def configure_logging(log_level: str) -> None:
+def configure_logging(log_level: str, *, tracing_enabled: bool = False) -> None:
     logging.basicConfig(level=log_level, format="%(message)s", force=True)
+    processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        sanitize_log_event,
+        structlog.processors.JSONRenderer(),
+    ]
+    if tracing_enabled:
+        from threads_platform.observability.tracing import install_opentelemetry_log_filter
+
+        processors.insert(5, add_trace_context)
+        install_opentelemetry_log_filter()
     structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            sanitize_log_event,
-            structlog.processors.JSONRenderer(),
-        ],
+        processors=processors,
         logger_factory=structlog.stdlib.LoggerFactory(),
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,

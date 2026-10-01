@@ -10,14 +10,14 @@ Completed:
 - Batch B — official-documentation-based Threads publishing, replies, conversation sync and moderation core.
 
 Current authorized implementation checkpoint:
-- **C6-02/9 — bounded Control Plane and scheduler metrics (#89)**.
+- **C6-02/10 — bounded OpenTelemetry tracing for Control Plane and scheduler (#91)**.
 
 Not production-ready:
 - issue #3 remains open as the production/release gate;
 - browser capabilities remain bounded by their accepted capability contracts;
 - scheduler availability does not imply production activation;
 - #62 remains a separate CRM result transport dependency;
-- distributed tracing is deferred; #89 adds bounded Prometheus-compatible metrics;
+- #91 adds opt-in bounded tracing; it is disabled by default and has no collector deployment;
 - the Windows x64 Worker bundle is an unsigned internal/test artifact, with no
   Windows service, signing, or auto-update channel. The current headed browser
   Worker runs under a dedicated logged-in Windows user through Task Scheduler;
@@ -129,10 +129,12 @@ bounded PostgreSQL and persisted Worker-fleet readiness. Database failure makes
 Structured logs carry bounded lifecycle correlation fields and centrally redact
 known credential patterns. See the
 [observability runbook](docs/OBSERVABILITY_RUNBOOK.md) for fields, limitations,
-readiness semantics, metric names, labels, and process ownership. `GET /metrics`
-uses the HTTP listener; the scheduler has a separate private metrics listener.
-Metrics do not change `/ready` or durable state. Distributed tracing remains
-deferred.
+readiness semantics, metric names and labels, trace spans and attributes, and
+process ownership. `GET /metrics` uses the HTTP listener; the scheduler has a
+separate private metrics listener. Metrics and tracing do not change `/ready`
+or durable state. Tracing is disabled by default. When enabled for a process,
+it exports over OTLP/HTTP using the standard OpenTelemetry endpoint settings,
+which default to the local OTLP/HTTP endpoint if no override is supplied.
 
 ## Linux/Docker Control Plane smoke (#87)
 
@@ -153,9 +155,9 @@ during a database outage. It confirms the scheduler metrics port is not
 published. It removes its temporary volume on completion. See the
 [Control Plane deployment and recovery runbook](docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md)
 for process commands, scrape boundaries, manual teardown, and recovery limits.
-The image is not published or signed; metrics remain process local, tracing and
-#62 transport behavior are not included, and no production release claim is
-made. #3 remains open and Phase B remains
+The image is not published or signed; metrics remain process local, the smoke
+keeps tracing disabled, no collector is deployed, and #62 transport behavior is
+not included. No production release claim is made. #3 remains open and Phase B remains
 `PARTIAL_LIVE_EVIDENCE / NOT_READY`.
 
 The scheduler dispatches only already-configured `threads.sync_conversation`
