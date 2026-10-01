@@ -89,6 +89,12 @@ No React-to-PostgreSQL connection, no generic IPC HTTP proxy that exposes secret
 
 Until backup/recovery is shipped, loss of the Controller host or Windows DPAPI user context may make data/identity unrecoverable. An internal/demo Windows Desktop acceptance is **not** a claim of production data durability or production release readiness. Record this limitation in installer/runbooks and do not certify a customer's irreplaceable data on an unrecoverable prototype.
 
+## Additional deployment and lifecycle security gates
+
+The current Worker device credential can complete—but does **not** initiate—the durable DRAINING workflow; the existing initiation route needs a static `worker_admin_token`. Disabling the legacy bypass therefore requires an explicit UX/authorization decision for intentional tray Quit while no human is logged in. The v1 default proposal is to require an authorized Operator login before the drain/Controller stop mutation; a device-authenticated **self-only** Worker drain endpoint is permitted only after a separate security review. Human UI logout must never stop a node. Actual Windows logoff/crash remains an ungraceful OS event.
+
+Linux/Docker Controller remains a supported IT/developer deployment using the same Operator API, Worker protocol and business schema, but **does not use Windows current-user DPAPI or Tauri for trust provisioning**. DX-06 must define a Linux-appropriate protected Controller trust-key store, HTTPS/WSS ingress and local administrator fingerprint display (e.g. CLI); DX-13 exercises Windows Worker/Console first-contact verification against it or records an explicit temporary unsupported scenario. No plaintext public Operator API or blind certificate trust.
+
 ## Verification and review
 
 See [test matrix](../desktop/ACCEPTANCE_MATRIX.md) and [operations](../desktop/WINDOWS_REHEARSAL.md). An ADR/planning PR must pass document/consistency review; implementation proceeds only via explicitly authorized issues. Keep the existing `#3` Meta live validation, `#80` discovery permission, `#62` production CRMResultSink and `#11` release-certification gates separate from Desktop vertical-slice evidence.
