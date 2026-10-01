@@ -495,8 +495,10 @@ def test_transport_retry_logs_do_not_disclose_otlp_endpoint_path(
         assert exporter.calls >= 1
         assert endpoint not in caplog.text
         assert "SYNTHETIC_TENANT_PATH_SECRET" not in caplog.text
-        assert "opentelemetry_internal_event" in caplog.text
-        assert endpoint not in transport_output.getvalue()
+        rendered_transport_log = transport_output.getvalue()
+        assert "opentelemetry_internal_event" in rendered_transport_log
+        assert endpoint not in rendered_transport_log
+        assert "SYNTHETIC_TENANT_PATH_SECRET" not in rendered_transport_log
     finally:
         transport_logger.removeHandler(transport_handler)
         transport_handler.close()
