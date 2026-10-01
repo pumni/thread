@@ -1,6 +1,6 @@
 # Threads Desktop v1 — Tổng quan kế hoạch
 
-**Trạng thái:** bản kế hoạch đề xuất trên nhánh riêng; **chưa triển khai ứng dụng, chưa nghiệm thu production**.
+**Trạng thái:** bản kế hoạch đề xuất trên nhánh riêng; **chưa triển khai ứng dụng, chưa nghiệm thu production**. Phiên mới **bắt đầu tại [SESSION_HANDOFF.md](SESSION_HANDOFF.md)** và đọc [bản audit](PREIMPLEMENTATION_AUDIT.md) trước khi viết code.
 
 ## Mục tiêu sản phẩm đã thống nhất
 
@@ -19,11 +19,13 @@ Một installer Windows và một ứng dụng **Threads Desktop** (Tauri 2 + Ru
 3. [SECURITY_AND_PROTOCOLS.md](SECURITY_AND_PROTOCOLS.md): Windows/Controller/Worker/Operator identity, HTTPS fingerprint verification, one-time pairing, RBAC, Worker-centric browser onboarding và data boundary.
 4. [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md): tiêu chí nghiệm thu, kiểm thử tiêu cực, regression, ma trận Windows/Linux/CI và ba máy.
 5. [WINDOWS_REHEARSAL.md](WINDOWS_REHEARSAL.md): first-run, data root, process startup/shutdown, reboot, packaging, runbook và checklist bằng chứng.
-6. [ISSUE_MAP.md](ISSUE_MAP.md): mapping issue GitHub, thứ tự và liên kết sau khi issue được tạo.
+6. [ISSUE_MAP.md](ISSUE_MAP.md): mapping epic #94 và 14 issue #95–#108, thứ tự, phụ thuộc và hard gates.
+7. [PREIMPLEMENTATION_AUDIT.md](PREIMPLEMENTATION_AUDIT.md): 16 phát hiện và việc cần sửa trước khi nghiệm thu implementation.
+8. [SESSION_HANDOFF.md](SESSION_HANDOFF.md): tài liệu **bàn giao một phiên mới** — nguồn sự thật, quyết định đã chốt, blocker và bước kế tiếp.
 
 ## Thứ tự ưu tiên
 
-- **M1:** chứng minh một installer/prototype có thể khởi động Controller trên Windows sạch; đóng UI vẫn chạy; Quit và mở lại giữ nguyên PostgreSQL state.
+- **M1:** chứng minh **engineering test bundle/prototype chỉ bind loopback với dữ liệu giả** có thể khởi động Controller trên Windows sạch; đóng UI vẫn chạy; Quit và mở lại giữ nguyên PostgreSQL state. Installer cuối và first OWNER + HTTPS thuộc các giai đoạn sau.
 - **M2:** Operator RBAC + LAN HTTPS trust, Worker pairing + Console login.
 - **M3:** Worker thêm account và đăng nhập Threads tại máy của mình; Controller tạo Account/assignment atomically; re-login/reassign an toàn.
 - **M4:** UI Controller/Worker/Console, một installer nội bộ và diễn tập E2E ba Windows PC/VM; độc lập với production release gate.
