@@ -1,5 +1,7 @@
 # Project State Handoff — 2026-09-30
 
+> **Proposed initiative update, 2026-10-01:** Windows-first Desktop planning exists on **draft PR #93**, epic #94 and issues #95–#108; it is **not on main / not coordinator-accepted** until live GitHub proves otherwise. New Desktop sessions must read [SESSION_HANDOFF.md](desktop/SESSION_HANDOFF.md) and [PREIMPLEMENTATION_AUDIT.md](desktop/PREIMPLEMENTATION_AUDIT.md) **from PR #93's branch** while unmerged, then the authorized DX issue. The dated historical notes below may predate later merge/release events; verify live main, PR, issue and CI status. Do not implement all DX issues just because planning issues exist.
+
 After the repository root `AGENTS.md`, this is the first state document a new coordinator or Codex session should read.
 
 ## 1. Repository
