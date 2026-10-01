@@ -4,6 +4,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -95,7 +96,7 @@ def test_authenticated_https_cancel_ack_is_narrow_and_rejects_extra_request_fiel
         "checkpoint_phase": "BEFORE_NAVIGATION",
     }
     with client:
-        typed_client = cast(httpx.Client, client)
+        typed_client = cast(httpx2.Client, client)
         response = typed_client.post(
             f"/v1/workers/jobs/{job_id}/cancel", headers=headers, json=request_body
         )
