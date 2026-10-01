@@ -2,7 +2,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-import httpx
+import httpx2
 import pytest
 
 from threads_platform.domain.worker_jobs import WorkerJobStatus
@@ -37,17 +37,17 @@ async def test_http_client_parses_pending_snapshot_and_sends_fenced_ack() -> Non
     lease_token = uuid4()
     request_id = uuid4()
     now = datetime(2026, 9, 29, 12, tzinfo=UTC)
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def handle(request: httpx.Request) -> httpx.Response:
+    async def handle(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
         if request.url.path.endswith("/auth/challenges"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"challenge_id": str(uuid4()), "nonce": "test-nonce"},
             )
         if request.url.path.endswith("/auth/sessions"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": "worker-test-token",
@@ -55,7 +55,7 @@ async def test_http_client_parses_pending_snapshot_and_sends_fenced_ack() -> Non
                 },
             )
         if request.url.path.endswith("/renew"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "id": str(job_id),
@@ -78,7 +78,7 @@ async def test_http_client_parses_pending_snapshot_and_sends_fenced_ack() -> Non
                     },
                 },
             )
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "id": str(job_id),
@@ -97,7 +97,7 @@ async def test_http_client_parses_pending_snapshot_and_sends_fenced_ack() -> Non
             },
         )
 
-    client = HttpWorkerControlClient("https://control.test", transport=httpx.MockTransport(handle))
+    client = HttpWorkerControlClient("https://control.test", transport=httpx2.MockTransport(handle))
     try:
         await _authenticate_client(client, worker_id)
         renewed = await client.renew_job(job_id, lease_token)
@@ -135,21 +135,21 @@ async def test_http_client_rejects_extra_pending_cancellation_metadata() -> None
     job_id = uuid4()
     worker_id = uuid4()
 
-    async def handle(_: httpx.Request) -> httpx.Response:
+    async def handle(_: httpx2.Request) -> httpx2.Response:
         if _.url.path.endswith("/auth/challenges"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"challenge_id": str(uuid4()), "nonce": "test-nonce"},
             )
         if _.url.path.endswith("/auth/sessions"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": "worker-test-token",
                     "expires_at": datetime.now(UTC).isoformat(),
                 },
             )
-        return httpx.Response(
+        return httpx2.Response(
             200,
             json={
                 "id": str(job_id),
@@ -174,7 +174,7 @@ async def test_http_client_rejects_extra_pending_cancellation_metadata() -> None
             },
         )
 
-    client = HttpWorkerControlClient("https://control.test", transport=httpx.MockTransport(handle))
+    client = HttpWorkerControlClient("https://control.test", transport=httpx2.MockTransport(handle))
     try:
         await _authenticate_client(client, worker_id)
         with pytest.raises(WorkerControlClientError, match="WORKER_PROTOCOL_INVALID_RESPONSE"):
@@ -186,17 +186,17 @@ async def test_http_client_rejects_extra_pending_cancellation_metadata() -> None
 @pytest.mark.asyncio
 async def test_http_client_completes_drain_with_worker_authentication() -> None:
     worker_id = uuid4()
-    requests: list[httpx.Request] = []
+    requests: list[httpx2.Request] = []
 
-    async def handle(request: httpx.Request) -> httpx.Response:
+    async def handle(request: httpx2.Request) -> httpx2.Response:
         requests.append(request)
         if request.url.path.endswith("/auth/challenges"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"challenge_id": str(uuid4()), "nonce": "test-nonce"},
             )
         if request.url.path.endswith("/auth/sessions"):
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={
                     "access_token": "worker-test-token",
@@ -205,14 +205,14 @@ async def test_http_client_completes_drain_with_worker_authentication() -> None:
             )
         if request.url.path == "/v1/workers/drain/complete":
             if request.headers.get("Authorization") != "Bearer worker-test-token":
-                return httpx.Response(401, json={"detail": {"code": "WORKER_UNAUTHORIZED"}})
-            return httpx.Response(
+                return httpx2.Response(401, json={"detail": {"code": "WORKER_UNAUTHORIZED"}})
+            return httpx2.Response(
                 200,
                 json={"worker_id": str(worker_id), "status": "OFFLINE"},
             )
-        return httpx.Response(404, json={"detail": {"code": "NOT_FOUND"}})
+        return httpx2.Response(404, json={"detail": {"code": "NOT_FOUND"}})
 
-    client = HttpWorkerControlClient("https://control.test", transport=httpx.MockTransport(handle))
+    client = HttpWorkerControlClient("https://control.test", transport=httpx2.MockTransport(handle))
     try:
         await _authenticate_client(client, worker_id)
         status = await client.complete_drain()

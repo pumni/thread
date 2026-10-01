@@ -64,6 +64,12 @@ jobs:
       - name: Check Threads API HTTPX2 TLS and proxy behavior
         run: uv run --locked pytest tests/unit/test_threads_httpx2_transport.py
 
+      - name: Check Worker Control Plane HTTPX2 TLS and proxy behavior
+        run: >-
+          uv run --locked pytest
+          tests/unit/test_worker_control_client_httpx2.py
+          tests/unit/test_worker_control_client_cancellation.py
+
       - name: Install only locked Playwright Chromium
         shell: pwsh
         env:

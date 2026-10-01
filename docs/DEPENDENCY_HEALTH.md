@@ -18,19 +18,20 @@ and retain a focused regression check.
 ## Audit findings (2026-10-01)
 
 The locked tree contains production, `dev`, and `packaging` groups. The
-Threads API adapter now uses `httpx2` at runtime, while the Worker Control
-Plane still uses `httpx` until its separate migration slice is reviewed.
-Both packages remain production dependencies during that transition.
+The Threads API and Worker Control Plane adapters now use `httpx2` at runtime.
+The direct `httpx` dependency remains through the separate Slice C review and
+cleanup; it is intentionally not removed as part of either transport slice.
 
-The Threads API client explicitly keeps certificate verification enabled,
-uses the operating-system trust store by default instead of HTTPX's bundled
-`certifi` store, and honors `SSL_CERT_FILE`, `SSL_CERT_DIR`, and the standard
-proxy environment variables through `trust_env=True`. Its 15-second timeout
-and redirect-disabled behavior are unchanged. HTTPX2 changes the default
-User-Agent from `python-httpx/...` to `python-httpx2/...`; the Threads API
-adapter has no contract that depends on that library-generated value. Do not
-remove `httpx` until the Worker Control Plane migration is separately accepted
-and the remaining runtime dependency tree is checked.
+Both HTTPX2 clients explicitly keep certificate verification enabled, use the
+operating-system trust store by default instead of HTTPX's bundled `certifi`
+store, and honor `SSL_CERT_FILE`, `SSL_CERT_DIR`, and the standard proxy
+environment variables through `trust_env=True`. The Threads API keeps its
+15-second timeout and redirect-disabled behavior; the Worker Control Plane
+keeps its 10-second timeout and redirect-disabled behavior. HTTPX2 changes the
+default User-Agent from `python-httpx/...` to `python-httpx2/...`; neither API
+contract depends on that library-generated value. Slice C owns removal of the
+direct `httpx` dependency after the remaining runtime and packaging tree is
+reviewed.
 
 The HTTPX2 migration guide describes it as a fork of HTTPX 0.28.1 with a
 largely compatible API; its project metadata and release notes include Python

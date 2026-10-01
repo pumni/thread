@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
-import httpx
+import httpx2
 import pytest
 from pydantic import SecretStr
 
@@ -55,8 +55,8 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
         worker_job_service=jobs,
         worker_session_service=sessions,
     )
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="https://control.test") as admin:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="https://control.test") as admin:
         enrollment = await admin.post(
             "/v1/workers/enrollments",
             headers={"Authorization": f"Bearer {admin_token}"},
@@ -126,7 +126,7 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
     challenge = await control.create_challenge(worker_id)
     signature = identity.sign(challenge_message(challenge.challenge_id, challenge.nonce))
     session = await control.exchange_challenge(challenge.challenge_id, signature)
-    async with httpx.AsyncClient(transport=transport, base_url="https://control.test") as worker:
+    async with httpx2.AsyncClient(transport=transport, base_url="https://control.test") as worker:
         context_response = await worker.get(
             f"/v1/workers/accounts/{account.id}/context",
             headers={"Authorization": f"Bearer {session.access_token}"},
