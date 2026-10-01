@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID, uuid4
 
-import httpx
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
@@ -24,8 +23,8 @@ from threads_platform.domain.workers import WorkerStatus
 
 async def test_worker_http_rejects_plain_http_before_authentication() -> None:
     app = create_app(Settings(worker_tls_required=True))
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://worker.test") as client:
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://worker.test") as client:
         response = await client.post(
             "/v1/workers/auth/challenges", json={"worker_id": str(uuid4())}
         )
@@ -96,8 +95,7 @@ def test_authenticated_https_cancel_ack_is_narrow_and_rejects_extra_request_fiel
         "checkpoint_phase": "BEFORE_NAVIGATION",
     }
     with client:
-        typed_client = cast(httpx2.Client, client)
-        response = typed_client.post(
+        response = client.post(
             f"/v1/workers/jobs/{job_id}/cancel", headers=headers, json=request_body
         )
         assert response.status_code == 200
@@ -113,7 +111,7 @@ def test_authenticated_https_cancel_ack_is_narrow_and_rejects_extra_request_fiel
             )
         ]
 
-        invalid = typed_client.post(
+        invalid = client.post(
             f"/v1/workers/jobs/{job_id}/cancel",
             headers=headers,
             json={**request_body, "reason_code": "CALLER_CONTROLLED"},

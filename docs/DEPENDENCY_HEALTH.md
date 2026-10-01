@@ -4,8 +4,11 @@ The Ubuntu quality gate and Windows Worker package workflow print the locked
 production, development, and packaging dependency graph with
 `uv tree --locked --all-groups`. This shows the versions in `uv.lock` for the
 applicable platform and asserts the lockfile remains unchanged; it does not
-check whether newer versions are available. Run the same command locally when
-reviewing the locked graph.
+check whether newer versions are available. The Windows Worker build then
+switches to `uv sync --locked --no-dev --group packaging` before PyInstaller,
+so its package is built from runtime and packaging dependencies without
+test-only libraries. Run the same commands locally when reviewing the locked
+graph.
 
 `uv run --locked pytest` treats `DeprecationWarning`,
 `PendingDeprecationWarning`, `FutureWarning`, and `PytestDeprecationWarning` as
@@ -18,9 +21,28 @@ and retain a focused regression check.
 ## Audit findings (2026-10-01)
 
 The locked tree contains production, `dev`, and `packaging` groups. The
-The Threads API and Worker Control Plane adapters now use `httpx2` at runtime.
-The direct `httpx` dependency remains through the separate Slice C review and
-cleanup; it is intentionally not removed as part of either transport slice.
+The Threads API and Worker Control Plane adapters use `httpx2` at runtime. No
+first-party runtime module imports legacy `httpx`, so its direct requirement is
+no longer in the project's runtime dependencies. It remains a direct `dev`
+dependency because `fastapi.testclient.TestClient` is backed by the original
+HTTPX package. Tests that use `ASGITransport`, `AsyncClient`, or response types
+with the new clients use the matching `httpx2` classes; old `httpx` and
+`httpx2` nominal classes are not cast across one another.
+
+The inverse locked trees are:
+
+- `httpx 0.28.1` → `threads-platform (group: dev)`;
+- `httpcore 1.0.9` → `httpx` → `threads-platform (group: dev)`;
+- `certifi 2026.7.22` → `httpx` / `httpcore` → `threads-platform (group: dev)`;
+- `httpx2 2.13.1` → `threads-platform` runtime dependency;
+- `httpcore2 2.13.1` → `httpx2`;
+- `truststore 0.10.4` → `httpx2` and `httpcore2`.
+
+The locked Windows runtime-plus-packaging graph therefore contains `httpx2`,
+`httpcore2`, and `truststore`; legacy `httpx`, `httpcore`, and `certifi` are
+excluded when the development group is omitted. The Worker package workflow
+verifies the HTTPX2 client and system trust context in both the locked runtime
+environment and the built executable.
 
 Both HTTPX2 clients explicitly keep certificate verification enabled, use the
 operating-system trust store by default instead of HTTPX's bundled `certifi`
@@ -46,8 +68,10 @@ withdrawn locked release was identified in the dependency tree. Security
 advisories must be assessed separately from deprecation notices.
 
 The refreshed universal lock contains 68 registry packages across its platform
-markers (69 entries including the project); the CI tree reports the applicable
-graph on both Ubuntu and Windows. The 2026-10-01 PyPI release-metadata check
+markers (69 entries including the project); moving `httpx` to the development
+group changes package scope without changing locked versions or this
+all-groups count. The CI tree reports the applicable graph on both Ubuntu and
+Windows. The 2026-10-01 PyPI release-metadata check
 covered the previous 57-package lock and found no yanked distributions among
 those releases. The current-lock freshness and yanked-release monitoring is
 tracked separately in #115. Two Windows-packaging transitives have a slower

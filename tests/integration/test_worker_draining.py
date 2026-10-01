@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-import httpx
+import httpx2
 import pytest
 from pydantic import SecretStr
 from structlog.testing import capture_logs
@@ -376,10 +376,12 @@ async def test_drain_http_auth_boundaries_status_and_advisory(
         worker_control_service=control,
         worker_notifications=notifications,
     )
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx2.ASGITransport(app=app)
 
     async with notifications.subscribe(worker_id) as events:
-        async with httpx.AsyncClient(transport=transport, base_url="https://worker.test") as client:
+        async with httpx2.AsyncClient(
+            transport=transport, base_url="https://worker.test"
+        ) as client:
             denied = await client.post(
                 f"/v1/workers/{worker_id}/drain",
                 headers={"Authorization": f"Bearer {worker_token}"},

@@ -56,6 +56,8 @@ dependencies. It contains the Worker executable, PyInstaller runtime, Playwright
 Playwright's matching Chromium, and `BUILD-MANIFEST.json`. Firefox and WebKit are not installed
 or bundled. Use the exact-head Windows package workflow to obtain the ZIP, SHA-256 file, and
 manifest; see `docs/WORKER_UPDATE_RUNBOOK.md` for installation and update steps.
+The package check initializes the HTTPX2 Control Plane client and verifies that its bundled
+TLS context uses the Windows system trust provider with certificate and hostname verification.
 
 The archive is unsigned and intended only as an internal/test artifact. Its SHA-256 identifies
 the bytes but does not authenticate the publisher. It has no Authenticode signature, production

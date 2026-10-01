@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-import httpx
+import httpx2
 import pytest
 from pydantic import SecretStr
 from starlette.types import Message, Scope
@@ -118,11 +118,11 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
         Settings(worker_admin_token=SecretStr(admin_token), worker_tls_required=True),
         worker_control_service=service,
     )
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx2.ASGITransport(app=app)
     worker_id = uuid4()
     identity = WorkerDeviceIdentity.generate()
 
-    async with httpx.AsyncClient(transport=transport, base_url="https://worker.test") as client:
+    async with httpx2.AsyncClient(transport=transport, base_url="https://worker.test") as client:
         admin_secret = "SYNTHETIC_WORKER_ADMIN_SENTINEL"
         denied_admin = await client.post(
             "/v1/workers/enrollments",
@@ -173,7 +173,7 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
         invalid_key = await client.post("/v1/workers/enroll", json=invalid_key_body)
         assert invalid_key.status_code == 422
         assert invalid_key.json() == {"detail": {"code": "INVALID_PUBLIC_KEY"}}
-        async with httpx.AsyncClient(
+        async with httpx2.AsyncClient(
             transport=transport, base_url="http://worker.test"
         ) as plain_http:
             rejected_transport = await plain_http.post("/v1/workers/enroll", json=enrollment_body)
@@ -269,11 +269,11 @@ async def test_durable_https_pull_recovers_job_without_wss_notification(
         worker_job_service=jobs,
         worker_notifications=notifications,
     )
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx2.ASGITransport(app=app)
     worker_id = uuid4()
     identity = WorkerDeviceIdentity.generate()
 
-    async with httpx.AsyncClient(transport=transport, base_url="https://worker.test") as client:
+    async with httpx2.AsyncClient(transport=transport, base_url="https://worker.test") as client:
         created = await client.post(
             "/v1/workers/enrollments",
             headers={"Authorization": f"Bearer {admin_token}"},
@@ -320,7 +320,7 @@ async def test_durable_https_pull_recovers_job_without_wss_notification(
 
         # The job is persisted while no WSS subscriber is connected; workers recover it by pull.
         queued = await jobs.enqueue("synthetic.echo", 1)
-        async with httpx.AsyncClient(
+        async with httpx2.AsyncClient(
             transport=transport, base_url="http://worker.test"
         ) as insecure_client:
             rejected = await insecure_client.post("/v1/workers/jobs/claim", headers=worker_headers)

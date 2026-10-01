@@ -1,7 +1,7 @@
 from typing import cast
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 
 from threads_platform.app import create_app
 from threads_platform.application.readiness import (

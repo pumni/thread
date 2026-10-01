@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import cast
 
-from httpx import ASGITransport, AsyncClient, Response
+from httpx2 import ASGITransport, AsyncClient, Response
 
 from threads_platform.app import create_app
 from threads_platform.application.worker_control import WorkerControlService

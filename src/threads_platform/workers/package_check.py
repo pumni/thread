@@ -23,6 +23,9 @@ def _is_windows() -> bool:
 
 
 async def _check_packaged_runtime() -> None:
+    import ssl
+
+    import httpx2
     from playwright.async_api import Route, async_playwright
 
     from threads_platform.infrastructure.worker_agent.identity import WorkerIdentityFileStore
@@ -31,6 +34,18 @@ async def _check_packaged_runtime() -> None:
         WorkerLocalStateStore,
     )
     from threads_platform.infrastructure.worker_agent.windows_keys import DPAPIWorkerKeyStore
+    from threads_platform.workers.control_client import HttpWorkerControlClient
+
+    ssl_context = httpx2.create_ssl_context(verify=True, trust_env=True)
+    if (
+        not type(ssl_context).__module__.startswith("truststore.")
+        or ssl_context.verify_mode != ssl.CERT_REQUIRED
+        or not ssl_context.check_hostname
+    ):
+        raise RuntimeError("packaged Worker HTTP client trust configuration is invalid")
+
+    control_client = HttpWorkerControlClient("https://control.test")
+    await control_client.aclose()
 
     with tempfile.TemporaryDirectory(
         prefix="threads-worker-package-check-", ignore_cleanup_errors=True

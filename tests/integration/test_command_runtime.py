@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from httpx import ASGITransport, AsyncClient, Response
+from httpx2 import ASGITransport, AsyncClient, Response
 from pydantic import SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
