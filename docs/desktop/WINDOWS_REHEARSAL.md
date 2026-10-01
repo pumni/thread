@@ -103,6 +103,12 @@ Use real Windows Job Objects/process locks where proven; test PostgreSQL gracefu
 
 Controller shows database liveness/ready, HTTP/scheduler health, configured LAN endpoint, Workspace ID/display name, runtime versions, up/down bounded status and redacted correlation IDs. Worker shows presence, capacity, assigned account count, local browser session states and interventions; Console shows Controller availability/trust and operator identity. Never expose raw DB URL/password, root private key, bearer, enrollment code after display expiry, browser cookie, DOM, unredacted URL or personal account data in diagnostics.
 
-## 9. Operational rehearsal and signoff
+## 9. Quit authorization and Linux Controller interoperability
+
+Normal Quit on a provisioned busy Worker needs a reviewable initiation mechanism, **not** an unbounded global static Worker admin token. Current device auth only completes a drain requested by a privileged caller. DX-05/DX-07 must choose a bounded v1 policy: proposed normal UX prompts for suitably privileged Operator login when no human is authenticated (or security-review a self-only device drain endpoint). Test no human login, expired Operator session, Worker mid-job and Controller unreachable; if the user confirms forced exit or Windows logs off, report possible lease recovery rather than pretending DRAINING reached OFFLINE. For Controller Quit, freeze Owner/Admin operational permission in DX-05; OS user process termination remains outside an API guarantee.
+
+Linux/Docker continues as an official IT/developer Controller profile: provide a separate OS-appropriate protected trust-key store and local administrator CLI fingerprint retrieval; configure an HTTPS/WSS public ingress that preserves Worker/Operator authorization and secure ASGI scheme semantics. Windows Worker and Console first-contact trust verification and login must interoperate with this profile. Linux packaging need not reuse the Tauri app or Windows DPAPI.
+
+## 10. Operational rehearsal and signoff
 
 Use [Acceptance Matrix](ACCEPTANCE_MATRIX.md) as the canonical case list. Each run captures: image/build/version, Desktop and sidecar SHA256, Python/Rust/TS lock hashes, Windows version, Windows account context (non-secret), Controller root fingerprints (public), endpoint, test identity synthetic labels, test timestamps, exact PR commit head, outcomes with failure logs redacted. Store evidence in repo only when sanitized and approved. External real Threads/Meta activity must obey existing live-validation gate #3; synthetic browser fixture/login on test accounts does not prove production API capability. Notify Product Owner of no-backup/no-before-login limitations at each pilot signoff.
