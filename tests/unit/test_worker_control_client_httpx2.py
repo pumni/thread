@@ -378,9 +378,6 @@ def _run_windows_root_store(operation: str, *arguments: str) -> str:
             [sys.executable, str(_WINDOWS_ROOT_STORE_HELPER), *arguments],
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=_CERT_STORE_OPERATION_TIMEOUT_SECONDS,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -408,13 +405,13 @@ def _run_windows_root_store(operation: str, *arguments: str) -> str:
         f"elapsed_ms={elapsed_ms} exit_code={result.returncode}"
     )
     if result.returncode != 0:
-        for diagnostic in result.stderr.splitlines():
+        for diagnostic in result.stderr.decode("ascii", errors="ignore").splitlines():
             if diagnostic.startswith("WINCRYPTO_FAILURE action="):
                 print(f"WINDOWS_ROOT_STORE diagnostic={diagnostic}")
     assert result.returncode == 0, (
         f"Windows root-store {operation} failed with exit code {result.returncode}"
     )
-    return result.stdout.strip()
+    return result.stdout.decode("utf-8").strip()
 
 
 def _windows_root_store_thumbprints(scope: str) -> set[str]:
