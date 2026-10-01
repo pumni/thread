@@ -41,6 +41,9 @@
 - **Transport:** Enforce TLS on Operator + Worker public paths and WSS; run through actual Windows terminating process with ASGI scope header-negative tests, not just HTTP fixtures.
 - **Operations:** Hard-kill Controller owner and check WAL restart; Worker unreachable on Quit cannot claim OFFLINE without authenticated Controller status.
 
+- **Quit authorization:** User logs out of Worker Desktop but Agent keeps executing device-authenticated jobs. Intentional tray Quit while no human is logged in must trigger approved Operator login for a Controller-authorized drain **or** pass a separately reviewed device-authenticated self-only drain implementation. Test Worker online/busy/Controller unreachable and no hidden static admin bearer; forced OS shutdown is not graceful.
+- **Linux/Docker interoperability:** Configure Linux-specific protected trust-key storage and HTTPS/WSS ingress. Verify Windows Worker/Console independently compare actual Controller root fingerprint from local CLI, then connect through the **same** API and Worker protocol; no Windows DPAPI import in Linux/domain and no plaintext public Operator API.
+
 ## Windows/CI matrix
 
 | Scope changed | Gate |
