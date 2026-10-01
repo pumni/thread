@@ -1,6 +1,6 @@
 # Threads Desktop v1 — Tổng quan kế hoạch
 
-**Trạng thái:** bản kế hoạch đề xuất trên nhánh riêng; **chưa triển khai ứng dụng, chưa nghiệm thu production**. Phiên mới **bắt đầu tại [SESSION_HANDOFF.md](SESSION_HANDOFF.md)** và đọc [bản audit](PREIMPLEMENTATION_AUDIT.md) trước khi viết code.
+**Trạng thái:** kế hoạch/ADR được nghiệm thu và merge vào `main` bằng PR #93 (`ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`); **chưa triển khai ứng dụng, chưa nghiệm thu production**. Phiên mới **bắt đầu tại [SESSION_HANDOFF.md](SESSION_HANDOFF.md)** và đọc [bản audit](PREIMPLEMENTATION_AUDIT.md) trước khi viết code.
 
 ## Mục tiêu sản phẩm đã thống nhất
 
