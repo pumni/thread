@@ -73,4 +73,4 @@ jobs:
           done
 
       - name: Run tests
-        run: uv run --locked pytest
+        run: uv run --locked pytest -ra
