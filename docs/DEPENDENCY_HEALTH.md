@@ -34,23 +34,29 @@ packages based on freshness alone. No other supported upstream deprecation or
 withdrawn locked release was identified in the dependency tree. Security
 advisories must be assessed separately from deprecation notices.
 
-The universal lock contains 57 registry packages across its platform markers;
-the CI tree reports the applicable graph on both Ubuntu and Windows. PyPI
-release metadata showed no yanked distributions for any of the 57 locked
-releases. Two Windows-packaging transitives have a slower release cadence:
+The refreshed universal lock contains 68 registry packages across its platform
+markers (69 entries including the project); the CI tree reports the applicable
+graph on both Ubuntu and Windows. The 2026-10-01 PyPI release-metadata check
+covered the previous 57-package lock and found no yanked distributions among
+those releases. The current-lock freshness and yanked-release monitoring is
+tracked separately in #115. Two Windows-packaging transitives have a slower
+release cadence:
 `pefile 2024.8.26` and `pywin32-ctypes 0.2.3` were last released in August 2024.
 They remain the current upstream releases and PyInstaller dependencies; no
 formal end-of-support notice or replacement was found. Treat the release gap
 as a watch item, not a deprecation.
 
-The `pip-audit` scan of the Windows-resolved tree and an OSV query covering all
-57 locked registry packages report one moderate advisory,
-GHSA-g6cj-pr64-35w5 (`PYSEC-2026-3552`), for `cryptography 49.0.0`; the patched
-version is 50.0.0. The advisory concerns PKCS#7 EnvelopedData decryption. The
-repository currently uses Ed25519 operations and private-key serialization,
-not PKCS#7 decryption, but the direct constraint `cryptography<50` blocks the
-patched release. Review that version-bound change and its Windows packaging
-impact in a separate security follow-up; it is not a deprecation remediation.
+The `pip-audit` scan of the Windows-resolved tree and an OSV query covering the
+previous 57 locked registry packages reported one moderate advisory,
+GHSA-g6cj-pr64-35w5 (`PYSEC-2026-3552`), for `cryptography 49.0.0`. It concerns
+PKCS#7 EnvelopedData decryption. The repository's reviewed call sites use
+Ed25519 operations and private-key serialization, not PKCS#7 decryption. PR
+#117 remediated the finding on `main` on 2026-10-01 by updating the constraint
+to `cryptography>=50,<51` and locking `50.0.2`. A current
+`uv audit --locked --python-version 3.14` scan of the combined 68-package lock
+reports no known vulnerabilities or adverse project statuses. The GHSA is a
+historical, remediated finding, not an unresolved current advisory. Ongoing
+automated advisory and upstream-health monitoring remains tracked in #115.
 
 Primary references:
 
