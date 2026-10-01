@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import replace
@@ -152,15 +153,22 @@ def synthetic_origin(
         server.server_close()
 
 
+@pytest.fixture
+def short_managed_profile_tmp_path() -> Iterator[Path]:
+    # Keep Chromium's nested profile/cache paths within Windows path limits.
+    with tempfile.TemporaryDirectory(prefix="bp-") as directory:
+        yield Path(directory)
+
+
 def test_playwright_managed_profile_contract_navigation_and_cleanup(
-    tmp_path: Path,
+    short_managed_profile_tmp_path: Path,
     synthetic_origin: str,
 ) -> None:
     async def scenario() -> None:
         worker_id = uuid4()
         account_id = uuid4()
         context, manager, store, resolver, opened = await _managed_session(
-            tmp_path,
+            short_managed_profile_tmp_path,
             worker_id,
             account_id,
             "logical-profile",
@@ -176,36 +184,43 @@ def test_playwright_managed_profile_contract_navigation_and_cleanup(
             adapter,
             headless=True,
         )
-        opened = await managed_manager.open(context)
-        session = managed_manager.browser_session(account_id)
-        assert session is not None
-        assert opened.state.state is BrowserSessionState.LOGIN_REQUIRED
         profile_directory = resolver.resolve(worker_id, account_id, "logical-profile")
         policy = _local_policy(synthetic_origin)
 
-        await session.navigate(f"{synthetic_origin}/authenticated", policy)
-        assert await session.inspect_contract() is BrowserSurfaceState.AUTHENTICATED
-        assert profile_directory.is_dir()
-        assert list(profile_directory.iterdir())
+        try:
+            opened = await managed_manager.open(context)
+            session = managed_manager.browser_session(account_id)
+            assert session is not None
+            assert opened.state.state is BrowserSessionState.LOGIN_REQUIRED
 
-        await session.navigate(f"{synthetic_origin}/unknown", policy)
-        with pytest.raises(UnsupportedUIState) as unknown:
-            await session.inspect_contract()
-        assert str(unknown.value) == "UNSUPPORTED_UI_STATE"
-        current = store.get_session(account_id)
-        assert current is not None and current.state is BrowserSessionState.ERROR
+            await session.navigate(f"{synthetic_origin}/authenticated", policy)
+            assert await session.inspect_contract() is BrowserSurfaceState.AUTHENTICATED
+            assert profile_directory.is_dir()
 
-        await session.navigate(f"{synthetic_origin}/missing", policy)
-        with pytest.raises(LocatorNotFound):
-            await session.inspect_contract()
+            await session.navigate(f"{synthetic_origin}/unknown", policy)
+            with pytest.raises(UnsupportedUIState) as unknown:
+                await session.inspect_contract()
+            assert str(unknown.value) == "UNSUPPORTED_UI_STATE"
+            current = store.get_session(account_id)
+            assert current is not None and current.state is BrowserSessionState.ERROR
 
-        with pytest.raises(NavigationTimeout):
-            await session.navigate(f"{synthetic_origin}/slow", policy)
+            await session.navigate(f"{synthetic_origin}/missing", policy)
+            with pytest.raises(LocatorNotFound):
+                await session.inspect_contract()
 
-        await managed_manager.close(account_id)
+            with pytest.raises(NavigationTimeout):
+                await session.navigate(f"{synthetic_origin}/slow", policy)
+        finally:
+            current = store.get_session(account_id)
+            if current is not None and current.state is not BrowserSessionState.STOPPED:
+                await managed_manager.close(account_id)
+
         assert store.active_session_count() == 0
         current = store.get_session(account_id)
         assert current is not None and current.state is BrowserSessionState.STOPPED
+        # Assert persisted profile data only after graceful context closure.
+        assert profile_directory.is_dir()
+        assert list(profile_directory.iterdir())
 
     asyncio.run(scenario())
 

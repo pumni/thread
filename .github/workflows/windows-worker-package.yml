@@ -12,6 +12,7 @@ on:
       - "src/threads_platform/infrastructure/browser/**"
       - "tests/unit/test_worker_package.py"
       - "tests/unit/test_worker_host_config.py"
+      - "tests/unit/test_browser_adapter.py"
       - "README.md"
       - "docs/ARCHITECTURE.md"
       - "docs/PROJECT_STATE_HANDOFF.md"
@@ -30,6 +31,7 @@ on:
       - "src/threads_platform/infrastructure/browser/**"
       - "tests/unit/test_worker_package.py"
       - "tests/unit/test_worker_host_config.py"
+      - "tests/unit/test_browser_adapter.py"
   workflow_dispatch:
 
 permissions:
@@ -209,3 +211,53 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  browser-tests:
+    name: Windows Playwright browser adapter tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONHASHSEED: "1"
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Install locked Playwright Chromium
+        run: uv run --locked playwright install chromium
+
+      - name: Repeat managed-profile lifecycle regression
+        shell: pwsh
+        run: |
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $baseTemp = Join-Path $env:RUNNER_TEMP 'profile-regression'
+          for ($attempt = 1; $attempt -le 10; $attempt++) {
+            Write-Output "Managed profile regression run $attempt/10"
+            uv run --locked pytest -q --tb=short `
+              --basetemp $baseTemp `
+              tests/unit/test_browser_adapter.py::test_playwright_managed_profile_contract_navigation_and_cleanup
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Run full Windows browser-adapter tests
+        shell: pwsh
+        run: |
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          $baseTemp = Join-Path $env:RUNNER_TEMP 'p'
+          uv run --locked pytest -q --tb=short `
+            tests/unit/test_browser_adapter.py `
+            --basetemp $baseTemp
