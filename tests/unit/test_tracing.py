@@ -515,6 +515,36 @@ def test_transport_retry_logs_do_not_disclose_otlp_endpoint_path(
         transport_handler.close()
 
 
+@pytest.mark.parametrize("logger_name", ["httpx2", "httpcore2.connection"])
+def test_httpx2_transport_logs_redact_endpoint_and_credentials(
+    logger_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    endpoint = (
+        "https://"
+        + "SYNTHETIC_USER:SYNTHETIC_PROXY_PASSWORD"
+        + "@threads.invalid/v1/SYNTHETIC_URL_PATH?access_token=SYNTHETIC_URL_TOKEN"
+    )
+    bearer = "SYNTHETIC_BEARER_TOKEN"
+    logger = logging.getLogger(logger_name)
+    monkeypatch.setattr(logger, "disabled", False)
+    tracing_module.install_opentelemetry_log_filter()
+
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        logger.warning("HTTP request failed for %s Authorization: Bearer %s", endpoint, bearer)
+
+    for secret in (
+        "SYNTHETIC_USER",
+        "SYNTHETIC_PROXY_PASSWORD",
+        "SYNTHETIC_URL_PATH",
+        "SYNTHETIC_URL_TOKEN",
+        bearer,
+    ):
+        assert secret not in caplog.text
+    assert "opentelemetry_internal_event" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_exporter_failure_does_not_change_scheduler_result_or_leak_logs(
     caplog: pytest.LogCaptureFixture,

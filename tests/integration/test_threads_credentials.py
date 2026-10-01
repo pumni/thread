@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import httpx2
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
@@ -500,6 +501,9 @@ async def test_environment_mode_process_composition_registers_local_api_handlers
     assert isinstance(enabled.threads_access_token_provider, PersistentThreadsAccessTokenProvider)
     assert enabled.threads_api_gateway is not None
     assert enabled.http_client is not None
+    assert isinstance(enabled.http_client, httpx2.AsyncClient)
+    assert enabled.http_client.timeout == httpx2.Timeout(15.0)
+    assert enabled.http_client.follow_redirects is False
     await enabled.http_client.aclose()
     assert enabled.http_client.is_closed
 

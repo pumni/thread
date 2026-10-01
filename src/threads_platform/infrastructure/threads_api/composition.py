@@ -1,7 +1,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-import httpx
+import httpx2
 
 from threads_platform.application.capability_router import CapabilityRouter
 from threads_platform.application.clock import Clock, SystemClock
@@ -30,7 +30,7 @@ class ProcessCommandRuntimeComposition:
     command_handler_registry: Mapping[str, CommandHandler]
     threads_api_gateway: ThreadsAPI | None
     threads_access_token_provider: ThreadsAccessTokenProvider | None
-    http_client: httpx.AsyncClient | None
+    http_client: httpx2.AsyncClient | None
 
 
 def compose_process_command_runtime(
@@ -62,10 +62,12 @@ def compose_process_command_runtime(
 
     http_client = None
     if threads_access_token_provider is not None and threads_api_gateway is None:
-        http_client = httpx.AsyncClient(
+        http_client = httpx2.AsyncClient(
             base_url=str(settings.threads_api_base_url),
-            timeout=httpx.Timeout(15.0),
+            timeout=httpx2.Timeout(15.0),
             follow_redirects=False,
+            verify=True,
+            trust_env=True,
         )
         threads_api_gateway = HttpThreadsAPI(http_client)
 

@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from urllib.parse import quote, urlsplit
 
-import httpx
+import httpx2
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
 from threads_platform.application.ports.threads import (
@@ -28,7 +28,7 @@ _OBJECT_LIST_ADAPTER = TypeAdapter(list[object])
 class HttpThreadsAPI:
     """HTTP adapter for the Meta-owned Threads API contract."""
 
-    def __init__(self, client: httpx.AsyncClient) -> None:
+    def __init__(self, client: httpx2.AsyncClient) -> None:
         self._client = client
 
     async def create_container(
@@ -246,7 +246,7 @@ class HttpThreadsAPI:
         self._check_success(response)
 
     @classmethod
-    def _check_success(cls, response: httpx.Response) -> None:
+    def _check_success(cls, response: httpx2.Response) -> None:
         if cls._object(response).get("success") is not True:
             raise ThreadsContractError()
 
@@ -291,7 +291,7 @@ class HttpThreadsAPI:
         )
 
     @classmethod
-    def _discovery_page(cls, response: httpx.Response) -> DiscoveryPage:
+    def _discovery_page(cls, response: httpx2.Response) -> DiscoveryPage:
         payload = cls._object(response)
         values = payload.get("data")
         paging_value = payload.get("paging")
@@ -392,7 +392,7 @@ class HttpThreadsAPI:
         token: SecretStr,
         *,
         params: dict[str, str] | None = None,
-    ) -> httpx.Response:
+    ) -> httpx2.Response:
         try:
             response = await self._client.request(
                 method,
@@ -400,8 +400,10 @@ class HttpThreadsAPI:
                 params=params,
                 headers={"Authorization": f"Bearer {token.get_secret_value()}"},
             )
-        except httpx.TransportError as error:
-            raise ThreadsTransportError() from error
+        except httpx2.TransportError:
+            response = None
+        if response is None:
+            raise ThreadsTransportError()
         if response.is_error:
             retry_after = self._retry_after(response.headers.get("Retry-After"))
             status = response.status_code
@@ -422,28 +424,42 @@ class HttpThreadsAPI:
         return response
 
     @staticmethod
-    def _object(response: httpx.Response) -> dict[str, object]:
+    def _object(response: httpx2.Response) -> dict[str, object]:
         try:
-            payload = _OBJECT_ADAPTER.validate_python(response.json())
-        except ValidationError, ValueError:
-            raise ThreadsContractError() from None
+            raw_payload = response.json()
+        except ValueError:
+            raw_payload = None
+        if raw_payload is None:
+            raise ThreadsContractError()
+        try:
+            payload = _OBJECT_ADAPTER.validate_python(raw_payload)
+        except ValidationError:
+            payload = None
+        if payload is None:
+            raise ThreadsContractError()
         return payload
 
     @staticmethod
     def _object_list(value: object) -> list[object]:
         try:
-            return _OBJECT_LIST_ADAPTER.validate_python(value)
+            result = _OBJECT_LIST_ADAPTER.validate_python(value)
         except ValidationError:
-            raise ThreadsContractError() from None
+            result = None
+        if result is None:
+            raise ThreadsContractError()
+        return result
 
     @staticmethod
     def _mapping(value: object) -> dict[str, object] | None:
         if not isinstance(value, dict):
             return None
         try:
-            return _OBJECT_ADAPTER.validate_python(value)
+            result = _OBJECT_ADAPTER.validate_python(value)
         except ValidationError:
-            raise ThreadsContractError() from None
+            result = None
+        if result is None:
+            raise ThreadsContractError()
+        return result
 
     @classmethod
     def _optional_mapping(cls, value: object) -> dict[str, object] | None:
@@ -489,7 +505,10 @@ class HttpThreadsAPI:
             parsed = urlsplit(result)
             hostname = parsed.hostname
         except ValueError:
-            raise ThreadsContractError() from None
+            parsed = None
+            hostname = None
+        if parsed is None:
+            raise ThreadsContractError()
         if (
             parsed.scheme != "https"
             or not hostname
@@ -508,7 +527,9 @@ class HttpThreadsAPI:
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
-            raise ThreadsContractError() from None
+            parsed = None
+        if parsed is None:
+            raise ThreadsContractError()
         if parsed.tzinfo is None:
             raise ThreadsContractError()
         return parsed.astimezone(UTC)
