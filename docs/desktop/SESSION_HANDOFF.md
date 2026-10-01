@@ -1,11 +1,11 @@
 # Desktop v1 — Fresh Session Handoff (start here)
 
-**Prepared:** 2026-10-01 after detailed pre-implementation audit. **Repository:** [pumni/thread](https://github.com/pumni/thread). **Planning PR:** [#93 — DRAFT](https://github.com/pumni/thread/pull/93), source branch `plan/desktop-windows-v1-20261001`. **Epic:** [#94](https://github.com/pumni/thread/issues/94), child issue map [#95–#108](ISSUE_MAP.md). The referenced branch is **not main until PR #93 is independently accepted and merged**.
+**Prepared:** 2026-10-01 after detailed pre-implementation audit. **Repository:** [pumni/thread](https://github.com/pumni/thread). **Planning PR:** [#93 — ACCEPTED/MERGED](https://github.com/pumni/thread/pull/93) at `ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`; use latest `main`. **Epic:** [#94](https://github.com/pumni/thread/issues/94), child issue map [#95–#108](ISSUE_MAP.md). The planning documents are on **main**. The issue-specific implementation security/feasibility gates are not accepted by planning merge.
 
 ## 1. Read order; never start from old conversation reconstruction
 
 1. Read `AGENTS.md` and the **current live** `docs/PROJECT_STATE_HANDOFF.md` on latest main (the historical handoff may be outdated; follow its dated Desktop pointer).
-2. Fetch live PR #93 status, its **current head SHA**, the current main SHA and any review comments. Read this handoff and [PREIMPLEMENTATION_AUDIT.md](PREIMPLEMENTATION_AUDIT.md) from the PR head while it is unmerged; do not assume these files already exist on main.
+2. Verify latest main SHA and PR #93 acceptance/merge. Read this handoff and [PREIMPLEMENTATION_AUDIT.md](PREIMPLEMENTATION_AUDIT.md) from latest main; inspect live issue comments and work only on an explicitly authorized issue.
 3. Read [ADR-0007](../adr/0007-windows-first-single-app-desktop.md), [DELIVERY_PLAN.md](DELIVERY_PLAN.md), [SECURITY_AND_PROTOCOLS.md](SECURITY_AND_PROTOCOLS.md), [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md), [WINDOWS_REHEARSAL.md](WINDOWS_REHEARSAL.md) and [ISSUE_MAP.md](ISSUE_MAP.md) **at the same ref**.
 4. Fetch live epic #94, scope/acceptance and comments on **DX-01 issue #95**. Inspect current implementation in scope. For a later task, read only its expressly authorized DX issue and linked focused docs rather than all Desktop material every time.
 5. Check exact-head docs/CI/review state; report PASS/BLOCKER by AC. **Do not self-merge** on CI success; obtain separate coordinator ACCEPTED and recheck unchanged SHA before any merge.
@@ -44,14 +44,14 @@ Read [audit findings A-01…A-18](PREIMPLEMENTATION_AUDIT.md) before changing an
 
 ## 5. First correct action in the next new session
 
-**If #93 still draft/open and DX-01 #95 not separately accepted:**
+**If planning acceptance or an issue's authorization is disputed by live GitHub:**
 1. Verify PR exact head and base, contents and issue links. Review updated planning docs against latest backend code and PR review comments.
 2. Run a documentation-consistency audit; verify every linked DX issue/body was updated with its applicable audit blocker and dependency.
 3. State any remaining BLOCKER/MAJOR and concrete fix. If evidence is sufficient, record exact-head technical **PASS**, then require explicit independent coordinator **ACCEPTED** of #93/#95. Do **not** merge without that acceptance and unchanged-head CI check.
 4. Only after plan acceptance and explicit user/coordinator authorization, start **DX-02 #96** (Tauri foundation) and **DX-03 #97** (Windows Python/PostgreSQL bundle feasibility). Those are parallelizable if resourced. DX-03 is a hard feasibility stop; DX-04 #98 needs **both accepted**.
 5. Next: DX-05 (#99) RBAC + Linux local bootstrap -> DX-06 (#100) TLS; DX-07 (#101) Worker Desktop host; DX-08 (#102) secure pairing; DX-09 (#103) account onboarding; DX-10/11; DX-12/13/14. See [issue dependency DAG](ISSUE_MAP.md).
 
-**If #93 was already merged and accepted:** use live merged main/ADR and current issue bodies rather than this PR branch as authority; start only the specifically authorized DX issue, rechecking tests/CI and base SHA.
+**Since #93 was accepted and merged:** use live merged main/ADR and current issue bodies rather than this PR branch as authority; start only the specifically authorized DX issue, rechecking tests/CI and base SHA.
 
 ## 6. Coordinator quality/merge policy
 

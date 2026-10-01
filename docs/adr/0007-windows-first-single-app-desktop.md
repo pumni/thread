@@ -1,6 +1,6 @@
 # ADR-0007 — Windows-first single-app Desktop and node provisioning
 
-- **Status:** Proposed for coordinator acceptance; planning only. Supersedes no accepted ADR until merged and approved. Read [pre-implementation audit](../desktop/PREIMPLEMENTATION_AUDIT.md) and [fresh-session handoff](../desktop/SESSION_HANDOFF.md) first; unresolved choices are guarded by the listed DX issues.
+- **Status:** Accepted as Desktop v1 **planning architecture** by DX-01/PR #93 (`ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`); individual packaging, TLS, RBAC and browser security protocols still require issue-specific implementation acceptance. Read [pre-implementation audit](../desktop/PREIMPLEMENTATION_AUDIT.md) and [fresh-session handoff](../desktop/SESSION_HANDOFF.md) first; unresolved choices are guarded by the listed DX issues.
 - **Date:** 2026-10-01
 - **Scope:** Threads Desktop v1; does not grant permission to activate unverified Threads API/browser capabilities.
 - **Related:** [Desktop delivery plan](../desktop/DELIVERY_PLAN.md), [ADR-0003](0003-distributed-hybrid-execution.md), [ADR-0004](0004-persistent-worker-affinity-and-worker-jobs.md), [Windows Worker](../WORKER_AGENT_WINDOWS.md).
