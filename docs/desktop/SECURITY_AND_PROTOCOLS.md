@@ -7,7 +7,7 @@
 | Identity | Owner and purpose | Storage and boundary |
 |---|---|---|
 | Windows interactive account | Runs one provisioned Controller/Worker node on a 24/7 PC | Existing Windows logon; never used as Threads RBAC identity |
-| Controller trust identity | Root of application-private TLS trust, scoped to one Workspace | Controller private key encrypted with current-user DPAPI; only Rust/native and TLS endpoint process may access |
+| Controller trust identity | Root of application-private TLS trust, scoped to one Workspace | Controller private key encrypted with current-user DPAPI; only Rust/native and TLS leaf endpoint must not hold Controller root CA private key |
 | Worker device identity | Proves an enrolled Worker is allowed to claim/report jobs | Existing Worker UUID + Ed25519/current-user DPAPI key and challenge/device session; Python Worker owns it |
 | OperatorUser identity | Human authorization, audit and role-specific account management | Controller PostgreSQL; independent from Windows and Worker device identity |
 
@@ -31,11 +31,11 @@ Tauri allowed commands are narrowly scoped; webview cannot choose arbitrary bina
 
 ## 3. Human login and sessions
 
-- Initial Workspace and first OWNER are provisioned locally in a one-shot bootstrap transaction before the LAN Operator API opens. Secret input crosses native boundary using a reviewed secret-safe channel (candidate stdin). If bootstrap has run, repeated invocation fails regardless of launch mode.
+- Initial Workspace and first OWNER are provisioned locally in a one-shot bootstrap transaction before the LAN Operator API opens. The same **non-network one-shot CLI/stdin bootstrap** must work under Linux/Docker independently of Tauri; repeat bootstrap and public unauthenticated Owner setup are prohibited. Secret input crosses native boundary using a reviewed secret-safe channel (candidate stdin). If bootstrap has run, repeated invocation fails regardless of launch mode.
 - Passwords use a modern slow salted password hash with recorded algorithm/parameter migration; backend validates and never logs sensitive inputs.
 - Login errors do not distinguish nonexistent user from wrong password. Bound request size, rate-limit guesses, audit events without credential values. Decide the exact lockout policy in DX-05 so deliberate account lockout cannot trivially disable the sole owner.
 - `OperatorSession`: high-entropy random bearer, DB stores only token digest, issued/expiry/revocation, user association, optional bounded last-used metadata. Every request checks current user status and current role; role change/disable takes effect without stale client-side privileges.
-- Rust retains bearer in process memory. React gets safe `/me` details and typed DTOs only. Window hide does not kill runtime; lock UI on unattended reopen/inactivity and when session expires; operator logout revokes bearer without stopping node.
+- Rust retains bearer in process memory. React gets safe `/me` details and typed DTOs only. Window hide does not kill runtime; **Windows session lock and unattended inactivity must lock the human UI, without stopping Controller/Worker**. Require reauthentication or a separately reviewed session-unlock method after expiry; operator logout revokes bearer without stopping node.
 - A Worker continues job protocol under **device identity** while no human is logged in. A human Operator session in Worker Desktop is solely an authorization to create onboarding intents, perform allowed interventions and use operator read models.
 - No localhost/same-Windows-user exemption for Owner. Console and Controller use same authorization policy and server.
 
@@ -54,7 +54,7 @@ Tauri allowed commands are narrowly scoped; webview cannot choose arbitrary bina
 
 ## 5. Worker one-time pairing and decommission
 
-- OWNER/ADMIN requests an audited enrollment session. Code is single-use, short-lived (target ~10 minutes), bounded attempts, high-quality random generation. A six-digit human-facing code, if chosen, is low-entropy: store a **keyed hash/HMAC** instead of unsalted SHA, rate-limit at Controller and account for online guessing; security review may choose longer code.
+- OWNER/ADMIN requests a server-attributed audited enrollment session. The **current accepted Worker enrollment code is a 256-bit `secrets.token_urlsafe(32)` value**, stored as a SHA-256 digest, single-use with a 10-minute expiry. Preserve that exact high-entropy credential and wire contract. First Desktop version may securely convey the full token after TLS trust via copy/paste. Any optional six-digit UX is a **separate, security-reviewed short-code redemption** endpoint *after* verified TLS, yielding the unchanged high-entropy enrollment credential; short code requires keyed hash/HMAC, strict global/per-invitation rate limiting and distributed guessing tests. Do not silently replace the Worker enrollment token with six digits.
 - The UI hides pairing code in logs, crash diagnostics, analytics and persistent browser storage. Its lifetime is shown. The Controller proves authorization to enroll, not first-contact identity.
 - Worker completes independent Controller fingerprint verification **first**. Rust supplies code transiently to existing Python Worker enrollment via the permitted process environment; never saved in local host config, command line or Windows task definition.
 - Controller associates Worker public key/UUID with the single Workspace and enforces existing challenge, device sessions, Worker protocol version, presence/capability and WorkerJob claim authorization.
@@ -108,10 +108,10 @@ Device identity is derived from TLS-authenticated Worker session, not from user-
 ### Server invariants
 
 - Validate intent issuer role against **current** actor role/status, target Worker enrollment/affinity, expiry, consumed state and per-actor/Worker limits. An intent is revoked if creator loses permissions.
-- Controller persists Account, BrowserProfile reference, one active Assignment, intent consumption and audit **in one DB transaction**; unique constraints enforce registration idempotency. Same idempotency key returns same result, changed payload rejects.
+- Controller persists Account, BrowserProfile reference, one active Assignment, intent consumption and audit **in one DB transaction**; unique constraints enforce registration idempotency. Same idempotency key returns same result, changed payload rejects. **Existing Worker `LocalBrowserSessionManager.open()` and Controller `WorkerSessionService.account_context()` require a preexisting Account and Assignment**. DX-09 must provide a separate bounded provisioning-only pending-profile launch **before** registration; it never creates WorkerJobs or bypasses established account affinity.
 - A local pending profile never receives business Commands and can be safely retried after temporary Controller disconnect until intent expiry. On expiry request a fresh authenticated human intent, preserving local profile only if policy allows; no unbounded unauthorized pending workspace.
 - If registration response is lost after commit, idempotent retry must retrieve the original account_id. No duplicate accounts/assignments.
-- Only owning Worker may report that profile's subsequent session state; revisions fence stale state updates and assignment changes.
+- Only owning Worker may report that profile's subsequent session state; revisions fence stale state updates and assignment changes. The approved browser read/upload capabilities do **not** automatically prove fresh-login recognition. Implement a separately reviewed login-state adapter with negative unknown-UI tests; never equate the user confirmation button with AUTHENTICATED. If Controller commits but Worker crashes before local binding, reconcile by idempotent intent to the **original** account_id/profile_ref. New onboarding endpoints require explicit additive Worker protocol/capability version negotiation; old v2 Workers must fail closed on unsupported calls.
 - Browser profile is a **local credential container**, not a migratable blob. Never transmit cookie, localStorage, sessionStorage, password, OTP, raw DOM, profile path, request headers, unredacted page URLs or screenshot as a registration field.
 
 ## 7. Identity, execution modes and account consistency
@@ -123,7 +123,13 @@ Device identity is derived from TLS-authenticated Worker session, not from user-
 - Re-login occurs on the same owning Worker and profile, never by passing credentials over Operator API. MFA/challenges are human-assisted; browser adapter must fail closed on unknown Threads UI.
 - Reassigning Account is an authenticated Controller mutation coordinating old lease/drain/quiescence with the existing account-execution lease. New Worker must create a new profile and ask the human to login. Do not imply automatic profile migration or guarantee old Worker cleanup while disconnected.
 
-## 8. Threat-model checklist before acceptance
+## 8. Legacy admin paths, TLS termination and migration profiles
+
+Existing `/v1/workers/enrollments`, admin drain/abort and intervention resolution are protected by a distinct `worker_admin_token` static bearer; request fields `created_by` and `resolved_by` currently accept untrusted caller-provided strings. DX-05 must inventory all privileged routes and migrate new Windows Desktop mutations to canonical Operator authentication/RBAC, with **server-derived human actor**, or **explicitly isolate and disable** the old token path on the Windows customer deployment profile. Linux/IT compatibility requires a restricted opt-in plan and regression tests; no accidental token interchange with CRM ingress, Worker device auth or Operator session. A new Operator API alone does not close the old bypass.
+
+Existing `WorkerTransportTLSMiddleware` validates Worker request ASGI `scope.scheme` only on `/v1/workers` paths and relies on an externally trusted TLS ingress. DX-06 must choose and test the real TLS terminator, leaf vs root private key custody, WSS upgrade compatibility, narrowly trusted proxy headers if any, and enforce HTTPS for all **public Operator and Worker** routes. First-contact untrusted certificate fetch is isolated, read-only and **never** carries an Operator password or Worker enrollment code. M1 only binds to loopback with disposable state; public LAN starts after DX-05/06 signoff.
+
+## 9. Threat-model checklist before acceptance
 
 - [ ] Operator session stolen through React/XSS/developer tools (token never exposed to JS; minimize IPC response data).
 - [ ] Untrusted first-connection TLS / intercepted pairing code / fingerprint spoofing.
