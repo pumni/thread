@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx2 import ASGITransport, AsyncClient
 from prometheus_client import CollectorRegistry, generate_latest
 from pydantic import ValidationError
 

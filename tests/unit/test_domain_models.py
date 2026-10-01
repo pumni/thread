@@ -78,7 +78,7 @@ def test_command_priority_defaults_to_normal_and_rejects_unmapped_values() -> No
 
 def test_domain_modules_do_not_import_infrastructure_or_transport_libraries() -> None:
     domain_root = Path(__file__).parents[2] / "src" / "threads_platform" / "domain"
-    forbidden = {"fastapi", "httpx", "sqlalchemy", "websockets", "starlette"}
+    forbidden = {"fastapi", "httpx", "httpx2", "sqlalchemy", "websockets", "starlette"}
 
     for source_file in domain_root.glob("*.py"):
         tree = ast.parse(source_file.read_text(encoding="utf-8"))
