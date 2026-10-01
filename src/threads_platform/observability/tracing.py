@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from typing import Literal, cast
@@ -24,16 +25,33 @@ TracingServiceName = Literal["threads-platform-http", "threads-platform-schedule
 _INSTRUMENTATION_SCOPE = "threads_platform"
 _EXPORT_TIMEOUT_SECONDS = 2.0
 _FLUSH_TIMEOUT_MILLIS = 2_500
+_SHUTDOWN_HARD_TIMEOUT_SECONDS = 3.0
+_SENSITIVE_TRANSPORT_LOGGER_PREFIXES = (
+    "opentelemetry",
+    "urllib3",
+    "requests",
+    "http.client",
+)
+_SENSITIVE_TRANSPORT_LOGGER_NAMES = (
+    *_SENSITIVE_TRANSPORT_LOGGER_PREFIXES,
+    "urllib3.connectionpool",
+    "urllib3.util.retry",
+    "requests.adapters",
+    "requests.sessions",
+)
 _HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"})
 _DIAGNOSTIC_ROUTES = frozenset({"/health", "/ready", "/metrics"})
 _TRACE_CONTEXT_PROPAGATOR = TraceContextTextMapPropagator()
 
 
 class _OpenTelemetryLogFilter(logging.Filter):
-    """Hide exporter diagnostics that may include endpoint or response details."""
+    """Hide tracing SDK and HTTP transport diagnostics that may contain endpoint data."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name.startswith("opentelemetry."):
+        if any(
+            record.name == prefix or record.name.startswith(f"{prefix}.")
+            for prefix in _SENSITIVE_TRANSPORT_LOGGER_PREFIXES
+        ):
             record.msg = "opentelemetry_internal_event"
             record.args = ()
             record.exc_info = None
@@ -44,11 +62,16 @@ class _OpenTelemetryLogFilter(logging.Filter):
 
 def install_opentelemetry_log_filter() -> None:
     root = logging.getLogger()
-    if any(isinstance(item, _OpenTelemetryLogFilter) for item in root.filters):
-        return
     for handler in root.handlers:
         if not any(isinstance(item, _OpenTelemetryLogFilter) for item in handler.filters):
             handler.addFilter(_OpenTelemetryLogFilter())
+    for logger_name in _SENSITIVE_TRANSPORT_LOGGER_NAMES:
+        logger = logging.getLogger(logger_name)
+        if not any(isinstance(item, _OpenTelemetryLogFilter) for item in logger.filters):
+            logger.addFilter(_OpenTelemetryLogFilter())
+        for handler in logger.handlers:
+            if not any(isinstance(item, _OpenTelemetryLogFilter) for item in handler.filters):
+                handler.addFilter(_OpenTelemetryLogFilter())
 
 
 class ProcessTracing:
@@ -65,27 +88,61 @@ class ProcessTracing:
         self.tracer = tracer
         self.enabled = tracer is not None
         self._shutdown = False
+        self._shutdown_lock = threading.Lock()
 
     def __repr__(self) -> str:
         return f"ProcessTracing(service_name={self.service_name!r}, enabled={self.enabled})"
 
     def shutdown(self) -> None:
-        if self._shutdown:
+        with self._shutdown_lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+        provider = self._provider
+        if provider is None:
             return
-        self._shutdown = True
-        if self._provider is None:
-            return
+
         logger = structlog.get_logger(__name__)
+
+        finished = threading.Event()
+
+        def close_provider() -> None:
+            try:
+                try:
+                    flushed = provider.force_flush(timeout_millis=_FLUSH_TIMEOUT_MILLIS)
+                    if not flushed:
+                        logger.warning(
+                            "tracing_exporter_flush_failed",
+                            service_role=self.service_name,
+                        )
+                except Exception:
+                    logger.warning(
+                        "tracing_exporter_flush_failed",
+                        service_role=self.service_name,
+                    )
+                try:
+                    provider.shutdown()
+                except Exception:
+                    logger.warning(
+                        "tracing_exporter_shutdown_failed",
+                        service_role=self.service_name,
+                    )
+            finally:
+                finished.set()
+
+        shutdown_thread = threading.Thread(
+            target=close_provider,
+            name="threads-platform-tracing-shutdown",
+            daemon=True,
+        )
         try:
-            flushed = self._provider.force_flush(timeout_millis=_FLUSH_TIMEOUT_MILLIS)
-            if not flushed:
-                logger.warning("tracing_exporter_flush_failed", service_role=self.service_name)
+            shutdown_thread.start()
         except Exception:
-            logger.warning("tracing_exporter_flush_failed", service_role=self.service_name)
-        try:
-            self._provider.shutdown()
-        except Exception:
-            logger.warning("tracing_exporter_shutdown_failed", service_role=self.service_name)
+            logger.warning("tracing_shutdown_start_failed", service_role=self.service_name)
+            return
+
+        if not finished.wait(_SHUTDOWN_HARD_TIMEOUT_SECONDS):
+            logger.warning("tracing_shutdown_timed_out", service_role=self.service_name)
 
 
 def create_process_tracing(
@@ -101,6 +158,7 @@ def create_process_tracing(
     provider = TracerProvider(
         resource=Resource({"service.name": service_name}),
         sampler=ParentBased(ALWAYS_ON),
+        shutdown_on_exit=False,
     )
     resolved_exporter = exporter
     if resolved_exporter is None:

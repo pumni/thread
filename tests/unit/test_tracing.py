@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from threading import Event
 from typing import cast
 
 import pytest
@@ -410,6 +411,95 @@ class _FailingExporter(SpanExporter):
 
     def shutdown(self) -> None:
         raise RuntimeError("SYNTHETIC_EXPORTER_SHUTDOWN_FAILURE")
+
+
+class _BlockingShutdownExporter(SpanExporter):
+    def __init__(self) -> None:
+        self.shutdown_started = Event()
+        self.allow_shutdown = Event()
+        self.shutdown_finished = Event()
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        del spans
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self) -> None:
+        try:
+            self.shutdown_started.set()
+            self.allow_shutdown.wait()
+        finally:
+            self.shutdown_finished.set()
+
+
+class _RetryLoggingExporter(SpanExporter):
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+        self.calls = 0
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        del spans
+        self.calls += 1
+        logging.getLogger("urllib3.connectionpool").warning(
+            "Retrying after an OTLP transport failure for %s",
+            self.endpoint,
+        )
+        return SpanExportResult.FAILURE
+
+    def shutdown(self) -> None:
+        return None
+
+
+def test_tracing_shutdown_has_a_hard_timeout_for_blocked_exporter(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(tracing_module, "_SHUTDOWN_HARD_TIMEOUT_SECONDS", 0.05)
+    exporter = _BlockingShutdownExporter()
+    tracing = create_process_tracing(True, SCHEDULER_SERVICE_NAME, exporter=exporter)
+
+    started_at = time.perf_counter()
+    try:
+        with caplog.at_level(logging.WARNING):
+            tracing.shutdown()
+        duration = time.perf_counter() - started_at
+
+        assert exporter.shutdown_started.wait(timeout=1)
+        assert duration < 0.5
+        assert "tracing_shutdown_timed_out" in caplog.text
+    finally:
+        exporter.allow_shutdown.set()
+        assert exporter.shutdown_finished.wait(timeout=1)
+
+
+def test_transport_retry_logs_do_not_disclose_otlp_endpoint_path(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    endpoint = "http://collector.invalid/tenant/SYNTHETIC_TENANT_PATH_SECRET/v1/traces"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint)
+    resolved_endpoint = tracing_module.resolve_exporter_endpoint()
+    assert resolved_endpoint == endpoint
+
+    exporter = _RetryLoggingExporter(endpoint)
+    transport_logger = logging.getLogger("urllib3.connectionpool")
+    transport_output = io.StringIO()
+    transport_handler = logging.StreamHandler(transport_output)
+    transport_logger.addHandler(transport_handler)
+    try:
+        tracing = create_process_tracing(True, SCHEDULER_SERVICE_NAME, exporter=exporter)
+        with caplog.at_level(logging.WARNING, logger="urllib3.connectionpool"):
+            with trace_span(tracing.tracer, "transport.retry_test"):
+                pass
+            tracing.shutdown()
+
+        assert exporter.calls >= 1
+        assert endpoint not in caplog.text
+        assert "SYNTHETIC_TENANT_PATH_SECRET" not in caplog.text
+        assert "opentelemetry_internal_event" in caplog.text
+        assert endpoint not in transport_output.getvalue()
+    finally:
+        transport_logger.removeHandler(transport_handler)
+        transport_handler.close()
 
 
 @pytest.mark.asyncio

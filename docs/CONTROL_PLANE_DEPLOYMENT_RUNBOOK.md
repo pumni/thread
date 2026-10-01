@@ -90,8 +90,12 @@ endpoint if tracing is enabled without an override. This repository does not
 deploy a collector, publish an OTLP port, or instrument SQLAlchemy or outbound
 Threads/Meta HTTP calls. HTTP and scheduler trace providers remain separate;
 they do not alter `/health`, `/ready`, `/metrics`, scheduler durability, or the
-Windows Worker protocol. See `docs/OBSERVABILITY_RUNBOOK.md` for span privacy,
-W3C propagation, correlation, and failure semantics.
+Windows Worker protocol. Shutdown gives exporter flush and provider close a
+three-second hard wait bound in a daemon cleanup thread; the SDK atexit shutdown
+hook is disabled. SDK and HTTP transport diagnostic records are replaced with
+a fixed event, including `urllib3` retry records that could contain endpoint
+paths. See `docs/OBSERVABILITY_RUNBOOK.md` for span privacy, W3C propagation,
+correlation, and failure semantics.
 
 Scrape the two process owners separately:
 

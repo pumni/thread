@@ -1021,11 +1021,15 @@ an active recording span is current; those fields are diagnostic correlation,
 not durable keys.
 
 The exporter uses a 64-span bounded queue, batches at most 64 spans, limits one
-OTLP/HTTP request to 1 MiB with a two-second request timeout, and attempts a
-bounded flush on normal process shutdown. Export/setup/shutdown failures are
-fail-open and logged with only fixed phase/service information. No SQLAlchemy
-or outbound Threads/Meta HTTP auto-instrumentation is installed; no SQL, URLs,
-headers, payloads, IDs, or exception messages are span data. #89 metrics and
+OTLP/HTTP request to 1 MiB with a two-second request timeout, and runs flush
+plus provider close in a daemon cleanup thread with a three-second hard wait
+bound. The SDK atexit shutdown hook is disabled to prevent an unbounded second
+shutdown path. OpenTelemetry, `urllib3`, `requests`, and `http.client` diagnostic
+records are replaced with a fixed event before logging handlers render them.
+Export/setup/shutdown failures are fail-open and logged with only fixed
+phase/service information. No SQLAlchemy or outbound Threads/Meta HTTP
+auto-instrumentation is installed; no SQL, URLs, headers, payloads, IDs, or
+exception messages are span data. #89 metrics and
 `/ready` semantics are unchanged. OpenTelemetry collection, dashboards, and
 alerts are not deployed. #3 remains OPEN, #62 remains separate, and this
 checkpoint makes no production release claim.

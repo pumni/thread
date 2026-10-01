@@ -407,7 +407,10 @@ accepted; `tracestate`, baggage, Worker protocol propagation, and durable trace
 context are excluded. Active trace/span IDs may correlate structured logs.
 
 The OTLP/HTTP exporter uses environment-only endpoint and header configuration,
-a bounded queue and request timeout, and fail-open process shutdown. Compose
+a bounded queue and request timeout, and fail-open process shutdown. Provider
+flush/close runs in a daemon thread with a three-second hard wait bound, and
+SDK plus urllib3/requests/http.client diagnostic messages are redacted to a
+fixed event. Compose
 keeps tracing disabled, with no collector or OTLP port. No SQLAlchemy/database
 or Threads/Meta HTTP auto-instrumentation, collector, schema migration, metrics
 change, or production release claim is included. #3 remains OPEN and #62

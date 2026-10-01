@@ -536,7 +536,7 @@ release claim follows from this checkpoint. See
 
 Issue #91 authorizes optional tracing for the existing HTTP Control Plane and
 standalone scheduler processes. Each process owns a separate provider, fixed
-service identity, bounded OTLP/HTTP exporter, and normal shutdown lifecycle.
+service identity, bounded OTLP/HTTP exporter, and hard-bounded process shutdown.
 Tracing is disabled by default, and committed Compose keeps it disabled with
 no collector or OTLP port. Inbound `traceparent` establishes HTTP request
 context; `tracestate`, baggage, Worker protocol propagation, and persisted
@@ -544,6 +544,9 @@ trace context are excluded. HTTP, Command, scheduler tick, and existing fixed
 scheduler-stage spans use only bounded role, route/method/status, Command
 status, scheduler outcome/stage, and generic error-type attributes. Trace/span
 IDs are added to structured logs only during an active recording span.
+Exporter SDK and HTTP transport diagnostics are reduced to a fixed log event;
+shutdown waits at most three seconds and disables the SDK's synchronous atexit
+shutdown hook.
 
 No SQLAlchemy/database or outbound Threads/Meta HTTP auto-instrumentation is
 included. Exporter failure is fail-open; `/health`, `/ready`, #89 metrics,

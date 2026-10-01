@@ -186,17 +186,20 @@ are never written to PostgreSQL or durable Command, WorkerJob, or Worker state.
 Structured logs receive lowercase 32-character `trace_id` and 16-character
 `span_id` fields only inside an active recording span. They are diagnostic
 correlation only. The normal redaction processor still runs after exception
-formatting and after trace fields are added. OpenTelemetry exporter and SDK
-diagnostic records are reduced to a fixed event so endpoint, header, response,
-or exception values cannot leak through dependency logs.
+formatting and after trace fields are added. OpenTelemetry SDK and HTTP
+transport records from `urllib3`, `requests`, and `http.client` are reduced to
+a fixed event before handlers render them, so endpoint paths, headers,
+responses, and exception values cannot leak through dependency logs.
 
 The exporter queue holds at most 64 spans, exports batches of at most 64, limits
-an OTLP request to 1 MiB, and sets a two-second request timeout. Normal process
-shutdown attempts a bounded flush and closes the provider. Exporter setup,
-export, flush, or shutdown failure is fail-open for Commands, scheduler ticks,
-readiness, metrics, and WorkerJob semantics; failures produce only fixed
-phase/service logs. Queue contents and trace data are process-local and may be
-lost on exporter failure or process restart. The locked application does not
+an OTLP request to 1 MiB, and sets a two-second request timeout. Process
+shutdown runs flush and provider close in a daemon cleanup thread and waits at
+most three seconds. The SDK's own atexit shutdown hook is disabled so it cannot
+add an unbounded synchronous shutdown path. Exporter setup, export, flush, or
+shutdown failure is fail-open for Commands, scheduler ticks, readiness,
+metrics, and WorkerJob semantics; failures produce only fixed phase/service
+logs. Queue contents and trace data are process-local and may be lost on
+exporter failure or process restart. The locked application does not
 install SQLAlchemy/database or outbound Threads/Meta HTTP auto-instrumentation.
 No OTel collector, tracing port, dashboard, or alerting service is deployed.
 Issue #3 remains OPEN and #62 remains separate.
