@@ -8,7 +8,7 @@ Deliver a single Windows customer app and installer, powered by Tauri 2 + Rust +
 
 **Customer-visible promise:** install one app; choose this PC's role once; configure Controller or join existing workspace; operate via one UI. Bundled private helper processes remain allowed and necessary. Controller/Worker dedicated Windows user must sign in after reboot. Windows Service, boot-before-login availability, cloud relay and one-file physical executable are **not** MVP requirements.
 
-**Target vertical slice:** clean Windows x64 machine, no preinstalled Python/PostgreSQL/Docker; install Desktop, provision a disposable local Controller, close UI to tray, verify database/API/scheduler continue, gracefully quit, restart, verify same Workspace/DB identity and durable scheduler state. This proof must precede broad UI work.
+**Target M1 vertical slice:** clean Windows x64 VM, no preinstalled Python/PostgreSQL/Docker; launch a **provisional, one-app, loopback-only engineering test bundle** with a **disposable** private Controller cluster, close UI to tray, verify database/API/scheduler continue, Quit, restart and prove the same cluster and durable state. M1 has **no public LAN listener**, no fake persisted Owner, and no production authentication promise. Real first OWNER bootstrap is DX-05, public HTTPS LAN is DX-06 and the final single customer installer is DX-12. This proof must precede broad UI work.
 
 ## 1. Existing implementation and non-negotiable reuse
 
@@ -134,29 +134,29 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 
 **DX-05 — Operator identity, fixed RBAC, audit and bootstrap** (depends DX-01; can start while DX-04 develops)
 - One Workspace singleton invariant; OperatorUser, password hash, disabled/must-change-password, server-side hashed opaque OperatorSession, expiry/revoke/logout and current-role validation; >=1 enabled OWNER.
-- Native initial Owner creation over local secret-safe channel **before** public operator endpoint opens. Repeat bootstrap rejected.
+- Native initial Owner creation over local secret-safe channel **before** public operator endpoint opens. Repeat bootstrap rejected. **Also support a non-network one-shot Linux/Docker CLI/stdin bootstrap**, without requiring Tauri or an unauthenticated web setup endpoint.
 - Operator routes login/logout/me/user management with bounded responses, rate limits, safe lockout recovery policy, generic login errors and redacted audit.
 - Implement direct human login on Worker Desktop using Controller Operator API; Worker device credential never substitutes for user credential.
-- Operator/Admin role matrix gets explicit product confirmation at this issue gate; each mutating endpoint independently enforces authorization.
+- Operator/Admin role matrix gets explicit product confirmation at this issue gate; each mutating endpoint independently enforces authorization. **Inventory and reconcile existing static `worker_admin_token` routes** (`/v1/workers/enrollments`, admin drain/abort, intervention resolve): new Windows profile must disable/isolate the legacy bypass and derive actor identity server-side; migration-compatible Linux/IT profile requires explicit gated configuration and tests. Existing CRM ingress remains a separate principal. Reopening unattended UI or locking Windows must lock the human session without stopping the node.
 - Verify PostgreSQL migration, concurrent last-owner demotion, revoked/disabled user, role downgrade next request, session expiry, no secret in logs/React/storage.
 
 **DX-06 — Controller private HTTPS identity and first-contact trust** (depends DX-03, DX-04, DX-05)
 - Provision long-lived Controller trust identity and locally issued leaf certificate with correct stable LAN endpoint identity/SAN; private key current-user DPAPI at rest; expose one HTTPS API endpoint with distinct Operator and Worker auth.
 - Controller localhost desktop uses exactly the same Operator API and authentication as remote Console; no localhost admin bypass or DB direct UI path.
-- On first Worker/Console contact obtain untrusted certificate but **do not send pairing code/password**. Display actual Controller root fingerprint on trusted local Controller UI; display independently calculated peer fingerprint on client; user verifies via trusted path before persisting application-scoped trust. Fail closed on mismatch.
+- Select and test exact TLS termination boundary for Python HTTP **and Worker WebSocket**, trusted proxy/ASGI scheme behavior if proxied, server certificate key custody and HTTPS enforcement on **new Operator plus existing Worker LAN routes**. On first Worker/Console contact obtain untrusted certificate but **do not send pairing code/password**. Display actual Controller root fingerprint on trusted local Controller UI; display independently calculated peer fingerprint on client; user verifies via trusted path before persisting application-scoped trust. Fail closed on mismatch.
 - Persist Controller CA/trust bound to configured endpoint and fingerprint; reject silent CA rotation, expired cert, endpoint mismatch, invalid SAN and downgrade to plaintext. No global CA installation.
 - Verify certificates under valid/invalid hostname/IP, no first-contact credential leakage, localhost vs LAN parity, signed identity rotation boundary and negative MITM simulation.
 - Security-review protocol before implementation; do not claim a six-digit pairing code solves TLS identity on its own.
 
 **DX-07 — desktop Worker host and safe legacy task cutover** (depends DX-02, DX-03)
 - Embed/supervise existing Worker Agent/Chromium, maintain interactive stable Windows principal, current-user DPAPI, stable data root, process lock, durable local journal and existing protocol.
-- Implement guarded migration from existing `ThreadsPlatformWorker` scheduled task: detect, explain, drain, disable old launch path, prove one live agent/identity, preserve rollback and never race double launch.
+- Implement guarded migration from existing `ThreadsPlatformWorker` scheduled task: detect, explain, drain, disable old launch path, prove one live agent/identity, preserve rollback and never race double launch. **Bound Quit if Controller is unreachable:** do not claim durable OFFLINE without server evidence; document interruption and lease recovery for an operator-confirmed forced exit.
 - Worker desktop works in tray, continues using device auth when operator logs out. Operator auth unlocks local account provisioning/intervention UI only.
 - Quit invokes durable DRAINING -> quiescence -> OFFLINE; if timeout/failure, explicitly ask for corrective action, never pretend hard-kill is graceful.
 - Test existing packaged Worker compatibility, browser foreground usability, same-user reboots and old-task collision.
 
 **DX-08 — Worker pairing, revoke and Console trust UX** (depends DX-05, DX-06, DX-07)
-- Owner/Admin creates single-use bounded enrollment with attempt limits, expiry, audit; show short human code only after Controller-side authorization. Pair Worker after independently verified Controller trust. Keep current Worker key generation/challenge/device session; enrollment code transient child environment, never file/CLI/log.
+- Owner/Admin creates single-use bounded enrollment with attempt limits, expiry and server-derived human audit. **Preserve the existing 256-bit `secrets.token_urlsafe(32)` Worker enrollment secret** as the actual protocol credential: first shipping UX may convey the full secret securely (copy/paste) after verified trust. A six-digit UX is optional **only through a reviewed, rate-limited short-code redemption** over verified TLS, never by replacing the high-entropy token in existing `/enroll`. Pair Worker after independently verified Controller trust. Keep current Worker key generation/challenge/device session; enrollment code transient child environment, never file/CLI/log.
 - Console first-connect performs Controller trust verification then human login; no Worker enrollment for read/write Console users.
 - Worker Controller changes only through explicit drain/decommission/revoke -> quarantine previous-workspace profiles -> clear old trust -> pair anew. Handle disconnected old Controller as documented forced offline path with separate security warning and eventual server revoke by old workspace owner.
 - Tests: replay/expiry/brute-force bounds, wrong Controller fingerprint, untrusted TLS without credentials, wrong Worker identity, revoked credential denied, offline force-revoke on reconnect, workspace profile isolation.
@@ -165,8 +165,8 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 
 **DX-09 — browser-only account identity and Worker-centric onboarding** (depends DX-05, DX-07, DX-08)
 - Reviewed Alembic migration: introduce internal operator label and nullable canonical `threads_user_id`/`username` for unverified browser accounts; partial uniqueness when known; explicit local/verified identity semantics; preserve API-only existing records.
-- Worker UI Add Account available after OWNER/ADMIN Operator login. Create bounded local pending profile, human opens Threads directly, intervention/validation reports session readiness without remote identity assertion.
-- Controller authorizes a one-time worker-bound onboarding intent under human session; Worker completes only using existing device auth + intent; transaction creates Account + BrowserProfile ref + active assignment with idempotency, audit and no partial rows; return canonical account UUID. Intent is not a candidate business Account.
+- Worker UI Add Account available after OWNER/ADMIN Operator login. Create bounded local pending profile **using a reviewed new provisioning-only browser path**: existing `LocalBrowserSessionManager.open()` requires an already-registered account/assignment and cannot open this profile unmodified. Human opens Threads directly; implement and evidence a bounded login-state validation contract rather than equating the user button, an already accepted read-only browser capability or a fixture with authentic session readiness.
+- Controller authorizes a one-time worker-bound onboarding intent under human session; Worker completes only using existing device auth + intent; transaction creates Account + BrowserProfile ref + active assignment with idempotency, audit and no partial rows; return canonical account UUID. Intent is not a candidate business Account. **Version/advertise any additive onboarding API/Worker protocol capability** and fail closed for old Worker versions; preserve Worker v2 business compatibility.
 - On Controller failure, pending local profile remains isolated and retryable with bounded idempotency; on cancellation/expiry explicit cleanup. Reject double submit, account affinity mismatch, wrong Worker, stale intent and duplicate verified remote ID.
 - Never send cookies, storage, password, OTP, raw DOM, browser path, entire URL or local files. `AUTHENTICATED` requires bounded evidence from approved adapter; UI button alone cannot assert it.
 - Capability requiring verified remote ID remains unavailable for local-only accounts. Legacy API-only tests and migration roundtrip remain green.
@@ -190,7 +190,7 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 
 **DX-12 — reproducible one-installer Windows pipeline and CI** (depends DX-04, DX-07, DX-08, DX-11)
 - Build one branded installer containing signed-ready Tauri app, approved runtime bundle(s), private PostgreSQL and Worker Chromium as applicable. NSIS `setup.exe` is candidate; MSI only if an actual enterprise deployment need arises.
-- Fresh install, upgrade over durable data without accidental reset, uninstall leaves deliberate data-retention prompt, no system-wide DB/Python dependency, checksums/provenance/third-party licenses and artifact manifests.
+- Fresh install, upgrade over durable data without accidental reset, uninstall leaves deliberate data-retention prompt, no system-wide DB/Python dependency, checksums/provenance/third-party licenses and artifact manifests. **Without user-facing backup/restore, only disposable/synthetic pilot data is in scope; no promise of safe destructive schema upgrade or production durable deployment.**
 - Add Windows desktop workflow for Rust fmt/clippy/test, pnpm frozen install/lint/typecheck/build, sidecar/packaging smoke, existing secret scan; backend integration suite runs for Python/schema/protocol changes. Keep Linux/Docker smoke official and green.
 - Signing/publisher validation is a **distribution gate**; do not call unsigned internal artifact a production installer. Auto-updater deferred.
 
@@ -206,7 +206,11 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 - Explicitly document deferred backup/recovery as a **hard limit** on real-data reliability; issue follow-ups for portable encrypted backup/Owner Recovery Key/recovery email once customer priority changes.
 - Coordinator closes Desktop epic only against explicit pilot definition and cross-checks #3/#80/#62/#11/#1 separately.
 
-## 5. Dependency graph and progressive gates
+## 5. Explicit audit reconciliation / implementation stop gates
+
+Read [the pre-implementation audit](PREIMPLEMENTATION_AUDIT.md) before starting any DX issue. It records hard mismatches confirmed in current code: legacy Worker admin-token bypass (DX-05), strong existing Worker enrollment vs proposed short pairing code (DX-08), assigned-Account prerequisite vs first-time browser login (DX-09), and limited M1 prototype vs real Owner/HTTPS/installer (DX-04/05/06/12). These are **issue acceptance gates**, not permission to rewrite accepted C1–C6 semantics. A fresh session starts from [SESSION_HANDOFF.md](SESSION_HANDOFF.md), fetches latest `main`, #93, #94 and authorized issue, and verifies proposed ADR acceptance before coding.
+
+## 6. Dependency graph and progressive gates
 
 ```text
 DX-01 ADR/contracts
@@ -225,7 +229,7 @@ DX-01 ADR/contracts
 
 M1 is the **first vertical slice** (no preinstalled dependencies, close-to-tray + restart durable state). M2 is authenticated LAN Controller/Worker/Console. M3 is Worker-centric browser onboarding and re-login. M4 is one-installer Windows pilot evidence. No calendar promises absent team capacity and packaging spike evidence.
 
-## 6. Cross-cutting definition of done for every issue/PR
+## 7. Cross-cutting definition of done for every issue/PR
 
 1. Issue is explicitly authorized before code; PR stays scoped to its DX acceptance criteria.
 2. No breach of Control Plane/Worker authority, data-root/DPAPI, browser capability, Command/WorkerJob lease or original Linux/Docker behavior.
@@ -235,7 +239,7 @@ M1 is the **first vertical slice** (no preinstalled dependencies, close-to-tray 
 6. Docs/runbooks/protocol versions updated in same PR where accepted behavior changes.
 7. Review reports exact tested head SHA, test/environment evidence, BLOCKER/MAJOR findings, criterion-by-criterion pass, and separate coordinator acceptance. PASS != ACCEPTED; CI green != permission to merge. Recheck unchanged head and CI before merge; merge with expected SHA; verify main afterwards.
 
-## 7. Sequencing rules and stop conditions
+## 8. Sequencing rules and stop conditions
 
 - Prioritize DX-03 packaging feasibility and DX-04 complete local vertical slice before elaborate React dashboards, optional backends or additional account features.
 - Freeze security handshakes and RBAC at their respective issues; do not improvise a weak TLS bootstrap or direct desktop access to Worker secrets under time pressure.
