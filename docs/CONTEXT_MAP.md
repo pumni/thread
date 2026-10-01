@@ -99,6 +99,23 @@ This is intentionally broad. Read:
 
 Release is one of the few tasks where broad context is appropriate.
 
+## DX — Windows-first Desktop v1 (epic #94 / planning PR #93)
+
+**Fresh-session start:** read `docs/desktop/SESSION_HANDOFF.md` and `docs/desktop/PREIMPLEMENTATION_AUDIT.md` **from PR #93 head while that PR is unmerged**; the main branch does not yet contain these documents.
+
+Read in order for Desktop tasks:
+- `docs/desktop/README.md` — Vietnamese overview and links;
+- `docs/desktop/ISSUE_MAP.md` and the **authorized DX issue** — exact scope, dependencies and status;
+- `docs/adr/0007-windows-first-single-app-desktop.md` — proposed architecture, only binding after review/acceptance;
+- `docs/desktop/DELIVERY_PLAN.md` — phases, M1–M4 gates and definition of done.
+
+Additional focused context:
+- DX-02/03/04/07/12: `docs/desktop/WINDOWS_REHEARSAL.md`, `docs/WORKER_AGENT_WINDOWS.md`, current package scripts/Windows CI;
+- DX-05/06/08/09/10: `docs/desktop/SECURITY_AND_PROTOCOLS.md`, current account/Worker auth/session domain and protocol, existing C1/C3 ADRs;
+- DX-11/13/14: `docs/desktop/ACCEPTANCE_MATRIX.md`, Operator API contracts, relevant existing runbooks and accepted scope.
+
+Read current `docs/PROJECT_STATE_HANDOFF.md` and current main first. Planning PR does not itself authorize implementation, close external release gates, or change the existing Worker service/Task Scheduler contract.
+
 ## Documentation-only changes
 
 Read only the document being edited plus its direct source-of-truth dependencies.
