@@ -30,6 +30,9 @@ This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PL
 - [#100 DX-06] Real TLS/WSS terminator, trusted ASGI scheme, new Operator HTTPS enforcement, correct leaf/root key custody.
 - [#97 DX-03/#98 DX-04] Windows installer admin context vs single non-elevated runtime user and DPAPI must be proven. No data-root/identity surprises.
 
+- [#99 DX-05 / #101 DX-07] Worker device credentials cannot currently **initiate** drain. Deliberate Quit without a human session must prompt for an authorized Operator login (default proposal) or use a separately reviewed self-only device drain. Never retain a hidden global admin bearer.
+- [#100 DX-06 / #107 DX-13] Linux/Docker Controller needs non-DPAPI protected TLS trust identity + local CLI fingerprint and must serve the same secure Operator/Worker API to Windows clients. Test interoperability before claiming deployment parity.
+
 ## Practical next authorized actions after planning review
 
 1. Coordinator reviews and accepts #93 / DX-01 (#95); approved ADR/review exact SHA is recorded.
