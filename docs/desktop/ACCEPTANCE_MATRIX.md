@@ -1,0 +1,62 @@
+# Desktop v1 — Acceptance Matrix
+
+**Rule:** evidence must map to an exact commit SHA, OS/build/runtime versions, test mode and artifacts. Green CI is a technical prerequisite, **not** product acceptance. Existing [acceptance protocol](../ACCEPTANCE_AND_REVIEW.md) continues to apply. A planned test is not a passing test.
+
+## Global gates
+
+| ID | Acceptance proof | Required evidence |
+|---|---|---|
+| G-01 | Python Control Plane remains authoritative; no React/Worker DB writes or Rust business retries | Code review of module boundaries and regression suite |
+| G-02 | `Command != WorkerJob`; assignment, active lease/fencing and safe checkpoint preserved | Existing PostgreSQL concurrency/recovery tests green |
+| G-03 | No approved browser capability widened, bypassed, or inferred from UI demo | Contract tests + reviewer scope diff |
+| G-04 | Operator login does not leak bearer; Worker private keys/profile material stay local | IPC snapshot inspection, secret scan, negative redaction tests |
+| G-05 | Linux/Docker Controller works against same schema/protocol/Operator API | Existing Compose smoke + new auth/schema smoke |
+| G-06 | Every PR updated docs, records exact-head test evidence and gets separate coordinator acceptance | PR checklist and links |
+
+## DX checkpoint evidence
+
+| Package | Positive evidence | Adversarial/failure evidence | Exit condition |
+|---|---|---|---|
+| DX-01 | ADR/plan/contracts approved | Conflict against existing ADR/workflow audited | Product scope and risk owner recorded |
+| DX-02 | On Windows X hides UI; tray node remains; existing app reopens | Second invocation, Quit during startup, force-kill fake helper, incorrect persisted role, shared-PC lock | Fake supervisor lifecycle deterministic |
+| DX-03 | Clean VM runs bundled Python HTTP/scheduler and private PostgreSQL without Python/Docker installed | Missing redistributable, wrong architecture, AV quarantined helper, bad ACL, license unresolved | Reproducible `onedir`/alternate packaging decision |
+| DX-04 | First-run initdb/migrate/HTTP/scheduler; close tray; quit; restart same data | Corrupt/unwritable DB root, disk full, failed migration, port conflict, DB outage, crash, orphan/double supervisor, second initdb | **M1** first vertical slice accepted |
+| DX-05 | Provision Owner, log in as each fixed role, create allowed user, logout/revoke | Last Owner concurrent disable/demote, brute force, stale role after downgrade, expired session, local bypass, login without audit | Server-side auth/RBAC accepted |
+| DX-06 | IP-SAN HTTPS verified; Controller local and Console API parity; fingerprint verified from trusted Controller UI | MITM peer, wrong SAN, wrong root/expired cert, changed IP, plaintext downgrade, tampered trust file, credentials before trust | TLS bootstrap security signoff |
+| DX-07 | Existing Worker package/current-user DPAPI/profile/journal continue under Desktop; headed browser visible | Old scheduled task double-start, wrong user, corrupted DPAPI identity, quit during active job, forced host shutdown | One Worker host + safe drain and rollback |
+| DX-08 | Owner/Admin pairing, verified Worker, authenticated job/presence, Console trust + human login | Reused/expired code, wrong trust root, wrong device, attempts limit, revoked offline Worker reconnect, cross-Workspace profile exposure | **M2** secure three-mode LAN connectivity |
+| DX-09 | Worker admin login -> browser login -> narrow validation -> atomic registration -> same profile UUID on restart | Registration response lost, retry race, role revoked while pending, wrong worker, stale intent, unknown UI, unverified ID/API duplicate, cookie leak | Browser-only Account first class |
+| DX-10 | Human same-profile re-login, disable/enable, safe reassign/quarantine, capability-specific API availability | Worker offline, race with WorkerJob claim/lease, old Worker stale report, unknown remote identity, profile deletion offline | **M3** account lifecycle acceptance |
+| DX-11 | Controller and Console consistent summary; Worker UI functional; Viewer truly read-only | API 403 even if UI control forged; revoked session, Worker status stale, long account lists, keyboard/focus/accessibility | Usable role-aware product UI |
+| DX-12 | One installer, pinned manifest/lockfiles, no user dependency prompts, data retained across upgrade | Uninstall vs data retention, shared root permission, wrong signature, corrupted archive, legacy task migration | Reproducible internal installer with release caveats |
+| DX-13 | Three fresh Windows PCs/VMs execute end-to-end pairing/account lifecycle, collect evidence | Network partition, Controller crash, scheduler restart, Windows reboot-before-login, Worker offline/reconnect, TLS mismatch, migration failure | **M4** controlled pilot/demo acceptance |
+| DX-14 | Signed-off threat-model/runbook and explicit deferred risks | Open blockers and external API/release gates misrepresented | Epic closed **only** for Desktop v1 accepted scope |
+
+## Windows/CI matrix
+
+| Scope changed | Gate |
+|---|---|
+| React UI only | `pnpm install --frozen-lockfile`, lint, TS strict typecheck, React tests, Vite build, Tauri IPC snapshot tests |
+| Rust supervisor/native auth | `cargo fmt --check`, clippy warnings-as-errors, Rust unit/integration, Windows lifecycle process tests |
+| Python auth/accounts/protocol | `uv sync --locked`, `ruff check`, `ruff format --check`, `pyright`, `alembic check`, `pytest`; PostgreSQL migration/real-concurrency tests |
+| Installer/sidecar/PostgreSQL | Windows x64 version-pinned packaging job, signed-ready artifacts, SHA256/manifest/third-party license audit, clean VM smoke |
+| Shared Operator/Worker protocol | Python + Rust/TS fixture parity and negative auth, version mismatch tests |
+| Linux/Docker backend/schema | Existing Docker Control Plane smoke and scheduler crash/recovery; new Operator API reachability smoke |
+| Any scope | Secret scan, dependency review where relevant, accepted issue and exact-head PR check |
+
+CI path filters optimize routine scope, **but** shared protocol/schema and packaging changes must trigger appropriate cross-language/Windows/Linux integration. Browser/Windows E2E may be gated manual runner rehearsal until reproducible automation exists; state this explicitly rather than treating a skipped test as passed.
+
+## Three-PC rehearsal script
+
+1. Windows x64 Controller VM: fresh image, sign in dedicated user, install one Desktop, select Controller; verify no Python/PostgreSQL/Docker required; set stable address, provision Workspace and first OWNER, inspect HTTPS identity and DB loopback-only.
+2. Window X -> hidden tray -> HTTP and scheduler stay alive; open Desktop again -> same PID/runtime and single Controller. Quit -> confirm impact and stop orderly; reopen -> same data and Controller identity.
+3. Worker VM: install same setup, Worker mode, verify trusted Controller fingerprint against local Controller screen **before submitting code**, pair once, allow no duplicate scheduled-task/desktop host, create device identity and start existing headed Worker.
+4. Console VM: install same setup, Console mode, verify root fingerprint out-of-band, login as each role, compare read model with local Controller view and test 403 server-side for disallowed mutations.
+5. Worker VM: OWNER/ADMIN login, Add Account, human browser login, bounded session validation, atomic Controller registration and account/profile/Worker affinity persistence. Logout human; Agent continues. Force restart and verify no cookie/profile material left Worker.
+6. Simulate expired browser session, human re-login on same profile, Worker network loss, Worker DRAINING and explicit re-pair requiring profile quarantine. Exercise Account disable/reassign and stale report fencing in staging.
+7. Crash HTTP and scheduler separately; disconnect PostgreSQL; repeat process start from one data root; inspect WAL-safe recovery, bounded retries and fail-closed migration. Check Windows lock vs actual logout; never claim reboot-before-login operation.
+8. Run Linux/Docker Controller compatibility route and source-of-truth regression tests; capture signed/dated, scrubbed evidence and outstanding production blockers.
+
+## Pilot acceptance vs production certification
+
+The **Desktop v1 pilot** may be accepted when M1–M4, DX-14 and all applicable gates pass on review. It must be labeled **controlled pilot/internal demonstration**, not general-availability/production durability. Production activation still independently requires #3 live Meta validation, #80 discovery permission gates if in scope, #62 CRM sink if included, #11 end-to-end certification and #1 owner's security follow-up as applicable. Backup/recovery deferral means a single Controller host failure may cause unrecoverable loss: do not onboard irreplaceable business data without an explicit owner risk decision and follow-on recovery implementation.
