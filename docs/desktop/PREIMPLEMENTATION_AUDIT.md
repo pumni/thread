@@ -32,6 +32,9 @@
 | A-15 | **MINOR** | The accepted baseline uses a 256-bit enrollment code and a versioned Worker protocol v2; old docs/issue headings may use WORKER_PROTOCOL_V1 filename. Filename is historical, not current wire version. | Reference the documented v2 additive section and current `application/worker_protocol.py` in all implementation briefs. | DX-07 #101, DX-08 #102 |
 | A-16 | **MINOR** | One full installer contains potentially heavy Chromium/PostgreSQL assets even for client-only Console; expected size/startup/anti-virus and signing costs have not been measured. | Measure size and cold startup in DX-03; reject a second product/installer unless product explicitly changes direction. Signing and SmartScreen readiness are separate release gates. | DX-03 #97, DX-12 #106 |
 
+| A-17 | **BLOCKER** | Normal Worker shutdown starts with admin-authenticated `request_drain`; Worker device auth can complete drain but cannot initiate it. Disabling legacy admin bearer means tray Quit without a human session cannot request graceful drain. Controller Quit also needs a clearly authorized human policy. | DX-05 freezes explicit node lifecycle authorization. Simple v1 proposal: prompt for appropriately authorized Operator login if absent; an alternative device-authenticated **self-only** Worker drain endpoint requires separate security review. No hidden global admin bearer in Rust, false OFFLINE or promise to intercept forced OS shutdown. | DX-02 #96, DX-05 #99, DX-07 #101, DX-13 #107 |
+| A-18 | **MAJOR** | Supported Linux/Docker Controller cannot use the Windows current-user DPAPI/private-CA wizard. The plan promises common HTTPS/Worker/Operator protocol but only describes Windows provisioning and local Controller UI fingerprint. | Define Linux/IT HTTPS ingress, non-DPAPI root-key custody and a locally authenticated CLI/out-of-band fingerprint method using the same verified Worker/Operator API; prove Windows Worker/Console interoperability or explicitly document a temporary feature gap. | DX-05 #99, DX-06 #100, DX-08 #102, DX-13 #107 |
+
 ## 3. Explicit product decisions already settled
 
 - A single **customer-visible** Windows Desktop app and setup; internal process sidecars remain allowed.
@@ -63,7 +66,7 @@ The approved order should remain **DX-01 (#95) -> parallel DX-02 (#96) / DX-03 (
 ## 6. Audit criteria and completion conditions for planning PR
 
 - [x] Product decisions matched conversation and accepted project invariants, distinguishing **confirmed** from **proposed**.
-- [x] Repository implementation checked, including legacy privileged endpoints, 256-bit enrollment and account-before-profile constraints.
+- [x] Repository implementation checked, including legacy privileged endpoints, 256-bit enrollment, account-before-profile constraints, Worker drain authorization and Linux/Docker hosting boundary.
 - [x] Dependency DAG and owner/security gates enumerated.
 - [x] Negative Windows and protocol scenarios inventoried in [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md).
 - [ ] Exact-head **documentation consistency re-review after these changes** with working GitHub paths, issue bodies and review findings.
