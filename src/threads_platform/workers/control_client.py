@@ -8,7 +8,7 @@ from typing import cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
-import httpx
+import httpx2
 
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
@@ -35,7 +35,7 @@ class HttpWorkerControlClient:
         self,
         control_plane_url: str,
         *,
-        transport: httpx.AsyncBaseTransport | None = None,
+        transport: httpx2.AsyncBaseTransport | None = None,
         timeout_seconds: float = 10.0,
     ) -> None:
         parsed = urlsplit(control_plane_url)
@@ -48,10 +48,12 @@ class HttpWorkerControlClient:
             or parsed.fragment
         ):
             raise ValueError("Worker Control Plane URL must be an HTTPS origin without credentials")
-        self._client = httpx.AsyncClient(
+        self._client = httpx2.AsyncClient(
             base_url=control_plane_url.rstrip("/"),
-            timeout=httpx.Timeout(timeout_seconds),
+            timeout=httpx2.Timeout(timeout_seconds),
             follow_redirects=False,
+            verify=True,
+            trust_env=True,
             transport=transport,
         )
         self._access_token: str | None = None
@@ -75,6 +77,8 @@ class HttpWorkerControlClient:
         max_browser_sessions: int,
     ) -> None:
         self._worker_id = worker_id
+        challenge: _Challenge | None = None
+        enrollment_code_for_use: str | None = None
         try:
             challenge = await self._create_challenge(worker_id)
         except WorkerControlClientError as error:
@@ -84,16 +88,21 @@ class HttpWorkerControlClient:
                 or not enrollment_code
             ):
                 raise
+            enrollment_code_for_use = enrollment_code
+
+        if enrollment_code_for_use is not None:
             await self._enroll(
                 worker_id,
                 identity.public_key_bytes,
-                enrollment_code=enrollment_code,
+                enrollment_code=enrollment_code_for_use,
                 display_name=display_name,
                 hostname=hostname,
                 max_concurrent_jobs=max_concurrent_jobs,
                 max_browser_sessions=max_browser_sessions,
             )
             challenge = await self._create_challenge(worker_id)
+        if challenge is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
         signature = identity.sign(challenge_message(challenge.challenge_id, challenge.nonce))
         session = await self._request(
@@ -219,9 +228,12 @@ class HttpWorkerControlClient:
         if response is None:
             raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
         try:
-            return WorkerStatus(_text_field(response, "status"))
-        except (ValueError, TypeError) as error:
-            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+            status = WorkerStatus(_text_field(response, "status"))
+        except ValueError, TypeError:
+            pass
+        else:
+            return status
+        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
     async def renew_job(self, job_id: UUID, lease_token: UUID) -> WorkerJobSnapshot:
         response = await self._request(
@@ -347,6 +359,7 @@ class HttpWorkerControlClient:
             if not isinstance(network_data, dict):
                 raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
             network_payload = cast(dict[str, object], network_data)
+            network_profile_invalid = False
             try:
                 network_profile = NetworkProfile(
                     account_id=resolved_account,
@@ -357,8 +370,10 @@ class HttpWorkerControlClient:
                     port=_optional_int_field(network_payload, "port"),
                     credential_ref=_optional_text_field(network_payload, "credential_ref"),
                 )
-            except (ValueError, TypeError) as error:
-                raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+            except ValueError, TypeError:
+                network_profile_invalid = True
+            if network_profile_invalid:
+                raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
         if resolved_account != account_id:
             raise WorkerControlClientError("ACCOUNT_CONTEXT_MISMATCH")
         return WorkerAccountContext(resolved_account, worker_id, profile_ref, network_profile)
@@ -393,24 +408,29 @@ class HttpWorkerControlClient:
             if self._access_token is None:
                 raise WorkerControlClientError("WORKER_SESSION_REQUIRED")
             headers["Authorization"] = f"Bearer {self._access_token}"
+        response: httpx2.Response | None = None
         try:
             response = await self._client.request(method, path, json=json, headers=headers)
-        except httpx.HTTPError as error:
-            raise WorkerControlClientError("CONTROL_PLANE_UNAVAILABLE") from error
+        except httpx2.HTTPError:
+            pass
+        if response is None:
+            # Do not retain the transport exception: it can hold a request with
+            # the enrollment code or bearer token in its body/headers.
+            raise WorkerControlClientError("CONTROL_PLANE_UNAVAILABLE")
         if allow_no_content and response.status_code == 204:
             return None
         if response.status_code < 200 or response.status_code >= 300:
             raise WorkerControlClientError(_error_code(response), status_code=response.status_code)
         try:
             payload = response.json()
-        except ValueError as error:
-            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+        except ValueError:
+            payload = None
         if not isinstance(payload, dict):
             raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
         return cast(dict[str, object], payload)
 
 
-def _error_code(response: httpx.Response) -> str:
+def _error_code(response: httpx2.Response) -> str:
     try:
         body = response.json()
     except ValueError:
@@ -430,15 +450,18 @@ def _presence(worker_id: UUID, payload: dict[str, object] | None) -> WorkerAgent
     if payload is None:
         raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
     try:
-        return WorkerAgentPresence(
+        presence = WorkerAgentPresence(
             worker_id=worker_id,
             status=WorkerStatus(_text_field(payload, "status")),
             protocol_compatible=payload.get("protocol_compatible") is True,
             max_browser_sessions=_int_field(payload, "max_browser_sessions"),
             active_browser_sessions=_int_field(payload, "active_browser_sessions"),
         )
-    except (ValueError, TypeError) as error:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+    except ValueError, TypeError:
+        pass
+    else:
+        return presence
+    raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
 
 def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
@@ -449,7 +472,7 @@ def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
             if pending_cancel_payload is None
             else _worker_job_cancel_snapshot(pending_cancel_payload)
         )
-        return WorkerJobSnapshot(
+        snapshot = WorkerJobSnapshot(
             job_id=_uuid_field(payload, "id"),
             capability_name=_text_field(payload, "capability_name"),
             capability_version=_int_field(payload, "capability_version"),
@@ -464,8 +487,11 @@ def _job_snapshot(payload: dict[str, object]) -> WorkerJobSnapshot:
             input_data=_optional_object_field(payload, "input_data") or {},
             pending_cancel=pending_cancel,
         )
-    except (ValueError, TypeError) as error:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+    except ValueError, TypeError:
+        pass
+    else:
+        return snapshot
+    raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
 
 def _worker_job_cancel_snapshot(value: object) -> WorkerJobCancelSnapshot:
@@ -479,14 +505,17 @@ def _worker_job_cancel_snapshot(value: object) -> WorkerJobCancelSnapshot:
     if generation < 1 or re.fullmatch(r"[A-Z0-9_]{1,120}", reason_code) is None:
         raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
     try:
-        return WorkerJobCancelSnapshot(
+        snapshot = WorkerJobCancelSnapshot(
             request_id=_uuid_field(payload, "request_id"),
             generation=generation,
             reason_code=reason_code,
             requested_at=_datetime_field(payload, "requested_at"),
         )
-    except (ValueError, TypeError) as error:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+    except ValueError, TypeError:
+        pass
+    else:
+        return snapshot
+    raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
 
 def _text_field(payload: dict[str, object], key: str) -> str:
@@ -506,8 +535,9 @@ def _int_field(payload: dict[str, object], key: str) -> int:
 def _uuid_field(payload: dict[str, object], key: str) -> UUID:
     try:
         return UUID(_text_field(payload, key))
-    except ValueError as error:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+    except ValueError:
+        pass
+    raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
 
 def _optional_uuid_field(payload: dict[str, object], key: str) -> UUID | None:
@@ -518,19 +548,22 @@ def _optional_uuid_field(payload: dict[str, object], key: str) -> UUID | None:
         raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
     try:
         return UUID(value)
-    except ValueError as error:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
+    except ValueError:
+        pass
+    raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
 
 def _datetime_field(payload: dict[str, object], key: str) -> datetime:
     value = _text_field(payload, key)
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE") from error
-    if parsed.tzinfo is None:
-        raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
-    return parsed
+    except ValueError:
+        pass
+    else:
+        if parsed.tzinfo is None:
+            raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
+        return parsed
+    raise WorkerControlClientError("WORKER_PROTOCOL_INVALID_RESPONSE")
 
 
 def _optional_datetime_field(payload: dict[str, object], key: str) -> datetime | None:

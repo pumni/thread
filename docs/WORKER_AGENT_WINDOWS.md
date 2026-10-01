@@ -20,7 +20,10 @@ By default local state lives below `%LOCALAPPDATA%/ThreadsOperations`:
 - `cache/`, `logs/`, and `updates/` are reserved local data areas.
 
 Configure `THREADS_WORKER_CONTROL_PLANE_URL` with an HTTPS origin. The HTTP client keeps normal
-certificate verification enabled and rejects URLs containing credentials. Set optional
+certificate verification enabled and rejects URLs containing credentials. It uses the operating
+system trust store by default, honors `SSL_CERT_FILE`/`SSL_CERT_DIR`, and uses the standard proxy
+environment variables with `NO_PROXY` support. These settings apply only to Control Plane HTTP
+traffic; they do not change an account's browser `NetworkProfile`. Set optional
 `THREADS_WORKER_DISPLAY_NAME`, `THREADS_WORKER_AGENT_VERSION`,
 `THREADS_WORKER_MAX_CONCURRENT_JOBS`, and `THREADS_WORKER_MAX_BROWSER_SESSIONS` values as needed.
 Feed browsing also requires the pinned Playwright package and its matching Chromium browser
