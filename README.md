@@ -12,7 +12,7 @@ Completed:
 Most recent accepted backend implementation checkpoint at the Desktop planning baseline:
 - **C6-02/10 — bounded OpenTelemetry tracing (#91, merged in PR #92).** Check current GitHub main/issue status for any later changes.
 
-**Proposed next initiative, not yet merged/authorized:** [Desktop v1 planning PR #93](https://github.com/pumni/thread/pull/93), [Epic #94](https://github.com/pumni/thread/issues/94), implementation issues #95–#108. While #93 is unmerged, read its branch's [fresh-session handoff](https://github.com/pumni/thread/blob/plan/desktop-windows-v1-20261001/docs/desktop/SESSION_HANDOFF.md) and [audit](https://github.com/pumni/thread/blob/plan/desktop-windows-v1-20261001/docs/desktop/PREIMPLEMENTATION_AUDIT.md) before authorizing any Desktop code. Planning docs/issue creation do not constitute separate coordinator acceptance.
+**Accepted Desktop planning baseline:** [PR #93](https://github.com/pumni/thread/pull/93) merged at `ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`; [Epic #94](https://github.com/pumni/thread/issues/94) tracks implementation issues #95–#108. Start at [fresh-session handoff](docs/desktop/SESSION_HANDOFF.md) and [audit](docs/desktop/PREIMPLEMENTATION_AUDIT.md) on latest `main`. Planning approval does **not** authorize all implementation slices or imply production release readiness.
 
 Not production-ready:
 - issue #3 remains open as the production/release gate;
