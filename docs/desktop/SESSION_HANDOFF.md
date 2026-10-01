@@ -36,8 +36,10 @@
 - **M1 scope error corrected (DX-04 #98):** M1 is **disposable, loopback-only** packaging/runtime/tray/crash proof without real Owner, remote API or final installer. DX-05 adds real Owner/operator bootstrap (Windows **and Linux CLI**), DX-06 adds verified public HTTPS/WSS, DX-12 packages final one-installer artifact. No unprotected LAN endpoint or fake persisted Owner.
 - **TLS deployment gap (DX-06 #100):** existing `WorkerTransportTLSMiddleware` only checks `/v1/workers` ASGI scheme. Prove exact TLS termination, WSS upgrade, constrained forwarded headers and HTTPS enforcement on newly added public Operator endpoints; preserve isolated CA root private key.
 - **Operational/data safety:** legacy Worker scheduled task can double-start with Desktop (#101); current-user DPAPI requires same runtime user and ACL/elevation handoff (#97/#98); parent kill-on-close is **abrupt** PostgreSQL stop and needs WAL test (#98); if Worker cannot reach Controller on Quit, never assert completed drain (#101); no customer production/irreplaceable data until future backup/recovery (#106–#108).
+- **Tray Quit without human Operator login (DX-05/DX-07):** once legacy `worker_admin_token` is disabled, existing device auth cannot initiate Worker drain. V1 proposal: prompt for authorized Operator login for intentional Quit/Restart, or security-review a device-authenticated **self-only** drain route. UI logout still leaves node running; Windows forced shutdown is not a graceful drain.
+- **Linux/Docker secure Controller parity (DX-05/DX-06):** current-user Windows DPAPI/private-CA wizard cannot run on Linux. Specify protected Linux trust-key custody, HTTPS/WSS ingress and independently verifiable CLI fingerprint with the **same** Operator API and Worker protocol.
 
-Read [audit findings A-01…A-16](PREIMPLEMENTATION_AUDIT.md) before changing any roadmap design.
+Read [audit findings A-01…A-18](PREIMPLEMENTATION_AUDIT.md) before changing any roadmap design.
 
 ## 5. First correct action in the next new session
 
