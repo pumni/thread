@@ -482,6 +482,7 @@ def test_transport_retry_logs_do_not_disclose_otlp_endpoint_path(
 
     exporter = _RetryLoggingExporter(endpoint)
     transport_logger = logging.getLogger("urllib3.connectionpool")
+    monkeypatch.setattr(transport_logger, "disabled", False)
     transport_output = io.StringIO()
     transport_handler = logging.StreamHandler(transport_output)
     transport_logger.addHandler(transport_handler)
@@ -490,6 +491,16 @@ def test_transport_retry_logs_do_not_disclose_otlp_endpoint_path(
         with caplog.at_level(logging.WARNING, logger="urllib3.connectionpool"):
             with trace_span(tracing.tracer, "transport.retry_test"):
                 pass
+            record = transport_logger.makeRecord(
+                transport_logger.name,
+                logging.WARNING,
+                __file__,
+                1,
+                "Retrying after an OTLP transport failure for %s",
+                (endpoint,),
+                None,
+            )
+            transport_logger.handle(record)
             tracing.shutdown()
 
         assert exporter.calls >= 1
