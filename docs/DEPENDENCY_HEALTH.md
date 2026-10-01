@@ -1,10 +1,11 @@
 # Backend dependency health checks
 
 The Ubuntu quality gate and Windows Worker package workflow print the locked
-production, development, and packaging dependency tree with
-`uv tree --locked --all-groups`. This shows the packages applicable on both
-platforms and the lock check prevents silently resolving newer versions. Run
-the same command locally when reviewing dependency changes.
+production, development, and packaging dependency graph with
+`uv tree --locked --all-groups`. This shows the versions in `uv.lock` for the
+applicable platform and asserts the lockfile remains unchanged; it does not
+check whether newer versions are available. Run the same command locally when
+reviewing the locked graph.
 
 `uv run --locked pytest` treats `DeprecationWarning`,
 `PendingDeprecationWarning`, `FutureWarning`, and `PytestDeprecationWarning` as
@@ -26,12 +27,12 @@ fork of HTTPX 0.28.1 with the same public API; its project metadata and release
 notes include Python 3.14 support. This does not constitute a runtime-client
 migration.
 
-The dependency tree also reports packages for which newer releases are
-available. That is release freshness information, not evidence of deprecation,
+Run `uv tree --outdated` separately to check for newer available package
+versions. This is release freshness information, not evidence of deprecation,
 end of support, or a security vulnerability, so this audit did not upgrade
-them. No other supported upstream deprecation or withdrawn locked release was
-identified in the dependency tree. Security advisories must be assessed
-separately from deprecation notices.
+packages based on freshness alone. No other supported upstream deprecation or
+withdrawn locked release was identified in the dependency tree. Security
+advisories must be assessed separately from deprecation notices.
 
 The universal lock contains 57 registry packages across its platform markers;
 the CI tree reports the applicable graph on both Ubuntu and Windows. PyPI
