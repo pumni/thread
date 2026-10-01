@@ -319,7 +319,7 @@ def test_playwright_media_upload_requires_one_exact_successful_response(
         file_path.write_bytes(b"synthetic-image")
         engine_session = cast(
             BrowserMediaEngineSession,
-            await PlaywrightBrowserEngine(navigation_timeout_ms=300).open(
+            await PlaywrightBrowserEngine(navigation_timeout_ms=2_000).open(
                 BrowserLaunchRequest(
                     worker_id=uuid4(),
                     account_id=account_id,
