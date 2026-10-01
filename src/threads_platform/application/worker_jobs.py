@@ -278,7 +278,7 @@ class WorkerJobService:
         token = uuid4()
         lease_expires_at = now + self._lease_duration
         async with self._unit_of_work_factory() as unit_of_work:
-            worker = await unit_of_work.workers.get_for_update(worker_id)
+            worker = await unit_of_work.workers.get_for_claim(worker_id)
             if worker is None:
                 raise WorkerJobControlError("WORKER_NOT_FOUND")
             if not self._eligible(worker, now):

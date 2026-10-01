@@ -2469,6 +2469,16 @@ class SQLAlchemyWorkerRepository(WorkerRepository):
         )
         return self._domain(record) if record is not None else None
 
+    async def get_for_claim(self, worker_id: UUID) -> WorkerNode | None:
+        # PostgreSQL FOR NO KEY UPDATE still serializes claims, but it is
+        # compatible with the KEY SHARE lock taken by WorkerJob foreign keys.
+        record = await self._session.scalar(
+            select(WorkerNodeRecord)
+            .where(WorkerNodeRecord.worker_id == worker_id)
+            .with_for_update(key_share=True)
+        )
+        return self._domain(record) if record is not None else None
+
     async def update(self, worker: WorkerNode) -> None:
         record = await self._session.get(WorkerNodeRecord, worker.worker_id)
         if record is None:

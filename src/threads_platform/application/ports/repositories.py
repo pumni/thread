@@ -341,6 +341,10 @@ class WorkerRepository(Protocol):
 
     async def get_for_update(self, worker_id: UUID) -> WorkerNode | None: ...
 
+    async def get_for_claim(self, worker_id: UUID) -> WorkerNode | None:
+        """Serialize claims while allowing foreign-key key-share checks."""
+        ...
+
     async def update(self, worker: WorkerNode) -> None: ...
 
     async def list_expired_presence_for_update(

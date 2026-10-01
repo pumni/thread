@@ -64,5 +64,13 @@ jobs:
       - name: Check migration metadata
         run: uv run --locked alembic check
 
+      - name: Repeat WorkerJob route-claim race on PostgreSQL 17
+        shell: bash
+        run: |
+          for attempt in {1..10}; do
+            echo "WorkerJob route-claim race run ${attempt}/10"
+            uv run --locked pytest -q tests/integration/test_worker_job_cancellation.py::test_low_and_normal_do_not_preempt_and_high_arrival_races_claim_safely
+          done
+
       - name: Run tests
-        run: uv run --locked pytest
+        run: uv run --locked pytest -ra

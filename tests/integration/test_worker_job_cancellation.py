@@ -17,7 +17,7 @@ from threads_platform.application.account_activity_materialization import (
     materialize_due_account_activities,
 )
 from threads_platform.application.capability_router import CapabilityRouter
-from threads_platform.application.commands.runtime import CommandRuntime
+from threads_platform.application.commands.runtime import CommandExecutionResult, CommandRuntime
 from threads_platform.application.ports.repositories import UnitOfWork
 from threads_platform.application.worker_control import WorkerControlService
 from threads_platform.application.worker_jobs import WorkerJobControlError, WorkerJobService
@@ -63,7 +63,9 @@ from threads_platform.infrastructure.persistence.models import (
     WorkerJobRecord,
 )
 from threads_platform.infrastructure.persistence.repositories import (
+    SQLAlchemyAccountRepository,
     SQLAlchemyWorkerJobPreemptionRepository,
+    SQLAlchemyWorkerJobRepository,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
 
@@ -1596,6 +1598,7 @@ async def test_unlinked_browser_job_blocks_profile_without_receiving_cancel_requ
 @pytest.mark.asyncio
 async def test_low_and_normal_do_not_preempt_and_high_arrival_races_claim_safely(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = await _running_activity_job(unit_of_work_factory)
     assert scenario.lease_token is not None
@@ -1632,10 +1635,59 @@ async def test_low_and_normal_do_not_preempt_and_high_arrival_races_claim_safely
         clock=scenario.clock,
         worker_job_service=scenario.service,
     )
-    claim_result, route_result = await asyncio.gather(
-        scenario.service.claim_next(scenario.worker_id),
-        high_runtime.process(high_command_id),
+    high_job_insert_paused = asyncio.Event()
+    allow_high_job_insert = asyncio.Event()
+    claim_account_lock_requested = asyncio.Event()
+    claim_task: asyncio.Task[WorkerJob | None] | None = None
+    route_task: asyncio.Task[CommandExecutionResult] | None = None
+    claim_result: WorkerJob | None = None
+    route_result: CommandExecutionResult | None = None
+    original_worker_job_add = SQLAlchemyWorkerJobRepository.add
+    original_account_get_for_update = SQLAlchemyAccountRepository.get_for_update
+
+    async def pause_high_job_insert(
+        repository: SQLAlchemyWorkerJobRepository,
+        job: WorkerJob,
+    ) -> None:
+        if job.account_id == scenario.account_id and job.priority == 100:
+            high_job_insert_paused.set()
+            await allow_high_job_insert.wait()
+        await original_worker_job_add(repository, job)
+
+    async def observe_claim_account_lock(
+        repository: SQLAlchemyAccountRepository,
+        account_id: UUID,
+    ) -> ThreadsAccount | None:
+        if asyncio.current_task() is claim_task and account_id == scenario.account_id:
+            claim_account_lock_requested.set()
+        return await original_account_get_for_update(repository, account_id)
+
+    monkeypatch.setattr(SQLAlchemyWorkerJobRepository, "add", pause_high_job_insert)
+    monkeypatch.setattr(
+        SQLAlchemyAccountRepository,
+        "get_for_update",
+        observe_claim_account_lock,
     )
+    try:
+        route_task = asyncio.create_task(high_runtime.process(high_command_id))
+        await asyncio.wait_for(high_job_insert_paused.wait(), timeout=5)
+        claim_task = asyncio.create_task(scenario.service.claim_next(scenario.worker_id))
+        await asyncio.wait_for(claim_account_lock_requested.wait(), timeout=5)
+        allow_high_job_insert.set()
+        route_result = await route_task
+        claim_result = await claim_task
+    finally:
+        allow_high_job_insert.set()
+        if claim_task is not None and not claim_task.done():
+            claim_task.cancel()
+        if route_task is not None and not route_task.done():
+            route_task.cancel()
+        if route_task is not None:
+            await asyncio.gather(route_task, return_exceptions=True)
+        if claim_task is not None:
+            await asyncio.gather(claim_task, return_exceptions=True)
+
+    assert route_result is not None
     assert claim_result is None
     assert route_result.status is CommandStatus.WAITING_EXECUTION
     async with unit_of_work_factory() as unit_of_work:
