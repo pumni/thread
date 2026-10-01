@@ -101,6 +101,8 @@ Release is one of the few tasks where broad context is appropriate.
 
 ## DX — Windows-first Desktop v1 (epic #94 / planning PR #93)
 
+**Fresh-session start:** read `docs/desktop/SESSION_HANDOFF.md` and `docs/desktop/PREIMPLEMENTATION_AUDIT.md` **from PR #93 head while that PR is unmerged**; the main branch does not yet contain these documents.
+
 Read in order for Desktop tasks:
 - `docs/desktop/README.md` — Vietnamese overview and links;
 - `docs/desktop/ISSUE_MAP.md` and the **authorized DX issue** — exact scope, dependencies and status;
