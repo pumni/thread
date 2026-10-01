@@ -2,7 +2,7 @@
 
 **Epic:** [#94](https://github.com/pumni/thread/issues/94) · **Planning draft:** [#93](https://github.com/pumni/thread/pull/93) · **Date:** 2026-10-01
 
-This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PLAN.md). All child issues are **open planning scope, not automatic authorization**. The ADR/plan must be reviewed and independently accepted before DX implementation work. The exact role-action policy is **proposed** until DX-05 product sign-off.
+This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PLAN.md). Begin a new conversation at [SESSION_HANDOFF.md](SESSION_HANDOFF.md), and read the [pre-implementation audit](PREIMPLEMENTATION_AUDIT.md). All child issues are **open planning scope, not automatic authorization**. The ADR/plan must be reviewed and independently accepted before DX implementation work. The exact role-action policy is **proposed** until DX-05 product sign-off.
 
 | ID | GitHub issue | Phase / checkpoint | Required dependencies |
 |---|---|---|---|
@@ -20,6 +20,15 @@ This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PL
 | DX-12 | [#106 — one installer/scoped CI](https://github.com/pumni/thread/issues/106) | P4 / M4 | #98, #101, #102, #105 |
 | DX-13 | [#107 — three-PC E2E/failure rehearsal](https://github.com/pumni/thread/issues/107) | P4 / M4 | applicable #98–#106 |
 | DX-14 | [#108 — security/operations/pilot handoff](https://github.com/pumni/thread/issues/108) | P4 / M4 closure | #100, #102, #104, #107 |
+
+## Audit-driven hard gates
+
+- [#99 DX-05] Close legacy `worker_admin_token` enrollment/drain/intervention bypass in new Windows profile; Windows and Linux secure Owner bootstrap before LAN auth.
+- [#102 DX-08] Do **not** replace existing 256-bit Worker enrollment credential with six-digit UI code. Optional short-code UX is a security-reviewed redemption after verified TLS; otherwise use securely conveyed high-entropy code.
+- [#103 DX-09] Existing browser session requires Account/assignment. Build isolated pending local profile + reviewed login-state detector, atomic Controller registration and version-negotiated additive protocol.
+- [#98 DX-04] M1 is loopback-only disposable prototype without final installer or real Owner/remote HTTPS. First usable LAN requires #99 + #100; final customer installer is #106.
+- [#100 DX-06] Real TLS/WSS terminator, trusted ASGI scheme, new Operator HTTPS enforcement, correct leaf/root key custody.
+- [#97 DX-03/#98 DX-04] Windows installer admin context vs single non-elevated runtime user and DPAPI must be proven. No data-root/identity surprises.
 
 ## Practical next authorized actions after planning review
 
