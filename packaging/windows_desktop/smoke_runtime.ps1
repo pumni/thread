@@ -7,7 +7,8 @@ param(
     [string]$ExpectedSourceRevision,
     [ValidateSet("local_non_clean_windows_smoke", "github_hosted_windows_x64_isolated")]
     [string]$RunKind = "local_non_clean_windows_smoke",
-    [switch]$CleanWindowsEvidence
+    [switch]$CleanWindowsEvidence,
+    [string]$ParentAdminProfilePath
 )
 
 $ErrorActionPreference = "Stop"
@@ -108,6 +109,11 @@ $evidence = [ordered]@{
         architecture_x64 = [Environment]::Is64BitOperatingSystem
         github_runner_image = $env:ImageOS
         current_user_is_administrator = $false
+        current_user_identity = $null
+        user_profile = $null
+        local_application_data = $null
+        profile_differs_from_parent_admin = $null
+        runtime_user_profile_isolated = $false
         ambient_path_prerequisites = @{}
         sanitized_path_entries = @()
         sanitized_path_tool_inventory = [ordered]@{}
@@ -442,7 +448,45 @@ try {
     }
     $evidence.checks.packaged_python_version = $runtimeVersion
 
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $userProfile = [string]$env:USERPROFILE
     $dataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    $evidence.host.current_user_identity = $currentIdentity
+    $evidence.host.user_profile = $userProfile
+    $evidence.host.local_application_data = $dataRoot
+    $profileEnvironmentValid = -not $isAdministrator -and
+        -not [string]::IsNullOrWhiteSpace($userProfile) -and
+        -not [string]::IsNullOrWhiteSpace($dataRoot)
+    $profileDiffersFromParentAdmin = $true
+    try {
+        if ($profileEnvironmentValid) {
+            $normalizedProfile = [System.IO.Path]::GetFullPath($userProfile).TrimEnd([char[]]@("\", "/"))
+            $normalizedDataRoot = [System.IO.Path]::GetFullPath($dataRoot).TrimEnd([char[]]@("\", "/"))
+            $profilePrefix = $normalizedProfile + [System.IO.Path]::DirectorySeparatorChar
+            $profileEnvironmentValid = $normalizedDataRoot.StartsWith(
+                $profilePrefix,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+            if (-not [string]::IsNullOrWhiteSpace($ParentAdminProfilePath)) {
+                $normalizedParentAdminProfile = [System.IO.Path]::GetFullPath($ParentAdminProfilePath).TrimEnd(
+                    [char[]]@("\", "/")
+                )
+                $profileDiffersFromParentAdmin = -not [string]::Equals(
+                    $normalizedProfile,
+                    $normalizedParentAdminProfile,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+        }
+    } catch {
+        $profileEnvironmentValid = $false
+        $profileDiffersFromParentAdmin = $false
+    }
+    $evidence.host.profile_differs_from_parent_admin = $profileDiffersFromParentAdmin
+    $evidence.host.runtime_user_profile_isolated = $profileEnvironmentValid -and $profileDiffersFromParentAdmin
+    if ($CleanWindowsEvidence -and -not $evidence.host.runtime_user_profile_isolated) {
+        throw "runtime_profile_environment_mismatch"
+    }
     $localRoot = Join-Path $dataRoot ("ThreadsDesktopDx03Smoke\" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $localRoot -Force | Out-Null
     Restrict-TreeToCurrentUser $localRoot

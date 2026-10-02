@@ -36,6 +36,9 @@ $parentPrincipal = [System.Security.Principal.WindowsPrincipal]::new($parentIden
 $parentIsAdministrator = $parentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 $smokeCredential = $null
 $smokeUserName = $null
+$smokeProfileRoot = [string]$env:USERPROFILE
+$parentAdminProfilePath = $null
+$smokeUserEnvironment = $null
 $stageRoot = if ($parentIsAdministrator) {
     Join-Path $env:SystemDrive "ThreadsDx03HostedSmoke-$runId"
 } else {
@@ -132,6 +135,11 @@ function Invoke-SmokeProcess([string]$BundleRoot, [string]$SmokeEvidencePath, [s
         if ($smokeCredential) {
             $processArgs.Credential = $smokeCredential
             $processArgs.LoadUserProfile = $true
+        }
+        $processArgs.Environment = $smokeUserEnvironment
+        if ($parentAdminProfilePath) {
+            $arguments += @("-ParentAdminProfilePath", "`"$parentAdminProfilePath`"")
+            $processArgs.ArgumentList = $arguments
         }
         $process = Start-Process @processArgs
         $process.Refresh()
@@ -234,6 +242,7 @@ try {
             throw "hosted_runner_cannot_create_non_admin_smoke_user"
         }
         $smokeUserName = "dx03_$($runId.Substring(0, 10))"
+        $parentAdminProfilePath = [string]$env:USERPROFILE
         $passwordBytes = [byte[]]::new(32)
         $randomGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
         try { $randomGenerator.GetBytes($passwordBytes) }
@@ -249,7 +258,45 @@ try {
             $securePassword
         )
         $securePassword = $null
+
+        $profileBootstrap = Start-Process -FilePath (Join-Path $PSHOME "pwsh.exe") `
+            -ArgumentList @("-NoProfile", "-Command", "exit 0") `
+            -Credential $smokeCredential -LoadUserProfile -PassThru -Wait -WindowStyle Hidden
+        $profileBootstrap.Refresh()
+        $profileBootstrapExitCode = $profileBootstrap.ExitCode
+        $profileBootstrap.Dispose()
+        if ($profileBootstrapExitCode -ne 0) { throw "hosted_smoke_user_profile_bootstrap_failed" }
+
+        try {
+            $smokeUserSid = (Get-LocalUser -Name $smokeUserName -ErrorAction Stop).SID.Value
+            $smokeProfiles = @(
+                Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$smokeUserSid'" -ErrorAction Stop |
+                    Where-Object { $_.SID -eq $smokeUserSid }
+            )
+        } catch {
+            throw "hosted_smoke_user_profile_unavailable"
+        }
+        if ($smokeProfiles.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$smokeProfiles[0].LocalPath)) {
+            throw "hosted_smoke_user_profile_unavailable"
+        }
+        $smokeProfileRoot = [System.IO.Path]::GetFullPath([string]$smokeProfiles[0].LocalPath)
         Set-HostedSmokeAcl $stageRoot "$env:COMPUTERNAME\$smokeUserName"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($smokeProfileRoot)) { throw "hosted_smoke_user_profile_unavailable" }
+    $smokeHomeDrive = [System.IO.Path]::GetPathRoot($smokeProfileRoot).TrimEnd([char[]]@("\", "/"))
+    if ([string]::IsNullOrWhiteSpace($smokeHomeDrive) -or
+        -not $smokeProfileRoot.StartsWith($smokeHomeDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "hosted_smoke_user_profile_unavailable"
+    }
+    $smokeUserEnvironment = @{
+        USERPROFILE = $smokeProfileRoot
+        APPDATA = Join-Path $smokeProfileRoot "AppData\Roaming"
+        LOCALAPPDATA = Join-Path $smokeProfileRoot "AppData\Local"
+        HOMEDRIVE = $smokeHomeDrive
+        HOMEPATH = $smokeProfileRoot.Substring($smokeHomeDrive.Length)
+        TEMP = Join-Path $smokeProfileRoot "AppData\Local\Temp"
+        TMP = Join-Path $smokeProfileRoot "AppData\Local\Temp"
     }
 
     New-Item -ItemType Directory -Path $stageCandidates -Force | Out-Null

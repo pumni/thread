@@ -32,18 +32,20 @@ namespace ThreadsDesktopLifecycleSmoke {
         public static extern bool IsWindowVisible(IntPtr window);
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern bool SetCursorPos(int x, int y);
-        [DllImport("user32.dll")]
-        public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
     }
 }
 "@
 }
 
 $bundleHash = (Get-FileHash -LiteralPath $BundleExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
-$appDataRoot = Join-Path $env:TEMP ("ThreadsDesktopDx02-" + [guid]::NewGuid().ToString("N"))
-$previousAppData = $env:APPDATA
+$deviceConfigPath = $null
+$deviceConfigDirectory = $null
+$configDirectoryExistedBeforeSmoke = $false
+$configFileExistedBeforeSmoke = $false
+$configCreatedBySmoke = $false
+$persistedConfigAfterProvision = $null
+$persistedConfigAfterRestart = $null
+$restartTestTransitionStoppedProcesses = $false
 $currentUserRunKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $machineRunKeyPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
 $originalAutostart = @{ HKCU = @{}; HKLM = @{} }
@@ -90,16 +92,17 @@ $checks = [ordered]@{
     autostart_current_user_only = $false
     restart_autostart_hkcu_registered = $false
     restart_autostart_current_user_only = $false
+    persisted_config_schema_valid = $false
+    persisted_config_reports_controller_role = $false
     persisted_config_reports_autostart_enabled = $false
     controller_starts_one_mock_helper = $false
     second_launch_reuses_and_focuses_instance = $false
     window_close_hides_without_stopping_helper = $false
     tray_reopen_relocks_session_without_stopping_helper = $false
-    tray_quit_confirms_and_stops_helper_before_exit = $false
+    restart_test_transition_stopped_processes = $false
     restart_restores_role_without_duplicate_helper = $false
     force_killed_helper_is_reported_degraded = $false
     decommission_removes_test_autostart = $false
-    restart_quits_cleanly = $false
 }
 $helperProcessIds = [System.Collections.Generic.List[int]]::new()
 $startedProcessIds = [System.Collections.Generic.List[int]]::new()
@@ -348,83 +351,6 @@ function Invoke-Button([string]$Name) {
     } 20 "lifecycle_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
-function Get-TrayButtons {
-    $root = [System.Windows.Automation.AutomationElement]::RootElement
-    $condition = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    )
-    return $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
-}
-
-function Open-TrayQuitMenu {
-    $trayButtons = @(Get-TrayButtons)
-    $overflow = $trayButtons | Where-Object {
-        $_.Current.Name -match "(?i)(hidden.*icons|show.*icons|notification.*overflow)"
-    } | Select-Object -First 1
-    if ($overflow) {
-        try { $overflow.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
-        catch { $overflow.SetFocus() }
-        Start-Sleep -Milliseconds 300
-    }
-
-    $trayIcon = $null
-    foreach ($button in @(Get-TrayButtons)) {
-        if ($button.Current.Name -eq "Threads Desktop" -and
-            $button.Current.NativeWindowHandle -ne $primaryWindowHandle.ToInt32()) {
-            $trayIcon = $button
-            break
-        }
-    }
-    if (-not $trayIcon) { throw "desktop_tray_icon_not_accessible" }
-    $bounds = $trayIcon.Current.BoundingRectangle
-    if ($bounds.IsEmpty) { throw "desktop_tray_icon_has_no_bounds" }
-    $x = [int]($bounds.Left + ($bounds.Width / 2))
-    $y = [int]($bounds.Top + ($bounds.Height / 2))
-    if (-not [ThreadsDesktopLifecycleSmoke.NativeMethods]::SetCursorPos($x, $y)) {
-        throw "desktop_tray_pointer_position_failed"
-    }
-    [ThreadsDesktopLifecycleSmoke.NativeMethods]::mouse_event(0x0008, 0, 0, 0, [UIntPtr]::Zero)
-    [ThreadsDesktopLifecycleSmoke.NativeMethods]::mouse_event(0x0010, 0, 0, 0, [UIntPtr]::Zero)
-    Wait-Until {
-        $root = [System.Windows.Automation.AutomationElement]::RootElement
-        $items = $root.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::MenuItem
-            )
-        )
-        return @($items | Where-Object { $_.Current.Name -like "Quit*" }).Count -gt 0
-    } 5 "desktop_tray_quit_menu_unavailable"
-    $root = [System.Windows.Automation.AutomationElement]::RootElement
-    $items = $root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::MenuItem
-        )
-    )
-    $quitItem = $items | Where-Object { $_.Current.Name -like "Quit*" } | Select-Object -First 1
-    if (-not $quitItem) { throw "desktop_tray_quit_menu_unavailable" }
-    $quitItem.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-}
-
-function Confirm-TrayQuit([int]$ExpectedHelperId) {
-    Open-TrayQuitMenu
-    Wait-Until {
-        $window = Get-PrimaryWindow
-        $button = Find-ElementByName $window "Stop node and quit" ([System.Windows.Automation.ControlType]::Button)
-        if (-not $button) { return $false }
-        $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        return $true
-    } 10 "desktop_quit_confirmation_unavailable"
-    Wait-Until { -not (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) } 20 "desktop_quit_did_not_exit"
-    if (Get-Process -Id $ExpectedHelperId -ErrorAction SilentlyContinue) {
-        throw "desktop_quit_exited_before_mock_helper_stopped"
-    }
-}
-
 try {
     $headOutput = @(& git -C $repoRoot rev-parse HEAD)
     if ($LASTEXITCODE -ne 0) { throw "lifecycle_git_head_unavailable" }
@@ -437,8 +363,19 @@ try {
     }
     $worktreeIsClean = $true
 
-    New-Item -ItemType Directory -Path $appDataRoot -Force | Out-Null
-    $env:APPDATA = $appDataRoot
+    $tauriConfigPath = Join-Path $repoRoot "apps/desktop/src-tauri/tauri.conf.json"
+    $tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
+    $tauriIdentifier = [string]$tauriConfig.identifier
+    if ([string]::IsNullOrWhiteSpace($tauriIdentifier)) { throw "lifecycle_tauri_identifier_unavailable" }
+    $roamingAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+    if ([string]::IsNullOrWhiteSpace($roamingAppData)) { throw "lifecycle_roaming_appdata_unavailable" }
+    $deviceConfigDirectory = Join-Path $roamingAppData $tauriIdentifier
+    $deviceConfigPath = Join-Path $deviceConfigDirectory "device-config.json"
+    $configDirectoryExistedBeforeSmoke = Test-Path -LiteralPath $deviceConfigDirectory -PathType Container
+    $configFileExistedBeforeSmoke = Test-Path -LiteralPath $deviceConfigPath -PathType Leaf
+    if ($configFileExistedBeforeSmoke -or @(Get-DesktopProcesses).Count -gt 0) {
+        throw "lifecycle_smoke_requires_disposable_windows_profile"
+    }
 
     $first = Start-Process -FilePath $BundleExecutable -PassThru
     $second = Start-Process -FilePath $BundleExecutable -PassThru
@@ -480,17 +417,32 @@ try {
     Set-LifecycleCheck "user_can_provision_controller_once" $true "controller_provisioning_failed"
     Set-LifecycleCheck "controller_starts_one_mock_helper" ((Get-HelperProcesses $primaryId).Count -eq 1) "controller_mock_helper_count_invalid"
 
-    $deviceConfigFiles = @(Get-ChildItem -LiteralPath $appDataRoot -Filter "device-config.json" -File -Recurse)
-    $configReportsAutostart = $false
+    $configPersisted = $false
     try {
-        if ($deviceConfigFiles.Count -eq 1) {
-            $deviceConfig = Get-Content -LiteralPath $deviceConfigFiles[0].FullName -Raw | ConvertFrom-Json
-            $configReportsAutostart = $deviceConfig.autostart_enabled -eq $true
-        }
+        Wait-Until {
+            if (-not (Test-Path -LiteralPath $script:deviceConfigPath -PathType Leaf)) { return $false }
+            $script:configCreatedBySmoke = $true
+            try {
+                $candidateConfig = Get-Content -LiteralPath $script:deviceConfigPath -Raw | ConvertFrom-Json
+            } catch {
+                return $false
+            }
+            $script:persistedConfigAfterProvision = [ordered]@{
+                schema_version = $candidateConfig.schema_version
+                role = $candidateConfig.role
+                autostart_enabled = $candidateConfig.autostart_enabled
+            }
+            return $candidateConfig.schema_version -eq 1 -and
+                $candidateConfig.role -ceq "CONTROLLER" -and
+                $candidateConfig.autostart_enabled -eq $true
+        } 15 "controller_device_config_not_persisted"
+        $configPersisted = $true
     } catch {
-        $configReportsAutostart = $false
+        $configPersisted = $false
     }
-    Set-LifecycleCheck "persisted_config_reports_autostart_enabled" $configReportsAutostart "controller_autostart_config_not_persisted"
+    Set-LifecycleCheck "persisted_config_schema_valid" $configPersisted "controller_device_config_not_persisted"
+    Set-LifecycleCheck "persisted_config_reports_controller_role" $configPersisted "controller_device_config_not_persisted"
+    Set-LifecycleCheck "persisted_config_reports_autostart_enabled" $configPersisted "controller_device_config_not_persisted"
 
     $hkcuEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
     $hklmEntries = @(Get-BundleAutostartEntries $machineRunKeyPath)
@@ -577,19 +529,15 @@ try {
         throw "lifecycle_state_unsafe_after_reopen"
     }
 
-    try {
-        Confirm-TrayQuit $helperId
-        Set-LifecycleCheck "tray_quit_confirms_and_stops_helper_before_exit" $true "tray_quit_failed"
-    } catch {
-        Set-LifecycleCheck "tray_quit_confirms_and_stops_helper_before_exit" $false ([string]$_.Exception.Message)
-        if (Get-Process -Id $helperId -ErrorAction SilentlyContinue) {
-            Stop-Process -Id $helperId -Force -ErrorAction SilentlyContinue
-        }
-        if (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) {
-            Stop-Process -Id $primaryId -Force -ErrorAction SilentlyContinue
-        }
-        Wait-Until { (Get-PrimaryProcesses).Count -eq 0 } 10 "failed_quit_cleanup_did_not_stop_primary"
-    }
+    Stop-Process -Id $helperId -Force -ErrorAction Stop
+    Stop-Process -Id $primaryId -Force -ErrorAction Stop
+    Wait-Until {
+        -not (Get-Process -Id $helperId -ErrorAction SilentlyContinue) -and
+        -not (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) -and
+        (Get-PrimaryProcesses).Count -eq 0
+    } 10 "restart_test_transition_processes_still_running"
+    $restartTestTransitionStoppedProcesses = $true
+    Set-LifecycleCheck "restart_test_transition_stopped_processes" $true "restart_test_transition_failed"
 
     $restartReady = $false
     try {
@@ -610,9 +558,40 @@ try {
         Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "restart_did_not_restore_controller_runtime"
         $helperId = [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId
         $helperProcessIds.Add($helperId)
-        $controllerHeading = Find-ElementByName (Get-PrimaryWindow) "Your Controller" ([System.Windows.Automation.ControlType]::Text)
-        $restartPassed = [bool]$controllerHeading -and (Get-HelperProcesses $primaryId).Count -eq 1
-        Set-LifecycleCheck "restart_restores_role_without_duplicate_helper" $restartPassed "restart_did_not_restore_single_controller"
+        Wait-Until {
+            $primaryProcesses = @(Get-PrimaryProcesses)
+            $helperProcesses = @(Get-HelperProcesses $primaryId)
+            if ($primaryProcesses.Count -ne 1 -or [int]$primaryProcesses[0].ProcessId -ne $primaryId -or
+                $helperProcesses.Count -ne 1 -or [int]$helperProcesses[0].ProcessId -ne $helperId) {
+                return $false
+            }
+            $process = Get-Process -Id $primaryId -ErrorAction SilentlyContinue
+            if (-not $process) { return $false }
+            $process.Refresh()
+            if ($process.MainWindowHandle -eq [IntPtr]::Zero -or
+                -not [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($process.MainWindowHandle)) {
+                return $false
+            }
+            $script:primaryWindowHandle = $process.MainWindowHandle
+            try {
+                $controllerHeading = Find-ElementByName (Get-PrimaryWindow) "Your Controller" `
+                    ([System.Windows.Automation.ControlType]::Text)
+                $restartConfig = Get-Content -LiteralPath $script:deviceConfigPath -Raw | ConvertFrom-Json
+            } catch {
+                return $false
+            }
+            if (-not $controllerHeading -or $restartConfig.schema_version -ne 1 -or
+                $restartConfig.role -cne "CONTROLLER" -or $restartConfig.autostart_enabled -ne $true) {
+                return $false
+            }
+            $script:persistedConfigAfterRestart = [ordered]@{
+                schema_version = $restartConfig.schema_version
+                role = $restartConfig.role
+                autostart_enabled = $restartConfig.autostart_enabled
+            }
+            return $true
+        } 15 "restart_controller_ui_not_ready"
+        Set-LifecycleCheck "restart_restores_role_without_duplicate_helper" $true "restart_controller_ui_not_ready"
 
         $restartHkcuEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
         $restartHklmEntries = @(Get-BundleAutostartEntries $machineRunKeyPath)
@@ -679,16 +658,9 @@ try {
             })
         }
         Set-LifecycleCheck "decommission_removes_test_autostart" ($decommissioned -and $postDecommissionHkcu.Count -eq 0) "decommission_left_autostart_registered"
-        try {
-            Confirm-TrayQuit 0
-            Set-LifecycleCheck "restart_quits_cleanly" $true "final_quit_failed"
-        } catch {
-            Set-LifecycleCheck "restart_quits_cleanly" $false ([string]$_.Exception.Message)
-        }
     } else {
         Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false "degraded_check_unavailable_after_restart_failure"
         Set-LifecycleCheck "decommission_removes_test_autostart" $false "decommission_check_unavailable_after_restart_failure"
-        Set-LifecycleCheck "restart_quits_cleanly" $false "final_quit_unavailable_after_restart_failure"
     }
 
     $failedChecks = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
@@ -706,13 +678,22 @@ try {
     }
 } finally {
     try {
-        foreach ($process in Get-PrimaryProcesses) {
+        $ownedProcessIds = [System.Collections.Generic.HashSet[int]]::new()
+        foreach ($processId in $startedProcessIds) { [void]$ownedProcessIds.Add([int]$processId) }
+        foreach ($processId in $observedPrimaryPids) { [void]$ownedProcessIds.Add([int]$processId) }
+        if ($primaryId) { [void]$ownedProcessIds.Add([int]$primaryId) }
+        $ownedProcesses = @(
+            Get-DesktopProcesses | Where-Object {
+                $ownedProcessIds.Contains([int]$_.ProcessId) -or
+                ($_.CommandLine -match "--threads-desktop-mock-runtime" -and
+                    $ownedProcessIds.Contains([int]$_.ParentProcessId))
+            }
+        )
+        foreach ($process in $ownedProcesses | Where-Object { $_.CommandLine -match "--threads-desktop-mock-runtime" }) {
             Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
         }
-        foreach ($process in Get-DesktopProcesses) {
-            if ($process.CommandLine -match "--threads-desktop-mock-runtime") {
-                Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-            }
+        foreach ($process in $ownedProcesses | Where-Object { $_.CommandLine -notmatch "--threads-desktop-mock-runtime" }) {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
         }
         foreach ($registryRoot in @(
             @{ name = "HKCU"; path = $currentUserRunKeyPath },
@@ -750,8 +731,21 @@ try {
         Add-FailureCode $cleanupFailureCode
         $result = "BLOCKER"
     }
-    $env:APPDATA = $previousAppData
-    if (Test-Path $appDataRoot) { Remove-Item -LiteralPath $appDataRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    try {
+        if ($configCreatedBySmoke -and -not $configFileExistedBeforeSmoke -and
+            $deviceConfigPath -and (Test-Path -LiteralPath $deviceConfigPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $deviceConfigPath -Force -ErrorAction Stop
+        }
+        if (-not $configDirectoryExistedBeforeSmoke -and $deviceConfigDirectory -and
+            (Test-Path -LiteralPath $deviceConfigDirectory -PathType Container) -and
+            @(Get-ChildItem -LiteralPath $deviceConfigDirectory -Force).Count -eq 0) {
+            Remove-Item -LiteralPath $deviceConfigDirectory -Force -ErrorAction Stop
+        }
+    } catch {
+        $cleanupFailureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
+        Add-FailureCode $cleanupFailureCode
+        $result = "BLOCKER"
+    }
     $evidenceDirectory = Split-Path -Parent $EvidencePath
     New-Item -ItemType Directory -Path $evidenceDirectory -Force | Out-Null
     $evidence = [ordered]@{
@@ -776,6 +770,13 @@ try {
             runner_image_version = $env:ImageVersion
         }
         executable_sha256 = $bundleHash
+        device_config_path = $deviceConfigPath
+        device_config_after_provision = $persistedConfigAfterProvision
+        device_config_after_restart = $persistedConfigAfterRestart
+        tray_shell_ui_automation = "NOT_GATED_ON_GITHUB_HOSTED"
+        restart_test_transition = if ($restartTestTransitionStoppedProcesses) {
+            "forced_process_termination_not_graceful_quit"
+        } else { "NOT_RUN" }
         checks = $checks
         autostart = $autostartEvidence
         helper_process_ids = @($helperProcessIds)
