@@ -358,14 +358,24 @@ function Quit-Desktop([int]$ProcessId) {
         55 "desktop_graceful_quit_timeout"
 }
 
-function Get-ProcessExitTime([System.Diagnostics.Process]$Process, [string]$Failure) {
-    Wait-Until {
+function Wait-ForProcessExit([System.Diagnostics.Process]$Process, [string]$Failure) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    while ([DateTime]::UtcNow -lt $deadline) {
         try {
             $Process.Refresh()
-            return $Process.HasExited
-        } catch { return $false }
-    } 20 $Failure
-    return $Process.ExitTime.ToUniversalTime()
+            if ($Process.HasExited) { return [DateTime]::UtcNow }
+        } catch { }
+        Start-Sleep -Milliseconds 200
+    }
+    throw $Failure
+}
+
+function Assert-ProcessStillRunning([System.Diagnostics.Process]$Process, [string]$Failure) {
+    try {
+        $Process.Refresh()
+        if (-not $Process.HasExited) { return }
+    } catch { }
+    throw $Failure
 }
 
 function Test-Http([object]$Config) {
@@ -520,16 +530,26 @@ try {
     }
     try {
         Quit-Desktop $desktop.Id
-        $schedulerExit = Get-ProcessExitTime $shutdownProcesses.scheduler "controller_scheduler_did_not_stop_first"
-        $httpExit = Get-ProcessExitTime $shutdownProcesses.http "controller_http_did_not_stop_after_scheduler"
-        $postgresExit = Get-ProcessExitTime $shutdownProcesses.postgres "controller_database_did_not_stop_after_http"
-        if (-not ($schedulerExit -lt $httpExit -and $httpExit -lt $postgresExit)) {
+        $schedulerExitObserved = Wait-ForProcessExit `
+            $shutdownProcesses.scheduler "controller_scheduler_did_not_stop_first"
+        Assert-ProcessStillRunning $shutdownProcesses.http "controller_http_stopped_before_scheduler"
+        Assert-ProcessStillRunning $shutdownProcesses.postgres "controller_database_stopped_before_scheduler"
+        $httpExitObserved = Wait-ForProcessExit `
+            $shutdownProcesses.http "controller_http_did_not_stop_after_scheduler"
+        Assert-ProcessStillRunning $shutdownProcesses.postgres "controller_database_stopped_before_http"
+        $postgresExitObserved = Wait-ForProcessExit `
+            $shutdownProcesses.postgres "controller_database_did_not_stop_after_http"
+        if (-not ($schedulerExitObserved -lt $httpExitObserved -and $httpExitObserved -lt $postgresExitObserved)) {
             throw "controller_shutdown_order_invalid"
         }
         $shutdownExitOrder = @(
-            [ordered]@{ process = "scheduler"; exited_utc = $schedulerExit.ToString("o") },
-            [ordered]@{ process = "http"; exited_utc = $httpExit.ToString("o") },
-            [ordered]@{ process = "postgres"; exited_utc = $postgresExit.ToString("o") }
+            [ordered]@{
+                process = "scheduler"; exit_observed_utc = $schedulerExitObserved.ToString("o")
+            },
+            [ordered]@{ process = "http"; exit_observed_utc = $httpExitObserved.ToString("o") },
+            [ordered]@{
+                process = "postgres"; exit_observed_utc = $postgresExitObserved.ToString("o")
+            }
         )
     } finally {
         foreach ($process in $shutdownProcesses.Values) { $process.Dispose() }
