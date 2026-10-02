@@ -7,6 +7,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$EvidenceOutput,
     [Parameter()]
+    [ValidateSet("shared", "split")]
+    [string]$RuntimeLayout = "shared",
+    [Parameter()]
+    [switch]$ControllerOnly,
+    [Parameter()]
     [string]$ControllerDesktopExecutable,
     [Parameter()]
     [string]$ControllerEvidenceOutput
@@ -20,6 +25,9 @@ $sourceStatus = @(& git -C $RepositoryRoot status --porcelain)
 $sourceStatusExitCode = $LASTEXITCODE
 $controllerSmokeRequested = -not [string]::IsNullOrWhiteSpace($ControllerDesktopExecutable)
 $controllerEvidenceRequested = -not [string]::IsNullOrWhiteSpace($ControllerEvidenceOutput)
+$controllerArgumentsValid = $controllerSmokeRequested -eq $controllerEvidenceRequested -and
+    (-not $controllerSmokeRequested -or $RuntimeLayout -eq "shared") -and
+    (-not $ControllerOnly -or $controllerSmokeRequested)
 if (
     $env:GITHUB_ACTIONS -ne "true" -or
     $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
@@ -31,7 +39,7 @@ if (
     $headExitCode -ne 0 -or
     $sourceStatusExitCode -ne 0 -or
     $sourceStatus.Count -ne 0 -or
-    $controllerSmokeRequested -ne $controllerEvidenceRequested -or
+    -not $controllerArgumentsValid -or
     -not [Environment]::Is64BitOperatingSystem
 ) {
     throw "hosted_smoke_requires_exact_sha_github_hosted_windows_x64_runner"
@@ -70,6 +78,7 @@ $stageControllerEvidence = Join-Path $stageEvidence "controller-lifecycle.json"
 $failures = [System.Collections.Generic.List[string]]::new()
 $icacls = Join-Path $env:SystemRoot "System32\icacls.exe"
 $verificationJsonPath = Join-Path $EvidenceOutput "runtime-evidence-verification.json"
+$layoutsToStage = if ($ControllerOnly) { @("shared") } else { @($RuntimeLayout) }
 
 function ConvertTo-SafeChildOutput([string]$Content) {
     $Content = [regex]::Replace(
@@ -319,7 +328,12 @@ function Invoke-ControllerSmokeProcess(
 try {
     New-Item -ItemType Directory -Path $EvidenceOutput -Force | Out-Null
     New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
-    $preflightPath = Join-Path $EvidenceOutput "hosted-runner-preflight.json"
+    $preflightName = if ($ControllerOnly) {
+        "hosted-controller-preflight.json"
+    } else {
+        "hosted-runner-preflight.json"
+    }
+    $preflightPath = Join-Path $EvidenceOutput $preflightName
     $preflight = [ordered]@{
         schema_version = 1
         source_revision = $ExpectedSourceRevision
@@ -414,7 +428,7 @@ try {
 
     New-Item -ItemType Directory -Path $stageCandidates -Force | Out-Null
     New-Item -ItemType Directory -Path $stageEvidence -Force | Out-Null
-    foreach ($layout in @("shared", "split")) {
+    foreach ($layout in $layoutsToStage) {
         try {
             $source = Join-Path $candidateRoot $layout
             if (-not (Test-Path -LiteralPath $source)) { throw "hosted_candidate_missing_$layout" }
@@ -423,7 +437,36 @@ try {
             $failures.Add("$layout candidate staging failed")
         }
     }
-    Copy-Item -LiteralPath $smokeScript -Destination $stageSmokeScript
+    if ($ControllerOnly) {
+        $runtimeVerificationPath = Join-Path $EvidenceOutput "runtime-evidence-verification.json"
+        $runtimeManifestPath = Join-Path $stageCandidates "shared\runtime-manifest.json"
+        if (-not (Test-Path -LiteralPath $runtimeVerificationPath -PathType Leaf)) {
+            throw "controller_runtime_verification_evidence_missing"
+        }
+        if (-not (Test-Path -LiteralPath $runtimeManifestPath -PathType Leaf)) {
+            throw "controller_shared_runtime_manifest_missing"
+        }
+        $runtimeVerification = Get-Content -LiteralPath $runtimeVerificationPath -Raw | ConvertFrom-Json
+        $sharedCandidateEvidence = @(
+            $runtimeVerification.candidates | Where-Object { $_.layout -eq "shared" -and $_.status -eq "PASS" }
+        )
+        $sharedSmokeEvidence = @(
+            $runtimeVerification.hosted_smokes | Where-Object { $_.layout -eq "shared" -and $_.status -eq "PASS" }
+        )
+        $runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
+        if (
+            $runtimeVerification.status -ne "PASS" -or
+            $runtimeVerification.source_revision -ne $ExpectedSourceRevision -or
+            $sharedCandidateEvidence.Count -ne 1 -or
+            $sharedSmokeEvidence.Count -ne 1 -or
+            $runtimeManifest.source_revision -ne $ExpectedSourceRevision -or
+            $runtimeManifest.layout -ne "shared"
+        ) {
+            throw "controller_shared_runtime_artifact_not_verified"
+        }
+    } else {
+        Copy-Item -LiteralPath $smokeScript -Destination $stageSmokeScript
+    }
     if ($controllerSmokeRequested) {
         $ControllerDesktopExecutable = (Resolve-Path -LiteralPath $ControllerDesktopExecutable).Path
         if (-not (Test-Path -LiteralPath $controllerSmokeScript -PathType Leaf)) {
@@ -437,42 +480,47 @@ try {
         Copy-Item -LiteralPath $controllerSmokeScript -Destination $stageControllerSmokeScript
     }
 
-    $archiveArgs = @(
-        "--candidate-root", $stageCandidates,
-        "--expected-source-revision", $ExpectedSourceRevision,
-        "--uv-lock", $lockPath,
-        "--download-manifest", $downloadManifestPath,
-        "--postgres-archive", $postgresArchivePath,
-        "--result-path", (Join-Path $EvidenceOutput "staged-candidate-verification.json")
-    )
-    & uv run --locked --no-dev --group packaging python $verifierScript @archiveArgs
-    if ($LASTEXITCODE -ne 0) { $failures.Add("hosted staged candidate checksum verification failed") }
+    if (-not $ControllerOnly) {
+        $archiveArgs = @(
+            "--candidate-root", $stageCandidates,
+            "--layouts", $RuntimeLayout,
+            "--expected-source-revision", $ExpectedSourceRevision,
+            "--uv-lock", $lockPath,
+            "--download-manifest", $downloadManifestPath,
+            "--postgres-archive", $postgresArchivePath,
+            "--result-path", (Join-Path $EvidenceOutput "staged-candidate-verification.json")
+        )
+        & uv run --locked --no-dev --group packaging python $verifierScript @archiveArgs
+        if ($LASTEXITCODE -ne 0) { $failures.Add("hosted staged candidate checksum verification failed") }
+    }
 
-    foreach ($layout in @("shared", "split")) {
-        $layoutEvidence = Join-Path $stageEvidence $layout
-        $bundleRoot = Join-Path $stageCandidates $layout
-        $smokeEvidencePath = Join-Path $layoutEvidence "smoke.json"
-        $outputLayout = Join-Path $EvidenceOutput $layout
-        $smokePassed = $false
-        try {
-            New-Item -ItemType Directory -Path $layoutEvidence -Force | Out-Null
-            New-Item -ItemType Directory -Path $outputLayout -Force | Out-Null
-            if (-not (Test-Path -LiteralPath $bundleRoot)) { throw "hosted_candidate_missing_$layout" }
-            $smokePassed = Invoke-SmokeProcess $bundleRoot $smokeEvidencePath $outputLayout
-        } catch {
-            $safeFailure = ConvertTo-SafeChildOutput ([string]$_.Exception.Message)
-            $failures.Add("$layout runtime smoke harness failed: $([regex]::Replace($safeFailure, '[^A-Za-z0-9_.-]', '_'))")
-        }
-        try {
-            if (Test-Path -LiteralPath $layoutEvidence) {
-                Get-ChildItem -LiteralPath $layoutEvidence -File | ForEach-Object {
-                    Copy-Item -LiteralPath $_.FullName -Destination $outputLayout -Force
-                }
+    if (-not $ControllerOnly) {
+        foreach ($layout in $layoutsToStage) {
+            $layoutEvidence = Join-Path $stageEvidence $layout
+            $bundleRoot = Join-Path $stageCandidates $layout
+            $smokeEvidencePath = Join-Path $layoutEvidence "smoke.json"
+            $outputLayout = Join-Path $EvidenceOutput $layout
+            $smokePassed = $false
+            try {
+                New-Item -ItemType Directory -Path $layoutEvidence -Force | Out-Null
+                New-Item -ItemType Directory -Path $outputLayout -Force | Out-Null
+                if (-not (Test-Path -LiteralPath $bundleRoot)) { throw "hosted_candidate_missing_$layout" }
+                $smokePassed = Invoke-SmokeProcess $bundleRoot $smokeEvidencePath $outputLayout
+            } catch {
+                $safeFailure = ConvertTo-SafeChildOutput ([string]$_.Exception.Message)
+                $failures.Add("$layout runtime smoke harness failed: $([regex]::Replace($safeFailure, '[^A-Za-z0-9_.-]', '_'))")
             }
-        } catch {
-            $failures.Add("$layout smoke evidence copy failed")
+            try {
+                if (Test-Path -LiteralPath $layoutEvidence) {
+                    Get-ChildItem -LiteralPath $layoutEvidence -File | ForEach-Object {
+                        Copy-Item -LiteralPath $_.FullName -Destination $outputLayout -Force
+                    }
+                }
+            } catch {
+                $failures.Add("$layout smoke evidence copy failed")
+            }
+            if (-not $smokePassed) { $failures.Add("$layout runtime smoke failed") }
         }
-        if (-not $smokePassed) { $failures.Add("$layout runtime smoke failed") }
     }
 
     if ($controllerSmokeRequested) {
@@ -480,7 +528,7 @@ try {
             $controllerSmokePassed = Invoke-ControllerSmokeProcess `
                 $stageControllerSmokeScript `
                 $stageControllerDesktop `
-                (Join-Path $stageCandidates "shared") `
+                (Join-Path $stageCandidates $RuntimeLayout) `
                 $stageControllerEvidence
             if (-not $controllerSmokePassed) { $failures.Add("shared M1 Controller lifecycle smoke failed") }
         } catch {
@@ -489,23 +537,26 @@ try {
         }
     }
 
-    $fullVerificationArgs = @(
-        "--candidate-root", $candidateRoot,
-        "--expected-source-revision", $ExpectedSourceRevision,
-        "--uv-lock", $lockPath,
-        "--download-manifest", $downloadManifestPath,
-        "--postgres-archive", $postgresArchivePath,
-        "--smoke-evidence-root", $EvidenceOutput,
-        "--result-path", $verificationJsonPath
-    )
-    & uv run --locked --no-dev --group packaging python $verifierScript @fullVerificationArgs
-    if ($LASTEXITCODE -ne 0) { $failures.Add("hosted runtime evidence verification failed") }
+    if (-not $ControllerOnly) {
+        $fullVerificationArgs = @(
+            "--candidate-root", $candidateRoot,
+            "--layouts", $RuntimeLayout,
+            "--expected-source-revision", $ExpectedSourceRevision,
+            "--uv-lock", $lockPath,
+            "--download-manifest", $downloadManifestPath,
+            "--postgres-archive", $postgresArchivePath,
+            "--smoke-evidence-root", $EvidenceOutput,
+            "--result-path", $verificationJsonPath
+        )
+        & uv run --locked --no-dev --group packaging python $verifierScript @fullVerificationArgs
+        if ($LASTEXITCODE -ne 0) { $failures.Add("hosted runtime evidence verification failed") }
+    }
 } catch {
     $safeFailure = ConvertTo-SafeChildOutput ([string]$_.Exception.Message)
     $failures.Add(("hosted runtime setup failed: " + [regex]::Replace($safeFailure, "[^A-Za-z0-9_.-]", "_")))
 } finally {
     try {
-        if (-not (Test-Path -LiteralPath $verificationJsonPath)) {
+        if (-not $ControllerOnly -and -not (Test-Path -LiteralPath $verificationJsonPath)) {
             $fallbackVerification = [ordered]@{
                 schema_version = 1
                 status = "BLOCKER"
@@ -534,4 +585,8 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
-Write-Output "DX-03 hosted Windows x64 non-admin smoke and evidence verification PASS for $ExpectedSourceRevision"
+if ($ControllerOnly) {
+    Write-Output "DX-04 hosted Windows x64 non-admin Controller smoke PASS for $ExpectedSourceRevision"
+} else {
+    Write-Output "DX-03 hosted Windows x64 non-admin $RuntimeLayout runtime smoke and evidence verification PASS for $ExpectedSourceRevision"
+}

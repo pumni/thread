@@ -334,3 +334,61 @@ def test_verification_artifact_records_both_layouts_after_one_smoke_fails(
         "packaged_http_exited_before_ready"
     )
     assert result["hosted_smokes"][1]["status"] == "PASS"
+
+
+def test_verification_accepts_only_the_selected_runtime_layout(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    verifier = _load_verifier()
+    revision = "d" * 40
+    uv_lock = tmp_path / "uv.lock"
+    uv_lock.write_text("locked", encoding="utf-8")
+    postgres_archive = tmp_path / "postgres.zip"
+    postgres_archive.write_bytes(b"pinned postgres archive")
+    download_manifest = tmp_path / "download-manifest.json"
+    _write_json(
+        download_manifest,
+        {
+            "postgresql": {
+                "sha256": hashlib.sha256(postgres_archive.read_bytes()).hexdigest(),
+                "content_bytes": postgres_archive.stat().st_size,
+            }
+        },
+    )
+    candidate_root = tmp_path / "candidates"
+    result_path = tmp_path / "runtime-evidence-verification.json"
+
+    def verify_selected(candidate: Path, *, layout: str, **_kwargs: Any) -> dict[str, Any]:
+        assert layout == "shared"
+        assert candidate == candidate_root / "shared"
+        return {"layout": layout}
+
+    monkeypatch.setattr(verifier, "verify_candidate", verify_selected)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--candidate-root",
+            str(candidate_root),
+            "--layouts",
+            "shared",
+            "--expected-source-revision",
+            revision,
+            "--uv-lock",
+            str(uv_lock),
+            "--download-manifest",
+            str(download_manifest),
+            "--postgres-archive",
+            str(postgres_archive),
+            "--result-path",
+            str(result_path),
+        ],
+    )
+
+    exit_code = verifier.main()
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert result["status"] == "PASS"
+    assert [candidate["layout"] for candidate in result["candidates"]] == ["shared"]

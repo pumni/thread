@@ -388,6 +388,13 @@ def main() -> int:
         description="Verify Windows Desktop runtime manifests and smoke evidence"
     )
     parser.add_argument("--candidate-root", type=Path, required=True)
+    parser.add_argument(
+        "--layouts",
+        nargs="+",
+        choices=LAYOUTS,
+        default=LAYOUTS,
+        help="Runtime layouts expected in this verification run",
+    )
     parser.add_argument("--expected-source-revision", required=True)
     parser.add_argument("--uv-lock", type=Path, required=True)
     parser.add_argument("--download-manifest", type=Path, required=True)
@@ -395,6 +402,7 @@ def main() -> int:
     parser.add_argument("--smoke-evidence-root", type=Path)
     parser.add_argument("--result-path", type=Path)
     args = parser.parse_args()
+    layouts = tuple(args.layouts)
 
     lock_sha256 = None
     expected_postgres_sha256 = None
@@ -420,7 +428,7 @@ def main() -> int:
         failures.append({"stage": "pinned_inputs", "failure": str(exc)})
 
     if lock_sha256 and expected_postgres_sha256:
-        for layout in LAYOUTS:
+        for layout in layouts:
             try:
                 candidate_result = verify_candidate(
                     args.candidate_root / layout,
@@ -442,7 +450,7 @@ def main() -> int:
     else:
         candidates = [
             {"layout": layout, "status": "BLOCKER", "failure": "pinned_inputs_unavailable"}
-            for layout in LAYOUTS
+            for layout in layouts
         ]
 
     preflight_status = "NOT_REQUESTED"
@@ -485,7 +493,7 @@ def main() -> int:
             preflight_status = "BLOCKER"
             failures.append({"stage": "preflight", "failure": str(exc)})
 
-        for layout in LAYOUTS:
+        for layout in layouts:
             try:
                 smoke = verify_smoke(
                     args.smoke_evidence_root,
