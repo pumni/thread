@@ -1,0 +1,80 @@
+name: Desktop CI
+
+on:
+  pull_request:
+    paths:
+      - "apps/desktop/**"
+      - "packaging/windows_desktop/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/desktop.yml"
+  push:
+    paths:
+      - "apps/desktop/**"
+      - "packaging/windows_desktop/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: corepack pnpm install --frozen-lockfile
+      - run: corepack pnpm lint
+      - run: corepack pnpm format:check
+      - run: corepack pnpm typecheck
+      - run: corepack pnpm test
+      - run: corepack pnpm build
+
+  native:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+      - run: corepack pnpm install --frozen-lockfile
+      - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: corepack pnpm tauri build --no-bundle -- --locked
+
+  runtime-packaging-static:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.12.21
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --locked ruff check packaging/windows_desktop
+      - run: uv run --locked ruff format --check packaging/windows_desktop
