@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import ntpath
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 METADATA_FILES = {"runtime-manifest.json", "runtime-manifest.json.sha256"}
@@ -242,7 +243,7 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
     process = verify_hosted_process_diagnostics(
         layout_root, layout=layout, expected_revision=expected_revision
     )
-    if evidence.get("schema_version") != 2:
+    if evidence.get("schema_version") != 3:
         raise SystemExit(f"Unsupported runtime smoke evidence version: {evidence_path}")
     if evidence.get("run_kind") != "github_hosted_windows_x64_isolated":
         raise SystemExit(f"Smoke did not use the hosted isolated-runner mode: {evidence_path}")
@@ -253,6 +254,8 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
         raise SystemExit(f"Smoke source revision mismatch: {evidence_path}")
     primary_failure = evidence.get("primary_failure_code") or evidence.get("failure_code")
     log_scrub_status = evidence.get("log_scrub_status")
+    if log_scrub_status not in {"PASS", "FAIL", "NOT_RUN"}:
+        raise SystemExit(f"Runtime log scrub status is invalid: {evidence_path}")
     smoke_passed = (
         evidence.get("status") == "PASS"
         and evidence.get("clean_windows_runner_status") == "PASS"
@@ -272,7 +275,7 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
         if smoke_passed:
             raise
     if not smoke_passed or runtime_log_verification_failure:
-        if not primary_failure and log_scrub_status != "PASS":
+        if not primary_failure and log_scrub_status == "FAIL":
             primary_failure = "runtime_log_scrub_verification_failed"
         if not primary_failure:
             primary_failure = process.get("spawn_failure_code") or "runtime_smoke_not_passed"
@@ -297,14 +300,17 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
         or host.get("current_user_is_administrator") is not False
     ):
         raise SystemExit(f"Smoke runner must be x64 and non-administrator: {evidence_path}")
+    verify_sanitized_path_inventory(host, evidence_path)
     if host.get("sanitized_path_missing_python_uv_docker") is not True:
         raise SystemExit(f"Smoke PATH exposes developer runtimes: {evidence_path}")
     sanitized_entries = host.get("sanitized_path_entries")
-    if not isinstance(sanitized_entries, list) or not {
+    if not isinstance(sanitized_entries, list) or set(sanitized_entries) != {
         "bundled-postgresql/bin",
         "Windows/System32",
-    }.issubset(set(sanitized_entries)):
-        raise SystemExit(f"Smoke PATH is not restricted to the bundle and Windows: {evidence_path}")
+    }:
+        raise SystemExit(
+            f"Smoke PATH is not restricted to the bundle and System32: {evidence_path}"
+        )
     required_checks = (
         "runtime_manifest_checksum_valid",
         "runtime_uses_only_packaged_postgresql",
@@ -331,6 +337,50 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
         "log_scrub_status": "PASS",
         "redacted_log_count": redacted_log_count,
     }
+
+
+def verify_sanitized_path_inventory(host: dict[str, Any], evidence_path: Path) -> None:
+    tool_names = (
+        "python.exe",
+        "python3.exe",
+        "py.exe",
+        "uv.exe",
+        "docker.exe",
+        "pg_ctl.exe",
+    )
+    inventory = host.get("sanitized_path_tool_inventory")
+    if not isinstance(inventory, dict) or set(inventory) != set(tool_names):
+        raise SystemExit(f"Smoke PATH tool inventory is incomplete: {evidence_path}")
+    for tool_name in tool_names:
+        item = inventory.get(tool_name)
+        if not isinstance(item, dict) or not isinstance(item.get("resolved"), bool):
+            raise SystemExit(f"Smoke PATH tool inventory is invalid: {evidence_path}")
+        resolved_path = item.get("path")
+        if item["resolved"]:
+            if (
+                not isinstance(resolved_path, str)
+                or not PureWindowsPath(resolved_path).is_absolute()
+            ):
+                raise SystemExit(f"Smoke PATH resolved path is not absolute: {evidence_path}")
+        elif resolved_path is not None:
+            raise SystemExit(f"Smoke PATH unresolved tool has a path: {evidence_path}")
+
+    forbidden_tools = tool_names[:-1]
+    leaked_tools = [name for name in forbidden_tools if inventory[name]["resolved"]]
+    if leaked_tools:
+        raise SystemExit(
+            f"Smoke PATH resolves forbidden host tools {leaked_tools}: {evidence_path}"
+        )
+
+    bundle_root = host.get("runtime_bundle_root")
+    pg_ctl = inventory["pg_ctl.exe"]
+    if not isinstance(bundle_root, str) or not PureWindowsPath(bundle_root).is_absolute():
+        raise SystemExit(f"Smoke runtime bundle root is not absolute: {evidence_path}")
+    expected_pg_ctl = str(PureWindowsPath(bundle_root) / "postgresql" / "bin" / "pg_ctl.exe")
+    if pg_ctl["resolved"] is not True or ntpath.normcase(
+        ntpath.normpath(pg_ctl["path"])
+    ) != ntpath.normcase(ntpath.normpath(expected_pg_ctl)):
+        raise SystemExit(f"Smoke PATH does not resolve packaged pg_ctl.exe: {evidence_path}")
 
 
 def main() -> int:

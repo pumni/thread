@@ -95,7 +95,7 @@ $postgresLog = $null
 $rawLogs = [System.Collections.Generic.List[string]]::new()
 $safeLogs = [System.Collections.Generic.List[string]]::new()
 $evidence = [ordered]@{
-    schema_version = 2
+    schema_version = 3
     run_kind = $RunKind
     source_revision = [string]$bundleManifest.source_revision
     source_tree_dirty = [bool]$bundleManifest.source_tree_dirty
@@ -110,6 +110,8 @@ $evidence = [ordered]@{
         current_user_is_administrator = $false
         ambient_path_prerequisites = @{}
         sanitized_path_entries = @()
+        sanitized_path_tool_inventory = [ordered]@{}
+        runtime_bundle_root = $null
         cleared_runtime_environment_names = @()
         sanitized_path_missing_python_uv_docker = $false
     }
@@ -122,8 +124,24 @@ $evidence = [ordered]@{
     log_scrub_failure_code = $null
 }
 
+function Get-ResolvedApplicationEvidence([string]$Name) {
+    $command = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $command) {
+        return [ordered]@{ resolved = $false; path = $null }
+    }
+    $resolvedPath = [string]$command.Source
+    if (-not [System.IO.Path]::IsPathFullyQualified($resolvedPath)) {
+        throw "runtime_tool_resolution_not_absolute"
+    }
+    return [ordered]@{
+        resolved = $true
+        path = [System.IO.Path]::GetFullPath($resolvedPath)
+    }
+}
+
 function Get-CommandPresence([string]$Name) {
-    return $null -ne (Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue)
+    return [bool](Get-ResolvedApplicationEvidence $Name).resolved
 }
 
 function Clear-RuntimeEnvironment {
@@ -391,18 +409,27 @@ try {
     }
 
     Clear-RuntimeEnvironment
-    $env:PATH = "$postgresBin;$env:SystemRoot\System32;$env:SystemRoot"
-    $evidence.host.sanitized_path_entries = @("bundled-postgresql/bin", "Windows/System32", "Windows")
-    $evidence.host.sanitized_path_missing_python_uv_docker = -not (
-        (Get-CommandPresence "python.exe") -or (Get-CommandPresence "python3.exe") -or
-        (Get-CommandPresence "py.exe") -or (Get-CommandPresence "uv.exe") -or
-        (Get-CommandPresence "docker.exe")
-    )
+    $env:PATH = "$postgresBin;$env:SystemRoot\System32"
+    $evidence.host.sanitized_path_entries = @("bundled-postgresql/bin", "Windows/System32")
+    $evidence.host.runtime_bundle_root = $BundleRoot
+    $toolInventory = [ordered]@{}
+    $hostToolNames = @("python.exe", "python3.exe", "py.exe", "uv.exe", "docker.exe")
+    foreach ($toolName in ($hostToolNames + @("pg_ctl.exe"))) {
+        $toolInventory[$toolName] = Get-ResolvedApplicationEvidence $toolName
+    }
+    $evidence.host.sanitized_path_tool_inventory = $toolInventory
+    $resolvedHostTools = @($hostToolNames | Where-Object { $toolInventory[$_].resolved })
+    $evidence.host.sanitized_path_missing_python_uv_docker = $resolvedHostTools.Count -eq 0
     if (-not $evidence.host.sanitized_path_missing_python_uv_docker) { throw "sanitized_path_leaked_build_tool" }
-    $resolvedPgCtl = Get-Command -Name "pg_ctl.exe" -CommandType Application -ErrorAction Stop
-    $evidence.checks.runtime_uses_only_packaged_postgresql = $resolvedPgCtl.Source.StartsWith(
-        $BundleRoot,
-        [System.StringComparison]::OrdinalIgnoreCase
+    $expectedPgCtl = [System.IO.Path]::GetFullPath((Join-Path $postgresBin "pg_ctl.exe"))
+    $resolvedPgCtl = [string]$toolInventory["pg_ctl.exe"].path
+    $evidence.checks.runtime_uses_only_packaged_postgresql = (
+        $toolInventory["pg_ctl.exe"].resolved -and
+        [string]::Equals(
+            $resolvedPgCtl,
+            $expectedPgCtl,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
     )
     if (-not $evidence.checks.runtime_uses_only_packaged_postgresql) { throw "sanitized_path_leaked_host_postgresql" }
 
@@ -581,6 +608,10 @@ try {
         }
     }
     $redactionVerified = $false
+    $runtimeLogsCreated =
+        (@($rawLogs | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0) -or
+        (@($safeLogs | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0) -or
+        ($postgresLog -and (Test-Path -LiteralPath $postgresLog))
     try {
         if ($localRoot) {
             Save-RedactedLogs
@@ -607,7 +638,10 @@ try {
         }
         $remainingRawLogs = @($rawLogs | Where-Object { Test-Path -LiteralPath $_ })
         $existingSafeLogs = @($safeLogs | Where-Object { Test-Path -LiteralPath $_ })
-        $redactionVerified = $remainingRawLogs.Count -eq 0 -and $existingSafeLogs.Count -gt 0
+        $runtimeLogsCreated = $runtimeLogsCreated -or $existingSafeLogs.Count -gt 0
+        $redactionVerified = $runtimeLogsCreated -and
+            $remainingRawLogs.Count -eq 0 -and
+            $existingSafeLogs.Count -gt 0
         foreach ($safeLog in $existingSafeLogs) {
             $content = [System.IO.File]::ReadAllText($safeLog)
             if (($databaseUrl -and $content.Contains($databaseUrl)) -or
@@ -620,17 +654,32 @@ try {
             }
         }
     } catch {
-        $redactionVerified = $false
-        $logScrubFailureCode = "runtime_log_scrub_verification_failed"
-    }
-    if (-not $redactionVerified) {
-        $localSmokeStatus = "FAIL"
-        if (-not $logScrubFailureCode) {
+        $runtimeLogsCreated = $runtimeLogsCreated -or
+            (@($rawLogs | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0) -or
+            (@($safeLogs | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0) -or
+            ($postgresLog -and (Test-Path -LiteralPath $postgresLog))
+        if ($runtimeLogsCreated) {
+            $redactionVerified = $false
             $logScrubFailureCode = "runtime_log_scrub_verification_failed"
         }
-        if (-not $primaryFailureCode) { $primaryFailureCode = $logScrubFailureCode }
     }
-    $logScrubStatus = if ($redactionVerified) { "PASS" } else { "FAIL" }
+    if ($runtimeLogsCreated) {
+        if (-not $redactionVerified) {
+            $localSmokeStatus = "FAIL"
+            if (-not $logScrubFailureCode) {
+                $logScrubFailureCode = "runtime_log_scrub_verification_failed"
+            }
+            if (-not $primaryFailureCode) { $primaryFailureCode = $logScrubFailureCode }
+        }
+        $logScrubStatus = if ($redactionVerified) { "PASS" } else { "FAIL" }
+    } else {
+        $logScrubFailureCode = $null
+        $logScrubStatus = "NOT_RUN"
+    }
+    if (-not $runtimeLogsCreated -and $localSmokeStatus -eq "PASS") {
+        $localSmokeStatus = "FAIL"
+        $primaryFailureCode = "runtime_logs_missing"
+    }
     if ($localRoot) { Remove-Item -LiteralPath $localRoot -Recurse -Force -ErrorAction SilentlyContinue }
     $env:PATH = $pathBefore
     foreach ($key in $savedRuntimeEnvironment.Keys) { Set-Item -LiteralPath "Env:$key" -Value $savedRuntimeEnvironment[$key] }
@@ -639,7 +688,13 @@ try {
     $evidence.failure_code = $primaryFailureCode
     $evidence.log_scrub_status = $logScrubStatus
     $evidence.log_scrub_failure_code = $logScrubFailureCode
-    $evidence.checks["redacted_runtime_logs"] = $redactionVerified
+    $evidence.checks["redacted_runtime_logs"] = if ($logScrubStatus -eq "PASS") {
+        $true
+    } elseif ($logScrubStatus -eq "FAIL") {
+        $false
+    } else {
+        $null
+    }
     $evidence.clean_windows_runner_status = $cleanVmStatus
     if ($CleanWindowsEvidence) {
         $evidence.clean_windows_runner_status = if ($localSmokeStatus -eq "PASS") { "PASS" } else { "BLOCKER" }
