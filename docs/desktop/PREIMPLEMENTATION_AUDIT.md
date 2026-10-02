@@ -53,7 +53,7 @@ The accepted `NetworkProfile` is account-scoped and the Worker currently lacks a
 
 | Gate | Open decision and acceptable evidence |
 |---|---|
-| DX-03 | Exact Python packaging topology (shared multipurpose onedir or a simpler proven alternative), Windows PostgreSQL distribution/licenses, default installer payload size, 64-bit supported target OS. Decide from clean VM evidence. |
+| DX-03 | Exact Python packaging topology (shared multipurpose onedir or a simpler proven alternative), Windows PostgreSQL distribution/licenses, default installer payload size, 64-bit supported target OS. Decide from fresh clean Windows x64 evidence; an isolated GitHub-hosted runner is acceptable. |
 | DX-04 | Real Windows process-tree/Job Object vs safe PostgreSQL shutdown implementation and crash policy. Require WAL/restart tests on the shipped Windows build. |
 | DX-05 | Fixed four-role per-action authorization matrix, idle lock, bootstrap and restricted legacy Worker admin API compatibility profile, initial Linux bootstrap. Explicit Owner decision before freezing rights. |
 | DX-06 | Root/leaf custody, verified TLS/WSS termination, trusted out-of-band fingerprint format, LAN endpoint/SAN rotation semantics. Security reviewer acceptance mandatory before exposing LAN. |

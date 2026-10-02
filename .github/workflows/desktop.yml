@@ -5,15 +5,19 @@ on:
     paths:
       - "apps/desktop/**"
       - "packaging/windows_desktop/**"
+      - "docs/desktop/**"
       - "pyproject.toml"
       - "uv.lock"
+      - "tests/unit/test_worker_control_client_httpx2.py"
       - ".github/workflows/desktop.yml"
   push:
     paths:
       - "apps/desktop/**"
       - "packaging/windows_desktop/**"
+      - "docs/desktop/**"
       - "pyproject.toml"
       - "uv.lock"
+      - "tests/unit/test_worker_control_client_httpx2.py"
       - ".github/workflows/desktop.yml"
   workflow_dispatch:
 
@@ -22,59 +26,150 @@ permissions:
 
 jobs:
   frontend:
-    runs-on: windows-latest
+    name: Bun frontend gates (Windows x64)
+    runs-on: windows-2025
     defaults:
       run:
         working-directory: apps/desktop
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
         with:
-          version: 10.34.6
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: apps/desktop/pnpm-lock.yaml
-      - run: corepack pnpm install --frozen-lockfile
-      - run: corepack pnpm lint
-      - run: corepack pnpm format:check
-      - run: corepack pnpm typecheck
-      - run: corepack pnpm test
-      - run: corepack pnpm build
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run format:check
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run build
 
   native:
-    runs-on: windows-latest
+    name: Rust and Tauri release build (Windows x64)
+    runs-on: windows-2025
     defaults:
       run:
         working-directory: apps/desktop
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: pnpm/action-setup@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          version: 10.34.6
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: apps/desktop/pnpm-lock.yaml
-      - run: corepack pnpm install --frozen-lockfile
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
       - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
-      - run: corepack pnpm tauri build --no-bundle -- --locked
+      - run: bun run tauri build --no-bundle -- --locked
+      - name: Run Windows tray and supervisor lifecycle smoke
+        shell: pwsh
+        run: >-
+          ../../packaging/windows_desktop/smoke_desktop_lifecycle.ps1
+          -BundleExecutable "$env:GITHUB_WORKSPACE/apps/desktop/src-tauri/target/release/threads-desktop.exe"
+          -ExpectedSourceRevision $env:GITHUB_SHA
+          -EvidencePath "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/desktop-lifecycle.json"
+      - name: Upload exact-SHA Desktop lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx02-windows-lifecycle-${{ github.sha }}
+          path: build/windows-desktop/evidence/desktop-lifecycle.json
+          if-no-files-found: warn
+          retention-days: 14
 
-  runtime-packaging-static:
-    runs-on: windows-latest
+  windows-runtime-packaging:
+    name: DX-03 packaged runtimes on isolated Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Assert exact clean source revision
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:GITHUB_SHA) { throw "checkout_sha_mismatch" }
+          if (-not [Environment]::Is64BitOperatingSystem) { throw "runner_must_be_windows_x64" }
+          Write-Output "DX03_SOURCE_SHA=$actual"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.12.21
+          enable-cache: true
+      - name: Install locked Python and packaging dependencies
+        run: uv sync --locked --no-dev --group packaging
+      - name: Check runtime packaging sources
+        run: |
+          uv run --locked --no-dev --group packaging ruff check packaging/windows_desktop
+          uv run --locked --no-dev --group packaging ruff format --check packaging/windows_desktop
+      - name: Build both pinned Windows runtime candidates
+        run: uv run --locked --no-dev --group packaging python packaging/windows_desktop/build_runtime.py --layout all
+      - name: Verify source, dependency, license and bundle checksums
+        run: >-
+          uv run --locked --no-dev --group packaging python
+          packaging/windows_desktop/verify_runtime_evidence.py
+          --candidate-root build/windows-desktop/candidates
+          --expected-source-revision $env:GITHUB_SHA
+          --uv-lock uv.lock
+          --download-manifest packaging/windows_desktop/download-manifest.json
+          --postgres-archive build/downloads/postgresql-17.11-4-windows-x64-binaries.zip
+          --result-path build/windows-desktop/evidence/build-verification.json
+      - name: Smoke candidates as a non-administrator with runtime prerequisites isolated
+        shell: pwsh
+        run: >-
+          ./packaging/windows_desktop/run_hosted_smoke.ps1
+          -RepositoryRoot $env:GITHUB_WORKSPACE
+          -ExpectedSourceRevision $env:GITHUB_SHA
+          -EvidenceOutput $env:GITHUB_WORKSPACE/build/windows-desktop/evidence/hosted
+      - name: Upload exact-SHA runtime and smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx03-windows-x64-${{ github.sha }}
+          path: |
+            build/windows-desktop/candidates
+            build/windows-desktop/evidence
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
+
+  windows-currentuser-root-ca:
+    name: CurrentUser Root trust security regression (Windows x64)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - uses: astral-sh/setup-uv@v6
         with:
           version: 0.12.21
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run --locked ruff check packaging/windows_desktop
-      - run: uv run --locked ruff format --check packaging/windows_desktop
+      - name: Run the unmodified CurrentUser Root security assertion
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build/windows-desktop/evidence -Force | Out-Null
+          $testLog = "build/windows-desktop/evidence/windows-currentuser-root-ca-test.log"
+          uv run --locked pytest -s -vv --tb=short `
+            tests/unit/test_worker_control_client_httpx2.py::test_control_client_trusts_only_windows_current_user_root_ca `
+            --basetemp "$env:RUNNER_TEMP\desktop-rootca-tests" 2>&1 | Tee-Object -FilePath $testLog
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) { exit $testExitCode }
+      - name: Upload sanitized CurrentUser Root test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx02-currentuser-root-ca-${{ github.sha }}
+          path: build/windows-desktop/evidence/windows-currentuser-root-ca-test.log
+          if-no-files-found: warn
+          retention-days: 14

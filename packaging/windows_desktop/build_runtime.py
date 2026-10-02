@@ -236,7 +236,13 @@ def build_layout(
         executable = destination / f"{name}.exe"
         if not executable.is_file():
             raise SystemExit(f"PyInstaller output missing: {executable}")
-        executables.append({"name": name, "executable_bytes": executable.stat().st_size})
+        executables.append(
+            {
+                "name": name,
+                "executable_bytes": executable.stat().st_size,
+                "executable_sha256": sha256_file(executable),
+            }
+        )
 
     postgres_root = candidate / "postgresql"
     extraction_root = output_root / "stage" / "postgresql-extract"
@@ -290,8 +296,12 @@ def build_layout(
         "database_data_included": False,
         "secrets_included": False,
     }
-    (candidate / "runtime-manifest.json").write_text(
+    manifest_path = candidate / "runtime-manifest.json"
+    manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (candidate / "runtime-manifest.json.sha256").write_text(
+        f"{sha256_file(manifest_path)}  runtime-manifest.json\n", encoding="ascii"
     )
     return manifest
 

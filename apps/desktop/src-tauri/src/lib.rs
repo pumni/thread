@@ -120,10 +120,11 @@ impl DeviceState {
     }
 
     fn snapshot(&self) -> Result<DesktopSnapshot, String> {
-        let inner = self
+        let mut inner = self
             .inner
             .lock()
             .map_err(|_| "state_unavailable".to_string())?;
+        inner.supervisor.refresh_health();
         Ok(DesktopSnapshot::from(&*inner))
     }
 

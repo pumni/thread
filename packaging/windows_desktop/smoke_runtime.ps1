@@ -3,7 +3,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BundleRoot,
     [Parameter(Mandatory = $true)]
-    [string]$EvidencePath
+    [string]$EvidencePath,
+    [string]$ExpectedSourceRevision,
+    [ValidateSet("local_non_clean_windows_smoke", "github_hosted_windows_x64_isolated")]
+    [string]$RunKind = "local_non_clean_windows_smoke",
+    [switch]$CleanWindowsEvidence
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,8 +71,12 @@ $BundleRoot = (Resolve-Path -LiteralPath $BundleRoot).Path
 $postgresBin = Join-Path $BundleRoot "postgresql\bin"
 $bundleManifest = Get-Content -LiteralPath (Join-Path $BundleRoot "runtime-manifest.json") -Raw | ConvertFrom-Json
 $layout = [string]$bundleManifest.layout
-$cleanVmStatus = "BLOCKER"
-$cleanVmReason = "No separate clean Windows x64 VM was available for this run."
+$cleanVmStatus = if ($CleanWindowsEvidence) { "PENDING" } else { "BLOCKER" }
+$cleanVmReason = if ($CleanWindowsEvidence) {
+    "GitHub-hosted Windows x64; runtime prerequisites are removed from PATH and environment before smoke."
+} else {
+    "Local smoke on a developer Windows host is not clean-machine acceptance evidence."
+}
 $localSmokeStatus = "FAIL"
 $failureCode = $null
 $httpStatus = $null
@@ -79,27 +87,28 @@ $databaseUrl = $null
 $databasePassword = $null
 $secretFile = $null
 $pathBefore = $env:PATH
-$databaseUrlBefore = $env:THREADS_PLATFORM_DATABASE_URL
-$pgPasswordBefore = $env:PGPASSWORD
-$otherRuntimeEnvironment = @{}
+$savedRuntimeEnvironment = @{}
 $localRoot = $null
 $postgresLog = $null
 $rawLogs = [System.Collections.Generic.List[string]]::new()
 $safeLogs = [System.Collections.Generic.List[string]]::new()
 $evidence = [ordered]@{
-    schema_version = 1
-    run_kind = "local_non_clean_windows_smoke"
+    schema_version = 2
+    run_kind = $RunKind
+    source_revision = [string]$bundleManifest.source_revision
+    source_tree_dirty = [bool]$bundleManifest.source_tree_dirty
     layout = $layout
     status = $localSmokeStatus
-    clean_windows_vm_status = $cleanVmStatus
-    clean_windows_vm_reason = $cleanVmReason
+    clean_windows_runner_status = $cleanVmStatus
+    clean_windows_runner_reason = $cleanVmReason
     host = [ordered]@{
         windows_version = [Environment]::OSVersion.Version.ToString()
+        architecture_x64 = [Environment]::Is64BitOperatingSystem
+        github_runner_image = $env:ImageOS
         current_user_is_administrator = $false
-        installed_python = $false
-        installed_uv = $false
-        installed_postgresql = $false
-        installed_docker = $false
+        ambient_path_prerequisites = @{}
+        sanitized_path_entries = @()
+        cleared_runtime_environment_names = @()
         sanitized_path_missing_python_uv_docker = $false
     }
     checks = [ordered]@{}
@@ -109,7 +118,22 @@ $evidence = [ordered]@{
 }
 
 function Get-CommandPresence([string]$Name) {
-    return $null -ne (Get-Command -Name $Name -ErrorAction SilentlyContinue)
+    return $null -ne (Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue)
+}
+
+function Clear-RuntimeEnvironment {
+    $names = @(
+        Get-ChildItem Env: |
+            Where-Object {
+                $_.Name -match "^(THREADS_PLATFORM_.*|PYTHON.*|PYLAUNCHER.*|UV_.*|VIRTUAL_ENV|PG.*|DOCKER_.*|COMPOSE_.*)$"
+            } |
+            ForEach-Object { $_.Name }
+    )
+    foreach ($name in $names) {
+        $savedRuntimeEnvironment[$name] = (Get-Item -LiteralPath "Env:$name").Value
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    }
+    $evidence.host.cleared_runtime_environment_names = @($names | Sort-Object)
 }
 
 function Get-Sha256Hex([string]$Path) {
@@ -266,14 +290,37 @@ $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
 $isAdministrator = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 $evidence.host.current_user_is_administrator = $isAdministrator
-$evidence.host.installed_python = Get-CommandPresence "python.exe"
-$evidence.host.installed_uv = Get-CommandPresence "uv.exe"
-$evidence.host.installed_postgresql = Get-CommandPresence "pg_ctl.exe"
-$evidence.host.installed_docker = Get-CommandPresence "docker.exe"
+$evidence.host.ambient_path_prerequisites = [ordered]@{
+    python = (Get-CommandPresence "python.exe") -or (Get-CommandPresence "python3.exe")
+    python_launcher = Get-CommandPresence "py.exe"
+    uv = Get-CommandPresence "uv.exe"
+    docker = Get-CommandPresence "docker.exe"
+    postgresql = Get-CommandPresence "pg_ctl.exe"
+}
 
 try {
+    if ($CleanWindowsEvidence -and (
+        $env:GITHUB_ACTIONS -ne "true" -or
+        $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
+        $env:RUNNER_OS -ne "Windows" -or
+        $env:RUNNER_ARCH -ne "X64" -or
+        $env:GITHUB_SHA -ne $ExpectedSourceRevision
+    )) {
+        throw "clean_windows_evidence_requires_exact_sha_github_hosted_windows_x64"
+    }
     if ($isAdministrator) { throw "smoke_requires_non_admin_user" }
     if ($layout -notin @("shared", "split")) { throw "unknown_runtime_layout" }
+    if ([string]$bundleManifest.source_tree_dirty -ne "False") { throw "runtime_source_tree_dirty" }
+    if ($ExpectedSourceRevision -and [string]$bundleManifest.source_revision -ne $ExpectedSourceRevision) {
+        throw "runtime_source_revision_mismatch"
+    }
+    $manifestChecksumPath = Join-Path $BundleRoot "runtime-manifest.json.sha256"
+    $manifestChecksum = (Get-Content -LiteralPath $manifestChecksumPath -Raw).Split([char[]]@(" ", "`t", "`r", "`n"), [StringSplitOptions]::RemoveEmptyEntries)
+    if ($manifestChecksum.Count -ne 2 -or $manifestChecksum[1] -cne "runtime-manifest.json" -or
+        $manifestChecksum[0] -cne (Get-Sha256Hex (Join-Path $BundleRoot "runtime-manifest.json"))) {
+        throw "runtime_manifest_checksum_mismatch"
+    }
+    $evidence.checks.runtime_manifest_checksum_valid = $true
     if ($layout -eq "shared") {
         $httpExe = Join-Path $BundleRoot "threads-runtime\threads-runtime.exe"
         $httpPrefix = @("http")
@@ -294,18 +341,27 @@ try {
         if (-not (Test-Path -LiteralPath $exe)) { throw "bundle_file_missing" }
     }
 
+    Clear-RuntimeEnvironment
+    $env:PATH = "$postgresBin;$env:SystemRoot\System32;$env:SystemRoot"
+    $evidence.host.sanitized_path_entries = @("bundled-postgresql/bin", "Windows/System32", "Windows")
+    $evidence.host.sanitized_path_missing_python_uv_docker = -not (
+        (Get-CommandPresence "python.exe") -or (Get-CommandPresence "python3.exe") -or
+        (Get-CommandPresence "py.exe") -or (Get-CommandPresence "uv.exe") -or
+        (Get-CommandPresence "docker.exe")
+    )
+    if (-not $evidence.host.sanitized_path_missing_python_uv_docker) { throw "sanitized_path_leaked_build_tool" }
+    $resolvedPgCtl = Get-Command -Name "pg_ctl.exe" -CommandType Application -ErrorAction Stop
+    $evidence.checks.runtime_uses_only_packaged_postgresql = $resolvedPgCtl.Source.StartsWith(
+        $BundleRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if (-not $evidence.checks.runtime_uses_only_packaged_postgresql) { throw "sanitized_path_leaked_host_postgresql" }
+
     $runtimeVersion = & $httpExe version 2>$null
     if ($LASTEXITCODE -ne 0 -or $runtimeVersion -notmatch "Python 3\.14\.") {
         throw "packaged_python_version_check_failed"
     }
     $evidence.checks.packaged_python_version = $runtimeVersion
-
-    $env:PATH = "$postgresBin;$env:SystemRoot\System32"
-    $evidence.host.sanitized_path_missing_python_uv_docker = -not (
-        (Get-CommandPresence "python.exe") -or (Get-CommandPresence "uv.exe") -or (Get-CommandPresence "docker.exe")
-    )
-    if (-not $evidence.host.sanitized_path_missing_python_uv_docker) { throw "sanitized_path_leaked_build_tool" }
-    $evidence.checks.runtime_uses_only_packaged_postgresql = (Get-Command -Name "pg_ctl.exe").Source.StartsWith($BundleRoot, [System.StringComparison]::OrdinalIgnoreCase)
 
     $dataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
     $localRoot = Join-Path $dataRoot ("ThreadsDesktopDx03Smoke\" + [guid]::NewGuid().ToString("N"))
@@ -317,10 +373,6 @@ try {
     $protectedCredential = Join-Path $localRoot "database-credential.dpapi"
     $secretFile = Join-Path $localRoot "initdb-password.transient"
 
-    foreach ($variable in @(Get-ChildItem Env: | Where-Object { $_.Name -like "THREADS_PLATFORM_*" -or $_.Name -like "PG*" })) {
-        $otherRuntimeEnvironment[$variable.Name] = $variable.Value
-        Remove-Item -LiteralPath "Env:$($variable.Name)" -ErrorAction SilentlyContinue
-    }
     $randomBytes = [byte[]]::new(32)
     $randomGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try { $randomGenerator.GetBytes($randomBytes) }
@@ -484,9 +536,11 @@ try {
             $postgresContent = [System.IO.File]::ReadAllText($postgresLog)
             if ($databaseUrl) { $postgresContent = $postgresContent.Replace($databaseUrl, "<REDACTED_DATABASE_URL>") }
             if ($databasePassword) { $postgresContent = $postgresContent.Replace($databasePassword, "<REDACTED>") }
+            $postgresContent = [regex]::Replace($postgresContent, "(?i)(password|database_url)\s*[:=]\s*\S+", '$1=<REDACTED>')
             $safePostgresLog = Join-Path $EvidenceDirectory "postgresql-startup.redacted.log"
             [System.IO.File]::WriteAllText($safePostgresLog, $postgresContent, [System.Text.UTF8Encoding]::new($false))
             $safeLogs.Add($safePostgresLog)
+            Remove-Item -LiteralPath $postgresLog -Force
         }
         $incompatibleRaw = Join-Path $localRoot "migration-incompatible.raw.log"
         $incompatibleSafe = Join-Path $EvidenceDirectory "migration-incompatible.redacted.log"
@@ -496,22 +550,37 @@ try {
             if ($databasePassword) { $incompatibleText = $incompatibleText.Replace($databasePassword, "<REDACTED>") }
             [System.IO.File]::WriteAllText($incompatibleSafe, $incompatibleText, [System.Text.UTF8Encoding]::new($false))
             $safeLogs.Add($incompatibleSafe)
+            Remove-Item -LiteralPath $incompatibleRaw -Force -ErrorAction SilentlyContinue
         }
         if ($secretFile -and (Test-Path -LiteralPath $secretFile)) { Remove-Item -LiteralPath $secretFile -Force }
         $credentialPath = Join-Path $localRoot "database-credential.dpapi"
         if (Test-Path -LiteralPath $credentialPath) { Remove-Item -LiteralPath $credentialPath -Force }
-        Remove-Item -LiteralPath $localRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+    $remainingRawLogs = @($rawLogs | Where-Object { Test-Path -LiteralPath $_ })
+    $existingSafeLogs = @($safeLogs | Where-Object { Test-Path -LiteralPath $_ })
+    $redactionVerified = $remainingRawLogs.Count -eq 0 -and $existingSafeLogs.Count -gt 0
+    foreach ($safeLog in $existingSafeLogs) {
+        $content = [System.IO.File]::ReadAllText($safeLog)
+        if (($databaseUrl -and $content.Contains($databaseUrl)) -or
+            ($databasePassword -and $content.Contains($databasePassword)) -or
+            [regex]::IsMatch($content, "(?i)(password|database_url)\s*[:=]\s*(?!<REDACTED>)[^\s]+")) {
+            $redactionVerified = $false
+        }
+    }
+    if (-not $redactionVerified) {
+        $localSmokeStatus = "FAIL"
+        $failureCode = "runtime_log_scrub_verification_failed"
+    }
+    if ($localRoot) { Remove-Item -LiteralPath $localRoot -Recurse -Force -ErrorAction SilentlyContinue }
     $env:PATH = $pathBefore
-    if ($null -eq $databaseUrlBefore) { Remove-Item Env:THREADS_PLATFORM_DATABASE_URL -ErrorAction SilentlyContinue }
-    else { $env:THREADS_PLATFORM_DATABASE_URL = $databaseUrlBefore }
-    if ($null -eq $pgPasswordBefore) { Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue }
-    else { $env:PGPASSWORD = $pgPasswordBefore }
-    foreach ($key in $otherRuntimeEnvironment.Keys) { Set-Item -LiteralPath "Env:$key" -Value $otherRuntimeEnvironment[$key] }
+    foreach ($key in $savedRuntimeEnvironment.Keys) { Set-Item -LiteralPath "Env:$key" -Value $savedRuntimeEnvironment[$key] }
     $evidence.status = $localSmokeStatus
     $evidence.failure_code = $failureCode
-    $evidence.checks | Add-Member -NotePropertyName redacted_runtime_logs -NotePropertyValue $true -Force
-    $evidence.clean_windows_vm_status = $cleanVmStatus
+    $evidence.checks | Add-Member -NotePropertyName redacted_runtime_logs -NotePropertyValue $redactionVerified -Force
+    $evidence.clean_windows_runner_status = $cleanVmStatus
+    if ($CleanWindowsEvidence) {
+        $evidence.clean_windows_runner_status = if ($localSmokeStatus -eq "PASS") { "PASS" } else { "BLOCKER" }
+    }
     $evidence.host.sanitized_path_missing_python_uv_docker = [bool]$evidence.host.sanitized_path_missing_python_uv_docker
     $evidence.redacted_logs = @($safeLogs | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object {
         [ordered]@{
@@ -528,6 +597,10 @@ try {
 }
 
 if ($localSmokeStatus -ne "PASS") {
-    throw "DX-03 local runtime smoke failed: $failureCode"
+    throw "DX-03 runtime smoke failed: $failureCode"
 }
-Write-Output "DX-03 local runtime smoke PASS; clean Windows VM remains BLOCKER. Evidence: $EvidencePath"
+if ($CleanWindowsEvidence) {
+    Write-Output "DX-03 GitHub-hosted Windows x64 runtime smoke PASS. Evidence: $EvidencePath"
+} else {
+    Write-Output "DX-03 local runtime smoke PASS; clean Windows runner evidence remains BLOCKER. Evidence: $EvidencePath"
+}

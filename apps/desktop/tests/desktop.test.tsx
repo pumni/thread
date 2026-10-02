@@ -73,6 +73,23 @@ describe("desktop provisioning", () => {
     expect(native.invoke).toHaveBeenCalledWith("provision_role", { role: "CONTROLLER" });
   });
 
+  it("provisions Worker without exposing an ordinary role switch", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot();
+      if (command === "provision_role") return snapshot("WORKER");
+      throw new Error("unknown command");
+    });
+
+    renderDesktop();
+    await screen.findByRole("heading", { name: "Choose this PC’s role" });
+    fireEvent.click(screen.getByRole("button", { name: "Provision as Worker" }));
+
+    await screen.findByRole("heading", { name: "Your Worker" });
+    expect(await screen.findByText("PID 4242")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Provision as Controller" })).not.toBeInTheDocument();
+    expect(native.invoke).toHaveBeenCalledWith("provision_role", { role: "WORKER" });
+  });
+
   it("keeps Console client-only without a local helper", async () => {
     native.invoke.mockImplementation(async (command: string) => {
       if (command === "get_desktop_snapshot") return snapshot();

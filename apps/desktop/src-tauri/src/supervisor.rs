@@ -71,6 +71,18 @@ pub(super) struct Supervisor {
 }
 
 impl Supervisor {
+    pub fn refresh_health(&mut self) {
+        let child_exited = self
+            .runtime
+            .as_mut()
+            .is_some_and(|runtime| matches!(runtime.child.try_wait(), Ok(Some(_))));
+        if child_exited {
+            self.runtime = None;
+            self.lifecycle = Lifecycle::Degraded;
+            self.diagnostic_code = Some("mock_runtime_exited_unexpectedly");
+        }
+    }
+
     pub fn snapshot(&self) -> SupervisorSnapshot {
         SupervisorSnapshot {
             state: self.lifecycle.label(),
@@ -222,5 +234,24 @@ mod tests {
         let snapshot = supervisor.snapshot();
         assert_eq!(snapshot.state, "stopped");
         assert_eq!(snapshot.process_id, None);
+    }
+
+    #[test]
+    fn force_killed_helper_is_reported_degraded() {
+        let mut supervisor = Supervisor::default();
+        supervisor.start().expect("start mock helper");
+        let runtime = supervisor.runtime.as_mut().expect("running helper");
+        runtime.child.kill().expect("force kill helper");
+        runtime.child.wait().expect("reap killed helper");
+
+        supervisor.refresh_health();
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, "degraded");
+        assert_eq!(snapshot.process_id, None);
+        assert_eq!(
+            snapshot.diagnostic_code,
+            Some("mock_runtime_exited_unexpectedly")
+        );
     }
 }
