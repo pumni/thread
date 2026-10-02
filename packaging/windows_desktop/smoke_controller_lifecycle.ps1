@@ -7,7 +7,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExpectedSourceRevision,
     [Parameter(Mandatory = $true)]
-    [string]$EvidencePath
+    [string]$EvidencePath,
+    [Parameter()]
+    [string]$VerifiedSourceRevision,
+    [Parameter()]
+    [switch]$VerifiedWorktreeClean
 )
 
 $ErrorActionPreference = "Stop"
@@ -375,16 +379,24 @@ function Assert-DatabaseValue([object]$Config, [string]$Expected) {
 }
 
 try {
-    $headLines = @(& git -C $repoRoot rev-parse HEAD)
-    if ($LASTEXITCODE -ne 0 -or $headLines.Count -eq 0) { throw "controller_git_head_unavailable" }
-    $head = ($headLines -join "`n").Trim()
-    $dirtyLines = @(& git -C $repoRoot status --porcelain)
-    if ($LASTEXITCODE -ne 0) { throw "controller_git_status_unavailable" }
-    $dirty = [string]::Join("`n", [string[]]$dirtyLines)
-    if ($LASTEXITCODE -ne 0 -or $head -ne $ExpectedSourceRevision -or $dirty.Length -ne 0) {
-        throw "controller_smoke_requires_exact_clean_source_revision"
+    if ($VerifiedSourceRevision) {
+        if (-not $VerifiedWorktreeClean -or $VerifiedSourceRevision -ne $ExpectedSourceRevision) {
+            throw "controller_smoke_requires_verified_exact_clean_source_revision"
+        }
+        $head = $VerifiedSourceRevision
+        $worktreeIsClean = $true
+    } else {
+        $headLines = @(& git -C $repoRoot rev-parse HEAD)
+        if ($LASTEXITCODE -ne 0 -or $headLines.Count -eq 0) { throw "controller_git_head_unavailable" }
+        $head = ($headLines -join "`n").Trim()
+        $dirtyLines = @(& git -C $repoRoot status --porcelain)
+        if ($LASTEXITCODE -ne 0) { throw "controller_git_status_unavailable" }
+        $dirty = [string]::Join("`n", [string[]]$dirtyLines)
+        if ($head -ne $ExpectedSourceRevision -or $dirty.Length -ne 0) {
+            throw "controller_smoke_requires_exact_clean_source_revision"
+        }
+        $worktreeIsClean = $true
     }
-    $worktreeIsClean = $true
     if ($deviceConfigExisted -or $controllerRootExisted -or
         (Test-Path -LiteralPath $savedRoot) -or (Test-Path -LiteralPath $unownedRoot)) {
         throw "controller_smoke_requires_disposable_windows_profile"
