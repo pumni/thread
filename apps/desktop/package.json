@@ -1,0 +1,39 @@
+{
+  "name": "threads-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint src tests vite.config.ts",
+    "format": "biome format --write src tests vite.config.ts",
+    "format:check": "biome format src tests vite.config.ts",
+    "test": "vitest run",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.104.0",
+    "@tauri-apps/api": "^2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "jsdom": "^30.1.1",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16",
+    "vitest": "^5.0.3"
+  }
+}

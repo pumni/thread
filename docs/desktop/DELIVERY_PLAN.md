@@ -8,7 +8,7 @@ Deliver a single Windows customer app and installer, powered by Tauri 2 + Rust +
 
 **Customer-visible promise:** install one app; choose this PC's role once; configure Controller or join existing workspace; operate via one UI. Bundled private helper processes remain allowed and necessary. Controller/Worker dedicated Windows user must sign in after reboot. Windows Service, boot-before-login availability, cloud relay and one-file physical executable are **not** MVP requirements.
 
-**Target M1 vertical slice:** clean Windows x64 VM, no preinstalled Python/PostgreSQL/Docker; launch a **provisional, one-app, loopback-only engineering test bundle** with a **disposable** private Controller cluster, close UI to tray, verify database/API/scheduler continue, Quit, restart and prove the same cluster and durable state. M1 has **no public LAN listener**, no fake persisted Owner, and no production authentication promise. Real first OWNER bootstrap is DX-05, public HTTPS LAN is DX-06 and the final single customer installer is DX-12. This proof must precede broad UI work.
+**Target M1 vertical slice:** fresh Windows x64 acceptance environment (GitHub-hosted runner with explicit runtime prerequisite isolation is accepted), with no runtime dependence on preinstalled Python/PostgreSQL/Docker; launch a **provisional, one-app, loopback-only engineering test bundle** with a **disposable** private Controller cluster, close UI to tray, verify database/API/scheduler continue, Quit, restart and prove the same cluster and durable state. M1 has **no public LAN listener**, no fake persisted Owner, and no production authentication promise. Real first OWNER bootstrap is DX-05, public HTTPS LAN is DX-06 and the final single customer installer is DX-12. This proof must precede broad UI work.
 
 ## 1. Existing implementation and non-negotiable reuse
 
@@ -56,8 +56,8 @@ Guard: >=1 enabled OWNER. Hard deletion of authoritative Account and destructive
 ```text
 thread/
   apps/desktop/
-    package.json                    # standalone pnpm app; no workspace/Nx/Turbo yet
-    pnpm-lock.yaml
+    package.json                    # standalone Bun app; no workspace/Nx/Turbo yet
+    bun.lock
     vite.config.ts
     tsconfig.json
     src/
@@ -191,7 +191,7 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 **DX-12 — reproducible one-installer Windows pipeline and CI** (depends DX-04, DX-07, DX-08, DX-11)
 - Build one branded installer containing signed-ready Tauri app, approved runtime bundle(s), private PostgreSQL and Worker Chromium as applicable. NSIS `setup.exe` is candidate; MSI only if an actual enterprise deployment need arises.
 - Fresh install, upgrade over durable data without accidental reset, uninstall leaves deliberate data-retention prompt, no system-wide DB/Python dependency, checksums/provenance/third-party licenses and artifact manifests. **Without user-facing backup/restore, only disposable/synthetic pilot data is in scope; no promise of safe destructive schema upgrade or production durable deployment.**
-- Add Windows desktop workflow for Rust fmt/clippy/test, pnpm frozen install/lint/typecheck/build, sidecar/packaging smoke, existing secret scan; backend integration suite runs for Python/schema/protocol changes. Keep Linux/Docker smoke official and green.
+- Add Windows desktop workflow for Rust fmt/clippy/test, Bun frozen install/lint/typecheck/test/build, sidecar/packaging smoke, existing secret scan; backend integration suite runs for Python/schema/protocol changes. Keep Linux/Docker smoke official and green.
 - Signing/publisher validation is a **distribution gate**; do not call unsigned internal artifact a production installer. Auto-updater deferred.
 
 **DX-13 — three-machine LAN end-to-end and failure rehearsal** (depends DX-04..DX-12)

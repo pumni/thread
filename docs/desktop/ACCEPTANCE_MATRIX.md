@@ -18,8 +18,8 @@
 | Package | Positive evidence | Adversarial/failure evidence | Exit condition |
 |---|---|---|---|
 | DX-01 | ADR/plan/contracts approved | Conflict against existing ADR/workflow audited | Product scope and risk owner recorded |
-| DX-02 | On Windows X hides UI; tray node remains; existing app reopens | Second invocation, Quit during startup, force-kill fake helper, incorrect persisted role, shared-PC lock | Fake supervisor lifecycle deterministic |
-| DX-03 | Clean VM runs bundled Python HTTP/scheduler and private PostgreSQL without Python/Docker installed | Missing redistributable, wrong architecture, AV quarantined helper, bad ACL, license unresolved | Reproducible `onedir`/alternate packaging decision |
+| DX-02 | On Windows X hides UI; tray node remains; reopening relocks protected UI; Windows session lock and inactivity timeout lock deterministically without stopping Controller/Worker helpers | Second invocation, Quit during startup, force-kill fake helper, incorrect persisted role, shared-PC lock, logout/relock, native WTS lock event, tray reopen | Fake supervisor and session lifecycle deterministic; Operator authentication/RBAC remains DX-05 |
+| DX-03 | Exact-SHA GitHub-hosted Windows x64 runner builds and runs both candidates as a non-admin; host Python/uv/PostgreSQL are excluded from runtime resolution, and ambient Docker presence is recorded without becoming a runtime prerequisite | Missing redistributable, wrong architecture, host runtime resolution, bad ACL, migration drift, non-loopback listen, log leak, license unresolved | Reproducible `onedir`/alternate packaging decision; coordinator selects no layout before review |
 | DX-04 | **Disposable loopback-only test bundle** initdb/migrate/HTTP/scheduler; close tray; quit; restart same data | No LAN listener or fake Owner before auth/TLS; corrupt/unwritable root, disk full, migration failure, port conflict, DB outage, true parent crash/WAL recovery, duplicate supervisor, second initdb | **M1** restricted prototype accepted (not final installer) |
 | DX-05 | Provision Owner on Windows **and Linux CLI**, login each role, create users, logout/revoke; operator-driven worker admin actions | Last Owner concurrent disable/demote, brute force, stale role after downgrade, **existing worker_admin_token enrollment/drain/intervention bypass**, forged created_by audit, Windows lock/unattended UI | Server-side auth/RBAC + legacy route reconciliation accepted |
 | DX-06 | IP-SAN HTTPS + **WSS** verified; Controller local/Console API parity; fingerprint from trusted local Controller identity; explicit TLS termination selection | MITM peer, wrong SAN/root/expiry, fake fingerprint UI, **spoofed forwarded headers, Worker ASGI scheme/proxy mismatch, Operator HTTP bypass**, changed IP, plaintext downgrade, credentials before trust | LAN trust security signoff |
@@ -49,10 +49,10 @@
 
 | Scope changed | Gate |
 |---|---|
-| React UI only | `pnpm install --frozen-lockfile`, lint, TS strict typecheck, React tests, Vite build, Tauri IPC snapshot tests |
+| React UI only | `bun install --frozen-lockfile`, lint, TS strict typecheck, React tests, Vite build, Tauri IPC snapshot tests |
 | Rust supervisor/native auth | `cargo fmt --check`, clippy warnings-as-errors, Rust unit/integration, Windows lifecycle process tests |
 | Python auth/accounts/protocol | `uv sync --locked`, `ruff check`, `ruff format --check`, `pyright`, `alembic check`, `pytest`; PostgreSQL migration/real-concurrency tests |
-| Installer/sidecar/PostgreSQL | Windows x64 version-pinned packaging job, signed-ready artifacts, SHA256/manifest/third-party license audit, clean VM smoke |
+| Installer/sidecar/PostgreSQL | Windows x64 version-pinned packaging job, signed-ready artifacts, SHA256/manifest/third-party license audit, isolated GitHub-hosted Windows x64 smoke |
 | Shared Operator/Worker protocol | Python + Rust/TS fixture parity and negative auth, version mismatch tests |
 | Linux/Docker backend/schema | Existing Docker Control Plane smoke and scheduler crash/recovery; new Operator API reachability smoke |
 | Any scope | Secret scan, dependency review where relevant, accepted issue and exact-head PR check |
