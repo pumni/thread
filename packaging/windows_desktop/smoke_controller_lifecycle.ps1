@@ -747,8 +747,7 @@ try {
     $aclWithDeny = Get-Acl -LiteralPath $controllerRoot
     $denyWriteRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
         [Security.Principal.SecurityIdentifier]::new($currentSid),
-        [System.Security.AccessControl.FileSystemRights]::Write -bor
-            [System.Security.AccessControl.FileSystemRights]::Modify,
+        [System.Security.AccessControl.FileSystemRights]::WriteData,
         [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
             [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
         [System.Security.AccessControl.PropagationFlags]::None,
