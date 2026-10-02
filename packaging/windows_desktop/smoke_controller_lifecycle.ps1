@@ -267,7 +267,21 @@ function Wait-ControllerState([int]$ProcessId, [string]$State, [string]$Diagnost
         if ($Diagnostic) {
             return $null -ne (Find-TextContaining $window $Diagnostic)
         }
-        return $null -ne (Find-Element $window $State ([System.Windows.Automation.ControlType]::Text))
+        if ($State -eq "Controller runtime is running") {
+            $failed = Find-TextContaining $window "Controller runtime failed"
+            if ($failed) {
+                $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
+                if ($diagnosticElement) {
+                    $diagnosticCode = ([string]$diagnosticElement.Current.Name) -replace `
+                        '^.*Diagnostic code:\s*', ''
+                    if (-not [string]::IsNullOrWhiteSpace($diagnosticCode)) {
+                        throw "controller_runtime_start_failed_$diagnosticCode"
+                    }
+                }
+                throw "controller_runtime_start_failed"
+            }
+        }
+        return $null -ne (Find-TextContaining $window $State)
     } $Timeout "controller_state_unavailable_$(if ($Diagnostic) { $Diagnostic } else { $State })"
 }
 
@@ -397,7 +411,7 @@ try {
 
     $desktop = Start-Desktop
     Invoke-Button $desktop.Id "Provision as Controller"
-    Wait-ControllerState $desktop.Id "Controller runtime is running" $null 360
+    Wait-ControllerState $desktop.Id "Controller runtime is running" $null 420
     $config = Get-ControllerConfig
     $controllerIdentity = [string]$config.controllerId
     $controllerAppData = [System.IO.Path]::GetFullPath($controllerRoot)
