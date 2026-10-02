@@ -49,6 +49,14 @@ namespace ThreadsControllerSmoke {
             out FileTime kernelTime,
             out FileTime userTime
         );
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr handle);
+
+        public static IntPtr OpenProcessForExitTime(uint processId) {
+            return OpenProcess(0x1000, false, processId);
+        }
 
         public static long GetProcessExitFileTime(IntPtr process) {
             FileTime creationTime;
@@ -383,14 +391,18 @@ function Quit-Desktop([int]$ProcessId) {
         55 "desktop_graceful_quit_timeout"
 }
 
-function Get-ProcessExitTime([System.Diagnostics.Process]$Process, [string]$Failure) {
+function Get-ProcessExitTime(
+    [System.Diagnostics.Process]$Process,
+    [IntPtr]$NativeHandle,
+    [string]$Failure
+) {
     Wait-Until {
         try {
             $Process.Refresh()
             return $Process.HasExited
         } catch { return $false }
     } 20 $Failure
-    $fileTime = [ThreadsControllerSmoke.NativeMethods]::GetProcessExitFileTime($Process.Handle)
+    $fileTime = [ThreadsControllerSmoke.NativeMethods]::GetProcessExitFileTime($NativeHandle)
     if ($fileTime -eq 0) { throw $Failure }
     return [DateTime]::FromFileTimeUtc($fileTime)
 }
@@ -545,14 +557,28 @@ try {
         foreach ($process in $shutdownProcesses.Values) { if ($process) { $process.Dispose() } }
         throw "controller_shutdown_process_handle_unavailable"
     }
+    $shutdownProcessHandles = [ordered]@{}
     try {
+        foreach ($name in @("scheduler", "http", "postgres")) {
+            $process = $shutdownProcesses[$name]
+            $nativeHandle = [ThreadsControllerSmoke.NativeMethods]::OpenProcessForExitTime(
+                [uint32]$process.Id
+            )
+            if ($nativeHandle -eq [IntPtr]::Zero) {
+                throw "controller_shutdown_process_handle_unavailable"
+            }
+            $shutdownProcessHandles[$name] = $nativeHandle
+        }
         Quit-Desktop $desktop.Id
         $schedulerExit = Get-ProcessExitTime `
-            $shutdownProcesses.scheduler "controller_scheduler_did_not_stop_first"
+            $shutdownProcesses.scheduler $shutdownProcessHandles["scheduler"] `
+            "controller_scheduler_did_not_stop_first"
         $httpExit = Get-ProcessExitTime `
-            $shutdownProcesses.http "controller_http_did_not_stop_after_scheduler"
+            $shutdownProcesses.http $shutdownProcessHandles["http"] `
+            "controller_http_did_not_stop_after_scheduler"
         $postgresExit = Get-ProcessExitTime `
-            $shutdownProcesses.postgres "controller_database_did_not_stop_after_http"
+            $shutdownProcesses.postgres $shutdownProcessHandles["postgres"] `
+            "controller_database_did_not_stop_after_http"
         if (-not ($schedulerExit -lt $httpExit -and $httpExit -lt $postgresExit)) {
             throw "controller_shutdown_order_invalid"
         }
@@ -566,6 +592,9 @@ try {
             }
         )
     } finally {
+        foreach ($nativeHandle in $shutdownProcessHandles.Values) {
+            $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($nativeHandle)
+        }
         foreach ($process in $shutdownProcesses.Values) { $process.Dispose() }
     }
     Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
