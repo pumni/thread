@@ -308,7 +308,15 @@ function Wait-ControllerState([int]$ProcessId, [string]$State, [string]$Diagnost
         $window = Get-Window $ProcessId
         if (-not $window) { return $false }
         if ($Diagnostic) {
-            return $null -ne (Find-TextContaining $window $Diagnostic)
+            $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
+            if (-not $diagnosticElement) { return $false }
+            $actualDiagnostic = ([string]$diagnosticElement.Current.Name) -replace `
+                '^.*Diagnostic code:\s*', ''
+            if (-not [string]::IsNullOrWhiteSpace($actualDiagnostic) -and
+                $actualDiagnostic -cne $Diagnostic) {
+                throw "controller_unexpected_diagnostic_$actualDiagnostic"
+            }
+            return $actualDiagnostic -ceq $Diagnostic
         }
         if ($State -eq "Controller runtime is running") {
             $failed = Find-TextContaining $window "Controller runtime failed"
@@ -748,6 +756,19 @@ try {
     )
     $aclWithDeny.AddAccessRule($denyWriteRule)
     Set-Acl -LiteralPath $controllerRoot -AclObject $aclWithDeny
+    $writeDenied = $false
+    try {
+        $writeProbe = [System.IO.File]::Open(
+            (Join-Path $controllerRoot "controller.json"),
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $writeProbe.Dispose()
+    } catch [System.UnauthorizedAccessException] {
+        $writeDenied = $true
+    }
+    if (-not $writeDenied) { throw "controller_unwritable_root_acl_not_enforced" }
     $desktop = Start-Desktop
     Wait-ControllerState $desktop.Id "Failed" "controller_data_root_access_denied" 40
     $checks.unwritable_root_is_rejected = $true
