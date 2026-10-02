@@ -642,7 +642,14 @@ try {
             if (-not $phraseInput) { throw "decommission_confirmation_input_unavailable" }
             $phraseInput.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue("RESET THIS DEVICE")
             Invoke-Button "Decommission"
-            Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 0 } 10 "decommission_did_not_stop_mock_helper"
+            Wait-Until {
+                if ((Get-HelperProcesses $primaryId).Count -ne 0) { return $false }
+                $decommissionConfig = Get-Content -LiteralPath $deviceConfigPath -Raw | ConvertFrom-Json
+                $decommissionEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
+                return $null -eq $decommissionConfig.role -and
+                    $decommissionConfig.autostart_enabled -eq $false -and
+                    $decommissionEntries.Count -eq 0
+            } 15 "decommission_did_not_clear_device_or_autostart"
             $decommissioned = $true
         } catch {
             Add-FailureCode ([string]$_.Exception.Message)
