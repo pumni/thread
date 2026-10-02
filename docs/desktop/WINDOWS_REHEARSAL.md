@@ -1,6 +1,6 @@
 # Windows Desktop v1 — Packaging, Operations and Rehearsal Runbook
 
-**Planning document, not an installed product runbook.** Commands/paths below are design contracts or test targets; implementers must replace illustrative invocations with real supported CLI only after DX-03/DX-04 confirm exact binaries.
+**M1 implementation and acceptance runbook.** This remains an internal disposable test bundle, not an installed customer product or production runbook. Exact-head Windows evidence and separate coordinator acceptance are still required.
 
 ## 1. Deployment profiles
 
@@ -15,7 +15,8 @@ Current legacy Windows Worker Task Scheduler host remains supported until explic
 
 ## 2. Prototype proof vs production-shaped first run
 
-- **M1 / DX-04:** provisional local engineering runtime **on loopback only**, using a disposable database and proven bundled test helpers. Does **not** expose an unauthenticated LAN API, create a fake durable Owner, imply production auth, or require final NSIS/MSI installer. Proves Controller PostgreSQL -> migrations -> HTTP -> scheduler -> X-to-tray -> Quit -> recovery.
+- **M1 / DX-04:** provisional local engineering runtime **on loopback only**, using a disposable database and the accepted `shared` PyInstaller onedir. Its `http` and `scheduler` modes are separate OS processes. M1 does **not** expose an unauthenticated LAN API, create a fake durable Owner, imply production auth, or require a final installer. It proves PostgreSQL -> migrations -> M1 bootstrap boundary (no Owner writes) -> HTTP -> scheduler -> X-to-tray -> Quit -> crash recovery.
+- The UI states that runtime is unavailable before this Windows user signs in, Windows logout is unsupported, and portable backup/production durability are unavailable.
 - **M2 / DX-05 + DX-06:** actual Owner bootstrap and authenticated HTTPS/WSS Controller endpoint. Before these gates, no remote Console login or LAN Worker pairing is permitted.
 - **M4 / DX-12:** one final installable Windows setup artifact for Controller/Worker/Console; package signing/licensing and real Windows test evidence are separate release checks.
 
@@ -41,36 +42,35 @@ Console wizard: enter Controller endpoint -> first-contact identity verification
 
 ## 4. Internal Controller root and permissions
 
-Target immutable binaries: `C:\Program Files\Threads Operations\...`. Target durable machine-role data: `%PROGRAMDATA%\ThreadsOperations\Controller\` with an explicit ACL granting the single stable Windows runtime user and expected OS administrators only. Child PostgreSQL runs under **the dedicated non-elevated Windows user**, not LocalSystem; verify this supported PostgreSQL privilege model in DX-03. No writable executable under data root and no durable state inside the release bundle.
+Target immutable binaries: `C:\Program Files\Threads Operations\...`. M1 uses the current user's Tauri app-local-data directory, `%LOCALAPPDATA%\com.pumni.threads-desktop\Controller\`, so the interactive user owns one ACL-scoped root and current-user DPAPI can protect its database credential. DX-04 records the runner privilege context and verifies current-user Full Control plus same-user DPAPI round-trip. A later installed deployment may use `%PROGRAMDATA%\ThreadsOperations\Controller\` only after the installer-to-runtime-user ACL handoff is proven; M1 does not claim that installer behavior. No writable executable is stored inside Controller data and no database directory is copied to a release artifact.
 
 Illustrative stable layout:
 
 ```text
 Controller/
-  config/                 non-secret role/endpoint/version
-  identity/               versioned DPAPI-protected CA/private material
-  postgres-data/          private PostgreSQL data directory
-  logs/                   fixed-bound redacted operational logs
-  runtime/                process locks and crash metadata, no secrets
+  controller.json                 atomic non-secret ID and persisted ports
+  database-credential.dpapi       current-user DPAPI protected credential
+  postgresql/                     private PostgreSQL data directory
+  .owner.lock                     exclusive current-process data-root lock
 ```
 
 Worker remains under its existing `%LOCALAPPDATA%\ThreadsOperations\worker|profiles|journal|logs` layout. A separate Console user-profile store contains non-secret recent endpoint/trust metadata; never copy Controller private material.
 
-PostgreSQL binds `127.0.0.1` private persisted app-managed port; no LAN 5432. Controller API binds a persisted dedicated TLS LAN port; fail if unavailable rather than silently changing to a new Worker endpoint. Firewall rule and elevation model must be implemented and reviewed in DX-12 (installer/elevated phase) without asking UI to run permanently as administrator.
+PostgreSQL and M1 HTTP bind `127.0.0.1` on ports persisted in `controller.json`; a collision fails without changing either port. M1 HTTP is intentionally unauthenticated and stays loopback-only. DX-05 adds Owner bootstrap/RBAC; DX-06 selects the trusted HTTPS/WSS LAN endpoint. Firewall and elevation behavior remain outside M1.
 
 ## 5. Startup and shutdown state machine
 
 ```text
-UNPROVISIONED -> PREFLIGHT -> DB_STARTING -> DB_READY
-              -> MIGRATING -> OWNER_READY -> HTTP_STARTING
-              -> HTTP_READY -> SCHEDULER_STARTING -> RUNNING
+UNPROVISIONED -> PREFLIGHT/ROOT_LOCK -> DB_STARTING -> DB_READY
+              -> MIGRATING -> M1_BOOTSTRAP_BOUNDARY (no Owner write)
+              -> HTTP_STARTING -> HTTP_READY -> SCHEDULER_STARTING -> RUNNING
 
 RUNNING --X--> RUNNING+HIDDEN
 RUNNING --explicit Quit--> STOPPING -> STOPPED -> desktop exits
-failure -> DEGRADED/FAILED with bounded restart/manual intervention
+failure -> FAILED with a fixed redacted code; readiness waits use bounded backoff
 ```
 
-Provisioning/role config has a versioned atomic file write. Lock identity/data root before launching children; fail duplicate launch. Schema unknown/newer than binary -> **stop and show diagnostics**, never auto downgrade/reinitialize. DB unavailable -> failed readiness, bounded restart only if safe; never delete cluster as self-healing. Browser Worker uses device-authenticated drain/quiescence before Quit; if timeout, report and require explicit user choice and documented interruption/recovery consequence.
+Controller config has a versioned atomic write and contains no credential. The DPAPI credential is separate. The root lock is held before any child starts; a second owner fails. Migrations use the unchanged Alembic head and never roll back schema. `initdb` runs only for a root created by the current first-run call; an incomplete, corrupt or unowned existing root fails without reset. HTTP and scheduler share `threads-runtime.exe` but have independent process IDs and lifecycles. Quit stops scheduler, then HTTP, then asks bundled `pg_ctl` for PostgreSQL fast shutdown. PostgreSQL crash or parent crash leaves the cluster in place for WAL recovery.
 
 Owner/operator session is unrelated to the tray node: UI logout or session expiry cannot stop Controller/Worker runtime. Reopening on an unattended PC should lock the business UI according to DX-05 security policy.
 
@@ -89,11 +89,11 @@ Owner/operator session is unrelated to the tray node: UI logout or session expir
 | Disk/DPAPI identity lost | No guaranteed Controller portable recovery in v1; clearly disclose |
 | Windows Update reboot | Autostart only after sign-in; no Windows auto-login solution |
 
-Use real Windows Job Objects/process locks where proven; test PostgreSQL graceful shutdown and recovery instead of presuming closing a parent tree is WAL-safe. When desktop crashes and PostgreSQL cannot stop cleanly, WAL recovery must be exercised; never recreate cluster. Worker OS-forced shutdown remains the existing durable lease-expiry/reconciliation scenario, not a graceful drain claim.
+DX-04 assigns each runtime child to a Windows Job Object with `KILL_ON_JOB_CLOSE` and holds an exclusive data-root file handle. A parent crash closes the job, terminates PostgreSQL/HTTP/scheduler, and releases the root lock. The acceptance smoke kills only the Tauri parent, verifies all three runtime processes exit, relaunches the same cluster, checks the PostgreSQL system identifier and a committed synthetic sentinel, and confirms exactly one scheduler. A PostgreSQL-only crash fails closed and stops its HTTP/scheduler dependents before same-data relaunch. No crash path runs `initdb` for an existing root.
 
 ## 7. Packaging and upgrade cutover
 
-- First DX-03 spike compares shared Python `onedir` multi-mode helper to alternative shared-runtime packaging; record binaries/manifest/license, **installer-elevation vs stable runtime user ACL/DPAPI handoff**, WSS TLS termination candidates and clean-machine proof. Bundle matching Playwright Chromium for Worker without copying browser profiles into release assets.
+- DX-03 compared shared Python `onedir` multi-mode helper to split executables; `shared` is selected for M1 only. M1 records binaries/manifest/license and verifies current-user ACL/DPAPI under the logged-in Windows user. Installer-elevation handoff, TLS termination, signing and AV remain later gates. Bundle matching Playwright Chromium for Worker without copying browser profiles into release assets.
 - Keep runtime binaries versioned and immutable. Desktop lifecycle/role/data schema do not depend on app release directory. No automatic downloader/updater.
 - Upgrade manually **for disposable/internal test data only in v1**: validate source version and schema, stop/drain, preserve state where possible, replace binaries, migrate forward, restart, inspect health. Schema rollback is not assumed. Do not claim customer-data upgrade safety without a portable backup/restore solution. Product backup/restore is deferred: destructive migration and production-data upgrades require explicit future safety gate.
 - Installer removal must not delete durable Controller DB or Worker browser profiles implicitly. Require separate explicit decommission/data-deletion user action and privacy warning.

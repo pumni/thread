@@ -87,15 +87,15 @@ foreach ($registryRoot in @(
 
 $checks = [ordered]@{
     concurrent_launch_keeps_one_primary = $false
-    user_can_provision_controller_once = $false
+    user_can_provision_worker_once = $false
     autostart_hkcu_registered = $false
     autostart_current_user_only = $false
     restart_autostart_hkcu_registered = $false
     restart_autostart_current_user_only = $false
     persisted_config_schema_valid = $false
-    persisted_config_reports_controller_role = $false
+    persisted_config_reports_worker_role = $false
     persisted_config_reports_autostart_enabled = $false
-    controller_starts_one_mock_helper = $false
+    worker_starts_one_mock_helper = $false
     second_launch_reuses_and_focuses_instance = $false
     window_close_hides_without_stopping_helper = $false
     tray_reopen_relocks_session_without_stopping_helper = $false
@@ -410,12 +410,12 @@ try {
     } 25 "desktop_initial_window_not_visible"
     Set-LifecycleCheck "concurrent_launch_keeps_one_primary" ((Get-PrimaryProcesses).Count -eq 1) "single_instance_primary_count_invalid"
 
-    Invoke-Button "Provision as Controller"
-    Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "controller_mock_helper_did_not_start"
+    Invoke-Button "Provision as Worker"
+    Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "worker_mock_helper_did_not_start"
     $helperId = [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId
     $helperProcessIds.Add($helperId)
-    Set-LifecycleCheck "user_can_provision_controller_once" $true "controller_provisioning_failed"
-    Set-LifecycleCheck "controller_starts_one_mock_helper" ((Get-HelperProcesses $primaryId).Count -eq 1) "controller_mock_helper_count_invalid"
+    Set-LifecycleCheck "user_can_provision_worker_once" $true "worker_provisioning_failed"
+    Set-LifecycleCheck "worker_starts_one_mock_helper" ((Get-HelperProcesses $primaryId).Count -eq 1) "worker_mock_helper_count_invalid"
 
     $configPersisted = $false
     try {
@@ -433,16 +433,16 @@ try {
                 autostart_enabled = $candidateConfig.autostart_enabled
             }
             return $candidateConfig.schema_version -eq 1 -and
-                $candidateConfig.role -ceq "CONTROLLER" -and
+                $candidateConfig.role -ceq "WORKER" -and
                 $candidateConfig.autostart_enabled -eq $true
-        } 15 "controller_device_config_not_persisted"
+        } 15 "worker_device_config_not_persisted"
         $configPersisted = $true
     } catch {
         $configPersisted = $false
     }
-    Set-LifecycleCheck "persisted_config_schema_valid" $configPersisted "controller_device_config_not_persisted"
-    Set-LifecycleCheck "persisted_config_reports_controller_role" $configPersisted "controller_device_config_not_persisted"
-    Set-LifecycleCheck "persisted_config_reports_autostart_enabled" $configPersisted "controller_device_config_not_persisted"
+    Set-LifecycleCheck "persisted_config_schema_valid" $configPersisted "worker_device_config_not_persisted"
+    Set-LifecycleCheck "persisted_config_reports_worker_role" $configPersisted "worker_device_config_not_persisted"
+    Set-LifecycleCheck "persisted_config_reports_autostart_enabled" $configPersisted "worker_device_config_not_persisted"
 
     $hkcuEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
     $hklmEntries = @(Get-BundleAutostartEntries $machineRunKeyPath)
@@ -574,14 +574,14 @@ try {
             }
             $script:primaryWindowHandle = $process.MainWindowHandle
             try {
-                $controllerHeading = Find-ElementByName (Get-PrimaryWindow) "Your Controller" `
+                $workerHeading = Find-ElementByName (Get-PrimaryWindow) "Your Worker" `
                     ([System.Windows.Automation.ControlType]::Text)
                 $restartConfig = Get-Content -LiteralPath $script:deviceConfigPath -Raw | ConvertFrom-Json
             } catch {
                 return $false
             }
-            if (-not $controllerHeading -or $restartConfig.schema_version -ne 1 -or
-                $restartConfig.role -cne "CONTROLLER" -or $restartConfig.autostart_enabled -ne $true) {
+            if (-not $workerHeading -or $restartConfig.schema_version -ne 1 -or
+                $restartConfig.role -cne "WORKER" -or $restartConfig.autostart_enabled -ne $true) {
                 return $false
             }
             $script:persistedConfigAfterRestart = [ordered]@{
@@ -590,8 +590,8 @@ try {
                 autostart_enabled = $restartConfig.autostart_enabled
             }
             return $true
-        } 15 "restart_controller_ui_not_ready"
-        Set-LifecycleCheck "restart_restores_role_without_duplicate_helper" $true "restart_controller_ui_not_ready"
+        } 15 "restart_worker_ui_not_ready"
+        Set-LifecycleCheck "restart_restores_role_without_duplicate_helper" $true "restart_worker_ui_not_ready"
 
         $restartHkcuEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
         $restartHklmEntries = @(Get-BundleAutostartEntries $machineRunKeyPath)
@@ -659,7 +659,7 @@ try {
         }
         Set-LifecycleCheck "decommission_removes_test_autostart" ($decommissioned -and $postDecommissionHkcu.Count -eq 0) "decommission_left_autostart_registered"
     } else {
-        Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false "degraded_check_unavailable_after_restart_failure"
+        Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false "failed_check_unavailable_after_restart_failure"
         Set-LifecycleCheck "decommission_removes_test_autostart" $false "decommission_check_unavailable_after_restart_failure"
     }
 

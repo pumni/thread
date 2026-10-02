@@ -86,16 +86,29 @@ jobs:
           path: build/windows-desktop/evidence/desktop-lifecycle.json
           if-no-files-found: warn
           retention-days: 14
+      - name: Upload exact-SHA Desktop executable for Controller lifecycle smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx04-desktop-${{ github.sha }}
+          path: apps/desktop/src-tauri/target/release/threads-desktop.exe
+          if-no-files-found: error
+          retention-days: 14
 
   windows-runtime-packaging:
     name: DX-03 packaged runtimes on isolated Windows x64
     runs-on: windows-2025
+    needs: native
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+      - name: Download exact-SHA Desktop executable
+        uses: actions/download-artifact@v4
+        with:
+          name: dx04-desktop-${{ github.sha }}
+          path: build/windows-desktop/desktop
       - name: Assert exact clean source revision
         shell: pwsh
         run: |
@@ -136,6 +149,14 @@ jobs:
           -RepositoryRoot $env:GITHUB_WORKSPACE
           -ExpectedSourceRevision $env:GITHUB_SHA
           -EvidenceOutput $env:GITHUB_WORKSPACE/build/windows-desktop/evidence/hosted
+      - name: Smoke the shared M1 Controller lifecycle with real Windows processes
+        shell: pwsh
+        run: >-
+          ./packaging/windows_desktop/smoke_controller_lifecycle.ps1
+          -DesktopExecutable "$env:GITHUB_WORKSPACE/build/windows-desktop/desktop/threads-desktop.exe"
+          -RuntimeRoot "$env:GITHUB_WORKSPACE/build/windows-desktop/candidates/shared"
+          -ExpectedSourceRevision $env:GITHUB_SHA
+          -EvidencePath "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/controller-lifecycle.json"
       - name: Upload exact-SHA runtime candidates
         if: always()
         uses: actions/upload-artifact@v4

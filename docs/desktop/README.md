@@ -1,6 +1,6 @@
 # Threads Desktop v1 — Tổng quan kế hoạch
 
-**Trạng thái:** kế hoạch/ADR được nghiệm thu và merge vào `main` bằng PR #93 (`ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`); **chưa triển khai ứng dụng, chưa nghiệm thu production**. Phiên mới **bắt đầu tại [SESSION_HANDOFF.md](SESSION_HANDOFF.md)** và đọc [bản audit](PREIMPLEMENTATION_AUDIT.md) trước khi viết code.
+**Trạng thái:** kế hoạch/ADR được nghiệm thu và merge vào `main` bằng PR #93 (`ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`). DX-04 M1 implementation is in progress and still needs exact-head Windows evidence and independent coordinator acceptance. **Chưa có installer hoặc production readiness.** Phiên Desktop mới **bắt đầu tại [SESSION_HANDOFF.md](SESSION_HANDOFF.md)** và đọc [bản audit](PREIMPLEMENTATION_AUDIT.md) trước khi làm việc.
 
 ## Mục tiêu sản phẩm đã thống nhất
 
@@ -26,6 +26,7 @@ Một installer Windows và một ứng dụng **Threads Desktop** (Tauri 2 + Ru
 ## Thứ tự ưu tiên
 
 - **M1:** chứng minh **engineering test bundle/prototype chỉ bind loopback với dữ liệu giả** có thể khởi động Controller trên Windows sạch; đóng UI vẫn chạy; Quit và mở lại giữ nguyên PostgreSQL state. Installer cuối và first OWNER + HTTPS thuộc các giai đoạn sau.
+- M1 only: `shared` is the selected PyInstaller onedir baseline. Its `http` and `scheduler` modes remain separate OS processes. This does not certify an installer, signing, AV readiness or DX-12 distribution.
 - **M2:** Operator RBAC + LAN HTTPS trust, Worker pairing + Console login.
 - **M3:** Worker thêm account và đăng nhập Threads tại máy của mình; Controller tạo Account/assignment atomically; re-login/reassign an toàn.
 - **M4:** UI Controller/Worker/Console, một installer nội bộ và diễn tập E2E ba Windows PC/VM; độc lập với production release gate.
@@ -34,4 +35,4 @@ Một installer Windows và một ứng dụng **Threads Desktop** (Tauri 2 + Ru
 
 ## Bước cần review trước khi viết code
 
-Duyệt ADR-0007, DX-01 và policy RBAC từng hành động (ma trận trong DELIVERY_PLAN.md). Nghiệm thu DX-03 **feasibility packaging** trước khi coi `threads-runtime.exe` là lựa chọn cuối cùng; duyệt security protocol DX-06/08 trước khi viết TLS pairing. Các external release gate cũ #3, #80, #62, #11 và #1 vẫn độc lập.
+ADR-0007, DX-01, DX-02 and DX-03 are accepted planning/feasibility baselines. DX-04 may use the selected `shared` runtime only for the disposable M1 scope above. Policy RBAC remains DX-05; TLS/pairing remain DX-06/08. External release gates #3, #80, #62, #11 and #1 remain independent.

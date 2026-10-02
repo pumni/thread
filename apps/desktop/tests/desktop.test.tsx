@@ -22,6 +22,12 @@ function snapshot(role: DesktopSnapshot["role"] = null): DesktopSnapshot {
     supervisor: {
       state: role === "CONSOLE" ? "not_applicable" : role ? "running" : "stopped",
       processId: role && role !== "CONSOLE" ? 4242 : null,
+      postgresProcessId: role === "CONTROLLER" ? 4243 : null,
+      httpProcessId: role === "CONTROLLER" ? 4244 : null,
+      schedulerProcessId: role === "CONTROLLER" ? 4245 : null,
+      controllerId: role === "CONTROLLER" ? "0123456789abcdef0123456789abcdef" : null,
+      endpoint: role === "CONTROLLER" ? "http://127.0.0.1:4246" : null,
+      databasePort: role === "CONTROLLER" ? 4247 : null,
       diagnosticCode: null,
     },
   };
@@ -60,7 +66,7 @@ describe("desktop provisioning", () => {
     ]);
   });
 
-  it("provisions one role and shows the native helper status", async () => {
+  it("provisions one Controller and shows its separate runtime processes", async () => {
     native.invoke.mockImplementation(async (command: string) => {
       if (command === "get_desktop_snapshot") return snapshot();
       if (command === "provision_role") return snapshot("CONTROLLER");
@@ -72,7 +78,11 @@ describe("desktop provisioning", () => {
     fireEvent.click(screen.getByRole("button", { name: "Provision as Controller" }));
 
     await screen.findByRole("heading", { name: "Your Controller" });
-    expect(await screen.findByText("PID 4242")).toBeInTheDocument();
+    expect(await screen.findByText("PID 4243")).toBeInTheDocument();
+    expect(screen.getByText("PID 4244")).toBeInTheDocument();
+    expect(screen.getByText("PID 4245")).toBeInTheDocument();
+    expect(screen.getByText("http://127.0.0.1:4246")).toBeInTheDocument();
+    expect(screen.getByText(/disposable test data only/i)).toBeInTheDocument();
     expect(native.invoke).toHaveBeenCalledWith("provision_role", { role: "CONTROLLER" });
   });
 
@@ -113,11 +123,11 @@ describe("desktop provisioning", () => {
   });
 
   it.each([
-    { role: "CONTROLLER" as const, heading: "Your Controller" },
-    { role: "WORKER" as const, heading: "Your Worker" },
+    { role: "CONTROLLER" as const, heading: "Your Controller", process: "PID 4243" },
+    { role: "WORKER" as const, heading: "Your Worker", process: "PID 4242" },
   ])(
-    "keeps the $role helper running when the native session relocks",
-    async ({ role, heading }) => {
+    "keeps the $role runtime running when the native session relocks",
+    async ({ role, heading, process }) => {
       const listeners: Record<string, (event: unknown) => void> = {};
       native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {
         listeners[event] = handler;
@@ -133,7 +143,7 @@ describe("desktop provisioning", () => {
       await waitFor(() => expect(listeners["desktop://session-locked"]).toBeDefined());
       act(() => listeners["desktop://session-locked"]({}));
 
-      expect(screen.getByText("PID 4242")).toBeInTheDocument();
+      expect(screen.getByText(process)).toBeInTheDocument();
       expect(native.invoke.mock.calls.map(([command]) => command)).toEqual(
         expect.arrayContaining(["get_desktop_snapshot"]),
       );

@@ -122,12 +122,13 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 - **Stop** if Python/PostgreSQL bundled runtime is not reproducible, license incompatible or cannot pass clean-machine smoke; revise packaging design before further work.
 
 **DX-04 — native Controller provisioning and supervisor vertical slice** (depends DX-02 and DX-03)
-- Preflight disk, OS, user context, ports, ACL, migration/schema compatibility; never erase an existing DB.
-- On provision create one protected durable Controller identity/data root; generate DB credential; private loopback Postgres on persisted non-default app-managed port; `initdb` only for missing cluster on explicit first-run path.
-- Fixed startup DAG: PostgreSQL -> bounded readiness -> one-shot Alembic -> HTTP -> /ready -> scheduler -> Ready. Initial test may use a synthetic owner/bootstrap stub; do not expose unauthenticated LAN operator routes.
-- Bounded per-helper restart/backoff/circuit-break, per-profile process/data-root locks, process-tree ownership, critical failure surfaced locally. No schema auto-rollback.
-- Quit: reject new admin work, stop scheduler, stop HTTP, graceful PostgreSQL shutdown; crash/restart must preserve WAL/data and detect orphan/duplicate processes.
-- Verification: fresh Windows VM without dependencies, close-to-tray continuity, restart same cluster, DB outage/recovery, repeated migration, collision prevention, power/sleep warning.
+- Use the DX-03 coordinator-selected `shared` PyInstaller onedir for M1 only. Keep HTTP and scheduler as distinct OS processes running the same executable in different modes; do not use `split` absent new failure evidence.
+- Preflight disk, OS, current user, ports, ACL, migration/schema compatibility and runtime files; never erase an existing DB. The M1 durable root is the current user's ACL-scoped `%LOCALAPPDATA%` app-local-data directory. The later `%PROGRAMDATA%` installer handoff remains unproven.
+- On provision create one protected durable Controller ID/data root, generate a current-user DPAPI database credential, and use private loopback PostgreSQL plus HTTP ports persisted in atomic non-secret config. `initdb` is limited to a root created by the current first-run call; any existing incomplete/corrupt/unowned root fails without reinitialization.
+- Fixed startup DAG: preflight/root lock -> PostgreSQL -> bounded readiness -> one-shot Alembic -> approved M1 bootstrap boundary with **no Owner/Workspace writes** -> loopback HTTP `/ready` -> separate scheduler -> Ready. Do not expose unauthenticated LAN routes.
+- Use a per-root exclusive owner lock and real Windows Job Object process-tree ownership. Readiness backoff is bounded; a helper/migration failure becomes `FAILED` with a fixed redacted code. No auto schema rollback or data deletion.
+- Quit stops scheduler, HTTP, then asks bundled `pg_ctl` for PostgreSQL fast shutdown; crash/restart must preserve WAL/data and detect duplicate processes. Never silently rotate a persisted port.
+- Verification: exact-SHA Windows process behavior on disposable synthetic data, CurrentUser ACL/DPAPI, X-to-tray continuity, ordered Quit/relaunch, DB crash recovery, true Tauri parent crash/WAL recovery, single scheduler after recovery, migration/port/root/disk failure paths. The evidence artifact contains no DB directory.
 - This is the **first milestone demo**. It proves runtime ownership, not authenticated remote control, safe Internet access or production-readiness.
 
 ### Phase 2 — human authorization and secure LAN

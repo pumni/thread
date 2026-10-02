@@ -6,9 +6,16 @@ export type UiTheme = "SYSTEM" | "LIGHT" | "DARK";
 export type SupervisorState =
   | "stopped"
   | "starting"
+  | "preflight"
+  | "starting_database"
+  | "migrating"
+  | "m1_bootstrap_boundary"
+  | "starting_http"
+  | "starting_scheduler"
   | "running"
   | "stopping"
   | "degraded"
+  | "failed"
   | "not_applicable";
 
 export interface DesktopSnapshot {
@@ -19,6 +26,12 @@ export interface DesktopSnapshot {
   supervisor: {
     state: SupervisorState;
     processId: number | null;
+    postgresProcessId: number | null;
+    httpProcessId: number | null;
+    schedulerProcessId: number | null;
+    controllerId: string | null;
+    endpoint: string | null;
+    databasePort: number | null;
     diagnosticCode: string | null;
   };
 }
