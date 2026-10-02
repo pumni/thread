@@ -49,6 +49,7 @@ jobs:
   native:
     name: Rust and Tauri release build (Windows x64)
     runs-on: windows-2025
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: apps/desktop

@@ -86,7 +86,9 @@ describe("desktop provisioning", () => {
 
     await screen.findByRole("heading", { name: "Your Worker" });
     expect(await screen.findByText("PID 4242")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Provision as Controller" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Provision as Controller" }),
+    ).not.toBeInTheDocument();
     expect(native.invoke).toHaveBeenCalledWith("provision_role", { role: "WORKER" });
   });
 

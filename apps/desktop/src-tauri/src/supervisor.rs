@@ -236,22 +236,4 @@ mod tests {
         assert_eq!(snapshot.process_id, None);
     }
 
-    #[test]
-    fn force_killed_helper_is_reported_degraded() {
-        let mut supervisor = Supervisor::default();
-        supervisor.start().expect("start mock helper");
-        let runtime = supervisor.runtime.as_mut().expect("running helper");
-        runtime.child.kill().expect("force kill helper");
-        runtime.child.wait().expect("reap killed helper");
-
-        supervisor.refresh_health();
-
-        let snapshot = supervisor.snapshot();
-        assert_eq!(snapshot.state, "degraded");
-        assert_eq!(snapshot.process_id, None);
-        assert_eq!(
-            snapshot.diagnostic_code,
-            Some("mock_runtime_exited_unexpectedly")
-        );
-    }
 }

@@ -66,6 +66,7 @@ $checks = [ordered]@{
     window_close_hides_without_stopping_helper = $false
     tray_quit_confirms_and_stops_helper_before_exit = $false
     restart_restores_role_without_duplicate_helper = $false
+    force_killed_helper_is_reported_degraded = $false
     decommission_removes_test_autostart = $false
     restart_quits_cleanly = $false
 }
@@ -319,6 +320,13 @@ try {
     $checks.restart_restores_role_without_duplicate_helper =
         [bool]$controllerHeading -and (Get-HelperProcesses $primaryId).Count -eq 1
     if (-not $checks.restart_restores_role_without_duplicate_helper) { throw "restart_did_not_restore_single_controller" }
+
+    Stop-Process -Id $helperId -Force -ErrorAction Stop
+    Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 0 } 10 "force_killed_helper_still_running"
+    Wait-Until {
+        [bool](Find-ElementByName (Get-PrimaryWindow) "Needs attention" ([System.Windows.Automation.ControlType]::Text))
+    } 10 "force_killed_helper_not_reported_degraded"
+    $checks.force_killed_helper_is_reported_degraded = $true
 
     Invoke-Button "Decommission device"
     $phraseInput = Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit)
