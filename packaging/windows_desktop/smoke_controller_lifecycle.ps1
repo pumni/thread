@@ -219,7 +219,8 @@ function Find-TextContaining([System.Windows.Automation.AutomationElement]$Root,
         [System.Windows.Automation.Condition]::TrueCondition
     )
     foreach ($element in $elements) {
-        if ($element.Current.Name.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $name = [string]$element.Current.Name
+        if ($name.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
             return $element
         }
     }
