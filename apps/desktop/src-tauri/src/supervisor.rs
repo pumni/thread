@@ -1,9 +1,12 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -13,6 +16,7 @@ use crate::{controller_store::ControllerStore, ProvisionedRole};
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 const MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
+const POSTGRES_STDERR_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,8 +345,63 @@ struct ControllerRuntime {
     store: ControllerStore,
     job: ProcessJob,
     postgres: Option<Child>,
+    postgres_stderr: Option<Arc<Mutex<Vec<u8>>>>,
+    postgres_stderr_finished: Option<Receiver<()>>,
     http: Option<Child>,
     scheduler: Option<Child>,
+}
+
+fn drain_bounded_stderr(mut stderr: impl Read, output: Arc<Mutex<Vec<u8>>>) {
+    let mut chunk = [0_u8; 1024];
+    while let Ok(count) = stderr.read(&mut chunk) {
+        if count == 0 {
+            break;
+        }
+
+        let Ok(mut output) = output.lock() else {
+            break;
+        };
+        let overflow = output
+            .len()
+            .saturating_add(count)
+            .saturating_sub(POSTGRES_STDERR_LIMIT);
+        if overflow > 0 {
+            output.drain(..overflow);
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn classify_postgres_start_failure(output: &[u8]) -> &'static str {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("address already in use")
+        || output.contains("only one usage of each socket address")
+        || output.contains("wsaeaddrinuse")
+    {
+        "controller_database_port_in_use"
+    } else if output.contains("invalid permissions")
+        || output.contains("permission denied")
+        || output.contains("access is denied")
+    {
+        "controller_data_root_unwritable"
+    } else if output.contains("could not open configuration file")
+        || output.contains("syntax error in file")
+    {
+        "controller_database_config_invalid"
+    } else if output.contains("database files are incompatible")
+        || output.contains("incompatible with this version")
+        || output.contains("database system identifier differs")
+    {
+        "controller_data_root_corrupt"
+    } else if output.contains("could not load library")
+        || output.contains("specified module could not be found")
+    {
+        "controller_database_runtime_dependency_failed"
+    } else if output.contains("postmaster.pid") && output.contains("already exists") {
+        "controller_database_already_running"
+    } else {
+        "controller_database_process_exited"
+    }
 }
 
 impl ControllerRuntime {
@@ -352,6 +411,8 @@ impl ControllerRuntime {
             store,
             job: ProcessJob::new()?,
             postgres: None,
+            postgres_stderr: None,
+            postgres_stderr_finished: None,
             http: None,
             scheduler: None,
         })
@@ -446,8 +507,49 @@ impl ControllerRuntime {
             .arg("-h")
             .arg("127.0.0.1")
             .arg("-p")
-            .arg(self.store.config().database_port.to_string());
-        self.spawn_attached(command, "controller_database_process_spawn_failed")
+            .arg(self.store.config().database_port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|_| "controller_database_process_spawn_failed")?;
+        if let Err(()) = self.job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("controller_process_job_assign_failed");
+        }
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("controller_database_diagnostics_unavailable");
+        };
+
+        let output = Arc::new(Mutex::new(Vec::with_capacity(POSTGRES_STDERR_LIMIT)));
+        let reader_output = Arc::clone(&output);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        if thread::Builder::new()
+            .name("controller-postgres-stderr".to_string())
+            .spawn(move || {
+                drain_bounded_stderr(stderr, reader_output);
+                let _ = finished_tx.send(());
+            })
+            .is_err()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("controller_database_diagnostics_unavailable");
+        }
+
+        self.postgres_stderr = Some(output);
+        self.postgres_stderr_finished = Some(finished_rx);
+        Ok(child)
     }
 
     fn wait_for_database(&mut self) -> Result<(), &'static str> {
@@ -455,7 +557,7 @@ impl ControllerRuntime {
         let mut delay = Duration::from_millis(150);
         while Instant::now() < deadline {
             if Self::child_exited(&mut self.postgres)? {
-                return Err("controller_database_process_exited");
+                return Err(self.postgres_start_failure());
             }
             let mut command = Command::new(self.store.postgres_ready_executable());
             command
@@ -474,6 +576,18 @@ impl ControllerRuntime {
             delay = (delay * 2).min(Duration::from_secs(1));
         }
         Err("controller_database_readiness_timeout")
+    }
+
+    fn postgres_start_failure(&self) -> &'static str {
+        if let Some(finished) = &self.postgres_stderr_finished {
+            let _ = finished.recv_timeout(Duration::from_millis(500));
+        }
+        if let Some(output) = &self.postgres_stderr {
+            if let Ok(output) = output.lock() {
+                return classify_postgres_start_failure(&output);
+            }
+        }
+        "controller_database_process_exited"
     }
 
     fn run_migration(&mut self) -> Result<(), &'static str> {
@@ -870,5 +984,23 @@ mod tests {
     fn controller_endpoints_are_loopback_only() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         assert_eq!(listener.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn postgres_startup_failure_diagnostics_are_fixed_and_redacted() {
+        let output = b"FATAL: could not bind IPv4 address: Only one usage of each socket address (protocol/network address/port) is normally permitted.\nsecret-marker";
+        assert_eq!(
+            classify_postgres_start_failure(output),
+            "controller_database_port_in_use"
+        );
+    }
+
+    #[test]
+    fn postgres_startup_failure_diagnostics_classify_corrupt_data() {
+        let output = b"FATAL: database files are incompatible with server";
+        assert_eq!(
+            classify_postgres_start_failure(output),
+            "controller_data_root_corrupt"
+        );
     }
 }
