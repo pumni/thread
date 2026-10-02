@@ -235,5 +235,4 @@ mod tests {
         assert_eq!(snapshot.state, "stopped");
         assert_eq!(snapshot.process_id, None);
     }
-
 }
