@@ -351,23 +351,14 @@ function Assert-ControllerProcesses {
     return $owned
 }
 
-function Quit-Desktop([int]$ProcessId) {
+function Request-DesktopQuit([int]$ProcessId) {
     Invoke-Button $ProcessId "Quit…"
     Invoke-Button $ProcessId "Stop node and quit"
-    Wait-Until { -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } `
-        55 "desktop_graceful_quit_timeout"
 }
 
 function Wait-ForProcessExit([System.Diagnostics.Process]$Process, [string]$Failure) {
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        try {
-            $Process.Refresh()
-            if ($Process.HasExited) { return [DateTime]::UtcNow }
-        } catch { }
-        Start-Sleep -Milliseconds 200
-    }
-    throw $Failure
+    if (-not $Process.WaitForExit(20000)) { throw $Failure }
+    return [DateTime]::UtcNow
 }
 
 function Assert-ProcessStillRunning([System.Diagnostics.Process]$Process, [string]$Failure) {
@@ -529,7 +520,7 @@ try {
         throw "controller_shutdown_process_handle_unavailable"
     }
     try {
-        Quit-Desktop $desktop.Id
+        Request-DesktopQuit $desktop.Id
         $schedulerExitObserved = Wait-ForProcessExit `
             $shutdownProcesses.scheduler "controller_scheduler_did_not_stop_first"
         Assert-ProcessStillRunning $shutdownProcesses.http "controller_http_stopped_before_scheduler"
@@ -539,6 +530,8 @@ try {
         Assert-ProcessStillRunning $shutdownProcesses.postgres "controller_database_stopped_before_http"
         $postgresExitObserved = Wait-ForProcessExit `
             $shutdownProcesses.postgres "controller_database_did_not_stop_after_http"
+        Wait-Until { -not (Get-Process -Id $desktop.Id -ErrorAction SilentlyContinue) } `
+            55 "desktop_graceful_quit_timeout"
         if (-not ($schedulerExitObserved -lt $httpExitObserved -and $httpExitObserved -lt $postgresExitObserved)) {
             throw "controller_shutdown_order_invalid"
         }
