@@ -295,8 +295,9 @@ function Invoke-Psql([object]$Config, [string]$Sql) {
     $oldPassword = $env:PGPASSWORD
     try {
         $env:PGPASSWORD = [System.Text.Encoding]::UTF8.GetString($plain)
-        $output = & $psql -X -w -h 127.0.0.1 -p $Config.databasePort `
+        $output = @(& $psql -X -w -h 127.0.0.1 -p $Config.databasePort `
             -U threads_platform -d postgres -A -t -v ON_ERROR_STOP=1 -c $Sql 2>$null
+        )
         if ($LASTEXITCODE -ne 0) { throw "controller_database_query_failed" }
         return ([string]::Join("", [string[]]$output)).Trim()
     } finally {
@@ -359,9 +360,12 @@ function Assert-DatabaseValue([object]$Config, [string]$Expected) {
 }
 
 try {
-    $head = (& git -C $repoRoot rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "controller_git_head_unavailable" }
-    $dirty = [string]::Join("`n", [string[]](& git -C $repoRoot status --porcelain))
+    $headLines = @(& git -C $repoRoot rev-parse HEAD)
+    if ($LASTEXITCODE -ne 0 -or $headLines.Count -eq 0) { throw "controller_git_head_unavailable" }
+    $head = ($headLines -join "`n").Trim()
+    $dirtyLines = @(& git -C $repoRoot status --porcelain)
+    if ($LASTEXITCODE -ne 0) { throw "controller_git_status_unavailable" }
+    $dirty = [string]::Join("`n", [string[]]$dirtyLines)
     if ($LASTEXITCODE -ne 0 -or $head -ne $ExpectedSourceRevision -or $dirty.Length -ne 0) {
         throw "controller_smoke_requires_exact_clean_source_revision"
     }
