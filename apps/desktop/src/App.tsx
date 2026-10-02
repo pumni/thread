@@ -364,7 +364,11 @@ function App() {
                     )}
                   </div>
                   {snapshot.supervisor.diagnosticCode && (
-                    <p className="diagnostic-code" role="status">
+                    <p
+                      className="diagnostic-code"
+                      role="status"
+                      aria-label={`Diagnostic code: ${snapshot.supervisor.diagnosticCode}`}
+                    >
                       Diagnostic code: {snapshot.supervisor.diagnosticCode}
                     </p>
                   )}
