@@ -1,14 +1,22 @@
 # Windows CurrentUser Root CA validation gate
 
-**Status: NOT VERIFIED.** Issue [#123](https://github.com/pumni/thread/issues/123) remains open. Windows package smoke and CA file/directory tests do not satisfy this gate.
+**Status: MANUALLY VERIFIED for the PR #128 executable validation code on 2026-10-02.** The supported interactive CurrentUser-root flow completed end-to-end on a disposable Windows profile. Ordinary Windows package smoke and CA file/directory tests alone do not satisfy this gate; use the procedure below when this release gate must be revalidated.
 
 ## Why this is a separate gate
 
-The Worker Control Plane client uses HTTPX2 with system trust and normal hostname and certificate validation. The missing evidence is a real HTTPS handshake when a synthetic CA exists only in the Windows `CurrentUser\Root` store.
+The Worker Control Plane client uses HTTPX2 with system trust and normal hostname and certificate validation. This gate proves a real HTTPS handshake when a synthetic CA exists only in the Windows `CurrentUser\Root` store, while preserving fail-closed hostname and expiry checks.
 
 The bounded probe in PR #128 timed out while adding the generated CA on both a local Windows environment and a GitHub-hosted `windows-latest` runner. On the hosted Windows Server 2025 runner, CurrentUser and LocalMachine root-store enumeration each completed in about 0.2 seconds with 571 certificates. The runner reported `elevated=True interactive=True`, yet the add call did not return within 15 seconds and was terminated at `add_current_user_root_start`; cleanup confirmed the generated CA was absent and the captured existing roots remained. The hosted attempt is recorded in [PR #128's Windows CurrentUser root job](https://github.com/pumni/thread/actions/runs/36922619408/job/110572115791). The earlier PowerShell attempt has no retained script or linked log in the issue/PR history. Available evidence does not identify whether a store provider, UI/session requirement, or another wait caused either hang. Do not describe this as a proven permission or prompt issue.
 
 Microsoft documents a Security Warning with a user confirmation when an untrusted self-signed CA is first installed into Current User Trusted Root in its Visual Studio/IIS Express scenario. That makes a hidden confirmation a testable hypothesis, not an established cause for this Worker test. See [Microsoft's untrusted-certificate warning procedure](https://learn.microsoft.com/en-us/troubleshoot/developer/visualstudio/installation/warnings-untrusted-certificate).
+
+## Verified evidence (2026-10-02)
+
+On PR #128 executable-validation head `7863b25c524c0d788ef2578b23fb52e256a800bd`, a disposable interactive Windows profile completed the documented two-phase flow. Windows displayed the Security Warning during the supported `Import-Certificate` operation and the operator confirmed only the generated `CN=worker-control-test-ca`.
+
+Before import, CurrentUser and LocalMachine Root each contained 69 certificates and the HTTPS rejection check passed. After import, CurrentUser Root contained 70 certificates while LocalMachine Root remained at 69. The handshake-only test then proved that `HttpWorkerControlClient` trusted the local HTTPS server through CurrentUser Root, rejected wrong-hostname and expired leaves while that CA was trusted, removed only the generated CA by thumbprint, and rejected the server again after removal. Final checks returned both stores to 69 certificates, confirmed the generated CA was absent, and confirmed the temporary fixture directory (including its synthetic private key) had been deleted.
+
+The operator-reported Windows context was `WindowsProductName=Windows 10 Home`, `WindowsVersion=2009`, `OsBuildNumber=26300`. The historical unattended CryptoAPI add timeout remains useful diagnostic context, but it no longer blocks the compatibility conclusion: supported interactive CurrentUser-root installation plus the actual HTTPX2 handshake path succeeded.
 
 ## Release validation procedure
 
@@ -87,8 +95,8 @@ Then confirm it is absent, remove the printed fixture directory and `$testTemp`,
 
 The store helper uses Windows CryptoAPI with an explicit CurrentUser or LocalMachine scope. Each helper process has a 15-second timeout. The tests log only operation names, elapsed time, exit status and sanitized WinCrypt error codes; they do not log the certificate, thumbprint, private key or request credentials.
 
-## Evidence required to close the gate
+## Evidence required for future release revalidation
 
-Attach the exact commit and Windows runner/OS context, whether the Security Warning appeared, the test result, operation timing/status lines, and the workflow or local validation log. Confirm the positive handshake and both fail-closed states, and confirm test cleanup restored the captured store state. A timeout, skipped test, SSL context inspection, CA file/directory override, or package smoke does not pass this gate. If the supported import still blocks on an accessible desktop, retain sanitized diagnostics and keep #123 open for the confirmation/store-write investigation; do not extend the timeout or route trust through a file override to claim success.
+Attach the exact candidate commit and Windows runner/OS context, whether the Security Warning appeared, the test result, operation timing/status lines, and the workflow or local validation log. Confirm the positive handshake and both fail-closed states, and confirm test cleanup restored the captured store state. A timeout, skipped test, SSL context inspection, CA file/directory override, or package smoke does not pass this gate. If the supported import still blocks on an accessible desktop, retain sanitized diagnostics and keep #123 open for the confirmation/store-write investigation; do not extend the timeout or route trust through a file override to claim success.
 
 The Win32 APIs used by the probe document system-store location flags and adding/removing certificate contexts: [CertOpenStore](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certopenstore), [CertAddEncodedCertificateToStore](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certaddencodedcertificatetostore), and [CertDeleteCertificateFromStore](https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certdeletecertificatefromstore).
