@@ -202,6 +202,12 @@
   align-items: center;
   gap: 16px;
 }
+.topbar-actions .quiet-link {
+  color: #5a5d69;
+}
+.topbar-actions .quiet-link:hover {
+  color: #21232b;
+}
 .environment-pill,
 .role-chip {
   display: inline-flex;
@@ -529,6 +535,9 @@ input:focus-visible {
   color: #999ba5;
   font-size: 10px;
 }
+.m1-limitations strong {
+  font-size: 13px;
+}
 .diagnostic-list {
   display: grid;
   margin-top: 14px;
@@ -692,6 +701,27 @@ input:focus-visible {
   color: #393b45;
   font: inherit;
   font-size: 12px;
+}
+
+.m1-limitations {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border: 1px solid #e7c98c;
+  border-radius: 10px;
+  background: #fff8e9;
+  color: #624a1a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.diagnostic-code {
+  margin: 12px 0 0;
+  color: #8b3741;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 900px) {

@@ -1,3 +1,4 @@
+mod controller_store;
 mod startup_gate;
 mod supervisor;
 
@@ -238,14 +239,18 @@ struct DeviceState {
 }
 
 impl DeviceState {
-    fn load(config_path: PathBuf) -> Result<Self, String> {
+    fn load(
+        config_path: PathBuf,
+        controller_root: PathBuf,
+        runtime_root: PathBuf,
+    ) -> Result<Self, String> {
         let config = DeviceConfig::load(&config_path)?;
-        let mut supervisor = Supervisor::default();
+        let mut supervisor = Supervisor::with_controller_paths(controller_root, runtime_root);
         if matches!(
             config.role,
             Some(ProvisionedRole::Controller | ProvisionedRole::Worker)
         ) {
-            let _ = supervisor.start();
+            let _ = supervisor.start(config.role.expect("role was checked"));
         }
 
         Ok(Self {
@@ -279,7 +284,7 @@ impl DeviceState {
         inner.config = updated;
 
         if matches!(role, ProvisionedRole::Controller | ProvisionedRole::Worker) {
-            inner.supervisor.start()?;
+            inner.supervisor.start(role)?;
         }
         Ok(DesktopSnapshot::from(&*inner))
     }
@@ -448,6 +453,17 @@ fn config_path(app: &tauri::App) -> tauri::Result<PathBuf> {
     Ok(app.path().app_config_dir()?.join("device-config.json"))
 }
 
+fn controller_root(app: &tauri::App) -> tauri::Result<PathBuf> {
+    Ok(app.path().app_local_data_dir()?.join("Controller"))
+}
+
+fn runtime_root(app: &tauri::App) -> tauri::Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("THREADS_DESKTOP_RUNTIME_DIR") {
+        return Ok(PathBuf::from(configured));
+    }
+    Ok(app.path().resource_dir()?.join("runtime"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(windows)]
@@ -467,7 +483,10 @@ pub fn run() {
         ])
         .setup(|app| {
             let path = config_path(app)?;
-            let state = DeviceState::load(path).map_err(std::io::Error::other)?;
+            let data_root = controller_root(app)?;
+            let runtime = runtime_root(app)?;
+            let state =
+                DeviceState::load(path, data_root, runtime).map_err(std::io::Error::other)?;
             let should_autostart = state
                 .snapshot()
                 .map(|snapshot| snapshot.autostart_enabled)
@@ -608,7 +627,12 @@ mod tests {
     fn provisioning_persists_one_role_and_rejects_an_ordinary_role_switch() {
         let directory = tempfile::tempdir().expect("temporary config directory");
         let path = directory.path().join("device-config.json");
-        let state = DeviceState::load(path.clone()).expect("load unprovisioned device");
+        let state = DeviceState::load(
+            path.clone(),
+            directory.path().join("Controller"),
+            directory.path().join("runtime"),
+        )
+        .expect("load unprovisioned device");
 
         let provisioned = state
             .provision(ProvisionedRole::Console)
@@ -620,7 +644,12 @@ mod tests {
             "device_already_provisioned"
         );
 
-        let restored = DeviceState::load(path).expect("restore provisioned device");
+        let restored = DeviceState::load(
+            path,
+            directory.path().join("Controller"),
+            directory.path().join("runtime"),
+        )
+        .expect("restore provisioned device");
         let snapshot = restored.snapshot().expect("read restored role");
         assert_eq!(snapshot.role, Some(ProvisionedRole::Console));
         assert_eq!(snapshot.supervisor.state, "not_applicable");

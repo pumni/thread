@@ -1,6 +1,6 @@
-# Threads Desktop scaffold
+# Threads Desktop M1 prototype
 
-This directory contains the DX-02 Windows-first Tauri 2 shell. Python remains the business runtime and PostgreSQL remains its source of truth. The Rust layer owns the narrow desktop lifecycle and native IPC surface; React owns presentation and has no filesystem, process, database, or secret access.
+This directory contains the DX-02 Tauri shell and the in-progress DX-04 disposable Controller slice. Python remains the business runtime and PostgreSQL remains its source of truth. The Rust layer owns local provisioning and process supervision; React owns presentation and has no filesystem, process, database, or secret access.
 
 ## Local development
 
@@ -11,7 +11,9 @@ bun install --frozen-lockfile
 bun run dev
 ```
 
-Use `bun run tauri dev` to run the native shell. The first role choice is persisted in a versioned native config file. Controller and Worker start the fixed mock helper; Console starts no helper. Closing the window hides it to the tray. The tray Quit action opens an explicit confirmation, asks the mock helper to stop, then exits.
+Use `bun run tauri dev` to run the native shell. For Controller mode, set `THREADS_DESKTOP_RUNTIME_DIR` to an absolute `shared` candidate root produced by `packaging/windows_desktop/build_runtime.py --layout shared`; the root contains `threads-runtime/` and `postgresql/`. No host Python/PostgreSQL or Docker fallback is used. Controller uses one current-user data root, a DPAPI-protected database credential, a persisted loopback endpoint, and separate HTTP and scheduler processes. The M1 bootstrap boundary creates no Owner. Worker remains on the DX-02 mock helper; Console starts no helper. Closing the window hides to tray; explicit Quit stops scheduler, HTTP, then PostgreSQL.
+
+M1 is internal and disposable. It has no Owner account or LAN endpoint. The runtime is unavailable before Windows sign-in; Windows logout is unsupported. Portable backup and production durability are not available.
 
 On Windows, startup is serialized by a named mutex and readiness event. The first process keeps startup ownership through Tauri plugin and application setup, then signals readiness. Later launches wait for that signal before entering the official `tauri-plugin-single-instance`, which remains the first Tauri plugin and forwards activation to the primary window. A startup owner that exits before readiness leaves an abandoned mutex for a waiting process to take over; timeout or an unready normal release fails closed.
 
@@ -28,8 +30,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The path-filtered `Desktop CI` workflow installs the frozen `bun.lock` and runs frontend checks, native Rust checks, the exact-SHA Windows tray/supervisor lifecycle smoke, and the DX-03 Windows runtime feasibility smoke on GitHub-hosted Windows x64. DX-03 runtime package experiments are in `packaging/windows_desktop`; this scaffold does not start Python or PostgreSQL yet.
+The path-filtered `Desktop CI` workflow installs the frozen `bun.lock` and runs frontend checks, native Rust checks, the Windows tray lifecycle smoke, DX-03 package feasibility checks, and the DX-04 Controller lifecycle smoke on GitHub-hosted Windows x64. The DX-04 smoke uses disposable synthetic database state; its artifact contains evidence only, never a PostgreSQL data directory.
 
 ## Contract boundary
 
-The exposed Tauri commands are an explicit allowlist in `src/desktop.ts` and `src-tauri/src/lib.rs`. The webview stores no bearer token and cannot access native filesystem or process APIs. Operator sign-in, business endpoints, credential storage, live PostgreSQL, and real Controller/Worker packaging remain outside DX-02.
+The exposed Tauri commands are an explicit allowlist in `src/desktop.ts` and `src-tauri/src/lib.rs`. The webview stores no database credential and cannot access native filesystem or process APIs. M1 HTTP is unauthenticated and loopback-only; Owner/RBAC and LAN HTTPS remain later issues. This is not the DX-12 installer or a production distribution.

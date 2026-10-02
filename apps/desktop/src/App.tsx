@@ -16,7 +16,7 @@ import "./App.css";
 const roleDetails: Record<ProvisionedRole, { label: string; description: string }> = {
   CONTROLLER: {
     label: "Controller",
-    description: "Owns this Workspace and its local runtime.",
+    description: "Runs the disposable M1 Controller runtime on this PC.",
   },
   WORKER: {
     label: "Worker",
@@ -92,7 +92,7 @@ function App() {
       await requestQuit();
       setQuitRequested(false);
     } catch {
-      setActionError("The mock runtime did not confirm shutdown. Threads Desktop is still open.");
+      setActionError("The runtime did not confirm shutdown. Threads Desktop is still open.");
     }
   }
 
@@ -204,8 +204,11 @@ function App() {
           <div className="topbar-actions">
             <span className="environment-pill">
               <span className="environment-dot" />
-              LOCAL SCAFFOLD
+              M1 PRIVATE RUNTIME
             </span>
+            <button type="button" className="quiet-link" onClick={() => setQuitRequested(true)}>
+              Quit…
+            </button>
             <button
               type="button"
               className="avatar-button"
@@ -266,6 +269,16 @@ function App() {
             </section>
           ) : (
             <>
+              {snapshot.role === "CONTROLLER" && (
+                <section className="m1-limitations" aria-label="M1 prototype limits">
+                  <strong>Internal M1 prototype — disposable test data only</strong>
+                  <span>
+                    The runtime is unavailable before this Windows user signs in. Windows logout is
+                    unsupported. M1 has no Owner account or LAN endpoint, portable backup, or
+                    production durability.
+                  </span>
+                </section>
+              )}
               <section className="overview-grid" aria-label="Runtime overview">
                 <article className="surface-card runtime-card">
                   <div className="card-heading">
@@ -281,28 +294,84 @@ function App() {
                   <p className="card-copy">
                     {snapshot.role === "CONSOLE"
                       ? "Console mode is client-only and starts no local helper process."
-                      : "A fixed mock helper keeps lifecycle behavior testable. Python and PostgreSQL packaging is handled in DX-03."}
+                      : snapshot.role === "CONTROLLER"
+                        ? "The private PostgreSQL cluster, loopback HTTP process, and scheduler run as separately supervised Windows processes."
+                        : "The Worker lifecycle remains on its DX-02 mock boundary until its own implementation issue."}
                   </p>
                   <div className="runtime-facts">
                     <div>
                       <span>Role</span>
                       <strong>{roleDetails[snapshot.role].label}</strong>
                     </div>
-                    <div>
-                      <span>Helper process</span>
-                      <strong>
-                        {snapshot.supervisor.processId
-                          ? `PID ${snapshot.supervisor.processId}`
-                          : "None"}
-                      </strong>
-                    </div>
+                    {snapshot.role === "CONTROLLER" ? (
+                      <>
+                        <div>
+                          <span>PostgreSQL</span>
+                          <strong>
+                            {snapshot.supervisor.postgresProcessId
+                              ? `PID ${snapshot.supervisor.postgresProcessId}`
+                              : "Stopped"}
+                          </strong>
+                        </div>
+                        <div>
+                          <span>HTTP</span>
+                          <strong>
+                            {snapshot.supervisor.httpProcessId
+                              ? `PID ${snapshot.supervisor.httpProcessId}`
+                              : "Stopped"}
+                          </strong>
+                        </div>
+                        <div>
+                          <span>Scheduler</span>
+                          <strong>
+                            {snapshot.supervisor.schedulerProcessId
+                              ? `PID ${snapshot.supervisor.schedulerProcessId}`
+                              : "Stopped"}
+                          </strong>
+                        </div>
+                      </>
+                    ) : (
+                      <div>
+                        <span>
+                          {snapshot.role === "WORKER" ? "Helper process" : "Local runtime"}
+                        </span>
+                        <strong>
+                          {snapshot.role === "WORKER"
+                            ? snapshot.supervisor.processId
+                              ? `PID ${snapshot.supervisor.processId}`
+                              : "Stopped"
+                            : "None"}
+                        </strong>
+                      </div>
+                    )}
                     <div>
                       <span>Autostart</span>
                       <strong>
                         {snapshot.autostartEnabled ? "Enabled at user sign-in" : "Not enabled"}
                       </strong>
                     </div>
+                    {snapshot.supervisor.endpoint && (
+                      <div>
+                        <span>Local endpoint</span>
+                        <strong>{snapshot.supervisor.endpoint}</strong>
+                      </div>
+                    )}
+                    {snapshot.supervisor.controllerId && (
+                      <div>
+                        <span>Controller ID</span>
+                        <strong>{snapshot.supervisor.controllerId}</strong>
+                      </div>
+                    )}
                   </div>
+                  {snapshot.supervisor.diagnosticCode && (
+                    <p
+                      className="diagnostic-code"
+                      role="status"
+                      aria-label={`Diagnostic code: ${snapshot.supervisor.diagnosticCode}`}
+                    >
+                      Diagnostic code: {snapshot.supervisor.diagnosticCode}
+                    </p>
+                  )}
                 </article>
 
                 <article className="surface-card authentication-card">
@@ -351,7 +420,9 @@ function App() {
                   </div>
                   <div>
                     <span>PostgreSQL / Python</span>
-                    <strong className="muted-value">Not included in DX-02</strong>
+                    <strong className="muted-value">
+                      {snapshot.role === "CONTROLLER" ? "Private M1 bundle" : "Not included"}
+                    </strong>
                   </div>
                 </div>
               </section>
@@ -360,8 +431,8 @@ function App() {
                 <div>
                   <strong>Change this device’s role</strong>
                   <span>
-                    Decommissioning clears the local mock role and is separate from resetting UI
-                    preferences.
+                    Decommissioning stops the local runtime and clears the role selection. It does
+                    not delete Controller data.
                   </span>
                 </div>
                 <button
@@ -390,8 +461,12 @@ function App() {
             </div>
             <h2 id="quit-title">Quit Threads Desktop?</h2>
             <p>
-              The mock node will stop before the desktop exits. Closing this window only hides it to
-              the tray.
+              {snapshot.role === "CONTROLLER"
+                ? "The Controller stops its scheduler, HTTP process, and PostgreSQL database before the desktop exits."
+                : snapshot.role === "WORKER"
+                  ? "The Worker helper stops before the desktop exits."
+                  : "Threads Desktop exits."}{" "}
+              Closing this window only hides it to the tray.
             </p>
             <div className="dialog-actions">
               <button
@@ -466,7 +541,8 @@ function App() {
 function statusClass(snapshot: DesktopSnapshot): string {
   if (snapshot.role === "CONSOLE") return "neutral";
   if (snapshot.supervisor.state === "running") return "healthy";
-  if (snapshot.supervisor.state === "degraded") return "danger";
+  if (snapshot.supervisor.state === "failed" || snapshot.supervisor.state === "degraded")
+    return "danger";
   return "neutral";
 }
 
@@ -475,12 +551,32 @@ function statusLabel(snapshot: DesktopSnapshot): string {
   if (snapshot.role === "CONSOLE") return "No local runtime";
   if (snapshot.supervisor.state === "running") return "Running";
   if (snapshot.supervisor.state === "degraded") return "Needs attention";
+  if (snapshot.supervisor.state === "failed") return "Failed";
+  if (
+    snapshot.supervisor.state === "starting" ||
+    snapshot.supervisor.state === "preflight" ||
+    snapshot.supervisor.state === "starting_database" ||
+    snapshot.supervisor.state === "migrating" ||
+    snapshot.supervisor.state === "m1_bootstrap_boundary" ||
+    snapshot.supervisor.state === "starting_http" ||
+    snapshot.supervisor.state === "starting_scheduler"
+  ) {
+    return "Starting";
+  }
+  if (snapshot.supervisor.state === "stopping") return "Stopping";
   return "Stopped";
 }
 
 function runtimeTitle(snapshot: DesktopSnapshot): string {
   if (snapshot.role === "CONSOLE") return "Console only";
-  return snapshot.supervisor.state === "running" ? "Mock node is running" : "Mock node is stopped";
+  if (snapshot.role === "CONTROLLER") {
+    if (snapshot.supervisor.state === "running") return "Controller runtime is running";
+    if (snapshot.supervisor.state === "failed") return "Controller runtime failed";
+    return "Controller runtime is stopped";
+  }
+  return snapshot.supervisor.state === "running"
+    ? "Worker mock is running"
+    : "Worker mock is stopped";
 }
 
 function roleSymbol(role: ProvisionedRole): string {
