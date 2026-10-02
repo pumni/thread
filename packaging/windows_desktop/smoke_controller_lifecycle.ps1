@@ -31,10 +31,35 @@ using System.Runtime.InteropServices;
 
 namespace ThreadsControllerSmoke {
     public static class NativeMethods {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime {
+            public uint Low;
+            public uint High;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(
+            IntPtr process,
+            out FileTime creationTime,
+            out FileTime exitTime,
+            out FileTime kernelTime,
+            out FileTime userTime
+        );
+
+        public static long GetProcessExitFileTime(IntPtr process) {
+            FileTime creationTime;
+            FileTime exitTime;
+            FileTime kernelTime;
+            FileTime userTime;
+            if (!GetProcessTimes(process, out creationTime, out exitTime, out kernelTime, out userTime)) {
+                return 0L;
+            }
+            return ((long)exitTime.High << 32) | exitTime.Low;
+        }
     }
 }
 "@
@@ -351,22 +376,23 @@ function Assert-ControllerProcesses {
     return $owned
 }
 
-function Request-DesktopQuit([int]$ProcessId) {
+function Quit-Desktop([int]$ProcessId) {
     Invoke-Button $ProcessId "Quit…"
     Invoke-Button $ProcessId "Stop node and quit"
+    Wait-Until { -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } `
+        55 "desktop_graceful_quit_timeout"
 }
 
-function Wait-ForProcessExit([System.Diagnostics.Process]$Process, [string]$Failure) {
-    if (-not $Process.WaitForExit(20000)) { throw $Failure }
-    return [DateTime]::UtcNow
-}
-
-function Assert-ProcessStillRunning([System.Diagnostics.Process]$Process, [string]$Failure) {
-    try {
-        $Process.Refresh()
-        if (-not $Process.HasExited) { return }
-    } catch { }
-    throw $Failure
+function Get-ProcessExitTime([System.Diagnostics.Process]$Process, [string]$Failure) {
+    Wait-Until {
+        try {
+            $Process.Refresh()
+            return $Process.HasExited
+        } catch { return $false }
+    } 20 $Failure
+    $fileTime = [ThreadsControllerSmoke.NativeMethods]::GetProcessExitFileTime($Process.Handle)
+    if ($fileTime -eq 0) { throw $Failure }
+    return [DateTime]::FromFileTimeUtc($fileTime)
 }
 
 function Test-Http([object]$Config) {
@@ -520,28 +546,23 @@ try {
         throw "controller_shutdown_process_handle_unavailable"
     }
     try {
-        Request-DesktopQuit $desktop.Id
-        $schedulerExitObserved = Wait-ForProcessExit `
+        Quit-Desktop $desktop.Id
+        $schedulerExit = Get-ProcessExitTime `
             $shutdownProcesses.scheduler "controller_scheduler_did_not_stop_first"
-        Assert-ProcessStillRunning $shutdownProcesses.http "controller_http_stopped_before_scheduler"
-        Assert-ProcessStillRunning $shutdownProcesses.postgres "controller_database_stopped_before_scheduler"
-        $httpExitObserved = Wait-ForProcessExit `
+        $httpExit = Get-ProcessExitTime `
             $shutdownProcesses.http "controller_http_did_not_stop_after_scheduler"
-        Assert-ProcessStillRunning $shutdownProcesses.postgres "controller_database_stopped_before_http"
-        $postgresExitObserved = Wait-ForProcessExit `
+        $postgresExit = Get-ProcessExitTime `
             $shutdownProcesses.postgres "controller_database_did_not_stop_after_http"
-        Wait-Until { -not (Get-Process -Id $desktop.Id -ErrorAction SilentlyContinue) } `
-            55 "desktop_graceful_quit_timeout"
-        if (-not ($schedulerExitObserved -lt $httpExitObserved -and $httpExitObserved -lt $postgresExitObserved)) {
+        if (-not ($schedulerExit -lt $httpExit -and $httpExit -lt $postgresExit)) {
             throw "controller_shutdown_order_invalid"
         }
         $shutdownExitOrder = @(
             [ordered]@{
-                process = "scheduler"; exit_observed_utc = $schedulerExitObserved.ToString("o")
+                process = "scheduler"; exited_utc = $schedulerExit.ToString("o")
             },
-            [ordered]@{ process = "http"; exit_observed_utc = $httpExitObserved.ToString("o") },
+            [ordered]@{ process = "http"; exited_utc = $httpExit.ToString("o") },
             [ordered]@{
-                process = "postgres"; exit_observed_utc = $postgresExitObserved.ToString("o")
+                process = "postgres"; exited_utc = $postgresExit.ToString("o")
             }
         )
     } finally {
