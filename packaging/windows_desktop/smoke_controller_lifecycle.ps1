@@ -236,8 +236,12 @@ function Invoke-Button([int]$ProcessId, [string]$Name) {
         $button = Find-Element (Get-Window $ProcessId) $Name `
             ([System.Windows.Automation.ControlType]::Button)
         if (-not $button) { return $false }
-        $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        return $true
+        try {
+            $pattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            if (-not $pattern) { return $false }
+            $pattern.Invoke()
+            return $true
+        } catch { return $false }
     } 20 "desktop_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
