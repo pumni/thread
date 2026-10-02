@@ -1,3 +1,4 @@
+mod startup_gate;
 mod supervisor;
 
 use std::{
@@ -406,7 +407,11 @@ fn config_path(app: &tauri::App) -> tauri::Result<PathBuf> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    #[cfg(windows)]
+    let mut startup_gate =
+        startup_gate::StartupGate::enter().expect("failed to enter Threads Desktop startup gate");
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
@@ -450,8 +455,18 @@ pub fn run() {
                 let _ = window.emit(SESSION_LOCKED_EVENT, ());
             }
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("failed to start Threads Desktop");
+
+    // `build` finishes plugin setup before the startup owner releases waiting
+    // launches into the official single-instance plugin.
+    #[cfg(windows)]
+    startup_gate
+        .signal_ready()
+        .expect("failed to signal Threads Desktop startup readiness");
+
+    // Keep the named-object handles alive for the lifetime of the event loop.
+    app.run(|_app_handle, _event| {});
 }
 
 pub fn run_mock_runtime() {

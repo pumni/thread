@@ -13,6 +13,8 @@ bun run dev
 
 Use `bun run tauri dev` to run the native shell. The first role choice is persisted in a versioned native config file. Controller and Worker start the fixed mock helper; Console starts no helper. Closing the window hides it to the tray. The tray Quit action opens an explicit confirmation, asks the mock helper to stop, then exits.
 
+On Windows, startup is serialized by a named mutex and readiness event. The first process keeps startup ownership through Tauri plugin and application setup, then signals readiness. Later launches wait for that signal before entering the official `tauri-plugin-single-instance`, which remains the first Tauri plugin and forwards activation to the primary window. A startup owner that exits before readiness leaves an abandoned mutex for a waiting process to take over; timeout or an unready normal release fails closed.
+
 ## Checks
 
 ```powershell
