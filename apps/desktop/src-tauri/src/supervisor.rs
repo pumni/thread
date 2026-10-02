@@ -447,7 +447,7 @@ impl ControllerRuntime {
             .arg("127.0.0.1")
             .arg("-p")
             .arg(self.store.config().database_port.to_string());
-        self.spawn_attached(command, "controller_database_start_failed")
+        self.spawn_attached(command, "controller_database_process_spawn_failed")
     }
 
     fn wait_for_database(&mut self) -> Result<(), &'static str> {
@@ -455,7 +455,7 @@ impl ControllerRuntime {
         let mut delay = Duration::from_millis(150);
         while Instant::now() < deadline {
             if Self::child_exited(&mut self.postgres)? {
-                return Err("controller_database_start_failed");
+                return Err("controller_database_process_exited");
             }
             let mut command = Command::new(self.store.postgres_ready_executable());
             command
@@ -675,7 +675,7 @@ impl ControllerRuntime {
         if let Err(()) = self.job.assign(&child) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(failure);
+            return Err("controller_process_job_assign_failed");
         }
         Ok(child)
     }
