@@ -44,21 +44,53 @@ namespace ThreadsDesktopLifecycleSmoke {
 $bundleHash = (Get-FileHash -LiteralPath $BundleExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
 $appDataRoot = Join-Path $env:TEMP ("ThreadsDesktopDx02-" + [guid]::NewGuid().ToString("N"))
 $previousAppData = $env:APPDATA
-$runKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-$originalAutostart = @{}
-if (Test-Path $runKeyPath) {
-    $runValues = Get-ItemProperty -LiteralPath $runKeyPath
-    foreach ($property in $runValues.PSObject.Properties) {
-        if ($property.Name -notlike "PS*" -and [string]$property.Value -like "*$BundleExecutable*") {
-            $originalAutostart[$property.Name] = [string]$property.Value
-        }
+$currentUserRunKeyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$machineRunKeyPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+$originalAutostart = @{ HKCU = @{}; HKLM = @{} }
+$autostartEvidence = [ordered]@{
+    after_provision = $null
+    after_restart = $null
+    after_decommission = $null
+}
+
+function ConvertTo-SafeAutostartCommand([string]$Command) {
+    $safe = [regex]::Replace(
+        $Command,
+        '(?i)(--?(?:password|token|secret|authorization|database-url)(?:=|\s+))("[^"]*"|\S+)',
+        '$1<REDACTED>'
+    )
+    $safe = [regex]::Replace($safe, '(?i)(postgres(?:ql)?(?:\+\w+)?://)[^:\s/@]+:[^@\s/]+@', '$1<REDACTED>@')
+    return [regex]::Replace($safe, '(?i)\bBearer\s+\S+', 'Bearer <REDACTED>')
+}
+
+function Get-BundleAutostartEntries([string]$KeyPath) {
+    if (-not (Test-Path -LiteralPath $KeyPath)) { return @() }
+    $runValues = Get-ItemProperty -LiteralPath $KeyPath
+    @($runValues.PSObject.Properties | Where-Object {
+        $_.Name -notlike "PS*" -and
+        ([string]$_.Value).IndexOf($BundleExecutable, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    } | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; Value = [string]$_.Value }
+    })
+}
+
+foreach ($registryRoot in @(
+    @{ name = "HKCU"; path = $currentUserRunKeyPath },
+    @{ name = "HKLM"; path = $machineRunKeyPath }
+)) {
+    foreach ($entry in @(Get-BundleAutostartEntries $registryRoot.path)) {
+        $originalAutostart[$registryRoot.name][$entry.Name] = $entry.Value
     }
 }
 
 $checks = [ordered]@{
     concurrent_launch_keeps_one_primary = $false
     user_can_provision_controller_once = $false
-    autostart_enabled_for_current_user = $false
+    autostart_hkcu_registered = $false
+    autostart_current_user_only = $false
+    restart_autostart_hkcu_registered = $false
+    restart_autostart_current_user_only = $false
+    persisted_config_reports_autostart_enabled = $false
     controller_starts_one_mock_helper = $false
     second_launch_reuses_and_focuses_instance = $false
     window_close_hides_without_stopping_helper = $false
@@ -72,6 +104,7 @@ $checks = [ordered]@{
 $helperProcessIds = [System.Collections.Generic.List[int]]::new()
 $startedProcessIds = [System.Collections.Generic.List[int]]::new()
 $observedPrimaryPids = [System.Collections.Generic.HashSet[int]]::new()
+$failureCodes = [System.Collections.Generic.List[string]]::new()
 $failureCode = $null
 $cleanupFailureCode = $null
 $result = "BLOCKER"
@@ -80,6 +113,18 @@ $primaryWindowHandle = [IntPtr]::Zero
 $first = $null
 $second = $null
 $concurrentLaunchDiagnostics = $null
+
+function Add-FailureCode([string]$Code) {
+    if ([string]::IsNullOrWhiteSpace($Code)) { return }
+    $safeCode = [regex]::Replace($Code, "[^A-Za-z0-9_.-]", "_")
+    if (-not $failureCodes.Contains($safeCode)) { $failureCodes.Add($safeCode) }
+    if (-not $script:failureCode) { $script:failureCode = $safeCode }
+}
+
+function Set-LifecycleCheck([string]$Name, [bool]$Passed, [string]$Failure) {
+    $checks[$Name] = $Passed
+    if (-not $Passed) { Add-FailureCode $Failure }
+}
 
 function Get-DesktopProcesses {
     @(Get-CimInstance Win32_Process -Filter "Name='threads-desktop.exe'" -ErrorAction Stop |
@@ -241,14 +286,6 @@ function Get-ConcurrentLaunchFailureCode($Diagnostics) {
 function Get-HelperProcesses([int]$ParentId) {
     @(Get-DesktopProcesses | Where-Object {
         $_.ParentProcessId -eq $ParentId -and $_.CommandLine -match "--threads-desktop-mock-runtime"
-    })
-}
-
-function Get-BundleAutostartEntries {
-    if (-not (Test-Path $runKeyPath)) { return @() }
-    $runValues = Get-ItemProperty -LiteralPath $runKeyPath
-    @($runValues.PSObject.Properties | Where-Object {
-        $_.Name -notlike "PS*" -and [string]$_.Value -like "*$BundleExecutable*"
     })
 }
 
@@ -434,99 +471,230 @@ try {
         $script:primaryWindowHandle = $process.MainWindowHandle
         return [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($script:primaryWindowHandle)
     } 25 "desktop_initial_window_not_visible"
-    $checks.concurrent_launch_keeps_one_primary = (Get-PrimaryProcesses).Count -eq 1
+    Set-LifecycleCheck "concurrent_launch_keeps_one_primary" ((Get-PrimaryProcesses).Count -eq 1) "single_instance_primary_count_invalid"
 
     Invoke-Button "Provision as Controller"
     Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "controller_mock_helper_did_not_start"
     $helperId = [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId
     $helperProcessIds.Add($helperId)
-    $checks.user_can_provision_controller_once = $true
-    $checks.autostart_enabled_for_current_user = (Get-BundleAutostartEntries).Count -gt 0
-    $checks.controller_starts_one_mock_helper = (Get-HelperProcesses $primaryId).Count -eq 1
-    if (-not $checks.autostart_enabled_for_current_user) { throw "controller_autostart_not_registered" }
+    Set-LifecycleCheck "user_can_provision_controller_once" $true "controller_provisioning_failed"
+    Set-LifecycleCheck "controller_starts_one_mock_helper" ((Get-HelperProcesses $primaryId).Count -eq 1) "controller_mock_helper_count_invalid"
 
-    $again = Start-Process -FilePath $BundleExecutable -PassThru
-    $startedProcessIds.Add($again.Id)
-    Wait-Until { $again.HasExited } 20 "second_invocation_did_not_exit_after_focus"
-    $process = Get-Process -Id $primaryId -ErrorAction Stop
-    $process.Refresh()
-    $checks.second_launch_reuses_and_focuses_instance =
-        (Get-PrimaryProcesses).Count -eq 1 -and
-        [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) -and
-        [ThreadsDesktopLifecycleSmoke.NativeMethods]::GetForegroundWindow() -eq $primaryWindowHandle -and
-        (Get-HelperProcesses $primaryId).Count -eq 1 -and
-        [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
-    if (-not $checks.second_launch_reuses_and_focuses_instance) { throw "second_launch_did_not_reuse_primary" }
-
-    if (-not [ThreadsDesktopLifecycleSmoke.NativeMethods]::PostMessage(
-        $primaryWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero
-    )) { throw "desktop_close_request_failed" }
-    Wait-Until { -not [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "desktop_close_did_not_hide_window"
-    $checks.window_close_hides_without_stopping_helper =
-        (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) -and
-        (Get-Process -Id $helperId -ErrorAction SilentlyContinue) -and
-        (Get-HelperProcesses $primaryId).Count -eq 1
-    if (-not $checks.window_close_hides_without_stopping_helper) { throw "window_close_stopped_mock_helper" }
-
-    $reopen = Start-Process -FilePath $BundleExecutable -PassThru
-    $startedProcessIds.Add($reopen.Id)
-    Wait-Until { $reopen.HasExited } 20 "reopen_invocation_did_not_exit_after_focus"
-    Wait-Until { [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "second_launch_did_not_reopen_hidden_window"
-    $checks.tray_reopen_relocks_session_without_stopping_helper =
-        [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text)) -and
-        (Get-HelperProcesses $primaryId).Count -eq 1 -and
-        [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
-    if (-not $checks.tray_reopen_relocks_session_without_stopping_helper) {
-        throw "reopen_did_not_relock_session_or_stopped_mock_helper"
+    $deviceConfigFiles = @(Get-ChildItem -LiteralPath $appDataRoot -Filter "device-config.json" -File -Recurse)
+    $configReportsAutostart = $false
+    try {
+        if ($deviceConfigFiles.Count -eq 1) {
+            $deviceConfig = Get-Content -LiteralPath $deviceConfigFiles[0].FullName -Raw | ConvertFrom-Json
+            $configReportsAutostart = $deviceConfig.autostart_enabled -eq $true
+        }
+    } catch {
+        $configReportsAutostart = $false
     }
+    Set-LifecycleCheck "persisted_config_reports_autostart_enabled" $configReportsAutostart "controller_autostart_config_not_persisted"
 
-    Confirm-TrayQuit $helperId
-    $checks.tray_quit_confirms_and_stops_helper_before_exit = $true
+    $hkcuEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
+    $hklmEntries = @(Get-BundleAutostartEntries $machineRunKeyPath)
+    $newHklmEntries = @(
+        foreach ($entry in $hklmEntries) {
+            if (-not $originalAutostart.HKLM.ContainsKey($entry.Name) -or
+                $originalAutostart.HKLM[$entry.Name] -cne $entry.Value) {
+                [ordered]@{
+                    value_name = $entry.Name
+                    command = ConvertTo-SafeAutostartCommand $entry.Value
+                }
+            }
+        }
+    )
+    $autostartEvidence.after_provision = [ordered]@{
+        autostart_hkcu_registered = $hkcuEntries.Count -gt 0
+        autostart_hklm_matching_entry_created = $newHklmEntries.Count -gt 0
+        hkcu_matching_entries = @($hkcuEntries | ForEach-Object {
+            [ordered]@{ value_name = $_.Name; command = ConvertTo-SafeAutostartCommand $_.Value }
+        })
+        new_hklm_matching_entries = $newHklmEntries
+    }
+    Set-LifecycleCheck "autostart_hkcu_registered" ($hkcuEntries.Count -gt 0) "controller_autostart_not_registered"
+    $checks.autostart_current_user_only =
+        ($hkcuEntries.Count -gt 0) -and ($newHklmEntries.Count -eq 0)
+    if ($newHklmEntries.Count -gt 0) { Add-FailureCode "controller_autostart_created_hklm_entry" }
 
-    $restart = Start-Process -FilePath $BundleExecutable -PassThru
-    $startedProcessIds.Add($restart.Id)
-    Wait-Until { (Get-PrimaryProcesses).Count -eq 1 } 20 "restart_primary_missing"
-    $primary = Get-PrimaryProcesses | Select-Object -First 1
-    $primaryId = [int]$primary.ProcessId
-    $process = Get-Process -Id $primaryId -ErrorAction Stop
-    Wait-Until {
-        $process = Get-Process -Id $primaryId -ErrorAction SilentlyContinue
-        if (-not $process) { return $false }
+    try {
+        $again = Start-Process -FilePath $BundleExecutable -PassThru
+        $startedProcessIds.Add($again.Id)
+        Wait-Until { $again.HasExited } 20 "second_invocation_did_not_exit_after_focus"
+        $process = Get-Process -Id $primaryId -ErrorAction Stop
         $process.Refresh()
-        if ($process.MainWindowHandle -eq [IntPtr]::Zero) { return $false }
-        $script:primaryWindowHandle = $process.MainWindowHandle
-        return [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($script:primaryWindowHandle)
-    } 20 "restart_window_not_visible"
-    Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "restart_did_not_restore_controller_runtime"
-    $helperId = [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId
-    $helperProcessIds.Add($helperId)
-    $controllerHeading = Find-ElementByName (Get-PrimaryWindow) "Your Controller" ([System.Windows.Automation.ControlType]::Text)
-    $checks.restart_restores_role_without_duplicate_helper =
-        [bool]$controllerHeading -and (Get-HelperProcesses $primaryId).Count -eq 1
-    if (-not $checks.restart_restores_role_without_duplicate_helper) { throw "restart_did_not_restore_single_controller" }
-
-    Stop-Process -Id $helperId -Force -ErrorAction Stop
-    Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 0 } 10 "force_killed_helper_still_running"
-    Wait-Until {
-        [bool](Find-ElementByName (Get-PrimaryWindow) "Needs attention" ([System.Windows.Automation.ControlType]::Text))
-    } 10 "force_killed_helper_not_reported_degraded"
-    $checks.force_killed_helper_is_reported_degraded = $true
-
-    Invoke-Button "Decommission device"
-    $phraseInput = Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit)
-    if (-not $phraseInput) { throw "decommission_confirmation_input_unavailable" }
-    $phraseInput.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue("RESET THIS DEVICE")
-    Invoke-Button "Decommission"
-    Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 0 } 10 "decommission_did_not_stop_mock_helper"
-    $checks.decommission_removes_test_autostart = (Get-BundleAutostartEntries).Count -eq 0
-    if (-not $checks.decommission_removes_test_autostart) { throw "decommission_left_autostart_registered" }
-    Confirm-TrayQuit 0
-    $checks.restart_quits_cleanly = $true
-    $result = if (@($checks.Values | Where-Object { -not $_ }).Count -eq 0) { "PASS" } else { "BLOCKER" }
-} catch {
-    if (-not $failureCode) {
-        $failureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
+        $secondLaunchPassed =
+            (Get-PrimaryProcesses).Count -eq 1 -and
+            [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) -and
+            [ThreadsDesktopLifecycleSmoke.NativeMethods]::GetForegroundWindow() -eq $primaryWindowHandle -and
+            (Get-HelperProcesses $primaryId).Count -eq 1 -and
+            [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
+        Set-LifecycleCheck "second_launch_reuses_and_focuses_instance" $secondLaunchPassed "second_launch_did_not_reuse_primary"
+    } catch {
+        Set-LifecycleCheck "second_launch_reuses_and_focuses_instance" $false ([string]$_.Exception.Message)
     }
+    $primaryProcesses = @(Get-PrimaryProcesses)
+    if ($primaryProcesses.Count -ne 1 -or [int]$primaryProcesses[0].ProcessId -ne $primaryId -or
+        (Get-HelperProcesses $primaryId).Count -ne 1) {
+        throw "lifecycle_state_unsafe_after_second_launch"
+    }
+
+    try {
+        if (-not [ThreadsDesktopLifecycleSmoke.NativeMethods]::PostMessage(
+            $primaryWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero
+        )) { throw "desktop_close_request_failed" }
+        Wait-Until { -not [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "desktop_close_did_not_hide_window"
+        $hidePassed = (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) -and
+            (Get-Process -Id $helperId -ErrorAction SilentlyContinue) -and
+            (Get-HelperProcesses $primaryId).Count -eq 1
+        Set-LifecycleCheck "window_close_hides_without_stopping_helper" $hidePassed "window_close_stopped_mock_helper"
+    } catch {
+        Set-LifecycleCheck "window_close_hides_without_stopping_helper" $false ([string]$_.Exception.Message)
+    }
+    if ((Get-PrimaryProcesses).Count -ne 1 -or
+        -not (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) -or
+        (Get-HelperProcesses $primaryId).Count -ne 1) {
+        throw "lifecycle_state_unsafe_after_window_close"
+    }
+
+    try {
+        $reopen = Start-Process -FilePath $BundleExecutable -PassThru
+        $startedProcessIds.Add($reopen.Id)
+        Wait-Until { $reopen.HasExited } 20 "reopen_invocation_did_not_exit_after_focus"
+        Wait-Until { [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "second_launch_did_not_reopen_hidden_window"
+        $reopenPassed =
+            [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text)) -and
+            (Get-HelperProcesses $primaryId).Count -eq 1 -and
+            [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
+        Set-LifecycleCheck "tray_reopen_relocks_session_without_stopping_helper" $reopenPassed "reopen_did_not_relock_session_or_stopped_mock_helper"
+    } catch {
+        Set-LifecycleCheck "tray_reopen_relocks_session_without_stopping_helper" $false ([string]$_.Exception.Message)
+    }
+    $primaryProcesses = @(Get-PrimaryProcesses)
+    if ($primaryProcesses.Count -ne 1 -or [int]$primaryProcesses[0].ProcessId -ne $primaryId -or
+        (Get-HelperProcesses $primaryId).Count -ne 1) {
+        throw "lifecycle_state_unsafe_after_reopen"
+    }
+
+    try {
+        Confirm-TrayQuit $helperId
+        Set-LifecycleCheck "tray_quit_confirms_and_stops_helper_before_exit" $true "tray_quit_failed"
+    } catch {
+        Set-LifecycleCheck "tray_quit_confirms_and_stops_helper_before_exit" $false ([string]$_.Exception.Message)
+        if (Get-Process -Id $helperId -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $helperId -Force -ErrorAction SilentlyContinue
+        }
+        if (Get-Process -Id $primaryId -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $primaryId -Force -ErrorAction SilentlyContinue
+        }
+        Wait-Until { (Get-PrimaryProcesses).Count -eq 0 } 10 "failed_quit_cleanup_did_not_stop_primary"
+    }
+
+    $restartReady = $false
+    try {
+        $restart = Start-Process -FilePath $BundleExecutable -PassThru
+        $startedProcessIds.Add($restart.Id)
+        Wait-Until { (Get-PrimaryProcesses).Count -eq 1 } 20 "restart_primary_missing"
+        $primary = Get-PrimaryProcesses | Select-Object -First 1
+        $primaryId = [int]$primary.ProcessId
+        $process = Get-Process -Id $primaryId -ErrorAction Stop
+        Wait-Until {
+            $process = Get-Process -Id $primaryId -ErrorAction SilentlyContinue
+            if (-not $process) { return $false }
+            $process.Refresh()
+            if ($process.MainWindowHandle -eq [IntPtr]::Zero) { return $false }
+            $script:primaryWindowHandle = $process.MainWindowHandle
+            return [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($script:primaryWindowHandle)
+        } 20 "restart_window_not_visible"
+        Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "restart_did_not_restore_controller_runtime"
+        $helperId = [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId
+        $helperProcessIds.Add($helperId)
+        $controllerHeading = Find-ElementByName (Get-PrimaryWindow) "Your Controller" ([System.Windows.Automation.ControlType]::Text)
+        $restartPassed = [bool]$controllerHeading -and (Get-HelperProcesses $primaryId).Count -eq 1
+        Set-LifecycleCheck "restart_restores_role_without_duplicate_helper" $restartPassed "restart_did_not_restore_single_controller"
+
+        $restartHkcuEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
+        $restartHklmEntries = @(Get-BundleAutostartEntries $machineRunKeyPath)
+        $newRestartHklmEntries = @(
+            foreach ($entry in $restartHklmEntries) {
+                if (-not $originalAutostart.HKLM.ContainsKey($entry.Name) -or
+                    $originalAutostart.HKLM[$entry.Name] -cne $entry.Value) {
+                    [ordered]@{
+                        value_name = $entry.Name
+                        command = ConvertTo-SafeAutostartCommand $entry.Value
+                    }
+                }
+            }
+        )
+        $autostartEvidence.after_restart = [ordered]@{
+            autostart_hkcu_registered = $restartHkcuEntries.Count -gt 0
+            autostart_hklm_matching_entry_created = $newRestartHklmEntries.Count -gt 0
+            hkcu_matching_entries = @($restartHkcuEntries | ForEach-Object {
+                [ordered]@{ value_name = $_.Name; command = ConvertTo-SafeAutostartCommand $_.Value }
+            })
+            new_hklm_matching_entries = $newRestartHklmEntries
+        }
+        Set-LifecycleCheck "restart_autostart_hkcu_registered" ($restartHkcuEntries.Count -gt 0) "restart_autostart_not_registered"
+        $checks.restart_autostart_current_user_only =
+            ($restartHkcuEntries.Count -gt 0) -and ($newRestartHklmEntries.Count -eq 0)
+        if ($newRestartHklmEntries.Count -gt 0) { Add-FailureCode "restart_autostart_created_hklm_entry" }
+        $restartReady = $true
+    } catch {
+        Set-LifecycleCheck "restart_restores_role_without_duplicate_helper" $false ([string]$_.Exception.Message)
+    }
+
+    if ($restartReady) {
+        try {
+            Stop-Process -Id $helperId -Force -ErrorAction Stop
+            Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 0 } 10 "force_killed_helper_still_running"
+            Wait-Until {
+                [bool](Find-ElementByName (Get-PrimaryWindow) "Needs attention" ([System.Windows.Automation.ControlType]::Text))
+            } 10 "force_killed_helper_not_reported_degraded"
+            Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $true "force_killed_helper_not_reported_degraded"
+        } catch {
+            Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false ([string]$_.Exception.Message)
+        }
+
+        $decommissioned = $false
+        try {
+            Invoke-Button "Decommission device"
+            $phraseInput = Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit)
+            if (-not $phraseInput) { throw "decommission_confirmation_input_unavailable" }
+            $phraseInput.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue("RESET THIS DEVICE")
+            Invoke-Button "Decommission"
+            Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 0 } 10 "decommission_did_not_stop_mock_helper"
+            $decommissioned = $true
+        } catch {
+            Add-FailureCode ([string]$_.Exception.Message)
+        }
+        $postDecommissionHkcu = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
+        $postDecommissionHklm = @(Get-BundleAutostartEntries $machineRunKeyPath)
+        $autostartEvidence.after_decommission = [ordered]@{
+            hkcu_matching_entries = @($postDecommissionHkcu | ForEach-Object {
+                [ordered]@{ value_name = $_.Name; command = ConvertTo-SafeAutostartCommand $_.Value }
+            })
+            hklm_matching_entries = @($postDecommissionHklm | ForEach-Object {
+                [ordered]@{ value_name = $_.Name; command = ConvertTo-SafeAutostartCommand $_.Value }
+            })
+        }
+        Set-LifecycleCheck "decommission_removes_test_autostart" ($decommissioned -and $postDecommissionHkcu.Count -eq 0) "decommission_left_autostart_registered"
+        try {
+            Confirm-TrayQuit 0
+            Set-LifecycleCheck "restart_quits_cleanly" $true "final_quit_failed"
+        } catch {
+            Set-LifecycleCheck "restart_quits_cleanly" $false ([string]$_.Exception.Message)
+        }
+    } else {
+        Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false "degraded_check_unavailable_after_restart_failure"
+        Set-LifecycleCheck "decommission_removes_test_autostart" $false "decommission_check_unavailable_after_restart_failure"
+        Set-LifecycleCheck "restart_quits_cleanly" $false "final_quit_unavailable_after_restart_failure"
+    }
+
+    $failedChecks = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
+    $result = if ($failedChecks.Count -eq 0 -and $failureCodes.Count -eq 0) { "PASS" } else { "BLOCKER" }
+} catch {
+    Add-FailureCode ([string]$_.Exception.Message)
     if (-not $concurrentLaunchDiagnostics -and $failureCode -in @(
         "primary_never_started",
         "both_primaries_survived",
@@ -546,21 +714,40 @@ try {
                 Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
-        if (Test-Path $runKeyPath) {
-            $currentValues = Get-ItemProperty -LiteralPath $runKeyPath
-            foreach ($property in $currentValues.PSObject.Properties) {
-                if ($property.Name -notlike "PS*" -and [string]$property.Value -like "*$BundleExecutable*" -and
-                    -not $originalAutostart.ContainsKey($property.Name)) {
-                    Remove-ItemProperty -LiteralPath $runKeyPath -Name $property.Name -ErrorAction SilentlyContinue
+        foreach ($registryRoot in @(
+            @{ name = "HKCU"; path = $currentUserRunKeyPath },
+            @{ name = "HKLM"; path = $machineRunKeyPath }
+        )) {
+            $originalEntries = $originalAutostart[$registryRoot.name]
+            if (Test-Path -LiteralPath $registryRoot.path) {
+                $currentValues = Get-ItemProperty -LiteralPath $registryRoot.path
+                foreach ($property in $currentValues.PSObject.Properties) {
+                    if ($property.Name -like "PS*") { continue }
+                    $currentValue = [string]$property.Value
+                    if ($originalEntries.ContainsKey($property.Name)) {
+                        if ($currentValue -cne $originalEntries[$property.Name]) {
+                            Set-ItemProperty -LiteralPath $registryRoot.path -Name $property.Name `
+                                -Value $originalEntries[$property.Name]
+                        }
+                    } elseif ($currentValue.IndexOf(
+                        $BundleExecutable,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0) {
+                        Remove-ItemProperty -LiteralPath $registryRoot.path -Name $property.Name `
+                            -ErrorAction SilentlyContinue
+                    }
                 }
             }
-            foreach ($name in $originalAutostart.Keys) {
-                Set-ItemProperty -LiteralPath $runKeyPath -Name $name -Value $originalAutostart[$name]
+            foreach ($name in $originalEntries.Keys) {
+                if (-not (Test-Path -LiteralPath $registryRoot.path)) {
+                    New-Item -Path $registryRoot.path -Force | Out-Null
+                }
+                Set-ItemProperty -LiteralPath $registryRoot.path -Name $name -Value $originalEntries[$name]
             }
         }
     } catch {
         $cleanupFailureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
-        if (-not $failureCode) { $failureCode = $cleanupFailureCode }
+        Add-FailureCode $cleanupFailureCode
         $result = "BLOCKER"
     }
     $env:APPDATA = $previousAppData
@@ -590,10 +777,12 @@ try {
         }
         executable_sha256 = $bundleHash
         checks = $checks
+        autostart = $autostartEvidence
         helper_process_ids = @($helperProcessIds)
         concurrent_launch_diagnostics = $concurrentLaunchDiagnostics
         result = $result
         failure_code = $failureCode
+        failure_codes = @($failureCodes)
         cleanup_failure_code = $cleanupFailureCode
     }
     [System.IO.File]::WriteAllText(

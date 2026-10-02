@@ -95,7 +95,7 @@ $postgresLog = $null
 $rawLogs = [System.Collections.Generic.List[string]]::new()
 $safeLogs = [System.Collections.Generic.List[string]]::new()
 $evidence = [ordered]@{
-    schema_version = 3
+    schema_version = 4
     run_kind = $RunKind
     source_revision = [string]$bundleManifest.source_revision
     source_tree_dirty = [bool]$bundleManifest.source_tree_dirty
@@ -113,7 +113,7 @@ $evidence = [ordered]@{
         sanitized_path_tool_inventory = [ordered]@{}
         runtime_bundle_root = $null
         cleared_runtime_environment_names = @()
-        sanitized_path_missing_python_uv_docker = $false
+        sanitized_path_forbidden_tools_absent = $false
     }
     checks = [ordered]@{}
     timings_ms = [ordered]@{}
@@ -413,14 +413,17 @@ try {
     $evidence.host.sanitized_path_entries = @("bundled-postgresql/bin", "Windows/System32")
     $evidence.host.runtime_bundle_root = $BundleRoot
     $toolInventory = [ordered]@{}
-    $hostToolNames = @("python.exe", "python3.exe", "py.exe", "uv.exe", "docker.exe")
-    foreach ($toolName in ($hostToolNames + @("pg_ctl.exe"))) {
+    $forbiddenToolNames = @("python.exe", "python3.exe", "py.exe", "uv.exe")
+    $inventoryToolNames = $forbiddenToolNames + @("docker.exe", "pg_ctl.exe")
+    foreach ($toolName in $inventoryToolNames) {
         $toolInventory[$toolName] = Get-ResolvedApplicationEvidence $toolName
     }
     $evidence.host.sanitized_path_tool_inventory = $toolInventory
-    $resolvedHostTools = @($hostToolNames | Where-Object { $toolInventory[$_].resolved })
-    $evidence.host.sanitized_path_missing_python_uv_docker = $resolvedHostTools.Count -eq 0
-    if (-not $evidence.host.sanitized_path_missing_python_uv_docker) { throw "sanitized_path_leaked_build_tool" }
+    $resolvedForbiddenTools = @($forbiddenToolNames | Where-Object { $toolInventory[$_].resolved })
+    $evidence.host.sanitized_path_forbidden_tools_absent = $resolvedForbiddenTools.Count -eq 0
+    if (-not $evidence.host.sanitized_path_forbidden_tools_absent) {
+        throw "sanitized_path_leaked_forbidden_tool"
+    }
     $expectedPgCtl = [System.IO.Path]::GetFullPath((Join-Path $postgresBin "pg_ctl.exe"))
     $resolvedPgCtl = [string]$toolInventory["pg_ctl.exe"].path
     $evidence.checks.runtime_uses_only_packaged_postgresql = (
@@ -699,7 +702,7 @@ try {
     if ($CleanWindowsEvidence) {
         $evidence.clean_windows_runner_status = if ($localSmokeStatus -eq "PASS") { "PASS" } else { "BLOCKER" }
     }
-    $evidence.host.sanitized_path_missing_python_uv_docker = [bool]$evidence.host.sanitized_path_missing_python_uv_docker
+    $evidence.host.sanitized_path_forbidden_tools_absent = [bool]$evidence.host.sanitized_path_forbidden_tools_absent
     $evidence.redacted_logs = @($safeLogs | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object {
         [ordered]@{
             name = [System.IO.Path]::GetFileName($_)

@@ -68,7 +68,7 @@ def test_runtime_smoke_keeps_root_failure_separate_from_log_scrub_failure(tmp_pa
     _write_json(
         layout_root / "smoke.json",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "run_kind": "github_hosted_windows_x64_isolated",
             "source_revision": revision,
             "source_tree_dirty": False,
@@ -100,14 +100,14 @@ def test_not_run_log_scrub_keeps_pre_runtime_primary_failure(tmp_path: Path) -> 
     _write_json(
         layout_root / "smoke.json",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "run_kind": "github_hosted_windows_x64_isolated",
             "source_revision": revision,
             "source_tree_dirty": False,
             "status": "FAIL",
             "clean_windows_runner_status": "BLOCKER",
-            "primary_failure_code": "sanitized_path_leaked_build_tool",
-            "failure_code": "sanitized_path_leaked_build_tool",
+            "primary_failure_code": "sanitized_path_leaked_forbidden_tool",
+            "failure_code": "sanitized_path_leaked_forbidden_tool",
             "log_scrub_status": "NOT_RUN",
             "log_scrub_failure_code": None,
             "redacted_logs": [],
@@ -118,18 +118,21 @@ def test_not_run_log_scrub_keeps_pre_runtime_primary_failure(tmp_path: Path) -> 
     result = verifier.verify_smoke(tmp_path, layout=layout, expected_revision=revision)
 
     assert result["status"] == "BLOCKER"
-    assert result["primary_failure_code"] == "sanitized_path_leaked_build_tool"
+    assert result["primary_failure_code"] == "sanitized_path_leaked_forbidden_tool"
     assert result["log_scrub_status"] == "NOT_RUN"
     assert result["log_scrub_failure_code"] is None
 
 
-def test_sanitized_path_inventory_records_only_packaged_pg_ctl(tmp_path: Path) -> None:
+def test_sanitized_path_inventory_allows_ambient_docker_with_packaged_pg_ctl(
+    tmp_path: Path,
+) -> None:
     verifier = _load_verifier()
     bundle = r"C:\staging\shared"
     inventory: dict[str, dict[str, Any]] = {
         name: {"resolved": False, "path": None}
         for name in ("python.exe", "python3.exe", "py.exe", "uv.exe", "docker.exe")
     }
+    inventory["docker.exe"] = {"resolved": True, "path": r"C:\Windows\System32\docker.exe"}
     inventory["pg_ctl.exe"] = {
         "resolved": True,
         "path": bundle + r"\postgresql\bin\pg_ctl.exe",
@@ -149,6 +152,29 @@ def test_sanitized_path_inventory_rejects_resolved_host_tool(tmp_path: Path) -> 
         for name in ("python.exe", "python3.exe", "py.exe", "uv.exe", "docker.exe")
     }
     inventory["py.exe"] = {"resolved": True, "path": r"C:\Windows\py.exe"}
+    inventory["pg_ctl.exe"] = {
+        "resolved": True,
+        "path": bundle + r"\postgresql\bin\pg_ctl.exe",
+    }
+
+    with pytest.raises(SystemExit, match="forbidden host tools"):
+        verifier.verify_sanitized_path_inventory(
+            {"runtime_bundle_root": bundle, "sanitized_path_tool_inventory": inventory},
+            tmp_path / "smoke.json",
+        )
+
+
+@pytest.mark.parametrize("tool_name", ["python.exe", "uv.exe"])
+def test_sanitized_path_inventory_rejects_host_python_and_uv(
+    tmp_path: Path, tool_name: str
+) -> None:
+    verifier = _load_verifier()
+    bundle = r"C:\staging\split"
+    inventory: dict[str, dict[str, Any]] = {
+        name: {"resolved": False, "path": None}
+        for name in ("python.exe", "python3.exe", "py.exe", "uv.exe", "docker.exe")
+    }
+    inventory[tool_name] = {"resolved": True, "path": rf"C:\host\{tool_name}"}
     inventory["pg_ctl.exe"] = {
         "resolved": True,
         "path": bundle + r"\postgresql\bin\pg_ctl.exe",

@@ -8,6 +8,9 @@ use std::{
     sync::Mutex,
 };
 
+#[cfg(windows)]
+use auto_launch::WindowsEnableMode;
+use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 use serde::{Deserialize, Serialize};
 use supervisor::{Supervisor, SupervisorSnapshot};
 use tauri::{
@@ -15,11 +18,55 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State,
 };
-use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
 const SESSION_LOCKED_EVENT: &str = "desktop://session-locked";
+
+fn autolaunch() -> Result<AutoLaunch, String> {
+    let executable =
+        std::env::current_exe().map_err(|_| "autostart_executable_path_unavailable".to_string())?;
+    #[cfg(windows)]
+    let executable = format!("\"{}\"", executable.to_string_lossy());
+    #[cfg(not(windows))]
+    let executable = executable.to_string_lossy().into_owned();
+
+    let mut builder = AutoLaunchBuilder::new();
+    let no_arguments: [&str; 0] = [];
+    builder
+        .set_app_name("Threads Desktop")
+        .set_app_path(&executable)
+        .set_args(&no_arguments);
+    #[cfg(windows)]
+    builder.set_windows_enable_mode(WindowsEnableMode::CurrentUser);
+
+    builder
+        .build()
+        .map_err(|_| "autostart_configuration_failed".to_string())
+}
+
+fn enable_autostart() -> Result<(), String> {
+    let registration = autolaunch()?;
+    if registration.enable().is_err() {
+        disable_registration(&registration).map_err(|_| "autostart_enable_cleanup_failed")?;
+        return Err("autostart_enable_failed".to_string());
+    }
+    Ok(())
+}
+
+fn disable_registration(registration: &AutoLaunch) -> Result<(), String> {
+    match registration.disable() {
+        Ok(()) => Ok(()),
+        Err(auto_launch::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
+        Err(_) => Err("autostart_disable_failed".to_string()),
+    }
+}
+
+fn disable_autostart() -> Result<(), String> {
+    disable_registration(&autolaunch()?)
+}
 
 #[cfg(windows)]
 mod windows_session_lock {
@@ -321,14 +368,13 @@ fn get_desktop_snapshot(state: State<'_, DeviceState>) -> Result<DesktopSnapshot
 
 #[tauri::command]
 fn provision_role(
-    app: AppHandle,
     state: State<'_, DeviceState>,
     role: ProvisionedRole,
 ) -> Result<DesktopSnapshot, String> {
     let snapshot = state.provision(role)?;
-    if app.autolaunch().enable().is_err() {
-        let _ = state.mark_autostart_unavailable();
-        return Err("autostart_enable_failed".to_string());
+    if let Err(error) = enable_autostart() {
+        state.decommission()?;
+        return Err(error);
     }
     Ok(snapshot)
 }
@@ -340,20 +386,17 @@ fn reset_ui_preferences(state: State<'_, DeviceState>) -> Result<DesktopSnapshot
 
 #[tauri::command]
 fn decommission_device(
-    app: AppHandle,
     state: State<'_, DeviceState>,
     confirmation: String,
 ) -> Result<DesktopSnapshot, String> {
     if confirmation != "RESET THIS DEVICE" {
         return Err("decommission_confirmation_required".to_string());
     }
-    app.autolaunch()
-        .disable()
-        .map_err(|_| "autostart_disable_failed".to_string())?;
+    disable_autostart()?;
     match state.decommission() {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => {
-            let _ = app.autolaunch().enable();
+            let _ = enable_autostart();
             Err(error)
         }
     }
@@ -415,11 +458,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
-        .plugin(
-            tauri_plugin_autostart::Builder::new()
-                .args([] as [&str; 0])
-                .build(),
-        )
         .invoke_handler(tauri::generate_handler![
             get_desktop_snapshot,
             provision_role,
@@ -435,7 +473,7 @@ pub fn run() {
                 .map(|snapshot| snapshot.autostart_enabled)
                 .unwrap_or(false);
             app.manage(state);
-            if should_autostart && app.autolaunch().enable().is_err() {
+            if should_autostart && enable_autostart().is_err() {
                 app.state::<DeviceState>()
                     .mark_autostart_unavailable()
                     .map_err(std::io::Error::other)?;

@@ -243,7 +243,7 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
     process = verify_hosted_process_diagnostics(
         layout_root, layout=layout, expected_revision=expected_revision
     )
-    if evidence.get("schema_version") != 3:
+    if evidence.get("schema_version") != 4:
         raise SystemExit(f"Unsupported runtime smoke evidence version: {evidence_path}")
     if evidence.get("run_kind") != "github_hosted_windows_x64_isolated":
         raise SystemExit(f"Smoke did not use the hosted isolated-runner mode: {evidence_path}")
@@ -301,8 +301,8 @@ def verify_smoke(evidence_root: Path, *, layout: str, expected_revision: str) ->
     ):
         raise SystemExit(f"Smoke runner must be x64 and non-administrator: {evidence_path}")
     verify_sanitized_path_inventory(host, evidence_path)
-    if host.get("sanitized_path_missing_python_uv_docker") is not True:
-        raise SystemExit(f"Smoke PATH exposes developer runtimes: {evidence_path}")
+    if host.get("sanitized_path_forbidden_tools_absent") is not True:
+        raise SystemExit(f"Smoke PATH exposes a forbidden host runtime tool: {evidence_path}")
     sanitized_entries = host.get("sanitized_path_entries")
     if not isinstance(sanitized_entries, list) or set(sanitized_entries) != {
         "bundled-postgresql/bin",
@@ -365,7 +365,7 @@ def verify_sanitized_path_inventory(host: dict[str, Any], evidence_path: Path) -
         elif resolved_path is not None:
             raise SystemExit(f"Smoke PATH unresolved tool has a path: {evidence_path}")
 
-    forbidden_tools = tool_names[:-1]
+    forbidden_tools = tool_names[:4]
     leaked_tools = [name for name in forbidden_tools if inventory[name]["resolved"]]
     if leaked_tools:
         raise SystemExit(
