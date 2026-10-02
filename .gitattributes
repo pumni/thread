@@ -1,0 +1,4 @@
+apps/desktop/** text eol=lf
+apps/desktop/**/*.png -text
+apps/desktop/**/*.ico -text
+apps/desktop/**/*.icns -text

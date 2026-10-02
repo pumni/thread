@@ -13,11 +13,9 @@ $PSNativeCommandUseErrorActionPreference = $false
 $BundleExecutable = (Resolve-Path -LiteralPath $BundleExecutable).Path
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../../")).Path
 $EvidencePath = [System.IO.Path]::GetFullPath($EvidencePath)
-$head = (& git -C $repoRoot rev-parse HEAD).Trim()
-$dirty = (& git -C $repoRoot status --porcelain).Trim()
-if ($head -ne $ExpectedSourceRevision -or $dirty) {
-    throw "lifecycle_smoke_requires_exact_clean_source_revision"
-}
+$head = $null
+$dirty = ""
+$worktreeIsClean = $false
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -64,6 +62,7 @@ $checks = [ordered]@{
     controller_starts_one_mock_helper = $false
     second_launch_reuses_and_focuses_instance = $false
     window_close_hides_without_stopping_helper = $false
+    tray_reopen_relocks_session_without_stopping_helper = $false
     tray_quit_confirms_and_stops_helper_before_exit = $false
     restart_restores_role_without_duplicate_helper = $false
     force_killed_helper_is_reported_degraded = $false
@@ -73,6 +72,7 @@ $checks = [ordered]@{
 $helperProcessIds = [System.Collections.Generic.List[int]]::new()
 $startedProcessIds = [System.Collections.Generic.List[int]]::new()
 $failureCode = $null
+$cleanupFailureCode = $null
 $result = "BLOCKER"
 $primaryId = $null
 $primaryWindowHandle = [IntPtr]::Zero
@@ -237,6 +237,17 @@ function Confirm-TrayQuit([int]$ExpectedHelperId) {
 }
 
 try {
+    $headOutput = @(& git -C $repoRoot rev-parse HEAD)
+    if ($LASTEXITCODE -ne 0) { throw "lifecycle_git_head_unavailable" }
+    $head = ($headOutput -join "`n").Trim()
+    $dirtyLines = @(& git -C $repoRoot status --porcelain)
+    if ($LASTEXITCODE -ne 0) { throw "lifecycle_git_status_unavailable" }
+    $dirty = [string]::Join("`n", [string[]]$dirtyLines)
+    if ($head -ne $ExpectedSourceRevision -or $dirty.Length -ne 0) {
+        throw "lifecycle_smoke_requires_exact_clean_source_revision"
+    }
+    $worktreeIsClean = $true
+
     New-Item -ItemType Directory -Path $appDataRoot -Force | Out-Null
     $env:APPDATA = $appDataRoot
 
@@ -294,7 +305,13 @@ try {
     $startedProcessIds.Add($reopen.Id)
     Wait-Until { $reopen.HasExited } 20 "reopen_invocation_did_not_exit_after_focus"
     Wait-Until { [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "second_launch_did_not_reopen_hidden_window"
-    if ((Get-HelperProcesses $primaryId).Count -ne 1) { throw "reopen_duplicated_mock_helper" }
+    $checks.tray_reopen_relocks_session_without_stopping_helper =
+        [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text)) -and
+        (Get-HelperProcesses $primaryId).Count -eq 1 -and
+        [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
+    if (-not $checks.tray_reopen_relocks_session_without_stopping_helper) {
+        throw "reopen_did_not_relock_session_or_stopped_mock_helper"
+    }
 
     Confirm-TrayQuit $helperId
     $checks.tray_quit_confirms_and_stops_helper_before_exit = $true
@@ -342,25 +359,31 @@ try {
 } catch {
     $failureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
 } finally {
-    foreach ($process in Get-PrimaryProcesses) {
-        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    foreach ($process in Get-DesktopProcesses) {
-        if ($process.CommandLine -match "--threads-desktop-mock-runtime") {
+    try {
+        foreach ($process in Get-PrimaryProcesses) {
             Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
         }
-    }
-    if (Test-Path $runKeyPath) {
-        $currentValues = Get-ItemProperty -LiteralPath $runKeyPath
-        foreach ($property in $currentValues.PSObject.Properties) {
-            if ($property.Name -notlike "PS*" -and [string]$property.Value -like "*$BundleExecutable*" -and
-                -not $originalAutostart.ContainsKey($property.Name)) {
-                Remove-ItemProperty -LiteralPath $runKeyPath -Name $property.Name -ErrorAction SilentlyContinue
+        foreach ($process in Get-DesktopProcesses) {
+            if ($process.CommandLine -match "--threads-desktop-mock-runtime") {
+                Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
-        foreach ($name in $originalAutostart.Keys) {
-            Set-ItemProperty -LiteralPath $runKeyPath -Name $name -Value $originalAutostart[$name]
+        if (Test-Path $runKeyPath) {
+            $currentValues = Get-ItemProperty -LiteralPath $runKeyPath
+            foreach ($property in $currentValues.PSObject.Properties) {
+                if ($property.Name -notlike "PS*" -and [string]$property.Value -like "*$BundleExecutable*" -and
+                    -not $originalAutostart.ContainsKey($property.Name)) {
+                    Remove-ItemProperty -LiteralPath $runKeyPath -Name $property.Name -ErrorAction SilentlyContinue
+                }
+            }
+            foreach ($name in $originalAutostart.Keys) {
+                Set-ItemProperty -LiteralPath $runKeyPath -Name $name -Value $originalAutostart[$name]
+            }
         }
+    } catch {
+        $cleanupFailureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
+        if (-not $failureCode) { $failureCode = $cleanupFailureCode }
+        $result = "BLOCKER"
     }
     $env:APPDATA = $previousAppData
     if (Test-Path $appDataRoot) { Remove-Item -LiteralPath $appDataRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -369,7 +392,8 @@ try {
     $evidence = [ordered]@{
         schema_version = 1
         source_revision = $ExpectedSourceRevision
-        source_worktree_clean = -not [bool]$dirty
+        checked_head = $head
+        source_worktree_clean = $worktreeIsClean
         host_windows_version = [Environment]::OSVersion.Version.ToString()
         architecture_x64 = [Environment]::Is64BitOperatingSystem
         current_user_is_administrator = [Security.Principal.WindowsPrincipal]::new(
@@ -380,6 +404,7 @@ try {
         helper_process_ids = @($helperProcessIds)
         result = $result
         failure_code = $failureCode
+        cleanup_failure_code = $cleanupFailureCode
     }
     [System.IO.File]::WriteAllText(
         $EvidencePath,

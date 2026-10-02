@@ -20,6 +20,93 @@ const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
 const SESSION_LOCKED_EVENT: &str = "desktop://session-locked";
 
+#[cfg(windows)]
+mod windows_session_lock {
+    use crate::SESSION_LOCKED_EVENT;
+    use tauri::{AppHandle, Emitter, WebviewWindow};
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        System::RemoteDesktop::{
+            WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+            NOTIFY_FOR_THIS_SESSION,
+        },
+        UI::{
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            WindowsAndMessaging::{
+                WM_NCDESTROY, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+            },
+        },
+    };
+
+    const SUBCLASS_ID: usize = 0x5448_5244;
+
+    fn event_for_session_message(message: u32, event: usize) -> Option<&'static str> {
+        (message == WM_WTSSESSION_CHANGE
+            && (event == WTS_SESSION_LOCK as usize || event == WTS_SESSION_UNLOCK as usize))
+            .then_some(SESSION_LOCKED_EVENT)
+    }
+
+    unsafe extern "system" fn session_window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        subclass_id: usize,
+        reference_data: usize,
+    ) -> LRESULT {
+        if let Some(event) = event_for_session_message(message, wparam) {
+            let app = &*(reference_data as *const AppHandle);
+            let _ = app.emit(event, ());
+        }
+
+        if message == WM_NCDESTROY {
+            let _ = RemoveWindowSubclass(hwnd, Some(session_window_proc), subclass_id);
+            let _ = WTSUnRegisterSessionNotification(hwnd);
+            drop(Box::from_raw(reference_data as *mut AppHandle));
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+
+    pub fn register(window: &WebviewWindow, app: AppHandle) -> Result<(), String> {
+        let hwnd = window
+            .hwnd()
+            .map_err(|_| "windows_session_lock_window_handle_unavailable".to_string())?
+            .0 as HWND;
+        let app_pointer = Box::into_raw(Box::new(app)) as usize;
+        unsafe {
+            if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
+                drop(Box::from_raw(app_pointer as *mut AppHandle));
+                return Err("windows_session_lock_registration_failed".to_string());
+            }
+            if SetWindowSubclass(hwnd, Some(session_window_proc), SUBCLASS_ID, app_pointer) == 0 {
+                let _ = WTSUnRegisterSessionNotification(hwnd);
+                drop(Box::from_raw(app_pointer as *mut AppHandle));
+                return Err("windows_session_lock_message_hook_failed".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn windows_session_lock_and_unlock_require_reauthentication() {
+            assert_eq!(
+                event_for_session_message(WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK as usize),
+                Some(SESSION_LOCKED_EVENT)
+            );
+            assert_eq!(
+                event_for_session_message(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK as usize),
+                Some(SESSION_LOCKED_EVENT),
+                "unlock must keep the Operator UI locked"
+            );
+            assert_eq!(event_for_session_message(WM_NCDESTROY, 0), None);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProvisionedRole {
@@ -280,6 +367,7 @@ fn request_quit(app: AppHandle, state: State<'_, DeviceState>) -> Result<(), Str
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit(SESSION_LOCKED_EVENT, ());
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
@@ -348,6 +436,11 @@ pub fn run() {
                     .map_err(std::io::Error::other)?;
             }
             install_tray(app)?;
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                windows_session_lock::register(&window, app.handle().clone())
+                    .map_err(std::io::Error::other)?;
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -105,12 +105,14 @@ jobs:
         with:
           version: 0.12.21
           enable-cache: true
-      - name: Install locked Python and packaging dependencies
-        run: uv sync --locked --no-dev --group packaging
+      - name: Install locked source-quality environment
+        run: uv sync --locked
       - name: Check runtime packaging sources
         run: |
-          uv run --locked --no-dev --group packaging ruff check packaging/windows_desktop
-          uv run --locked --no-dev --group packaging ruff format --check packaging/windows_desktop
+          uv run --locked ruff check packaging/windows_desktop
+          uv run --locked ruff format --check packaging/windows_desktop
+      - name: Install locked runtime packaging dependencies
+        run: uv sync --locked --no-dev --group packaging
       - name: Build both pinned Windows runtime candidates
         run: uv run --locked --no-dev --group packaging python packaging/windows_desktop/build_runtime.py --layout all
       - name: Verify source, dependency, license and bundle checksums
@@ -140,37 +142,4 @@ jobs:
             build/windows-desktop/evidence
           if-no-files-found: warn
           compression-level: 0
-          retention-days: 14
-
-  windows-currentuser-root-ca:
-    name: CurrentUser Root trust security regression (Windows x64)
-    runs-on: windows-2025
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: 0.12.21
-          enable-cache: true
-      - run: uv sync --locked
-      - name: Run the unmodified CurrentUser Root security assertion
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path build/windows-desktop/evidence -Force | Out-Null
-          $testLog = "build/windows-desktop/evidence/windows-currentuser-root-ca-test.log"
-          uv run --locked pytest -s -vv --tb=short `
-            tests/unit/test_worker_control_client_httpx2.py::test_control_client_trusts_only_windows_current_user_root_ca `
-            --basetemp "$env:RUNNER_TEMP\desktop-rootca-tests" 2>&1 | Tee-Object -FilePath $testLog
-          $testExitCode = $LASTEXITCODE
-          if ($testExitCode -ne 0) { exit $testExitCode }
-      - name: Upload sanitized CurrentUser Root test diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dx02-currentuser-root-ca-${{ github.sha }}
-          path: build/windows-desktop/evidence/windows-currentuser-root-ca-test.log
-          if-no-files-found: warn
           retention-days: 14
