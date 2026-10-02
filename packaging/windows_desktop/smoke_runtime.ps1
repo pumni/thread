@@ -78,7 +78,9 @@ $cleanVmReason = if ($CleanWindowsEvidence) {
     "Local smoke on a developer Windows host is not clean-machine acceptance evidence."
 }
 $localSmokeStatus = "FAIL"
-$failureCode = $null
+$primaryFailureCode = $null
+$logScrubStatus = "NOT_RUN"
+$logScrubFailureCode = $null
 $httpStatus = $null
 $apiProcess = $null
 $schedulerProcess = $null
@@ -114,7 +116,10 @@ $evidence = [ordered]@{
     checks = [ordered]@{}
     timings_ms = [ordered]@{}
     redacted_logs = @()
+    primary_failure_code = $null
     failure_code = $null
+    log_scrub_status = $logScrubStatus
+    log_scrub_failure_code = $null
 }
 
 function Get-CommandPresence([string]$Name) {
@@ -147,33 +152,80 @@ function Get-Sha256Hex([string]$Path) {
     return [BitConverter]::ToString($digest).Replace("-", "").ToLowerInvariant()
 }
 
+function ConvertTo-RedactedRuntimeLog([string]$Content) {
+    if ($databaseUrl) { $Content = $Content.Replace($databaseUrl, "<REDACTED_DATABASE_URL>") }
+    if ($databasePassword) { $Content = $Content.Replace($databasePassword, "<REDACTED>") }
+    $Content = [regex]::Replace(
+        $Content,
+        "(?i)(password|database_url)\s*[:=]\s*(?!<REDACTED>)[^\s]+",
+        '$1=<REDACTED>'
+    )
+    $Content = [regex]::Replace(
+        $Content,
+        "(?i)(authorization\s*[:=]\s*Bearer\s+)(?!<REDACTED>)[^\s]+",
+        '$1<REDACTED>'
+    )
+    $Content = [regex]::Replace(
+        $Content,
+        "(?i)\bBearer\s+(?!<REDACTED>)[A-Za-z0-9._~+/-]{24,}",
+        'Bearer <REDACTED>'
+    )
+    return [regex]::Replace(
+        $Content,
+        "(?i)(postgres(?:ql)?(?:\+\w+)?://)[^\s:@/]+:[^@\s/]+@",
+        '$1<REDACTED>@'
+    )
+}
+
 function Restrict-TreeToCurrentUser([string]$Path) {
-    $acl = [System.IO.Directory]::GetAccessControl($Path)
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($existingRule in $acl.GetAccessRules(
-        $true,
-        $true,
-        [System.Security.Principal.SecurityIdentifier]
-    )) {
-        [void]$acl.RemoveAccessRuleSpecific($existingRule)
-    }
+    try { $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop }
+    catch { throw "private_data_acl_query_failed" }
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-        $currentSid,
-        [System.Security.AccessControl.FileSystemRights]::FullControl,
-        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
-        [System.Security.AccessControl.PropagationFlags]::None,
-        [System.Security.AccessControl.AccessControlType]::Allow
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $accessRules = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+    $alreadyRestricted = $acl.AreAccessRulesProtected -and $accessRules.Count -eq 1 -and
+        $accessRules[0].IdentityReference.Value -eq $currentSid.Value -and
+        $accessRules[0].AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $accessRules[0].FileSystemRights -eq [System.Security.AccessControl.FileSystemRights]::FullControl -and
+        $accessRules[0].InheritanceFlags -eq $inheritance -and
+        $accessRules[0].PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None -and
+        -not $accessRules[0].IsInherited
+
+    if (-not $alreadyRestricted) {
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($existingRule in $acl.GetAccessRules(
+            $true,
+            $true,
+            [System.Security.Principal.SecurityIdentifier]
+        )) {
+            [void]$acl.RemoveAccessRuleSpecific($existingRule)
+        }
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $currentSid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$acl.AddAccessRule($rule)
+        try { Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop }
+        catch { throw ("private_data_acl_write_failed_{0}" -f $_.Exception.HResult.ToString("X8")) }
+    }
+
+    try { $verified = Get-Acl -LiteralPath $Path -ErrorAction Stop }
+    catch { throw "private_data_acl_verify_failed" }
+    $verifiedRules = @(
+        $verified.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
     )
-    [void]$acl.AddAccessRule($rule)
-    [System.IO.Directory]::SetAccessControl($Path, $acl)
-    $verified = [System.IO.Directory]::GetAccessControl($Path)
-    $identities = @(
-        $verified.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
-            ForEach-Object { $_.IdentityReference.Value } |
-            Sort-Object -Unique
-    )
-    if ($identities.Count -ne 1 -or $identities[0] -ne $currentSid.Value) {
+    $verifiedCorrectly = $verified.AreAccessRulesProtected -and $verifiedRules.Count -eq 1 -and
+        $verifiedRules[0].IdentityReference.Value -eq $currentSid.Value -and
+        $verifiedRules[0].AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $verifiedRules[0].FileSystemRights -eq [System.Security.AccessControl.FileSystemRights]::FullControl -and
+        $verifiedRules[0].InheritanceFlags -eq $inheritance -and
+        $verifiedRules[0].PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None -and
+        -not $verifiedRules[0].IsInherited
+    if (-not $verifiedCorrectly) {
         throw "private_data_acl_mismatch"
     }
 }
@@ -275,10 +327,7 @@ function Save-RedactedLogs {
         $raw = $rawLogs[$index]
         $safe = $safeLogs[$index]
         if (-not (Test-Path -LiteralPath $raw)) { continue }
-        $content = [System.IO.File]::ReadAllText($raw)
-        if ($databaseUrl) { $content = $content.Replace($databaseUrl, "<REDACTED_DATABASE_URL>") }
-        if ($databasePassword) { $content = $content.Replace($databasePassword, "<REDACTED>") }
-        $content = [regex]::Replace($content, "(?i)(password|database_url)\s*[:=]\s*\S+", '$1=<REDACTED>')
+        $content = ConvertTo-RedactedRuntimeLog ([System.IO.File]::ReadAllText($raw))
         [System.IO.File]::WriteAllText($safe, $content, [System.Text.UTF8Encoding]::new($false))
         Remove-Item -LiteralPath $raw -Force -ErrorAction SilentlyContinue
     }
@@ -509,7 +558,8 @@ try {
 
     $localSmokeStatus = "PASS"
 } catch {
-    $failureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
+    $safeFailureText = ConvertTo-RedactedRuntimeLog ([string]$_.Exception.Message)
+    $primaryFailureCode = [regex]::Replace($safeFailureText, "[^A-Za-z0-9_.-]", "_")
 } finally {
     if ($apiProcess -and -not $apiProcess.HasExited) { Stop-Process -Id $apiProcess.Id -Force -ErrorAction SilentlyContinue }
     if ($schedulerProcess -and -not $schedulerProcess.HasExited) { Stop-Process -Id $schedulerProcess.Id -Force -ErrorAction SilentlyContinue }
@@ -530,53 +580,66 @@ try {
             $stopProcess.Dispose()
         }
     }
-    if ($localRoot) {
-        Save-RedactedLogs
-        if ($postgresLog -and (Test-Path -LiteralPath $postgresLog)) {
-            $postgresContent = [System.IO.File]::ReadAllText($postgresLog)
-            if ($databaseUrl) { $postgresContent = $postgresContent.Replace($databaseUrl, "<REDACTED_DATABASE_URL>") }
-            if ($databasePassword) { $postgresContent = $postgresContent.Replace($databasePassword, "<REDACTED>") }
-            $postgresContent = [regex]::Replace($postgresContent, "(?i)(password|database_url)\s*[:=]\s*\S+", '$1=<REDACTED>')
+    $redactionVerified = $false
+    try {
+        if ($localRoot) {
+            Save-RedactedLogs
+        }
+        if ($localRoot -and $postgresLog -and (Test-Path -LiteralPath $postgresLog)) {
+            $postgresContent = ConvertTo-RedactedRuntimeLog ([System.IO.File]::ReadAllText($postgresLog))
             $safePostgresLog = Join-Path $EvidenceDirectory "postgresql-startup.redacted.log"
             [System.IO.File]::WriteAllText($safePostgresLog, $postgresContent, [System.Text.UTF8Encoding]::new($false))
             $safeLogs.Add($safePostgresLog)
             Remove-Item -LiteralPath $postgresLog -Force
         }
-        $incompatibleRaw = Join-Path $localRoot "migration-incompatible.raw.log"
-        $incompatibleSafe = Join-Path $EvidenceDirectory "migration-incompatible.redacted.log"
-        if ((Test-Path -LiteralPath $incompatibleRaw) -and -not (Test-Path -LiteralPath $incompatibleSafe)) {
-            $incompatibleText = [System.IO.File]::ReadAllText($incompatibleRaw)
-            if ($databaseUrl) { $incompatibleText = $incompatibleText.Replace($databaseUrl, "<REDACTED_DATABASE_URL>") }
-            if ($databasePassword) { $incompatibleText = $incompatibleText.Replace($databasePassword, "<REDACTED>") }
-            [System.IO.File]::WriteAllText($incompatibleSafe, $incompatibleText, [System.Text.UTF8Encoding]::new($false))
-            $safeLogs.Add($incompatibleSafe)
-            Remove-Item -LiteralPath $incompatibleRaw -Force -ErrorAction SilentlyContinue
+        if ($localRoot) {
+            $incompatibleRaw = Join-Path $localRoot "migration-incompatible.raw.log"
+            $incompatibleSafe = Join-Path $EvidenceDirectory "migration-incompatible.redacted.log"
+            if ((Test-Path -LiteralPath $incompatibleRaw) -and -not (Test-Path -LiteralPath $incompatibleSafe)) {
+                $incompatibleText = ConvertTo-RedactedRuntimeLog ([System.IO.File]::ReadAllText($incompatibleRaw))
+                [System.IO.File]::WriteAllText($incompatibleSafe, $incompatibleText, [System.Text.UTF8Encoding]::new($false))
+                $safeLogs.Add($incompatibleSafe)
+                Remove-Item -LiteralPath $incompatibleRaw -Force -ErrorAction SilentlyContinue
+            }
+            if ($secretFile -and (Test-Path -LiteralPath $secretFile)) { Remove-Item -LiteralPath $secretFile -Force }
+            $credentialPath = Join-Path $localRoot "database-credential.dpapi"
+            if (Test-Path -LiteralPath $credentialPath) { Remove-Item -LiteralPath $credentialPath -Force }
         }
-        if ($secretFile -and (Test-Path -LiteralPath $secretFile)) { Remove-Item -LiteralPath $secretFile -Force }
-        $credentialPath = Join-Path $localRoot "database-credential.dpapi"
-        if (Test-Path -LiteralPath $credentialPath) { Remove-Item -LiteralPath $credentialPath -Force }
-    }
-    $remainingRawLogs = @($rawLogs | Where-Object { Test-Path -LiteralPath $_ })
-    $existingSafeLogs = @($safeLogs | Where-Object { Test-Path -LiteralPath $_ })
-    $redactionVerified = $remainingRawLogs.Count -eq 0 -and $existingSafeLogs.Count -gt 0
-    foreach ($safeLog in $existingSafeLogs) {
-        $content = [System.IO.File]::ReadAllText($safeLog)
-        if (($databaseUrl -and $content.Contains($databaseUrl)) -or
-            ($databasePassword -and $content.Contains($databasePassword)) -or
-            [regex]::IsMatch($content, "(?i)(password|database_url)\s*[:=]\s*(?!<REDACTED>)[^\s]+")) {
-            $redactionVerified = $false
+        $remainingRawLogs = @($rawLogs | Where-Object { Test-Path -LiteralPath $_ })
+        $existingSafeLogs = @($safeLogs | Where-Object { Test-Path -LiteralPath $_ })
+        $redactionVerified = $remainingRawLogs.Count -eq 0 -and $existingSafeLogs.Count -gt 0
+        foreach ($safeLog in $existingSafeLogs) {
+            $content = [System.IO.File]::ReadAllText($safeLog)
+            if (($databaseUrl -and $content.Contains($databaseUrl)) -or
+                ($databasePassword -and $content.Contains($databasePassword)) -or
+                [regex]::IsMatch($content, "(?i)(password|database_url)\s*[:=]\s*(?!<REDACTED>)[^\s]+") -or
+                [regex]::IsMatch($content, "(?i)(authorization\s*[:=]\s*Bearer\s+)(?!<REDACTED>)[^\s]+") -or
+                [regex]::IsMatch($content, "(?i)\bBearer\s+(?!<REDACTED>)[A-Za-z0-9._~+/-]{24,}") -or
+                [regex]::IsMatch($content, "(?i)postgres(?:ql)?(?:\+\w+)?://[^\s:@/]+:[^@\s/]+@")) {
+                $redactionVerified = $false
+            }
         }
+    } catch {
+        $redactionVerified = $false
+        $logScrubFailureCode = "runtime_log_scrub_verification_failed"
     }
     if (-not $redactionVerified) {
         $localSmokeStatus = "FAIL"
-        $failureCode = "runtime_log_scrub_verification_failed"
+        if (-not $logScrubFailureCode) {
+            $logScrubFailureCode = "runtime_log_scrub_verification_failed"
+        }
+        if (-not $primaryFailureCode) { $primaryFailureCode = $logScrubFailureCode }
     }
+    $logScrubStatus = if ($redactionVerified) { "PASS" } else { "FAIL" }
     if ($localRoot) { Remove-Item -LiteralPath $localRoot -Recurse -Force -ErrorAction SilentlyContinue }
     $env:PATH = $pathBefore
     foreach ($key in $savedRuntimeEnvironment.Keys) { Set-Item -LiteralPath "Env:$key" -Value $savedRuntimeEnvironment[$key] }
     $evidence.status = $localSmokeStatus
-    $evidence.failure_code = $failureCode
-    $evidence.checks | Add-Member -NotePropertyName redacted_runtime_logs -NotePropertyValue $redactionVerified -Force
+    $evidence.primary_failure_code = $primaryFailureCode
+    $evidence.failure_code = $primaryFailureCode
+    $evidence.log_scrub_status = $logScrubStatus
+    $evidence.log_scrub_failure_code = $logScrubFailureCode
+    $evidence.checks["redacted_runtime_logs"] = $redactionVerified
     $evidence.clean_windows_runner_status = $cleanVmStatus
     if ($CleanWindowsEvidence) {
         $evidence.clean_windows_runner_status = if ($localSmokeStatus -eq "PASS") { "PASS" } else { "BLOCKER" }
@@ -597,7 +660,7 @@ try {
 }
 
 if ($localSmokeStatus -ne "PASS") {
-    throw "DX-03 runtime smoke failed: $failureCode"
+    throw "DX-03 runtime smoke failed: $primaryFailureCode"
 }
 if ($CleanWindowsEvidence) {
     Write-Output "DX-03 GitHub-hosted Windows x64 runtime smoke PASS. Evidence: $EvidencePath"

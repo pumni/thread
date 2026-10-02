@@ -9,6 +9,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "tests/unit/test_worker_control_client_httpx2.py"
+      - "tests/unit/test_windows_desktop_evidence.py"
       - ".github/workflows/desktop.yml"
   push:
     paths:
@@ -18,6 +19,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "tests/unit/test_worker_control_client_httpx2.py"
+      - "tests/unit/test_windows_desktop_evidence.py"
       - ".github/workflows/desktop.yml"
   workflow_dispatch:
 
@@ -109,8 +111,10 @@ jobs:
         run: uv sync --locked
       - name: Check runtime packaging sources
         run: |
-          uv run --locked ruff check packaging/windows_desktop
-          uv run --locked ruff format --check packaging/windows_desktop
+          uv run --locked ruff check packaging/windows_desktop tests/unit/test_windows_desktop_evidence.py
+          uv run --locked ruff format --check packaging/windows_desktop tests/unit/test_windows_desktop_evidence.py
+      - name: Test runtime smoke evidence failure reporting
+        run: uv run --locked pytest -q tests/unit/test_windows_desktop_evidence.py
       - name: Install locked runtime packaging dependencies
         run: uv sync --locked --no-dev --group packaging
       - name: Build both pinned Windows runtime candidates
@@ -132,14 +136,20 @@ jobs:
           -RepositoryRoot $env:GITHUB_WORKSPACE
           -ExpectedSourceRevision $env:GITHUB_SHA
           -EvidenceOutput $env:GITHUB_WORKSPACE/build/windows-desktop/evidence/hosted
-      - name: Upload exact-SHA runtime and smoke evidence
+      - name: Upload exact-SHA runtime candidates
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dx03-windows-x64-${{ github.sha }}
-          path: |
-            build/windows-desktop/candidates
-            build/windows-desktop/evidence
+          name: dx03-candidates-${{ github.sha }}
+          path: build/windows-desktop/candidates
           if-no-files-found: warn
           compression-level: 0
+          retention-days: 14
+      - name: Upload compact exact-SHA runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx03-evidence-${{ github.sha }}
+          path: build/windows-desktop/evidence
+          if-no-files-found: warn
           retention-days: 14

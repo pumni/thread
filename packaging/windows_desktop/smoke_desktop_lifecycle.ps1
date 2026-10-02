@@ -71,11 +71,15 @@ $checks = [ordered]@{
 }
 $helperProcessIds = [System.Collections.Generic.List[int]]::new()
 $startedProcessIds = [System.Collections.Generic.List[int]]::new()
+$observedPrimaryPids = [System.Collections.Generic.HashSet[int]]::new()
 $failureCode = $null
 $cleanupFailureCode = $null
 $result = "BLOCKER"
 $primaryId = $null
 $primaryWindowHandle = [IntPtr]::Zero
+$first = $null
+$second = $null
+$concurrentLaunchDiagnostics = $null
 
 function Get-DesktopProcesses {
     @(Get-CimInstance Win32_Process -Filter "Name='threads-desktop.exe'" -ErrorAction Stop |
@@ -84,6 +88,154 @@ function Get-DesktopProcesses {
 
 function Get-PrimaryProcesses {
     @(Get-DesktopProcesses | Where-Object { $_.CommandLine -notmatch "--threads-desktop-mock-runtime" })
+}
+
+function Get-ProcessWindowDetails([int]$ProcessId) {
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $process) {
+            return [ordered]@{
+                process_alive = $false
+                main_window_handle = $null
+                main_window_visible = $null
+                window_query_failure = $null
+            }
+        }
+        $process.Refresh()
+        $handle = [Int64]$process.MainWindowHandle.ToInt64()
+        $visible = if ($handle -eq 0) { $false } else {
+            [bool][ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible([IntPtr]$handle)
+        }
+        return [ordered]@{
+            process_alive = $true
+            main_window_handle = $handle
+            main_window_visible = $visible
+            window_query_failure = $null
+        }
+    } catch {
+        return [ordered]@{
+            process_alive = $null
+            main_window_handle = $null
+            main_window_visible = $null
+            window_query_failure = "process_window_query_failed"
+        }
+    }
+}
+
+function Get-LaunchProcessDetails([string]$Name, [System.Diagnostics.Process]$Process) {
+    if (-not $Process) {
+        return [ordered]@{
+            name = $Name
+            pid = $null
+            has_exited = $null
+            exit_code = $null
+            window = $null
+            process_query_failure = "process_not_created"
+        }
+    }
+
+    $hasExited = $null
+    $exitCode = $null
+    $queryFailure = $null
+    try {
+        $Process.Refresh()
+        $hasExited = [bool]$Process.HasExited
+        if ($hasExited) { $exitCode = [int]$Process.ExitCode }
+    } catch {
+        $queryFailure = "launch_process_query_failed"
+    }
+
+    $window = if ($hasExited -eq $false) { Get-ProcessWindowDetails $Process.Id } else { $null }
+    return [ordered]@{
+        name = $Name
+        pid = [int]$Process.Id
+        has_exited = $hasExited
+        exit_code = $exitCode
+        window = $window
+        process_query_failure = $queryFailure
+    }
+}
+
+function ConvertTo-SafeProcessCommandLine([string]$CommandLine) {
+    if (-not $CommandLine) { return $null }
+    $safe = [regex]::Replace(
+        $CommandLine,
+        '(?i)(--?(?:password|token|secret|authorization|database-url)(?:=|\s+))("[^"]*"|\S+)',
+        '$1<REDACTED>'
+    )
+    $safe = [regex]::Replace($safe, '(?i)(postgres(?:ql)?(?:\+\w+)?://)[^:\s/@]+:[^@\s/]+@', '$1<REDACTED>@')
+    $safe = [regex]::Replace($safe, '(?i)\bBearer\s+\S+', 'Bearer <REDACTED>')
+    return $safe
+}
+
+function Get-ConcurrentLaunchDiagnostics(
+    [System.Diagnostics.Process]$FirstProcess,
+    [System.Diagnostics.Process]$SecondProcess
+) {
+    $desktopProcesses = @()
+    $inventoryFailure = $null
+    try { $desktopProcesses = @(Get-DesktopProcesses) }
+    catch { $inventoryFailure = "desktop_process_inventory_failed" }
+
+    $discovered = @(
+        foreach ($process in $desktopProcesses) {
+            $window = Get-ProcessWindowDetails ([int]$process.ProcessId)
+            [ordered]@{
+                pid = [int]$process.ProcessId
+                executable_path = [string]$process.ExecutablePath
+                command_line = ConvertTo-SafeProcessCommandLine ([string]$process.CommandLine)
+                session_id = [int]$process.SessionId
+                is_primary = [string]$process.CommandLine -notmatch "--threads-desktop-mock-runtime"
+                process_alive = $window.process_alive
+                main_window_handle = $window.main_window_handle
+                main_window_visible = $window.main_window_visible
+                window_query_failure = $window.window_query_failure
+            }
+        }
+    )
+    $primaryCount = @($desktopProcesses | Where-Object {
+        $_.CommandLine -notmatch "--threads-desktop-mock-runtime"
+    }).Count
+    $currentProcess = [System.Diagnostics.Process]::GetCurrentProcess()
+    $runnerContext = [ordered]@{
+        current_process_session_id = $currentProcess.SessionId
+        session_name = $env:SESSIONNAME
+        user_interactive = [Environment]::UserInteractive
+        github_actions = $env:GITHUB_ACTIONS -eq "true"
+        runner_environment = $env:RUNNER_ENVIRONMENT
+        runner_os = $env:RUNNER_OS
+        runner_arch = $env:RUNNER_ARCH
+        runner_image = $env:ImageOS
+        runner_image_version = $env:ImageVersion
+    }
+
+    return [ordered]@{
+        captured_at_utc = [DateTime]::UtcNow.ToString("o")
+        first_launch = Get-LaunchProcessDetails "first" $FirstProcess
+        second_launch = Get-LaunchProcessDetails "second" $SecondProcess
+        final_primary_process_count = $primaryCount
+        observed_primary_pids = @($observedPrimaryPids | Sort-Object)
+        discovered_processes = $discovered
+        runner_context = $runnerContext
+        inventory_failure = $inventoryFailure
+    }
+}
+
+function Get-ConcurrentLaunchFailureCode($Diagnostics) {
+    if ($Diagnostics.final_primary_process_count -ge 2) { return "both_primaries_survived" }
+    if ($Diagnostics.inventory_failure) { return "single_instance_convergence_timeout" }
+    if ($Diagnostics.final_primary_process_count -eq 0) {
+        $observed = @($Diagnostics.observed_primary_pids)
+        if ($observed.Count -eq 0) { return "primary_never_started" }
+        $observedLaunchExited = @(
+            $Diagnostics.first_launch,
+            $Diagnostics.second_launch
+        ) | Where-Object { $_.has_exited -eq $true -and $_.pid -in $observed }
+        if ($observedLaunchExited.Count -gt 0) {
+            return "primary_exited_during_startup"
+        }
+    }
+    return "single_instance_convergence_timeout"
 }
 
 function Get-HelperProcesses([int]$ParentId) {
@@ -255,7 +407,22 @@ try {
     $second = Start-Process -FilePath $BundleExecutable -PassThru
     $startedProcessIds.Add($first.Id)
     $startedProcessIds.Add($second.Id)
-    Wait-Until { (Get-PrimaryProcesses).Count -eq 1 } 25 "concurrent_launch_did_not_converge_to_one_primary"
+    $convergenceDeadline = [DateTime]::UtcNow.AddSeconds(25)
+    $concurrentPrimaries = @()
+    do {
+        $concurrentPrimaries = @(Get-PrimaryProcesses)
+        foreach ($candidate in $concurrentPrimaries) {
+            [void]$observedPrimaryPids.Add([int]$candidate.ProcessId)
+        }
+        if ($concurrentPrimaries.Count -eq 1) { break }
+        Start-Sleep -Milliseconds 150
+    } while ([DateTime]::UtcNow -lt $convergenceDeadline)
+    if ($concurrentPrimaries.Count -ne 1) {
+        $concurrentLaunchDiagnostics = Get-ConcurrentLaunchDiagnostics $first $second
+        $failureCode = Get-ConcurrentLaunchFailureCode $concurrentLaunchDiagnostics
+        $concurrentLaunchDiagnostics["failure_code"] = $failureCode
+        throw $failureCode
+    }
     $primary = Get-PrimaryProcesses | Select-Object -First 1
     $primaryId = [int]$primary.ProcessId
     $process = Get-Process -Id $primaryId -ErrorAction Stop
@@ -357,7 +524,18 @@ try {
     $checks.restart_quits_cleanly = $true
     $result = if (@($checks.Values | Where-Object { -not $_ }).Count -eq 0) { "PASS" } else { "BLOCKER" }
 } catch {
-    $failureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
+    if (-not $failureCode) {
+        $failureCode = [regex]::Replace($_.Exception.Message, "[^A-Za-z0-9_.-]", "_")
+    }
+    if (-not $concurrentLaunchDiagnostics -and $failureCode -in @(
+        "primary_never_started",
+        "both_primaries_survived",
+        "primary_exited_during_startup",
+        "single_instance_convergence_timeout"
+    )) {
+        $concurrentLaunchDiagnostics = Get-ConcurrentLaunchDiagnostics $first $second
+        $concurrentLaunchDiagnostics["failure_code"] = $failureCode
+    }
 } finally {
     try {
         foreach ($process in Get-PrimaryProcesses) {
@@ -399,9 +577,21 @@ try {
         current_user_is_administrator = [Security.Principal.WindowsPrincipal]::new(
             [Security.Principal.WindowsIdentity]::GetCurrent()
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        windows_session_context = [ordered]@{
+            current_process_session_id = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+            session_name = $env:SESSIONNAME
+            user_interactive = [Environment]::UserInteractive
+            github_actions = $env:GITHUB_ACTIONS -eq "true"
+            runner_environment = $env:RUNNER_ENVIRONMENT
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            runner_image = $env:ImageOS
+            runner_image_version = $env:ImageVersion
+        }
         executable_sha256 = $bundleHash
         checks = $checks
         helper_process_ids = @($helperProcessIds)
+        concurrent_launch_diagnostics = $concurrentLaunchDiagnostics
         result = $result
         failure_code = $failureCode
         cleanup_failure_code = $cleanupFailureCode
