@@ -4,11 +4,16 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import os
 import ssl
+import subprocess
+import sys
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import httpx2
@@ -17,6 +22,18 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from windows_root_ca_support import (
+    TestCertificateAuthority as _TestCertificateAuthority,
+)
+from windows_root_ca_support import (
+    cleanup_test_certificate_authority_fixture,
+    load_root_store_snapshot,
+    load_test_certificate_authority,
+    validate_test_certificate_authority_fixture,
+)
+from windows_root_ca_support import (
+    create_test_certificate_authority as _create_test_certificate_authority,
+)
 
 from threads_platform.application.ports.worker_agent import WorkerControlClientError
 from threads_platform.workers.control_client import HttpWorkerControlClient
@@ -25,6 +42,8 @@ from threads_platform.workers.key_store import WorkerDeviceIdentity
 _WORKER_TOKEN = uuid4().hex
 _ENROLLMENT_CODE = uuid4().hex
 _CHALLENGE_ID = UUID("3d8f6cd0-8c3f-4b5e-8fa5-d6d887f32458")
+_CERT_STORE_OPERATION_TIMEOUT_SECONDS = 15.0
+_WINDOWS_ROOT_STORE_HELPER = Path(__file__).parents[1] / "scripts" / "windows_root_store.py"
 
 
 def _write_server_certificate(
@@ -32,45 +51,17 @@ def _write_server_certificate(
     *,
     subject_alt_name: x509.GeneralName,
     expired: bool = False,
+    authority: _TestCertificateAuthority | None = None,
 ) -> tuple[Path, Path, Path]:
-    ca_key = ec.generate_private_key(ec.SECP256R1())
-    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "worker-control-test-ca")])
+    directory.mkdir(parents=True, exist_ok=True)
+    selected_authority = authority or _create_test_certificate_authority()
     now = datetime.now(UTC)
-    ca_certificate = (
-        x509.CertificateBuilder()
-        .subject_name(ca_name)
-        .issuer_name(ca_name)
-        .public_key(ca_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(days=1))
-        .not_valid_after(now + timedelta(days=30))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=True,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
-            critical=False,
-        )
-        .sign(ca_key, hashes.SHA256())
-    )
     server_key = ec.generate_private_key(ec.SECP256R1())
     server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "worker-control-test")])
     server_certificate = (
         x509.CertificateBuilder()
         .subject_name(server_name)
-        .issuer_name(ca_certificate.subject)
+        .issuer_name(selected_authority.certificate.subject)
         .public_key(server_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - timedelta(days=2 if expired else 1))
@@ -96,18 +87,20 @@ def _write_server_certificate(
             critical=False,
         )
         .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                selected_authority.private_key.public_key()
+            ),
             critical=False,
         )
-        .sign(ca_key, hashes.SHA256())
+        .sign(selected_authority.private_key, hashes.SHA256())
     )
     ca_path = directory / "worker-control-test-ca.pem"
     certificate_path = directory / "worker-control-test-server.pem"
     key_path = directory / "worker-control-test-key.pem"
-    ca_path.write_bytes(ca_certificate.public_bytes(serialization.Encoding.PEM))
+    ca_path.write_bytes(selected_authority.certificate.public_bytes(serialization.Encoding.PEM))
     certificate_path.write_bytes(
         server_certificate.public_bytes(serialization.Encoding.PEM)
-        + ca_certificate.public_bytes(serialization.Encoding.PEM)
+        + selected_authority.certificate.public_bytes(serialization.Encoding.PEM)
     )
     key_path.write_bytes(
         server_key.private_bytes(
@@ -139,11 +132,13 @@ async def _control_plane_server(
     *,
     subject_alt_name: x509.GeneralName,
     expired: bool = False,
+    authority: _TestCertificateAuthority | None = None,
 ) -> AsyncGenerator[tuple[str, Path, list[tuple[str, str, dict[str, str], bytes]]]]:
     ca_path, certificate_path, key_path = _write_server_certificate(
         directory,
         subject_alt_name=subject_alt_name,
         expired=expired,
+        authority=authority,
     )
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_context.load_cert_chain(certificate_path, key_path)
@@ -345,6 +340,144 @@ def _assert_sanitized_worker_error(error: WorkerControlClientError, *secrets: st
     assert all(secret not in str(error) and secret not in repr(error) for secret in secrets)
 
 
+def _run_windows_root_store(operation: str, *arguments: str) -> str:
+    started_at = time.monotonic()
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_WINDOWS_ROOT_STORE_HELPER), *arguments],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_CERT_STORE_OPERATION_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as error:
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        captured = error.stderr or b""
+        captured_text = captured.decode("ascii", errors="ignore")
+        stages = [
+            line for line in captured_text.splitlines() if line.startswith("WINCRYPT_STAGE stage=")
+        ]
+        print(
+            f"WINDOWS_ROOT_STORE operation={operation} result=timeout "
+            f"elapsed_ms={elapsed_ms} timeout_s={_CERT_STORE_OPERATION_TIMEOUT_SECONDS:g} "
+            f"child_terminated=True last_stage={stages[-1] if stages else 'unavailable'}"
+        )
+        raise AssertionError(
+            f"Windows root-store {operation} exceeded its bounded timeout"
+        ) from None
+
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    result_label = "ok" if result.returncode == 0 else "failed"
+    print(
+        f"WINDOWS_ROOT_STORE operation={operation} result={result_label} "
+        f"elapsed_ms={elapsed_ms} exit_code={result.returncode}"
+    )
+    if result.returncode != 0:
+        for diagnostic in result.stderr.decode("ascii", errors="ignore").splitlines():
+            if diagnostic.startswith("WINCRYPTO_FAILURE action="):
+                print(f"WINDOWS_ROOT_STORE diagnostic={diagnostic}")
+    assert result.returncode == 0, (
+        f"Windows root-store {operation} failed with exit code {result.returncode}"
+    )
+    return result.stdout.decode("utf-8").strip()
+
+
+def _windows_root_store_thumbprints(scope: str) -> set[str]:
+    started_at = time.monotonic()
+    output = _run_windows_root_store(
+        f"enumerate_{scope.replace('-', '_')}_root",
+        "list",
+        "--scope",
+        scope,
+    )
+    decoded: object = json.loads(output)
+    assert isinstance(decoded, list)
+    parsed = cast(list[object], decoded)
+    thumbprints = [thumbprint for thumbprint in parsed if isinstance(thumbprint, str)]
+    assert len(thumbprints) == len(parsed)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    print(
+        f"WINDOWS_ROOT_STORE operation=enumerate_{scope.replace('-', '_')}_root "
+        f"result=ok elapsed_ms={elapsed_ms} certificate_count={len(thumbprints)}"
+    )
+    return set(thumbprints)
+
+
+def _windows_store_contains_thumbprint(thumbprint: str, *, current_user: bool) -> bool:
+    scope = "current-user" if current_user else "local-machine"
+    return thumbprint in _windows_root_store_thumbprints(scope)
+
+
+def _remove_generated_root_certificate(thumbprint: str) -> None:
+    if _windows_store_contains_thumbprint(thumbprint, current_user=True):
+        _run_windows_root_store(
+            "remove_currentuser_root",
+            "remove-current-user",
+            thumbprint,
+        )
+    assert not _windows_store_contains_thumbprint(thumbprint, current_user=True), (
+        "generated test CA remains in CurrentUser Root after cleanup"
+    )
+
+
+async def _assert_control_client_rejects_tls(base_url: str) -> None:
+    client = HttpWorkerControlClient(base_url, timeout_seconds=2.0)
+    try:
+        with pytest.raises(WorkerControlClientError) as rejected:
+            await _authenticate(client)
+    finally:
+        await client.aclose()
+    assert rejected.value.code == "CONTROL_PLANE_UNAVAILABLE"
+    _assert_sanitized_worker_error(rejected.value, _WORKER_TOKEN, _ENROLLMENT_CODE)
+
+
+async def _assert_current_user_root_ca_handshake_contract(
+    base_url: str,
+    directory: Path,
+    authority: _TestCertificateAuthority,
+    received: list[tuple[str, str, dict[str, str], bytes]],
+) -> None:
+    await _authenticate_and_claim(base_url)
+    claim = next(item for item in received if item[1] == "/v1/workers/jobs/claim")
+    assert claim[0] == "POST"
+    assert claim[2]["authorization"] == f"Bearer {_WORKER_TOKEN}"
+    assert _WORKER_TOKEN not in claim[1]
+
+    async with _control_plane_server(
+        directory / "wrong-host-server",
+        subject_alt_name=x509.DNSName("control-plane.invalid"),
+        authority=authority,
+    ) as (wrong_host_url, _, wrong_host_requests):
+        await _assert_control_client_rejects_tls(wrong_host_url)
+        assert wrong_host_requests == []
+
+    async with _control_plane_server(
+        directory / "expired-server",
+        subject_alt_name=x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        expired=True,
+        authority=authority,
+    ) as (expired_url, _, expired_requests):
+        await _assert_control_client_rejects_tls(expired_url)
+        assert expired_requests == []
+
+
+def _load_prepared_windows_root_ca_fixture() -> tuple[
+    Path, _TestCertificateAuthority, set[str], set[str]
+]:
+    fixture_directory_value = os.environ.get("THREADS_WINDOWS_ROOT_CA_FIXTURE_DIR")
+    if fixture_directory_value is None:
+        pytest.skip("prepare a synthetic CA and set THREADS_WINDOWS_ROOT_CA_FIXTURE_DIR first")
+    fixture_directory = Path(fixture_directory_value).resolve()
+    repository_root = Path(__file__).parents[2].resolve()
+    if fixture_directory == repository_root or repository_root in fixture_directory.parents:
+        pytest.fail("the Windows root CA fixture must live outside the repository")
+    validate_test_certificate_authority_fixture(fixture_directory)
+    authority = load_test_certificate_authority(fixture_directory)
+    original_user_roots, original_machine_roots = load_root_store_snapshot(fixture_directory)
+    return fixture_directory, authority, original_user_roots, original_machine_roots
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ca_override", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
 async def test_control_client_uses_verified_tls_and_trusted_ca_overrides(
@@ -390,6 +523,195 @@ async def test_control_client_uses_verified_tls_and_trusted_ca_overrides(
     assert claim[0] == "POST"
     assert claim[2]["authorization"] == f"Bearer {_WORKER_TOKEN}"
     assert _WORKER_TOKEN not in claim[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows CurrentUser root store")
+async def test_control_client_trusts_only_windows_current_user_root_ca(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_http_environment(monkeypatch)
+    controlled_proxy = "http://127.0.0.1:9"
+    for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(variable, controlled_proxy)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    assert os.environ.get("SSL_CERT_FILE") is None
+    assert os.environ.get("SSL_CERT_DIR") is None
+
+    authority = _create_test_certificate_authority()
+    ca_der = authority.certificate.public_bytes(serialization.Encoding.DER)
+    thumbprint = hashlib.sha1(ca_der).hexdigest().upper()
+    ca_path = tmp_path / "synthetic-worker-control-root.cer"
+    ca_path.write_bytes(ca_der)
+    original_user_root_thumbprints = _windows_root_store_thumbprints("current-user")
+    original_machine_root_thumbprints = _windows_root_store_thumbprints("local-machine")
+    assert thumbprint not in original_user_root_thumbprints
+    assert thumbprint not in original_machine_root_thumbprints
+
+    san = x509.IPAddress(ipaddress.ip_address("127.0.0.1"))
+    root_import_attempted = False
+    try:
+        async with _control_plane_server(
+            tmp_path / "valid-server",
+            subject_alt_name=san,
+            authority=authority,
+        ) as (base_url, _, received):
+            await _assert_control_client_rejects_tls(base_url)
+            assert received == []
+
+            root_import_attempted = True
+            assert (
+                _run_windows_root_store(
+                    "add_currentuser_root",
+                    "add-current-user",
+                    str(ca_path),
+                )
+                == "added"
+            )
+            roots_with_test_ca = _windows_root_store_thumbprints("current-user")
+            machine_roots_during_test = _windows_root_store_thumbprints("local-machine")
+            assert original_user_root_thumbprints <= roots_with_test_ca
+            assert original_machine_root_thumbprints == machine_roots_during_test
+            assert thumbprint in roots_with_test_ca
+
+            await _assert_current_user_root_ca_handshake_contract(
+                base_url,
+                tmp_path,
+                authority,
+                received,
+            )
+
+            _remove_generated_root_certificate(thumbprint)
+            root_import_attempted = False
+            roots_after_removal = _windows_root_store_thumbprints("current-user")
+            machine_roots_after_removal = _windows_root_store_thumbprints("local-machine")
+            assert original_user_root_thumbprints <= roots_after_removal
+            assert original_machine_root_thumbprints == machine_roots_after_removal
+            assert thumbprint not in roots_after_removal
+            await _assert_control_client_rejects_tls(base_url)
+            assert len(received) == 3
+    finally:
+        if root_import_attempted:
+            _remove_generated_root_certificate(thumbprint)
+        roots_after_cleanup = _windows_root_store_thumbprints("current-user")
+        machine_roots_after_cleanup = _windows_root_store_thumbprints("local-machine")
+        assert original_user_root_thumbprints <= roots_after_cleanup
+        assert original_machine_root_thumbprints == machine_roots_after_cleanup
+        assert thumbprint not in roots_after_cleanup
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows CurrentUser root store")
+async def test_control_client_rejects_untrusted_windows_current_user_root_ca_before_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_http_environment(monkeypatch)
+    controlled_proxy = "http://127.0.0.1:9"
+    for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(variable, controlled_proxy)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    assert os.environ.get("SSL_CERT_FILE") is None
+    assert os.environ.get("SSL_CERT_DIR") is None
+
+    (
+        _,
+        authority,
+        original_user_root_thumbprints,
+        original_machine_root_thumbprints,
+    ) = _load_prepared_windows_root_ca_fixture()
+    thumbprint = (
+        hashlib.sha1(authority.certificate.public_bytes(serialization.Encoding.DER))
+        .hexdigest()
+        .upper()
+    )
+    assert thumbprint not in original_user_root_thumbprints
+    assert thumbprint not in original_machine_root_thumbprints
+    roots_before_request = _windows_root_store_thumbprints("current-user")
+    machine_roots_before_request = _windows_root_store_thumbprints("local-machine")
+    assert original_user_root_thumbprints <= roots_before_request
+    assert original_machine_root_thumbprints == machine_roots_before_request
+    assert thumbprint not in roots_before_request
+
+    async with _control_plane_server(
+        tmp_path / "before-import-server",
+        subject_alt_name=x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        authority=authority,
+    ) as (base_url, _, received):
+        await _assert_control_client_rejects_tls(base_url)
+        assert received == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows CurrentUser root store")
+async def test_control_client_trusts_preimported_windows_current_user_root_ca(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_http_environment(monkeypatch)
+    controlled_proxy = "http://127.0.0.1:9"
+    for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(variable, controlled_proxy)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    assert os.environ.get("SSL_CERT_FILE") is None
+    assert os.environ.get("SSL_CERT_DIR") is None
+
+    (
+        fixture_directory,
+        authority,
+        original_user_root_thumbprints,
+        original_machine_root_thumbprints,
+    ) = _load_prepared_windows_root_ca_fixture()
+    ca_der = authority.certificate.public_bytes(serialization.Encoding.DER)
+    thumbprint = hashlib.sha1(ca_der).hexdigest().upper()
+    root_removal_attempted = False
+    try:
+        assert thumbprint not in original_user_root_thumbprints
+        assert thumbprint not in original_machine_root_thumbprints
+        roots_before_handshake = _windows_root_store_thumbprints("current-user")
+        machine_roots_before_handshake = _windows_root_store_thumbprints("local-machine")
+        assert original_user_root_thumbprints <= roots_before_handshake
+        assert original_machine_root_thumbprints == machine_roots_before_handshake
+        assert thumbprint in roots_before_handshake, (
+            "the prepared synthetic CA is not installed in CurrentUser Root"
+        )
+
+        san = x509.IPAddress(ipaddress.ip_address("127.0.0.1"))
+        async with _control_plane_server(
+            tmp_path / "valid-server",
+            subject_alt_name=san,
+            authority=authority,
+        ) as (base_url, _, received):
+            await _assert_current_user_root_ca_handshake_contract(
+                base_url,
+                tmp_path,
+                authority,
+                received,
+            )
+            assert len(received) == 3
+
+            root_removal_attempted = True
+            _remove_generated_root_certificate(thumbprint)
+            roots_after_removal = _windows_root_store_thumbprints("current-user")
+            machine_roots_after_removal = _windows_root_store_thumbprints("local-machine")
+            assert original_user_root_thumbprints <= roots_after_removal
+            assert original_machine_root_thumbprints == machine_roots_after_removal
+            assert thumbprint not in roots_after_removal
+            await _assert_control_client_rejects_tls(base_url)
+            assert len(received) == 3
+    finally:
+        if not root_removal_attempted and _windows_store_contains_thumbprint(
+            thumbprint,
+            current_user=True,
+        ):
+            _remove_generated_root_certificate(thumbprint)
+        roots_after_cleanup = _windows_root_store_thumbprints("current-user")
+        machine_roots_after_cleanup = _windows_root_store_thumbprints("local-machine")
+        assert original_user_root_thumbprints <= roots_after_cleanup
+        assert original_machine_root_thumbprints == machine_roots_after_cleanup
+        assert thumbprint not in roots_after_cleanup
+        cleanup_test_certificate_authority_fixture(fixture_directory)
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ on:
       - "src/threads_platform/infrastructure/browser/**"
       - "tests/unit/test_worker_package.py"
       - "tests/unit/test_worker_host_config.py"
+      - "tests/unit/test_worker_control_client_httpx2.py"
       - "tests/unit/test_browser_adapter.py"
       - "README.md"
       - "docs/ARCHITECTURE.md"
@@ -31,6 +32,7 @@ on:
       - "src/threads_platform/infrastructure/browser/**"
       - "tests/unit/test_worker_package.py"
       - "tests/unit/test_worker_host_config.py"
+      - "tests/unit/test_worker_control_client_httpx2.py"
       - "tests/unit/test_browser_adapter.py"
   workflow_dispatch:
 
@@ -66,11 +68,13 @@ jobs:
       - name: Check Threads API HTTPX2 TLS and proxy behavior
         run: uv run --locked pytest tests/unit/test_threads_httpx2_transport.py
 
-      - name: Check Worker Control Plane HTTPX2 TLS and proxy behavior
+      # The OS-root store mutation is a separate release gate; see docs/WINDOWS_CURRENTUSER_ROOT_CA_VALIDATION.md.
+      - name: Check Worker Control Plane HTTPX2 TLS and proxy behavior (CurrentUser root is release-gated)
         run: >-
           uv run --locked pytest
           tests/unit/test_worker_control_client_httpx2.py
           tests/unit/test_worker_control_client_cancellation.py
+          -k "not windows_current_user_root_ca"
 
       - name: Install locked runtime and packaging dependencies
         run: uv sync --locked --no-dev --group packaging
