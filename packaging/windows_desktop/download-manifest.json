@@ -1,0 +1,19 @@
+{
+  "postgresql": {
+    "version": "17.11",
+    "distribution": "EDB Windows x64 binary ZIP",
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-17.11-4-windows-x64-binaries.zip",
+    "content_bytes": 379726839,
+    "sha256": "b9424ee7bc60b52450ff910a3630225df32e633f3cb29c1d126d9299d59aea28",
+    "sha256_source": "https://github.com/EnterpriseDB/edb-installers/issues/706",
+    "license": "PostgreSQL License; keep the upstream license and bundled dependency notices with the package"
+  },
+  "python": {
+    "version": "3.14.x",
+    "source": "uv.lock"
+  },
+  "pyinstaller": {
+    "version": "6.22.3",
+    "source": "pyproject.toml packaging dependency group and uv.lock"
+  }
+}
