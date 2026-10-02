@@ -81,6 +81,7 @@ $checks = [ordered]@{
 }
 $result = "BLOCKER"
 $failureCode = $null
+$failureScriptLine = $null
 $head = $null
 $worktreeIsClean = $false
 $controllerIdentity = $null
@@ -719,6 +720,7 @@ try {
         "PASS"
     } else { "BLOCKER" }
 } catch {
+    $failureScriptLine = [int]$_.InvocationInfo.ScriptLineNumber
     Add-Failure ([string]$_.Exception.Message)
 } finally {
     try {
@@ -807,6 +809,7 @@ try {
         result = $result
         failure_code = $failureCode
         failure_codes = @($failureCodes)
+        failure_script_line = $failureScriptLine
     }
     [System.IO.File]::WriteAllText(
         $EvidencePath,
