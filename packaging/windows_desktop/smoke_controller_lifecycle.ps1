@@ -231,12 +231,60 @@ function Get-TrackedProcess([int]$ProcessId, [string]$ExpectedPath) {
     }
 }
 
+function Get-ProcessIfPresent([int]$ProcessId) {
+    try {
+        return Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch {
+        if ($_.FullyQualifiedErrorId -like "NoProcessFoundForGivenId,*") { return $null }
+        throw
+    }
+}
+
+function Test-ElementUnavailable([System.Exception]$Exception) {
+    while ($null -ne $Exception) {
+        if ($Exception -is [System.Windows.Automation.ElementNotAvailableException]) {
+            return $true
+        }
+        $Exception = $Exception.InnerException
+    }
+    return $false
+}
+
+function Test-ProcessExitRace(
+    [System.Exception]$Exception,
+    [System.Diagnostics.Process]$Process
+) {
+    $processAccessFailure = $false
+    while ($null -ne $Exception) {
+        if ($Exception -is [System.InvalidOperationException] -or
+            $Exception -is [System.ComponentModel.Win32Exception]) {
+            $processAccessFailure = $true
+            break
+        }
+        $Exception = $Exception.InnerException
+    }
+    if (-not $processAccessFailure) { return $false }
+    try { return $Process.HasExited } catch { return $false }
+}
+
 function Get-Window([int]$ProcessId) {
-    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    $process = Get-ProcessIfPresent $ProcessId
     if (-not $process) { return $null }
-    $process.Refresh()
-    if ($process.MainWindowHandle -eq [IntPtr]::Zero) { return $null }
-    return [System.Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
+    try {
+        try {
+            $process.Refresh()
+            if ($process.HasExited) { return $null }
+            $windowHandle = $process.MainWindowHandle
+            if ($windowHandle -eq [IntPtr]::Zero) { return $null }
+            return [System.Windows.Automation.AutomationElement]::FromHandle($windowHandle)
+        } catch {
+            if (Test-ElementUnavailable $_.Exception) { return $null }
+            if (Test-ProcessExitRace $_.Exception $process) { return $null }
+            throw
+        }
+    } finally {
+        $process.Dispose()
+    }
 }
 
 function Find-Element(
@@ -254,20 +302,41 @@ function Find-Element(
         )
     )
     $condition = [System.Windows.Automation.AndCondition]::new($conditions)
-    return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    try {
+        return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
+    }
+}
+
+function Get-ElementName([System.Windows.Automation.AutomationElement]$Element) {
+    if (-not $Element) { return $null }
+    try {
+        return [string]$Element.Current.Name
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
+    }
 }
 
 function Find-TextContaining([System.Windows.Automation.AutomationElement]$Root, [string]$Text) {
     if (-not $Root) { return $null }
-    $elements = $Root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.Condition]::TrueCondition
-    )
-    foreach ($element in $elements) {
-        $name = [string]$element.Current.Name
-        if ($name.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            return $element
+    try {
+        $elements = $Root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition
+        )
+        foreach ($element in $elements) {
+            $name = Get-ElementName $element
+            if ($name -and
+                $name.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $element
+            }
         }
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
     }
     return $null
 }
@@ -524,8 +593,11 @@ function Quit-Desktop([int]$ProcessId) {
         }
         try {
             Wait-Until {
-                if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }
+                $desktopProcess = Get-ProcessIfPresent $ProcessId
+                if (-not $desktopProcess) { return $true }
+                $desktopProcess.Dispose()
                 $window = Get-Window $ProcessId
+                if (-not $window) { return $false }
                 if (Find-TextContaining $window "An active Operator session with permission to stop this node is required") {
                     throw "controller_stop_operator_authorization_denied"
                 }
@@ -556,8 +628,9 @@ function Quit-Desktop([int]$ProcessId) {
             $remaining = Get-ControllerProcesses
             $window = Get-Window $ProcessId
             $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
-            $diagnosticCode = if ($diagnosticElement) {
-                ([string]$diagnosticElement.Current.Name) -replace '^.*Diagnostic code:\s*', ''
+            $diagnosticName = Get-ElementName $diagnosticElement
+            $diagnosticCode = if ($diagnosticName) {
+                $diagnosticName -replace '^.*Diagnostic code:\s*', ''
             } else { $null }
             $processEvidence.graceful_quit_failure = [ordered]@{
                 postgres = $remaining.postgres.Count
