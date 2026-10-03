@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct OperatorIdentity {
     pub id: String,
     pub username: String,
@@ -17,7 +17,7 @@ pub(crate) struct OperatorIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct OperatorUser {
     pub id: String,
     pub username: String,
@@ -28,21 +28,21 @@ pub(crate) struct OperatorUser {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct CreatedOperatorUser {
     pub user: OperatorUser,
     pub temporary_password: String,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct LoginResponse {
     access_token: String,
     operator: OperatorIdentity,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct CreateUserResponse {
     user: OperatorUser,
     temporary_password: String,
@@ -70,7 +70,7 @@ struct UpdateUserRequest<'a> {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 struct ChangePasswordRequest<'a> {
     new_password: &'a str,
 }
@@ -417,6 +417,61 @@ mod tests {
             assert!(!lifecycle_session_allowed(role, true, false));
             assert!(!lifecycle_session_allowed(role, true, true));
         }
+    }
+
+    #[test]
+    fn operator_http_payloads_use_snake_case_and_tauri_dtos_use_camel_case() {
+        let response: LoginResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "synthetic-session-value",
+            "token_type": "Bearer",
+            "expires_at": "2026-10-03T18:00:00Z",
+            "operator": {
+                "id": "owner-id",
+                "username": "first-owner",
+                "role": "OWNER",
+                "must_change_password": false,
+                "expires_at": "2026-10-03T18:00:00Z"
+            }
+        }))
+        .expect("snake_case Operator login response");
+        assert_eq!(response.access_token, "synthetic-session-value");
+
+        let identity = serde_json::to_value(response.operator).expect("Tauri identity DTO");
+        assert_eq!(identity["mustChangePassword"], false);
+        assert_eq!(identity["expiresAt"], "2026-10-03T18:00:00Z");
+        assert!(identity.get("must_change_password").is_none());
+        assert!(identity
+            .to_string()
+            .find("synthetic-session-value")
+            .is_none());
+
+        let request = serde_json::to_value(ChangePasswordRequest {
+            new_password: "synthetic-test-passphrase",
+        })
+        .expect("FastAPI password request");
+        assert_eq!(request["new_password"], "synthetic-test-passphrase");
+        assert!(request.get("newPassword").is_none());
+
+        let create_response: CreateUserResponse = serde_json::from_value(serde_json::json!({
+            "user": {
+                "id": "operator-id",
+                "username": "new-operator",
+                "role": "OPERATOR",
+                "enabled": true,
+                "must_change_password": true,
+                "created_at": "2026-10-03T18:00:00Z"
+            },
+            "temporary_password": "synthetic-one-time-value"
+        }))
+        .expect("snake_case Operator user response");
+        let created = CreatedOperatorUser {
+            user: create_response.user,
+            temporary_password: create_response.temporary_password,
+        };
+        let created = serde_json::to_value(created).expect("Tauri created-user DTO");
+        assert_eq!(created["temporaryPassword"], "synthetic-one-time-value");
+        assert_eq!(created["user"]["mustChangePassword"], true);
+        assert_eq!(created["user"]["createdAt"], "2026-10-03T18:00:00Z");
     }
 
     #[test]
