@@ -13,14 +13,17 @@ authorized issue
   -> local implementation
   -> deterministic local preflight
   -> Draft PR
-  -> optional coordinator-authorized targeted hosted diagnostic
-  -> coordinator marks Ready
-  -> one exact-head full PR acceptance wave
+  -> Secret scan + PR Head Guard only
+  -> coordinator exact-head review
+  -> Ready for Review
+  -> ONE PR Acceptance heavy workflow
   -> coordinator acceptance / merge
-  -> one main-push verification wave
+  -> ONE Main Verification heavy workflow
 ```
 
-Heavy PR workflows intentionally do not run on every Draft synchronization. Secret scan may still run because it is cheap and prevents credential mistakes from accumulating.
+Draft PRs run only the cheap, exact-head `Secret scan` and `PR Head Guard` workflows. The single merge-authoritative hosted gate is the aggregate `PR Acceptance` job. Before starting its components, it checks the latest exact-head successful `Secret scan` and `PR Head Guard` workflow runs; it does not rerun Gitleaks when an unchanged Draft becomes Ready. Linux/PostgreSQL, Docker, Windows Desktop/Controller, and relevant Worker checks run as reusable components underneath that one workflow.
+
+Reopened PRs do NOT automatically launch heavy acceptance. Keep or return the PR to Draft, inspect both cheap gates and review the exact head, then have the coordinator mark it Ready deliberately. A Ready-head push fails `PR Head Guard`; return the PR to Draft, classify the previous evidence, and review the new exact head before another Ready checkpoint. Each push to `main` starts one aggregate `Main Verification` workflow that reuses the same components and scans the current tree plus the `before..head` commit range when that range is available. The existing hosted-failure hard stop and repeated-signature policy remain unchanged.
 
 A hosted failure is a hard stop for the coding agent and invalidates the acceptance checkpoint. The coordinator may return the PR to Draft, classify the evidence and authorize one bounded correction.
 
@@ -88,7 +91,7 @@ When a smoke requires reauthentication, explicitly perform the sign-in flow and 
 
 ## 5. Ready-for-review gate
 
-The coordinator, not the coding agent, decides when the PR becomes Ready for Review.
+The coordinator, not the coding agent, decides when the PR becomes Ready for Review. That event starts the one heavy `PR Acceptance` workflow; it is the single merge-authoritative hosted result.
 
 Before requesting Ready:
 - worktree/branch head is stable;
@@ -96,12 +99,13 @@ Before requesting Ready:
 - no unresolved hosted failure signature remains;
 - task-specific deterministic tests cover the new state transitions;
 - no known product/harness ambiguity is being deferred to the full smoke.
+- latest `Secret scan` and `PR Head Guard` runs for the exact head succeeded.
 
-Moving the PR to Ready triggers the expensive exact-head acceptance wave. A new code push after an accepted Ready checkpoint invalidates that evidence and requires a new coordinator checkpoint.
+The PR Acceptance evidence job requires the latest exact-head PR-triggered run of each cheap gate to be successful. Missing, queued, failed, cancelled, or skipped evidence stops the aggregate gate. It logs the two accepted run IDs and does not rerun Gitleaks. A push after a PR becomes Ready fails the Head Guard; return it to Draft and have the coordinator review the new head before another Ready checkpoint. Reopening alone does not launch heavy acceptance.
 
 ## 6. Targeted hosted diagnostics
 
-Use `workflow_dispatch` only when the failure materially depends on hosted Windows/runtime behavior that cannot be reproduced locally.
+Use the `Desktop Diagnostic` `workflow_dispatch` only when the failure materially depends on hosted Windows/runtime behavior that cannot be reproduced locally. Every manual diagnostic must specify the exact `source_sha`; `runtime_layout` remains `shared` or `split`.
 
 A targeted run must have:
 - a specific hypothesis;
@@ -109,7 +113,7 @@ A targeted run must have:
 - an exact SHA;
 - one bounded attempt.
 
-It is not a substitute for local tests.
+It is not a substitute for local tests and does not replace the PR Acceptance workflow.
 
 ## 7. DX-05 lesson
 

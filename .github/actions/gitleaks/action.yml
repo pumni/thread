@@ -1,0 +1,88 @@
+name: Run redacted Gitleaks scans
+description: Verify and run the repository-pinned Gitleaks release against the current tree and optional commit range.
+inputs:
+  base_sha:
+    description: Base commit for the optional range scan
+    required: false
+    default: ""
+  head_sha:
+    description: Exact checked-out commit
+    required: true
+  scan_commit_range:
+    description: Whether to scan commits between base_sha and head_sha
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Download and verify Gitleaks
+      shell: bash
+      env:
+        GITLEAKS_VERSION: 8.30.1
+      run: |
+        set -euo pipefail
+        archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        base_url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+        archive_path="${RUNNER_TEMP}/${archive}"
+        checksums_path="${RUNNER_TEMP}/gitleaks_checksums.txt"
+        install_dir="${RUNNER_TEMP}/gitleaks-bin"
+
+        curl --fail --location --silent --show-error \
+          "${base_url}/${archive}" --output "$archive_path"
+        curl --fail --location --silent --show-error \
+          "${base_url}/gitleaks_${GITLEAKS_VERSION}_checksums.txt" \
+          --output "$checksums_path"
+
+        checksum_line="$(awk -v file="$archive" '$2 == file { print; count++ } END { if (count != 1) exit 1 }' "$checksums_path")"
+        printf '%s\n' "$checksum_line" | (cd "$RUNNER_TEMP" && sha256sum --check --status)
+        mkdir -p "$install_dir"
+        tar -xzf "$archive_path" -C "$install_dir" gitleaks
+        "$install_dir/gitleaks" version
+
+    - name: Assert exact source revision
+      shell: bash
+      env:
+        SOURCE_SHA: ${{ inputs.head_sha }}
+      run: |
+        set -euo pipefail
+        actual="$(git rev-parse HEAD)"
+        if [[ "$actual" != "$SOURCE_SHA" ]]; then
+          echo "checkout_sha_mismatch: expected $SOURCE_SHA, got $actual" >&2
+          exit 1
+        fi
+
+    - name: Scan current tree with redacted output
+      shell: bash
+      run: |
+        set -euo pipefail
+        "${RUNNER_TEMP}/gitleaks-bin/gitleaks" dir \
+          --config=.gitleaks.toml \
+          --redact \
+          --no-banner .
+
+    - name: Scan commit range with redacted output
+      if: ${{ inputs.scan_commit_range == 'true' }}
+      shell: bash
+      env:
+        SCAN_BASE_SHA: ${{ inputs.base_sha }}
+        SCAN_HEAD_SHA: ${{ inputs.head_sha }}
+      run: |
+        set -euo pipefail
+        if [[ "$SCAN_BASE_SHA" =~ ^0{40}$ ]]; then
+          echo "Initial repository commit has no preceding range; current-tree scan is complete."
+          exit 0
+        fi
+        if [[ ! "$SCAN_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+          || [[ ! "$SCAN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Could not resolve the scan commit range" >&2
+          exit 1
+        fi
+        git cat-file -e "${SCAN_BASE_SHA}^{commit}"
+        git cat-file -e "${SCAN_HEAD_SHA}^{commit}"
+        scan_range="${SCAN_BASE_SHA}..${SCAN_HEAD_SHA}"
+        scan_log_opts="${scan_range} --diff-filter=ACMRT"
+        "${RUNNER_TEMP}/gitleaks-bin/gitleaks" git \
+          --config=.gitleaks.toml \
+          --redact \
+          --no-banner \
+          --log-opts="$scan_log_opts" .
