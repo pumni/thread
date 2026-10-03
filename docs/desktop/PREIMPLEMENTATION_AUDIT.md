@@ -4,6 +4,8 @@
 
 **Disposition:** **CHANGES REQUIRED before DX-01 acceptance** at initial audit; the corrections below are incorporated in this planning branch and/or assigned an explicit blocking issue gate. This is **not** a claim that Desktop code, CI or reviewer acceptance is complete. Exact-head review and final coordinator sign-off still required.
 
+This is a historical pre-implementation snapshot. For DX-05, the latest coordinator authorization comment on #99 supersedes open proposals in this audit, including A-17 lifecycle authorization; follow the frozen policy recorded in [SESSION_HANDOFF.md](SESSION_HANDOFF.md) and [ISSUE_MAP.md](ISSUE_MAP.md).
+
 ## 1. Evidence inspected
 
 - Root `AGENTS.md`, architecture/master plan/work breakdown/acceptance rules/current handoff and accepted ADR-0003/0004/0005/0006; Windows Worker host/update documents and Worker protocol v2 extension.

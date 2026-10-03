@@ -63,6 +63,15 @@ describe("desktop provisioning", () => {
       "reset_ui_preferences",
       "decommission_device",
       "request_quit",
+      "request_restart",
+      "operator_login",
+      "operator_bootstrap_owner",
+      "operator_current",
+      "operator_logout",
+      "operator_list_users",
+      "operator_create_user",
+      "operator_update_user",
+      "operator_change_password",
     ]);
   });
 
@@ -120,6 +129,44 @@ describe("desktop provisioning", () => {
       await screen.findByText("Console mode is client-only and starts no local helper process."),
     ).toBeInTheDocument();
     expect(screen.getByText("None")).toBeInTheDocument();
+  });
+
+  it("keeps the Operator bearer inside Rust during first-Owner login", async () => {
+    const bearer = "SYNTHETIC_OPERATOR_BEARER_NEVER_RENDERED";
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") return null;
+      if (command === "operator_bootstrap_owner") {
+        return {
+          id: "owner-id",
+          username: "first-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2026-10-03T18:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByRole("heading", { name: "Your Controller" });
+    fireEvent.click(screen.getByRole("button", { name: "Set up first Owner" }));
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "first-owner" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "synthetic owner passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create first Owner" }));
+
+    expect(await screen.findByText("Signed in as first-owner")).toBeInTheDocument();
+    expect(screen.queryByText(bearer)).not.toBeInTheDocument();
+    expect(native.invoke).toHaveBeenCalledWith("operator_bootstrap_owner", {
+      username: "first-owner",
+      password: "synthetic owner passphrase",
+    });
+    expect(localStorage.length).toBe(0);
   });
 
   it.each([

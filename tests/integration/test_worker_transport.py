@@ -115,7 +115,11 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
     admin_token = "c1-test-worker-admin-token"
     service = WorkerControlService(unit_of_work_factory)
     app = create_app(
-        Settings(worker_admin_token=SecretStr(admin_token), worker_tls_required=True),
+        Settings(
+            worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
+            worker_tls_required=True,
+        ),
         worker_control_service=service,
     )
     transport = httpx2.ASGITransport(app=app)
@@ -264,7 +268,11 @@ async def test_durable_https_pull_recovers_job_without_wss_notification(
     notifications = WorkerNotificationHub()
     jobs = WorkerJobService(unit_of_work_factory, notifications=notifications)
     app = create_app(
-        Settings(worker_admin_token=SecretStr(admin_token), worker_tls_required=True),
+        Settings(
+            worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
+            worker_tls_required=True,
+        ),
         worker_control_service=control,
         worker_job_service=jobs,
         worker_notifications=notifications,

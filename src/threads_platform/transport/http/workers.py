@@ -10,6 +10,7 @@ from fastapi import APIRouter, Header, HTTPException, Response, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from threads_platform.application.operator_access import OperatorAction, role_allows
 from threads_platform.application.worker_control import (
     WorkerControlError,
     WorkerControlService,
@@ -22,6 +23,7 @@ from threads_platform.application.worker_sessions import (
     WorkerSessionControlError,
     WorkerSessionService,
 )
+from threads_platform.domain.operators import OperatorPrincipal
 from threads_platform.domain.worker_jobs import WorkerJob, WorkerJobRetrySafety, WorkerJobStatus
 from threads_platform.domain.workers import (
     BrowserSessionState,
@@ -29,6 +31,10 @@ from threads_platform.domain.workers import (
     WorkerAccountSession,
     WorkerCapability,
     WorkerStatus,
+)
+from threads_platform.infrastructure.security.operator_auth import (
+    OperatorAuthError,
+    OperatorAuthService,
 )
 from threads_platform.transport.http.auth import CommandAuthenticator
 
@@ -38,7 +44,7 @@ class _WorkerRequest(BaseModel):
 
 
 class CreateEnrollmentRequest(_WorkerRequest):
-    created_by: str = Field(default="operator", min_length=1, max_length=255)
+    created_by: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class CreateEnrollmentResponse(BaseModel):
@@ -258,7 +264,7 @@ class WorkerJobInterventionRequest(WorkerJobLeaseRequest):
 class ResolveInterventionRequest(_WorkerRequest):
     requeue: bool
     confirmed_safe_to_retry: bool = False
-    resolved_by: str = Field(default="operator", min_length=1, max_length=255)
+    resolved_by: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 def create_worker_router(
@@ -267,6 +273,9 @@ def create_worker_router(
     notifications: WorkerNotificationHub,
     job_service: WorkerJobService | None = None,
     session_service: WorkerSessionService | None = None,
+    operator_auth: OperatorAuthService | None = None,
+    *,
+    legacy_admin_compatibility: bool = False,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1/workers", tags=["workers"])
 
@@ -287,13 +296,57 @@ def create_worker_router(
             )
         return session_service
 
-    def require_admin(authorization: str | None) -> None:
-        if not admin_authenticator.is_authorized(authorization):
+    async def require_operator(
+        authorization: str | None,
+        action: OperatorAction,
+    ) -> tuple[str | None, OperatorPrincipal | None]:
+        token = _bearer_token(authorization)
+        principal = await operator_auth.authenticate(token) if operator_auth and token else None
+        if principal is not None:
+            if principal.must_change_password:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"code": "OPERATOR_PASSWORD_CHANGE_REQUIRED"},
+                )
+            if not role_allows(principal.role, action):
+                raise HTTPException(status_code=403, detail={"code": "OPERATOR_FORBIDDEN"})
+            return token, principal
+        if legacy_admin_compatibility and admin_authenticator.is_authorized(authorization):
+            return None, None
+        status_code = 503 if operator_auth is None and not legacy_admin_compatibility else 401
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "code": "OPERATOR_AUTH_UNAVAILABLE"
+                if status_code == 503
+                else "OPERATOR_UNAUTHORIZED"
+            },
+            headers={"WWW-Authenticate": "Bearer"} if status_code == 401 else None,
+        )
+
+    async def audit_operator_action(
+        token: str | None,
+        event_type: str,
+        target_type: str,
+        target_id: str,
+        details: dict[str, str | int | bool | None],
+    ) -> None:
+        if operator_auth is None or token is None:
+            return
+        try:
+            await operator_auth.record_action(
+                token,
+                event_type,
+                target_type,
+                target_id,
+                details,
+            )
+        except OperatorAuthError as error:
             raise HTTPException(
                 status_code=401,
-                detail={"code": "WORKER_ADMIN_UNAUTHORIZED"},
+                detail={"code": "OPERATOR_SESSION_INVALID"},
                 headers={"WWW-Authenticate": "Bearer"},
-            )
+            ) from error
 
     async def authenticated_worker(authorization: str | None) -> UUID:
         control = require_service()
@@ -313,7 +366,7 @@ def create_worker_router(
         request: WorkerDrainRequest,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerDrainStatusResponse:
-        require_admin(authorization)
+        token, _ = await require_operator(authorization, OperatorAction.DRAIN_WORKER)
         control = require_service()
         try:
             changed = await control.request_drain(worker_id, request.reason_code)
@@ -321,6 +374,13 @@ def create_worker_router(
                 notifications.publish(
                     worker_id,
                     {"type": "worker.drain", "reason_code": request.reason_code},
+                )
+                await audit_operator_action(
+                    token,
+                    "worker.drain_requested",
+                    "worker",
+                    str(worker_id),
+                    {"reason_code": request.reason_code},
                 )
             return _drain_status_response(await control.drain_status(worker_id))
         except WorkerControlError as error:
@@ -331,7 +391,7 @@ def create_worker_router(
         worker_id: UUID,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerDrainStatusResponse:
-        require_admin(authorization)
+        await require_operator(authorization, OperatorAction.VIEW_FLEET)
         try:
             return _drain_status_response(await require_service().drain_status(worker_id))
         except WorkerControlError as error:
@@ -353,9 +413,16 @@ def create_worker_router(
         worker_id: UUID,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerDrainTransitionResponse:
-        require_admin(authorization)
+        token, _ = await require_operator(authorization, OperatorAction.DRAIN_WORKER)
         try:
             await require_service().abort_drain(worker_id)
+            await audit_operator_action(
+                token,
+                "worker.drain_aborted",
+                "worker",
+                str(worker_id),
+                {},
+            )
         except WorkerControlError as error:
             raise _http_error(error) from error
         return WorkerDrainTransitionResponse(worker_id=worker_id, status=WorkerStatus.OFFLINE)
@@ -366,13 +433,16 @@ def create_worker_router(
         response: Response,
         authorization: Annotated[str | None, Header()] = None,
     ) -> CreateEnrollmentResponse:
-        if not admin_authenticator.is_authorized(authorization):
-            raise HTTPException(
-                status_code=401,
-                detail={"code": "WORKER_ADMIN_UNAUTHORIZED"},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        result = await require_service().create_enrollment(request.created_by)
+        token, principal = await require_operator(authorization, OperatorAction.PROVISION_WORKER)
+        actor = principal.username if principal is not None else "legacy-worker-admin"
+        result = await require_service().create_enrollment(actor)
+        await audit_operator_action(
+            token,
+            "worker.enrollment_created",
+            "worker_enrollment",
+            str(result.expires_at),
+            {},
+        )
         response.headers["Cache-Control"] = "no-store"
         return CreateEnrollmentResponse(
             enrollment_code=result.code,
@@ -704,18 +774,23 @@ def create_worker_router(
         request: ResolveInterventionRequest,
         authorization: Annotated[str | None, Header()] = None,
     ) -> WorkerJobResponse:
-        if not admin_authenticator.is_authorized(authorization):
-            raise HTTPException(
-                status_code=401,
-                detail={"code": "WORKER_ADMIN_UNAUTHORIZED"},
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+        token, principal = await require_operator(
+            authorization,
+            OperatorAction.RESOLVE_INTERVENTION,
+        )
         try:
             job = await require_job_service().resolve_intervention(
                 intervention_id,
                 requeue=request.requeue,
                 confirmed_safe_to_retry=request.confirmed_safe_to_retry,
-                resolved_by=request.resolved_by,
+                resolved_by=principal.username if principal is not None else "legacy-worker-admin",
+            )
+            await audit_operator_action(
+                token,
+                "worker.intervention_resolved",
+                "worker_intervention",
+                str(intervention_id),
+                {"requeue": request.requeue},
             )
         except WorkerJobControlError as error:
             raise _worker_job_error(error) from error

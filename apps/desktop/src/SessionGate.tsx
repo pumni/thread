@@ -5,22 +5,41 @@ interface SessionGateProps {
   validSession: boolean;
   idleTimeoutMs?: number;
   onUnlock: () => Promise<boolean>;
+  onLock?: () => void | Promise<void>;
   children: ReactNode;
 }
 
-export function SessionGate({ validSession, idleTimeoutMs, onUnlock, children }: SessionGateProps) {
+export function SessionGate({
+  validSession,
+  idleTimeoutMs,
+  onUnlock,
+  onLock,
+  children,
+}: SessionGateProps) {
   const [locked, setLocked] = useState(!validSession);
   const lockedRef = useRef(locked);
   const lastActivityAt = useRef(Date.now());
+  const onLockRef = useRef(onLock);
+  onLockRef.current = onLock;
 
   useEffect(() => {
     lockedRef.current = locked;
   }, [locked]);
 
   useEffect(() => {
-    if (!validSession) setLocked(true);
+    if (!validSession) {
+      lockedRef.current = true;
+      setLocked(true);
+    } else if (!lockedRef.current) {
+      lastActivityAt.current = Date.now();
+    }
 
-    const lock = () => setLocked(true);
+    const lock = () => {
+      if (lockedRef.current) return;
+      lockedRef.current = true;
+      setLocked(true);
+      void onLockRef.current?.();
+    };
     const recordActivity = () => {
       if (!lockedRef.current) lastActivityAt.current = Date.now();
     };
@@ -59,6 +78,7 @@ export function SessionGate({ validSession, idleTimeoutMs, onUnlock, children }:
     const authenticated = await onUnlock();
     if (authenticated) {
       lastActivityAt.current = Date.now();
+      lockedRef.current = false;
       setLocked(false);
     }
   }

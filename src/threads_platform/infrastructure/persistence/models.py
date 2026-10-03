@@ -98,6 +98,110 @@ class Base(DeclarativeBase):
     pass
 
 
+class WorkspaceRecord(Base):
+    __tablename__ = "workspaces"
+    __table_args__ = (
+        CheckConstraint("singleton_key = 1", name="ck_workspaces_singleton"),
+        UniqueConstraint("singleton_key", name="uq_workspaces_singleton_key"),
+    )
+
+    workspace_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    singleton_key: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OperatorUserRecord(Base):
+    __tablename__ = "operator_users"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "username", name="uq_operator_users_workspace_username"),
+        CheckConstraint(
+            "role IN ('OWNER', 'ADMIN', 'OPERATOR', 'VIEWER')",
+            name="ck_operator_users_role",
+        ),
+        CheckConstraint("length(btrim(username)) > 0", name="ck_operator_users_username_nonblank"),
+        Index("ix_operator_users_workspace_enabled_role", "workspace_id", "enabled", "role"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("workspaces.workspace_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    username: Mapped[str] = mapped_column(String(100), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OperatorSessionRecord(Base):
+    __tablename__ = "operator_sessions"
+    __table_args__ = (
+        UniqueConstraint("token_digest", name="uq_operator_sessions_token_digest"),
+        Index("ix_operator_sessions_user_expiry", "operator_user_id", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    operator_user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("operator_users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OperatorLoginThrottleRecord(Base):
+    __tablename__ = "operator_login_throttles"
+    __table_args__ = (
+        CheckConstraint(
+            "failed_attempts BETWEEN 1 AND 5",
+            name="ck_operator_login_throttles_failed_attempts",
+        ),
+    )
+
+    operator_user_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("operator_users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    failed_attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkspaceAuditEventRecord(Base):
+    __tablename__ = "workspace_audit_events"
+    __table_args__ = (
+        Index("ix_workspace_audit_events_workspace_created", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("workspaces.workspace_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    actor_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("operator_users.id", ondelete="SET NULL")
+    )
+    actor_username: Mapped[str] = mapped_column(String(100), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    target_type: Mapped[str | None] = mapped_column(String(80))
+    target_id: Mapped[str | None] = mapped_column(String(255))
+    details: Mapped[dict[str, Any]] = mapped_column(
+        "details", JSON_DOCUMENT, nullable=False, default=dict, server_default=JSON_OBJECT_DEFAULT
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class AccountRecord(Base):
     __tablename__ = "threads_accounts"
     __table_args__ = (UniqueConstraint("threads_user_id", name="uq_threads_accounts_user_id"),)

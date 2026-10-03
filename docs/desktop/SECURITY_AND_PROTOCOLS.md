@@ -1,6 +1,6 @@
 # Desktop v1 — Security, Pairing and Account Data Contracts
 
-**Status:** Planning contract; implementation must pass security review at DX-05/DX-06/DX-08/DX-09. The text below deliberately distinguishes selected product behavior from protocol details still requiring validation.
+**Status:** DX-05 operator identity, session, role and lifecycle policy is implemented against the frozen #99 authorization; Controller TLS/pairing and later account flows remain planned.
 
 ## 1. Three separate identities
 
@@ -17,8 +17,8 @@ One Controller serves exactly one Workspace. Controller replacement/identity rot
 
 | Material | May exist on | May be sent to Controller | Forbidden |
 |---|---|---|---|
-| Operator password | React input transiently -> Rust -> HTTPS login endpoint | Yes, only TLS-protected login request | Persisting in UI/localStorage/CLI/log |
-| Operator session bearer | Rust process memory | HTTPS Authorization header | Returning to React, persisted webview storage/log |
+| Operator password | React input transiently -> Rust -> Controller login endpoint | HTTPS remotely; loopback HTTP only on local Controller | Persisting in UI/localStorage/CLI/log |
+| Operator session bearer | Rust process memory | HTTPS Authorization header; loopback HTTP only on local Controller | Returning to React, persisted webview storage/log |
 | Controller root private key | Controller current-user DPAPI-protected state | No, except private TLS process provisioning as strictly required | Worker/Console/global CA installation |
 | Controller root public cert/fingerprint | Controller, verified Worker and Console | Public trust anchor | Treating unverified certificate as trusted without a comparison |
 | DB credential | Controller protected configuration / child env or secure launch channel | Internal loopback only | UI/log/argv/Git |
@@ -31,12 +31,13 @@ Tauri allowed commands are narrowly scoped; webview cannot choose arbitrary bina
 
 ## 3. Human login and sessions
 
-- Initial Workspace and first OWNER are provisioned locally in a one-shot bootstrap transaction before the LAN Operator API opens. The same **non-network one-shot CLI/stdin bootstrap** must work under Linux/Docker independently of Tauri; repeat bootstrap and public unauthenticated Owner setup are prohibited. Secret input crosses native boundary using a reviewed secret-safe channel (candidate stdin). If bootstrap has run, repeated invocation fails regardless of launch mode.
-- Passwords use a modern slow salted password hash with recorded algorithm/parameter migration; backend validates and never logs sensitive inputs.
-- Login errors do not distinguish nonexistent user from wrong password. Bound request size, rate-limit guesses, audit events without credential values. Decide the exact lockout policy in DX-05 so deliberate account lockout cannot trivially disable the sole owner.
-- `OperatorSession`: high-entropy random bearer, DB stores only token digest, issued/expiry/revocation, user association, optional bounded last-used metadata. Every request checks current user status and current role; role change/disable takes effect without stale client-side privileges.
-- Rust retains bearer in process memory. React gets safe `/me` details and typed DTOs only. Window hide does not kill runtime; **Windows session lock and unattended inactivity must lock the human UI, without stopping Controller/Worker**. Require reauthentication or a separately reviewed session-unlock method after expiry; operator logout revokes bearer without stopping node.
-- A Worker continues job protocol under **device identity** while no human is logged in. A human Operator session in Worker Desktop is solely an authorization to create onboarding intents, perform allowed interventions and use operator read models. **Normal intentional Quit/Restart needs a reviewed authority path:** current device credentials can complete but cannot initiate drain. V1 proposal: prompt for suitable human Operator login if absent; a device-authenticated self-only drain endpoint needs separate security review. UI logout does not stop the node.
+- Initial Workspace and first OWNER are provisioned locally in a one-shot bootstrap transaction before the LAN Operator API opens. Windows invokes the local runtime's `bootstrap-owner` mode with the password on stdin. Linux/Docker uses `python -m threads_platform.operator_bootstrap --username <name>` with the password on stdin. No network Owner-bootstrap endpoint exists; repeat bootstrap fails.
+- Passwords use salted scrypt (`N=32768`, `r=8`, `p=1`). Passwords are at least 12 characters; login failures use a generic response and lock an account after 5 failures in a 15-minute window for 5 minutes. Audit events contain no credential values.
+- `OperatorSession` uses a 256-bit random bearer. PostgreSQL stores only its SHA-256 digest, issue/expiry/revocation and user association. Sessions expire after 8 hours by default. Every request checks current user status and current role; role change/disable takes effect on the next request.
+- Rust retains bearer in process memory. React gets safe `/me` details and typed DTOs only. Window hide, Windows session lock/blur and 5 minutes of inactivity clear the local session and lock protected UI without stopping Controller/Worker. Reopening requires sign-in. Operator logout revokes bearer without stopping the node.
+- Remote Operator URLs must use HTTPS with normal certificate validation and redirects disabled. Plain HTTP is accepted only for loopback Controller access; LAN TLS provisioning is DX-06.
+- A Worker continues job protocol under **device identity** while no human is logged in. A human Operator session in Worker Desktop is solely an authorization to perform permitted operator actions. Deliberate Worker Quit/Restart requires OWNER/ADMIN/OPERATOR; Controller stop/restart requires OWNER/ADMIN. A Worker device credential can complete but cannot initiate drain. No device self-drain endpoint or hidden admin bearer exists. UI logout does not stop the node.
+- Windows always ignores the legacy `worker_admin_token`; Linux/IT migration compatibility is opt-in with `THREADS_PLATFORM_WORKER_ADMIN_AUTH_PROFILE=legacy_linux_it`. Existing CRM ingress remains a separate principal.
 - No localhost/same-Windows-user exemption for Owner. Console and Controller use same authorization policy and server.
 
 ## 4. Controller TLS identity and first-contact protocol

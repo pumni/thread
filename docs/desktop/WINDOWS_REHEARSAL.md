@@ -15,9 +15,9 @@ Current legacy Windows Worker Task Scheduler host remains supported until explic
 
 ## 2. Prototype proof vs production-shaped first run
 
-- **M1 / DX-04:** provisional local engineering runtime **on loopback only**, using a disposable database and the accepted `shared` PyInstaller onedir. Its `http` and `scheduler` modes are separate OS processes. M1 does **not** expose an unauthenticated LAN API, create a fake durable Owner, imply production auth, or require a final installer. It proves PostgreSQL -> migrations -> M1 bootstrap boundary (no Owner writes) -> HTTP -> scheduler -> X-to-tray -> Quit -> crash recovery.
+- **M1 / DX-04 + DX-05:** provisional local engineering runtime **on loopback only**, using a disposable database and the accepted `shared` PyInstaller onedir. Its `http` and `scheduler` modes are separate OS processes. DX-05 adds a real locally bootstrapped Owner and Operator-session authorization; this still does **not** expose an unauthenticated LAN API, imply verified remote TLS, or require a final installer. The runtime proves PostgreSQL -> migrations -> local Owner bootstrap -> HTTP -> scheduler -> X-to-tray -> authenticated Quit -> crash recovery.
 - The UI states that runtime is unavailable before this Windows user signs in, Windows logout is unsupported, and portable backup/production durability are unavailable.
-- **M2 / DX-05 + DX-06:** actual Owner bootstrap and authenticated HTTPS/WSS Controller endpoint. Before these gates, no remote Console login or LAN Worker pairing is permitted.
+- **M2 / DX-06:** authenticated HTTPS/WSS Controller endpoint and remote Console/Worker trust. DX-05 supplies the local first-Owner bootstrap; before DX-06, no remote Console login or LAN Worker pairing is permitted.
 - **M4 / DX-12:** one final installable Windows setup artifact for Controller/Worker/Console; package signing/licensing and real Windows test evidence are separate release checks.
 
 ## 3. Installation vs first run
@@ -26,7 +26,7 @@ Installer installs branded Desktop and bundled dependencies under immutable rele
 
 Controller first-run wizard:
 1. Check OS/architecture, running dedicated interactive Windows user, supported data-root ACL, free disk and LAN addresses; warn if power plan allows sleep.
-2. **At M2 or later** ask Workspace display name, first OWNER username/password, preferred Controller LAN IP/hostname and HTTPS port; recommend static IP/DHCP reservation. User acknowledges that the router configuration is outside the app. M1 is a restricted loopback-only engineering proof with no persisted fake Owner.
+2. DX-05 provisions the first OWNER locally after migrations, through the native stdin bootstrap; there is no network Owner-setup endpoint. Workspace display name and Controller LAN address/HTTPS provisioning remain later setup work. The M1 HTTP listener stays loopback-only.
 3. Show and verify planned immutable runtime version and data root. Explicitly disclose **data backup/recovery not yet available** and no runtime before Windows login. Accept only **disposable/synthetic pilot data** until a separately reviewed backup/recovery release gate exists.
 4. Create provisioned Controller identity and private PostgreSQL cluster; store generated DB password and trust keys encrypted for the same current Windows account.
 5. Migrate schema exactly once per eligible version; bootstrap first Owner locally; start HTTP/scheduler behind bounded health gates; show trusted Controller fingerprint plus Worker pairing entry.
@@ -56,17 +56,17 @@ Controller/
 
 Worker remains under its existing `%LOCALAPPDATA%\ThreadsOperations\worker|profiles|journal|logs` layout. A separate Console user-profile store contains non-secret recent endpoint/trust metadata; never copy Controller private material.
 
-PostgreSQL and M1 HTTP bind `127.0.0.1` on ports persisted in `controller.json`; a collision fails without changing either port. M1 HTTP is intentionally unauthenticated and stays loopback-only. DX-05 adds Owner bootstrap/RBAC; DX-06 selects the trusted HTTPS/WSS LAN endpoint. Firewall and elevation behavior remain outside M1.
+PostgreSQL and M1 HTTP bind `127.0.0.1` on ports persisted in `controller.json`; a collision fails without changing either port. The Operator API uses Workspace sessions and server-side roles. First OWNER bootstrap is a local stdin operation; the listener remains loopback-only until DX-06 selects the trusted HTTPS/WSS LAN endpoint. Firewall and elevation behavior remain outside M1.
 
 ## 5. Startup and shutdown state machine
 
 ```text
 UNPROVISIONED -> PREFLIGHT/ROOT_LOCK -> DB_STARTING -> DB_READY
-              -> MIGRATING -> M1_BOOTSTRAP_BOUNDARY (no Owner write)
+              -> MIGRATING -> M1_BOOTSTRAP_BOUNDARY (local Owner stdin path)
               -> HTTP_STARTING -> HTTP_READY -> SCHEDULER_STARTING -> RUNNING
 
 RUNNING --X--> RUNNING+HIDDEN
-RUNNING --explicit Quit--> STOPPING -> STOPPED -> desktop exits
+RUNNING --authenticated Quit--> STOPPING -> STOPPED -> desktop exits
 failure -> FAILED with a fixed redacted code; readiness waits use bounded backoff
 ```
 
@@ -82,7 +82,7 @@ Owner/operator session is unrelated to the tray node: UI logout or session expir
 | Sign-in after boot | Tauri autostart -> configured runtime startup |
 | Lock Windows | Existing process remains alive subject to OS sleep/power policy |
 | Explicit Quit | Confirmation and ordered graceful node stop |
-| Worker job in progress on Quit | Durable DRAINING/quiescence; no unchecked hard-kill |
+| Worker job in progress on Quit | DX-07 defines the Worker host/drain path; DX-05 adds no device self-drain endpoint |
 | Unexpected Desktop death | Test real Windows process-tree/Job Object behavior; abrupt PostgreSQL termination is not graceful, so prove WAL recovery; Worker never reports completed drain on crash |
 | Windows logout | Windows terminates interactive session; node stops. **Unsupported continuity** |
 | Reboot before any sign-in | Node **not running** until designated Windows user signs in |
@@ -105,9 +105,9 @@ Controller shows database liveness/ready, HTTP/scheduler health, configured LAN 
 
 ## 9. Quit authorization and Linux Controller interoperability
 
-Normal Quit on a provisioned busy Worker needs a reviewable initiation mechanism, **not** an unbounded global static Worker admin token. Current device auth only completes a drain requested by a privileged caller. DX-05/DX-07 must choose a bounded v1 policy: proposed normal UX prompts for suitably privileged Operator login when no human is authenticated (or security-review a self-only device drain endpoint). Test no human login, expired Operator session, Worker mid-job and Controller unreachable; if the user confirms forced exit or Windows logs off, report possible lease recovery rather than pretending DRAINING reached OFFLINE. For Controller Quit, freeze Owner/Admin operational permission in DX-05; OS user process termination remains outside an API guarantee.
+Deliberate Worker Quit/Restart requires current OWNER/ADMIN/OPERATOR authentication; VIEWER is denied. Controller stop/restart requires OWNER/ADMIN. Windows disables the legacy `worker_admin_token` bypass; Linux/IT compatibility is opt-in with `THREADS_PLATFORM_WORKER_ADMIN_AUTH_PROFILE=legacy_linux_it`. No device self-drain endpoint or hidden/global admin bearer is allowed. DX-07 defines the real Worker host/drain path; DX-05 authorizes the deliberate local lifecycle action only. OS process termination remains outside an API guarantee.
 
-Linux/Docker continues as an official IT/developer Controller profile: provide a separate OS-appropriate protected trust-key store and local administrator CLI fingerprint retrieval; configure an HTTPS/WSS public ingress that preserves Worker/Operator authorization and secure ASGI scheme semantics. Windows Worker and Console first-contact trust verification and login must interoperate with this profile. Linux packaging need not reuse the Tauri app or Windows DPAPI.
+Linux/Docker first-Owner bootstrap uses the same local CLI/stdin contract and Operator API as Windows. Remote Operator login requires HTTPS with normal certificate validation; DX-06 defines trusted HTTPS/WSS ingress and first-contact identity. Windows Worker and Console login interoperate after that gate. Linux packaging need not reuse the Tauri app or Windows DPAPI.
 
 ## 10. Operational rehearsal and signoff
 

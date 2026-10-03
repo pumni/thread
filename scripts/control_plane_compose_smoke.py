@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
 
 
@@ -96,6 +96,8 @@ asyncio.run(main())
 
 
 def _compose(*arguments: str, input_text: str | None = None, timeout: int = 180) -> str:
+    environment = os.environ.copy()
+    environment["THREADS_PLATFORM_WORKER_TLS_REQUIRED"] = "false"
     result = subprocess.run(
         ["docker", "compose", *arguments],
         capture_output=True,
@@ -103,6 +105,7 @@ def _compose(*arguments: str, input_text: str | None = None, timeout: int = 180)
         text=True,
         input=input_text,
         timeout=timeout,
+        env=environment,
     )
     if result.returncode != 0:
         label = arguments[0] if arguments else "compose"
@@ -172,15 +175,163 @@ def _json_object(payload: bytes) -> dict[str, object] | None:
     return result
 
 
-def _get_json(path: str) -> tuple[int | None, dict[str, object] | None]:
+def _get_json(
+    path: str,
+    *,
+    bearer: str | None = None,
+) -> tuple[int | None, dict[str, object] | None]:
     port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer is not None else {}
+    request = Request(f"http://127.0.0.1:{port}{path}", headers=headers)
     try:
-        with urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as response:
+        with urlopen(request, timeout=3) as response:
             return response.status, _json_object(response.read())
     except HTTPError as error:
         return error.code, _json_object(error.read())
     except TimeoutError, URLError, OSError, json.JSONDecodeError:
         return None, None
+
+
+def _post_json(
+    path: str,
+    payload: dict[str, object],
+    *,
+    bearer: str | None = None,
+) -> tuple[int | None, dict[str, object] | None, object | None]:
+    port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
+    headers = {"Content-Type": "application/json"}
+    if bearer is not None:
+        headers["Authorization"] = f"Bearer {bearer}"
+    request = Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=5) as response:
+            return response.status, _json_object(response.read()), response.headers
+    except HTTPError as error:
+        return error.code, _json_object(error.read()), error.headers
+    except TimeoutError, URLError, OSError, json.JSONDecodeError:
+        return None, None, None
+
+
+def _create_smoke_operator(owner_token: str, username: str, role: str) -> tuple[str, str]:
+    status, body, headers = _post_json(
+        "/v1/operator/users",
+        {"username": username, "role": role},
+        bearer=owner_token,
+    )
+    if (
+        status != 201
+        or body is None
+        or not isinstance(body.get("temporary_password"), str)
+        or not hasattr(headers, "get")
+        or headers.get("Cache-Control") != "no-store"
+    ):
+        raise SmokeFailure("Operator user creation response was not one-time/no-store")
+    temporary_password = cast(str, body["temporary_password"])
+    login_status, login, _ = _post_json(
+        "/v1/operator/login",
+        {"username": username, "password": temporary_password},
+    )
+    if login_status != 200 or login is None or not isinstance(login.get("access_token"), str):
+        raise SmokeFailure("temporary Operator password did not authenticate")
+    token = cast(str, login["access_token"])
+    password_status, _, _ = _post_json(
+        "/v1/operator/me/password",
+        {"new_password": f"{username} smoke passphrase 2026"},
+        bearer=token,
+    )
+    if password_status != 200:
+        raise SmokeFailure("temporary Operator password could not be changed")
+    return token, f"{username} smoke passphrase 2026"
+
+
+def _operator_bootstrap_api_parity() -> None:
+    bootstrap_password = "synthetic local owner passphrase"
+    output = _compose(
+        "exec",
+        "-T",
+        "http",
+        "python",
+        "-m",
+        "threads_platform.operator_bootstrap",
+        "--username",
+        "smoke-owner",
+        input_text=f"{bootstrap_password}\n",
+        timeout=60,
+    )
+    if "First Owner created: smoke-owner" not in output:
+        raise SmokeFailure("local stdin bootstrap did not create the first Workspace Owner")
+
+    status, login, headers = _post_json(
+        "/v1/operator/login",
+        {"username": "smoke-owner", "password": bootstrap_password},
+    )
+    if (
+        status != 200
+        or login is None
+        or not isinstance(login.get("access_token"), str)
+        or not hasattr(headers, "get")
+        or headers.get("Cache-Control") != "no-store"
+    ):
+        raise SmokeFailure("Linux/Docker first Owner could not log in through the Operator API")
+    owner_token = cast(str, login["access_token"])
+    owner_status, owner = _get_json("/v1/operator/me", bearer=owner_token)
+    if owner_status != 200 or owner is None or owner.get("role") != "OWNER":
+        raise SmokeFailure("Operator /me role did not match the Linux/Docker first Owner")
+
+    role_tokens = {"OWNER": owner_token}
+    for role in ("ADMIN", "OPERATOR", "VIEWER"):
+        role_tokens[role], _ = _create_smoke_operator(owner_token, f"smoke-{role.lower()}", role)
+
+    for role, token in role_tokens.items():
+        me_status, me = _get_json("/v1/operator/me", bearer=token)
+        users_status, _ = _get_json("/v1/operator/users", bearer=token)
+        expected_users_status = 200 if role in {"OWNER", "ADMIN"} else 403
+        enrollment_status, _, _ = _post_json(
+            "/v1/workers/enrollments",
+            {"created_by": "forged-smoke-actor"},
+            bearer=token,
+        )
+        expected_enrollment_status = 200 if role in {"OWNER", "ADMIN"} else 403
+        command_status, _, _ = _post_json("/v1/operator/commands", {}, bearer=token)
+        expected_command_status = 403 if role == "VIEWER" else 422
+        if (
+            me_status != 200
+            or me is None
+            or me.get("role") != role
+            or users_status != expected_users_status
+            or enrollment_status != expected_enrollment_status
+            or command_status != expected_command_status
+        ):
+            raise SmokeFailure(f"Linux/Docker Operator role parity failed for {role}")
+
+    if _post_json("/v1/operator/bootstrap-owner", {}, bearer=owner_token)[0] != 404:
+        raise SmokeFailure("first Owner bootstrap unexpectedly has a network endpoint")
+    repeat = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "http",
+            "python",
+            "-m",
+            "threads_platform.operator_bootstrap",
+            "--username",
+            "another-owner",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        input="another synthetic passphrase\n",
+        timeout=60,
+    )
+    if repeat.returncode == 0 or "OPERATOR_BOOTSTRAP_ALREADY_COMPLETED" not in repeat.stderr:
+        raise SmokeFailure("repeat Owner bootstrap was not explicitly rejected")
 
 
 def _get_metrics() -> tuple[int | None, str | None, str | None]:
@@ -387,6 +538,8 @@ def _run_smoke() -> None:
         or _assert_bounded_readiness(ready)["total"] != 0
     ):
         raise SmokeFailure("initial readiness did not report an empty Worker fleet")
+    _operator_bootstrap_api_parity()
+    print("PASS local stdin first-Owner bootstrap and Linux/Docker Operator API parity")
 
     http_id = _compose("ps", "-q", "http")
     scheduler_id = _compose("ps", "-q", "scheduler")

@@ -31,13 +31,13 @@ Deliver a single Windows customer app and installer, powered by Tauri 2 + Rust +
 | Availability | No Windows Service or runtime before Windows login | Confirmed |
 | LAN | Stable Controller address, no discovery, HTTPS/private trust | Confirmed direction; cryptographic protocol requires security review |
 | Human access | Mandatory login on Controller, Worker and Console | Confirmed |
-| Roles | OWNER, ADMIN, OPERATOR, VIEWER fixed | Confirmed direction; exact per-action matrix below is a **proposal** awaiting product sign-off |
+| Roles | OWNER, ADMIN, OPERATOR, VIEWER fixed | Exact per-action matrix below frozen by the coordinator authorization comment on #99 |
 | Browser onboarding | Login locally on Worker; Controller owns Account and assignment | Confirmed |
 | Re-pair | Explicit Worker decommission/drain/re-pair; do not reuse old browser profiles | Confirmed |
 | Data recovery | Backup, portable restore, owner recovery email deferred | Confirmed deferral; durability risk explicitly documented |
 | Release | No auto-updater/Internet/SSO/HA/auto-discovery in v1 | Confirmed |
 
-**Proposed minimal RBAC matrix — authorize and audit on server, never only hide React buttons:**
+**Frozen #99 RBAC matrix — authorize and audit on server, never only hide React buttons:**
 
 | Action | OWNER | ADMIN | OPERATOR | VIEWER |
 |---|---:|---:|---:|---:|
@@ -98,7 +98,7 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 
 **DX-01 — Desktop architecture/contract baseline**
 - Approve ADR-0007, repo folder boundaries, role provisioning, Supervisor/Operator/Worker transport authority.
-- Freeze in-scope/out-of-scope, proposed RBAC matrix, data-root/Windows-login limitation, single-installer definition, security and account onboarding threat models.
+- Freeze in-scope/out-of-scope, accepted RBAC matrix, data-root/Windows-login limitation, single-installer definition, security and account onboarding threat models.
 - Decide packaging candidate experimentally rather than treating `threads-runtime.exe` as proven.
 - Deliverables: architecture ADR; delivery plan; trust/auth/onboarding contract; acceptance matrix; Windows runbook; epic/issue dependencies.
 - Gate: coordinator signs off scope, unresolved security questions are recorded as explicit blockers for respective slices.
@@ -125,7 +125,7 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 - Use the DX-03 coordinator-selected `shared` PyInstaller onedir for M1 only. Keep HTTP and scheduler as distinct OS processes running the same executable in different modes; do not use `split` absent new failure evidence.
 - Preflight disk, OS, current user, ports, ACL, migration/schema compatibility and runtime files; never erase an existing DB. The M1 durable root is the current user's ACL-scoped `%LOCALAPPDATA%` app-local-data directory. The later `%PROGRAMDATA%` installer handoff remains unproven.
 - On provision create one protected durable Controller ID/data root, generate a current-user DPAPI database credential, and use private loopback PostgreSQL plus HTTP ports persisted in atomic non-secret config. `initdb` is limited to a root created by the current first-run call; any existing incomplete/corrupt/unowned root fails without reinitialization.
-- Fixed startup DAG: preflight/root lock -> PostgreSQL -> bounded readiness -> one-shot Alembic -> approved M1 bootstrap boundary with **no Owner/Workspace writes** -> loopback HTTP `/ready` -> separate scheduler -> Ready. Do not expose unauthenticated LAN routes.
+- Fixed startup DAG: preflight/root lock -> PostgreSQL -> bounded readiness -> one-shot Alembic -> loopback HTTP `/ready` -> separate scheduler -> Ready. DX-05 adds a local-only first-Owner bootstrap after migration; no unauthenticated network setup or LAN Operator route is exposed.
 - Use a per-root exclusive owner lock and real Windows Job Object process-tree ownership. Readiness backoff is bounded; a helper/migration failure becomes `FAILED` with a fixed redacted code. No auto schema rollback or data deletion.
 - Quit stops scheduler, HTTP, then asks bundled `pg_ctl` for PostgreSQL fast shutdown; crash/restart must preserve WAL/data and detect duplicate processes. Never silently rotate a persisted port.
 - Verification: exact-SHA Windows process behavior on disposable synthetic data, CurrentUser ACL/DPAPI, X-to-tray continuity, ordered Quit/relaunch, DB crash recovery, true Tauri parent crash/WAL recovery, single scheduler after recovery, migration/port/root/disk failure paths. The evidence artifact contains no DB directory.
@@ -137,8 +137,8 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 - One Workspace singleton invariant; OperatorUser, password hash, disabled/must-change-password, server-side hashed opaque OperatorSession, expiry/revoke/logout and current-role validation; >=1 enabled OWNER.
 - Native initial Owner creation over local secret-safe channel **before** public operator endpoint opens. Repeat bootstrap rejected. **Also support a non-network one-shot Linux/Docker CLI/stdin bootstrap**, without requiring Tauri or an unauthenticated web setup endpoint.
 - Operator routes login/logout/me/user management with bounded responses, rate limits, safe lockout recovery policy, generic login errors and redacted audit.
-- Implement direct human login on Worker Desktop using Controller Operator API; Worker device credential never substitutes for user credential. Freeze node lifecycle authorization when deliberate Quit/Restart occurs without an active human session. **V1 proposal:** prompt for suitably privileged Operator login to request drain/stop, or separately security-review a device-authenticated self-only Worker drain endpoint; never embed the old global admin token in Rust.
-- Operator/Admin role matrix gets explicit product confirmation at this issue gate; each mutating endpoint independently enforces authorization. **Inventory and reconcile existing static `worker_admin_token` routes** (`/v1/workers/enrollments`, admin drain/abort, intervention resolve): new Windows profile must disable/isolate the legacy bypass and derive actor identity server-side; migration-compatible Linux/IT profile requires explicit gated configuration and tests. Existing CRM ingress remains a separate principal. Reopening unattended UI or locking Windows must lock the human session without stopping the node.
+- Implement direct human login on Worker Desktop using Controller Operator API; Worker device credential never substitutes for user credential. Deliberate Worker Quit/Restart requires OWNER/ADMIN/OPERATOR login; Controller stop/restart requires OWNER/ADMIN. No device self-drain endpoint or hidden admin bearer.
+- Frozen #99 matrix: all four roles can view; OWNER alone creates/changes OWNER/ADMIN, OWNER/ADMIN manage OPERATOR/VIEWER and provision Worker/Account/API, and OWNER/ADMIN/OPERATOR drain, resolve interventions and submit commands. Each mutating endpoint enforces authorization server-side. Windows always isolates legacy `worker_admin_token`; Linux/IT compatibility requires explicit `legacy_linux_it` configuration. Operator actors are derived from the current server session. Existing CRM ingress remains a separate principal. Windows lock/blur and 5-minute inactivity clear the Rust-memory session without stopping the node; reopen requires sign-in.
 - Verify PostgreSQL migration, concurrent last-owner demotion, revoked/disabled user, role downgrade next request, session expiry, no secret in logs/React/storage.
 
 **DX-06 — Controller private HTTPS identity and first-contact trust** (depends DX-03, DX-04, DX-05)
@@ -209,7 +209,7 @@ Stable identifiers `DX-01`…`DX-14` map to GitHub child issues; actual GitHub n
 
 ## 5. Explicit audit reconciliation / implementation stop gates
 
-Read [the pre-implementation audit](PREIMPLEMENTATION_AUDIT.md) before starting any DX issue. It records hard mismatches confirmed in current code: legacy Worker admin-token bypass (DX-05), strong existing Worker enrollment vs proposed short pairing code (DX-08), assigned-Account prerequisite vs first-time browser login (DX-09), and limited M1 prototype vs real Owner/HTTPS/installer (DX-04/05/06/12). These are **issue acceptance gates**, not permission to rewrite accepted C1–C6 semantics. A fresh session starts from [SESSION_HANDOFF.md](SESSION_HANDOFF.md), fetches latest `main`, #93, #94 and authorized issue, and verifies proposed ADR acceptance before coding.
+Read [the pre-implementation audit](PREIMPLEMENTATION_AUDIT.md) before starting any DX issue. It records historical mismatches confirmed in code: legacy Worker admin-token bypass (DX-05), strong existing Worker enrollment vs proposed short pairing code (DX-08), assigned-Account prerequisite vs first-time browser login (DX-09), and limited M1 prototype vs real Owner/HTTPS/installer (DX-04/05/06/12). These are **issue acceptance gates**, not permission to rewrite accepted C1–C6 semantics. A fresh session starts from [SESSION_HANDOFF.md](SESSION_HANDOFF.md), fetches latest `main`, #93, #94 and the authorized issue, and follows the current coordinator authorization. DX-05 policy is frozen by the latest authorization comment on #99.
 
 ## 6. Dependency graph and progressive gates
 

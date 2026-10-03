@@ -371,6 +371,7 @@ async def test_drain_http_auth_boundaries_status_and_advisory(
         Settings(
             database_url=None,
             worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
             worker_tls_required=True,
         ),
         worker_control_service=control,
