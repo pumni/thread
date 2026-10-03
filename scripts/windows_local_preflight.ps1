@@ -56,7 +56,11 @@ function Get-FreeLoopbackPort {
 }
 
 $runId = [guid]::NewGuid().ToString("N")
-$runRoot = Join-Path $repoRoot "build/local-ci/$runId"
+$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($localAppData)) {
+    throw "windows_local_preflight_local_app_data_unavailable"
+}
+$runRoot = Join-Path $localAppData "ThreadsOperationsLocalCi/$runId"
 $tempRoot = Join-Path $runRoot "temp"
 $pytestBaseTemp = Join-Path $runRoot "pytest"
 $dataRoot = Join-Path $runRoot "postgres-data"
