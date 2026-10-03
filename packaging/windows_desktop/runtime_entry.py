@@ -8,11 +8,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="threads-runtime")
     parser.add_argument(
         "mode",
-        choices=("http", "scheduler", "migrate", "bootstrap-owner", "version"),
+        choices=("http", "scheduler", "migrate", "bootstrap-owner", "owner-status", "version"),
     )
     parser.add_argument("--username")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--ssl-certfile")
+    parser.add_argument("--ssl-keyfile")
     args = parser.parse_args()
 
     if args.mode == "version":
@@ -25,10 +27,18 @@ def main() -> int:
         from threads_platform.operator_bootstrap import bootstrap_owner_from_stdin
 
         return bootstrap_owner_from_stdin(args.username)
+    if args.mode == "owner-status":
+        from threads_platform.operator_bootstrap import controller_owner_status
+
+        return controller_owner_status()
     if args.mode == "http":
         from runtime_http import main as run_http
 
-        run_http(args.host, args.port)
+        try:
+            run_http(args.host, args.port, args.ssl_certfile, args.ssl_keyfile)
+        except RuntimeError as error:
+            print(str(error), file=sys.stderr)
+            return 2
     elif args.mode == "scheduler":
         from runtime_scheduler import main as run_scheduler
 

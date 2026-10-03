@@ -2,6 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   decommissionDevice,
+  controllerHttpsConfigure,
+  controllerHttpsSummary,
+  controllerTrustConfirm,
+  controllerTrustProbe,
+  controllerTrustSummary,
   getDesktopSnapshot,
   listenForTrayQuit,
   operatorBootstrapOwner,
@@ -18,11 +23,14 @@ import {
   requestQuit,
   requestRestart,
   type CreatedOperatorUser,
+  type ControllerHttpsSummary,
   type DesktopSnapshot,
   type OperatorIdentity,
   type OperatorRole,
   type OperatorUser,
   type ProvisionedRole,
+  type TrustProbeSummary,
+  type TrustedControllerSummary,
 } from "./desktop";
 import { SessionGate } from "./SessionGate";
 import "./App.css";
@@ -53,7 +61,41 @@ const operatorAccessMessages: Record<string, string> = {
     "The Controller could not verify Operator access. Try again when it is available.",
   operator_request_failed: "The Controller could not verify Operator access. Try again.",
   operator_response_invalid: "The Controller returned an invalid Operator response. Try again.",
+  controller_https_configuration_required:
+    "Configure a stable LAN IPv4 address and HTTPS port before starting the Controller.",
+  controller_lan_address_invalid: "Enter a valid IPv4 address assigned to this PC.",
+  controller_lan_address_unavailable: "That IPv4 address is not assigned to this PC.",
+  controller_endpoint_port_in_use: "That HTTPS port is already in use. Choose another port.",
+  controller_tls_identity_invalid:
+    "The saved Controller TLS identity is invalid. The Controller did not replace it.",
+  controller_trust_required: "Verify and confirm this Controller before signing in.",
+  controller_trust_probe_failed: "The HTTPS trust probe failed. Check the address and try again.",
+  controller_trust_probe_expired: "The trust probe expired. Probe the Controller again.",
+  controller_trust_confirmation_mismatch:
+    "The Controller identity changed during confirmation. Probe it again and compare fingerprints.",
+  controller_trust_store_invalid: "The saved Controller trust record is invalid.",
 };
+
+function canonicalHttpsOrigin(value: string): string | null {
+  try {
+    const parsed = new URL(value.trim());
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash ||
+      !/^\d{1,3}(\.\d{1,3}){3}$/.test(parsed.hostname) ||
+      parsed.hostname.split(".").some((part) => Number(part) > 255)
+    ) {
+      return null;
+    }
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
 
 function App() {
   const queryClient = useQueryClient();
@@ -65,6 +107,13 @@ function App() {
   const [operatorLoaded, setOperatorLoaded] = useState(false);
   const [sessionLocked, setSessionLocked] = useState(false);
   const [apiUrl, setApiUrl] = useState("");
+  const [controllerHttps, setControllerHttps] = useState<ControllerHttpsSummary | null>(null);
+  const [lanAddress, setLanAddress] = useState("");
+  const [httpsPort, setHttpsPort] = useState("8443");
+  const [tlsConfiguring, setTlsConfiguring] = useState(false);
+  const [pendingTrustProbe, setPendingTrustProbe] = useState<TrustProbeSummary | null>(null);
+  const [trustedController, setTrustedController] = useState<TrustedControllerSummary | null>(null);
+  const [trustBusy, setTrustBusy] = useState(false);
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [firstOwnerSetup, setFirstOwnerSetup] = useState(false);
@@ -138,6 +187,46 @@ function App() {
       setApiUrl(snapshotQuery.data.supervisor.endpoint);
     }
   }, [snapshotQuery.data?.role, snapshotQuery.data?.supervisor.endpoint]);
+
+  useEffect(() => {
+    if (snapshotQuery.data?.role !== "CONTROLLER") {
+      setControllerHttps(null);
+      return;
+    }
+    let mounted = true;
+    void controllerHttpsSummary()
+      .then((summary) => {
+        if (!mounted) return;
+        setControllerHttps(summary);
+        if (summary.lanAddress) setLanAddress(summary.lanAddress);
+        setHttpsPort(String(summary.httpsPort));
+      })
+      .catch(() => {
+        if (mounted) setControllerHttps(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [snapshotQuery.data?.role]);
+
+  useEffect(() => {
+    if (snapshotQuery.data?.role === "CONTROLLER" || !canonicalHttpsOrigin(apiUrl)) {
+      setTrustedController(null);
+      return;
+    }
+    let mounted = true;
+    setTrustedController(null);
+    void controllerTrustSummary(apiUrl)
+      .then((summary) => {
+        if (mounted) setTrustedController(summary);
+      })
+      .catch(() => {
+        if (mounted) setTrustedController(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [apiUrl, snapshotQuery.data?.role]);
 
   useEffect(() => {
     if (!operator || operator.mustChangePassword || !["OWNER", "ADMIN"].includes(operator.role)) {
@@ -221,11 +310,26 @@ function App() {
   }
 
   async function handleOperatorLogin() {
+    if (snapshot?.role === "CONTROLLER" && !controllerHttps?.configured && !firstOwnerSetup) {
+      setActionError("Configure Controller HTTPS before signing in.");
+      return;
+    }
+    if (
+      snapshot?.role !== "CONTROLLER" &&
+      (!trustedController?.trusted || trustedController.endpoint !== canonicalHttpsOrigin(apiUrl))
+    ) {
+      setActionError("Verify and confirm this Controller before signing in.");
+      return;
+    }
     setActionError(null);
     try {
       const signedIn = firstOwnerSetup
         ? await operatorBootstrapOwner(loginUsername, loginPassword)
-        : await operatorLogin(apiUrl, loginUsername, loginPassword);
+        : await operatorLogin(
+            snapshot?.role === "CONTROLLER" ? (controllerHttps?.localHttpsOrigin ?? "") : apiUrl,
+            loginUsername,
+            loginPassword,
+          );
       loginGeneration.current += 1;
       nativeLockNotification.current += 1;
       setOperator(signedIn);
@@ -233,12 +337,86 @@ function App() {
       setSessionLocked(false);
       setLoginPassword("");
       setFirstOwnerSetup(false);
-    } catch {
+    } catch (error) {
+      const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
       setActionError(
-        firstOwnerSetup
-          ? "First Owner setup failed. Check the local Controller and try again."
-          : "Sign-in failed. Check the Controller address and credentials.",
+        operatorAccessMessages[code] ??
+          (firstOwnerSetup
+            ? "First Owner setup failed. Check the local Controller and try again."
+            : (operatorAccessMessages[code] ??
+              "Sign-in failed. Check the Controller address, trust status, and credentials.")),
       );
+    }
+  }
+
+  async function handleControllerHttpsConfigure() {
+    const port = Number(httpsPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setActionError("Enter an HTTPS port from 1 to 65535.");
+      return;
+    }
+    setTlsConfiguring(true);
+    setActionError(null);
+    try {
+      const configured = await controllerHttpsConfigure(lanAddress.trim(), port);
+      setControllerHttps(configured);
+      setLanAddress(configured.lanAddress ?? lanAddress.trim());
+      setHttpsPort(String(configured.httpsPort));
+      await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+    } catch (error) {
+      const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setActionError(
+        operatorAccessMessages[code] ??
+          "Controller HTTPS setup failed. Check the IPv4 address and port, then try again.",
+      );
+    } finally {
+      setTlsConfiguring(false);
+    }
+  }
+
+  async function handleTrustProbe() {
+    const origin = canonicalHttpsOrigin(apiUrl);
+    if (!origin) {
+      setActionError("Enter an exact HTTPS origin using the Controller IPv4 address and port.");
+      return;
+    }
+    setTrustBusy(true);
+    setPendingTrustProbe(null);
+    setTrustedController(null);
+    setLoginUsername("");
+    setLoginPassword("");
+    setActionError(null);
+    try {
+      const pending = await controllerTrustProbe(apiUrl.trim());
+      setPendingTrustProbe(pending);
+    } catch (error) {
+      const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setActionError(
+        operatorAccessMessages[code] ?? "Controller trust probe failed. Check the HTTPS address.",
+      );
+    } finally {
+      setTrustBusy(false);
+    }
+  }
+
+  async function handleTrustConfirm() {
+    if (!pendingTrustProbe) return;
+    setTrustBusy(true);
+    setActionError(null);
+    try {
+      const trusted = await controllerTrustConfirm(pendingTrustProbe.probeId);
+      setTrustedController(trusted);
+      setPendingTrustProbe(null);
+    } catch (error) {
+      const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setPendingTrustProbe(null);
+      setTrustedController(null);
+      setActionError(
+        operatorAccessMessages[code] ??
+          "Trust confirmation failed. Probe the Controller again and compare fingerprints.",
+      );
+    } finally {
+      setTrustBusy(false);
     }
   }
 
@@ -373,6 +551,15 @@ function App() {
   }
 
   const snapshot = snapshotQuery.data;
+  const canonicalEndpoint = canonicalHttpsOrigin(apiUrl);
+  const remoteTrustReady =
+    trustedController?.trusted === true && trustedController.endpoint === canonicalEndpoint;
+  const ownerBootstrapRequired = snapshot.supervisor.state === "owner_bootstrap_required";
+  const controllerLoginReady =
+    snapshot.role !== "CONTROLLER" ||
+    (controllerHttps?.configured === true &&
+      (ownerBootstrapRequired ? firstOwnerSetup : !firstOwnerSetup));
+  const loginReady = snapshot.role === "CONTROLLER" ? controllerLoginReady : remoteTrustReady;
   return (
     <main className="desktop-shell">
       <aside className="sidebar">
@@ -531,14 +718,89 @@ function App() {
           ) : (
             <>
               {snapshot.role === "CONTROLLER" && (
-                <section className="m1-limitations" aria-label="M1 prototype limits">
-                  <strong>Internal M1 prototype — disposable test data only</strong>
-                  <span>
-                    The runtime is unavailable before this Windows user signs in. Windows logout is
-                    unsupported. Operator login is local-only until DX-06 provisions HTTPS for LAN
-                    clients. M1 has no portable backup or production durability.
-                  </span>
-                </section>
+                <>
+                  <section className="m1-limitations" aria-label="M1 prototype limits">
+                    <strong>Internal M1 prototype — disposable test data only</strong>
+                    <span>
+                      The runtime is available while this Windows user is signed in. Windows logout
+                      is unsupported. M1 has no portable backup or production durability.
+                    </span>
+                  </section>
+                  <section className="surface-card" aria-label="Controller HTTPS identity">
+                    <div className="card-heading">
+                      <div>
+                        <p className="eyebrow">CONTROLLER TRANSPORT</p>
+                        <h2>Private HTTPS identity</h2>
+                      </div>
+                    </div>
+                    {controllerHttps?.configured ? (
+                      <div className="runtime-facts">
+                        <div>
+                          <span>Public Controller address</span>
+                          <strong>{controllerHttps.publicHttpsOrigin}</strong>
+                        </div>
+                        <div>
+                          <span>Local HTTPS</span>
+                          <strong>{controllerHttps.localHttpsOrigin} · Verified</strong>
+                        </div>
+                        <div>
+                          <span>Controller root fingerprint</span>
+                          <code>{controllerHttps.rootFingerprint}</code>
+                        </div>
+                        {controllerHttps.leafExpiresAt && (
+                          <div>
+                            <span>Leaf certificate expires</span>
+                            <strong>
+                              {new Date(controllerHttps.leafExpiresAt).toLocaleString()}
+                            </strong>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <form
+                        className="operator-login-form"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void handleControllerHttpsConfigure();
+                        }}
+                      >
+                        <p className="card-copy">
+                          Set the stable IPv4 address assigned to this PC. The Controller will keep
+                          this address and HTTPS port until you explicitly reconfigure it.
+                        </p>
+                        <label>
+                          Stable LAN IPv4 address
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            autoComplete="off"
+                            value={lanAddress}
+                            onChange={(event) => setLanAddress(event.target.value)}
+                            required
+                          />
+                        </label>
+                        <label>
+                          HTTPS port
+                          <input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={httpsPort}
+                            onChange={(event) => setHttpsPort(event.target.value)}
+                            required
+                          />
+                        </label>
+                        <button
+                          type="submit"
+                          className="button button-primary"
+                          disabled={tlsConfiguring}
+                        >
+                          {tlsConfiguring ? "Configuring…" : "Configure HTTPS"}
+                        </button>
+                      </form>
+                    )}
+                  </section>
+                </>
               )}
               <section className="overview-grid" aria-label="Runtime overview">
                 <article className="surface-card runtime-card">
@@ -556,7 +818,7 @@ function App() {
                     {snapshot.role === "CONSOLE"
                       ? "Console mode is client-only and starts no local helper process."
                       : snapshot.role === "CONTROLLER"
-                        ? "The private PostgreSQL cluster, loopback HTTP process, and scheduler run as separately supervised Windows processes."
+                        ? "The private PostgreSQL cluster, direct Uvicorn HTTPS/WSS listener, and scheduler run as separately supervised Windows processes."
                         : "The Worker lifecycle remains on its DX-02 mock boundary until its own implementation issue."}
                   </p>
                   <div className="runtime-facts">
@@ -728,13 +990,81 @@ function App() {
                           <input
                             type="url"
                             autoComplete="url"
-                            placeholder="https://controller.example"
+                            placeholder="https://192.168.1.20:8443"
                             value={apiUrl}
-                            onChange={(event) => setApiUrl(event.target.value)}
+                            onChange={(event) => {
+                              setApiUrl(event.target.value);
+                              setPendingTrustProbe(null);
+                              setTrustedController(null);
+                              setLoginUsername("");
+                              setLoginPassword("");
+                            }}
                             required
                           />
                         </label>
                       )}
+                      {snapshot.role !== "CONTROLLER" && (
+                        <section
+                          className="trust-panel"
+                          aria-label="Controller first-contact trust"
+                        >
+                          <button
+                            type="button"
+                            className="button button-secondary"
+                            onClick={() => void handleTrustProbe()}
+                            disabled={trustBusy || !canonicalEndpoint}
+                          >
+                            {trustBusy ? "Checking identity…" : "Probe Controller identity"}
+                          </button>
+                          {pendingTrustProbe &&
+                            pendingTrustProbe.endpoint === canonicalEndpoint && (
+                              <div className="runtime-facts">
+                                <p className="card-copy">
+                                  Compare this fingerprint with the value shown on the Controller
+                                  over a trusted local or out-of-band channel.
+                                </p>
+                                <div>
+                                  <span>Candidate Controller root fingerprint</span>
+                                  <code>{pendingTrustProbe.rootFingerprint}</code>
+                                </div>
+                                <div>
+                                  <span>Probe expires</span>
+                                  <strong>
+                                    {new Date(
+                                      pendingTrustProbe.expiresAt * 1_000,
+                                    ).toLocaleTimeString()}
+                                  </strong>
+                                </div>
+                                <button
+                                  type="button"
+                                  className="button button-primary"
+                                  onClick={() => void handleTrustConfirm()}
+                                  disabled={trustBusy}
+                                >
+                                  Confirm matching fingerprint
+                                </button>
+                              </div>
+                            )}
+                          {remoteTrustReady && (
+                            <p className="card-copy" role="status">
+                              Trusted Controller root: {trustedController.rootFingerprint}
+                            </p>
+                          )}
+                        </section>
+                      )}
+                      {snapshot.role === "CONTROLLER" && !controllerHttps?.configured && (
+                        <p className="card-copy" role="status">
+                          Configure the Controller HTTPS identity before Owner setup or sign-in.
+                        </p>
+                      )}
+                      {snapshot.role === "CONTROLLER" &&
+                        ownerBootstrapRequired &&
+                        !firstOwnerSetup && (
+                          <p className="card-copy" role="status">
+                            HTTPS is configured. Create the first Owner using the local native setup
+                            operation to start the HTTPS listener.
+                          </p>
+                        )}
                       <label>
                         Username
                         <input
@@ -742,6 +1072,7 @@ function App() {
                           autoComplete="username"
                           value={loginUsername}
                           onChange={(event) => setLoginUsername(event.target.value)}
+                          disabled={!loginReady}
                           required
                         />
                       </label>
@@ -752,6 +1083,7 @@ function App() {
                           autoComplete="current-password"
                           value={loginPassword}
                           onChange={(event) => setLoginPassword(event.target.value)}
+                          disabled={!loginReady}
                           required
                         />
                       </label>
@@ -761,13 +1093,18 @@ function App() {
                           The password is sent through stdin and never placed in command arguments.
                         </p>
                       )}
-                      <button type="submit" className="button button-primary">
+                      <button
+                        type="submit"
+                        className="button button-primary"
+                        disabled={!loginReady}
+                      >
                         {firstOwnerSetup ? "Create first Owner" : "Sign in"}
                       </button>
-                      {snapshot.role === "CONTROLLER" && (
+                      {snapshot.role === "CONTROLLER" && ownerBootstrapRequired && (
                         <button
                           type="button"
                           className="quiet-link"
+                          disabled={!controllerHttps?.configured}
                           onClick={() => setFirstOwnerSetup((enabled) => !enabled)}
                         >
                           {firstOwnerSetup ? "Return to sign in" : "Set up first Owner"}
@@ -1088,6 +1425,8 @@ function statusLabel(snapshot: DesktopSnapshot): string {
   if (snapshot.supervisor.state === "running") return "Running";
   if (snapshot.supervisor.state === "degraded") return "Needs attention";
   if (snapshot.supervisor.state === "failed") return "Failed";
+  if (snapshot.supervisor.state === "https_setup_required") return "HTTPS setup required";
+  if (snapshot.supervisor.state === "owner_bootstrap_required") return "Owner setup required";
   if (
     snapshot.supervisor.state === "starting" ||
     snapshot.supervisor.state === "preflight" ||
@@ -1108,6 +1447,8 @@ function runtimeTitle(snapshot: DesktopSnapshot): string {
   if (snapshot.role === "CONTROLLER") {
     if (snapshot.supervisor.state === "running") return "Controller runtime is running";
     if (snapshot.supervisor.state === "failed") return "Controller runtime failed";
+    if (snapshot.supervisor.state === "https_setup_required") return "Configure Controller HTTPS";
+    if (snapshot.supervisor.state === "owner_bootstrap_required") return "Create the first Owner";
     return "Controller runtime is stopped";
   }
   return snapshot.supervisor.state === "running"

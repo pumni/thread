@@ -26,7 +26,7 @@ function snapshot(role: DesktopSnapshot["role"] = null): DesktopSnapshot {
       httpProcessId: role === "CONTROLLER" ? 4244 : null,
       schedulerProcessId: role === "CONTROLLER" ? 4245 : null,
       controllerId: role === "CONTROLLER" ? "0123456789abcdef0123456789abcdef" : null,
-      endpoint: role === "CONTROLLER" ? "http://127.0.0.1:4246" : null,
+      endpoint: role === "CONTROLLER" ? "https://127.0.0.1:8443" : null,
       databasePort: role === "CONTROLLER" ? 4247 : null,
       diagnosticCode: null,
     },
@@ -90,6 +90,11 @@ describe("desktop provisioning", () => {
       "operator_create_user",
       "operator_update_user",
       "operator_change_password",
+      "controller_https_configure",
+      "controller_https_summary",
+      "controller_trust_probe",
+      "controller_trust_confirm",
+      "controller_trust_summary",
     ]);
   });
 
@@ -108,7 +113,7 @@ describe("desktop provisioning", () => {
     expect(await screen.findByText("PID 4243")).toBeInTheDocument();
     expect(screen.getByText("PID 4244")).toBeInTheDocument();
     expect(screen.getByText("PID 4245")).toBeInTheDocument();
-    expect(screen.getByText("http://127.0.0.1:4246")).toBeInTheDocument();
+    expect(screen.getByText("https://127.0.0.1:8443")).toBeInTheDocument();
     expect(screen.getByText(/disposable test data only/i)).toBeInTheDocument();
     expect(native.invoke).toHaveBeenCalledWith("provision_role", { role: "CONTROLLER" });
   });
@@ -149,10 +154,90 @@ describe("desktop provisioning", () => {
     expect(screen.getByText("None")).toBeInTheDocument();
   });
 
+  it("requires an explicit native trust confirmation before remote Operator credentials", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONSOLE");
+      if (command === "operator_current") return null;
+      if (command === "controller_trust_probe") {
+        return {
+          probeId: "opaque-probe-id",
+          endpoint: "https://192.168.1.20:8443",
+          rootFingerprint: "SHA256:0123456789abcdef",
+          expiresAt: 1_800_000_000,
+        };
+      }
+      if (command === "controller_trust_confirm") {
+        return {
+          endpoint: "https://192.168.1.20:8443",
+          rootFingerprint: "SHA256:0123456789abcdef",
+          trusted: true,
+        };
+      }
+      if (command === "operator_login") {
+        return {
+          id: "operator-id",
+          username: "remote-operator",
+          role: "OPERATOR",
+          mustChangePassword: false,
+          expiresAt: "2026-10-04T18:00:00Z",
+        };
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByRole("heading", { name: "Your Console" });
+    fireEvent.change(screen.getByLabelText("Controller address"), {
+      target: { value: "https://192.168.1.20:8443" },
+    });
+    expect(screen.getByLabelText("Username")).toBeDisabled();
+    expect(screen.getByLabelText("Password")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Probe Controller identity" }));
+    expect(await screen.findByText("SHA256:0123456789abcdef")).toBeInTheDocument();
+    expect(screen.getByLabelText("Username")).toBeDisabled();
+    expect(native.invoke).not.toHaveBeenCalledWith("operator_login", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm matching fingerprint" }));
+    await waitFor(() => expect(screen.getByLabelText("Username")).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "remote-operator" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "synthetic password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByText("Signed in as remote-operator");
+    expect(native.invoke).toHaveBeenCalledWith("controller_trust_confirm", {
+      probeId: "opaque-probe-id",
+    });
+    expect(native.invoke).toHaveBeenCalledWith("operator_login", {
+      apiUrl: "https://192.168.1.20:8443",
+      username: "remote-operator",
+      password: "synthetic password",
+    });
+  });
+
   it("keeps the Operator bearer inside Rust during first-Owner login", async () => {
     const bearer = "SYNTHETIC_OPERATOR_BEARER_NEVER_RENDERED";
+    const controllerSnapshot = snapshot("CONTROLLER");
+    controllerSnapshot.supervisor.state = "owner_bootstrap_required";
+    controllerSnapshot.supervisor.httpProcessId = null;
+    controllerSnapshot.supervisor.schedulerProcessId = null;
     native.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "get_desktop_snapshot") return controllerSnapshot;
+      if (command === "controller_https_summary") {
+        return {
+          configured: true,
+          lanAddress: "192.168.1.20",
+          httpsPort: 8443,
+          publicHttpsOrigin: "https://192.168.1.20:8443",
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: "SHA256:0123456789abcdef",
+          leafExpiresAt: "2026-12-31T00:00:00Z",
+        };
+      }
       if (command === "operator_current") return null;
       if (command === "operator_bootstrap_owner") {
         return {

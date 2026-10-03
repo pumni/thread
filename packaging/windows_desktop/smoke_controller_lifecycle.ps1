@@ -97,7 +97,16 @@ $checks = [ordered]@{
     controller_root_current_user_acl = $false
     dpapi_current_user_round_trip = $false
     atomic_non_secret_config = $false
-    loopback_only_database_and_endpoint = $false
+    controller_https_configuration_persisted = $false
+    no_lan_listener_before_local_owner_bootstrap = $false
+    loopback_postgres_wildcard_https_listener = $false
+    controller_https_root_fingerprint_matches_ui = $false
+    local_readiness_uses_private_root = $false
+    plaintext_health_rejected = $false
+    serving_leaf_key_cleaned_on_shutdown = $false
+    stale_serving_leaf_key_replaced_on_startup = $false
+    leaf_renewal_preserves_root_identity = $false
+    root_identity_persists_across_restart = $false
     no_owner_or_lan_bootstrap = $false
     local_first_owner_bootstrap = $false
     separate_http_and_scheduler_processes = $false
@@ -110,6 +119,7 @@ $checks = [ordered]@{
     relaunch_preserves_database_and_endpoint = $false
     database_crash_fails_closed_and_recovers_wal = $false
     desktop_parent_crash_owns_process_tree_and_recovers_wal = $false
+    controller_root_identity_survives_crash_restart = $false
     failed_migration_preserves_existing_cluster = $false
     database_port_collision_does_not_rotate = $false
     endpoint_port_collision_does_not_rotate = $false
@@ -706,13 +716,195 @@ function Get-ProcessExitTime(
     return [DateTime]::FromFileTimeUtc($fileTime)
 }
 
-function Test-Http([object]$Config) {
+function Get-LocalControllerIpv4 {
+    $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Sort-Object RouteMetric, InterfaceMetric |
+        Select-Object -First 1
+    $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction Stop |
+        Where-Object {
+            $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and
+            $_.IPAddress -notlike "224.*" -and $_.IPAddress -ne "255.255.255.255"
+        })
+    if ($defaultRoute) {
+        $preferred = $addresses | Where-Object { $_.InterfaceIndex -eq $defaultRoute.InterfaceIndex } |
+            Select-Object -First 1
+        if ($preferred) { return [string]$preferred.IPAddress }
+    }
+    $selected = $addresses | Select-Object -First 1
+    if (-not $selected) { throw "controller_smoke_lan_ipv4_unavailable" }
+    return [string]$selected.IPAddress
+}
+
+function Get-FreeHttpsPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
+    $listener.Start()
+    try { return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port }
+    finally { $listener.Stop() }
+}
+
+function Test-ControllerHttps([object]$Config) {
     try {
-        $response = Invoke-WebRequest -Uri "http://127.0.0.1:$($Config.endpointPort)/ready" `
-            -TimeoutSec 3 -UseBasicParsing
-        return $response.StatusCode -eq 200
+        $rootPath = Join-Path (Join-Path $controllerRoot "tls") "root-cert.der"
+        $rootCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            [System.IO.File]::ReadAllBytes($rootPath)
+        )
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.UseProxy = $false
+        $handler.ServerCertificateCustomValidationCallback = {
+            param($request, $certificate, $chain, $errors)
+            $nameOrMissing = [System.Net.Security.SslPolicyErrors]::RemoteCertificateNameMismatch -bor
+                [System.Net.Security.SslPolicyErrors]::RemoteCertificateNotAvailable
+            if (($errors -band $nameOrMissing) -ne 0) { return $false }
+            $chain.ChainPolicy.TrustMode =
+                [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+            $chain.ChainPolicy.VerificationFlags =
+                [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+            $chain.ChainPolicy.RevocationMode =
+                [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            $null = $chain.ChainPolicy.CustomTrustStore.Add($rootCertificate)
+            return $chain.Build($certificate)
+        }.GetNewClosure()
+        $client = [System.Net.Http.HttpClient]::new($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(3)
+        try {
+            $response = $client.GetAsync(
+                "https://127.0.0.1:$($Config.endpointPort)/ready"
+            ).GetAwaiter().GetResult()
+            try { return [int]$response.StatusCode -eq 200 }
+            finally { $response.Dispose() }
+        } finally {
+            $client.Dispose()
+            $handler.Dispose()
+            $rootCertificate.Dispose()
+        }
     } catch {
         return $false
+    }
+}
+
+function Test-PlaintextHttpRejected([object]$Config) {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $client.ReceiveTimeout = 1_000
+        $client.SendTimeout = 1_000
+        $client.Connect([Net.IPAddress]::Loopback, [int]$Config.endpointPort)
+        $stream = $client.GetStream()
+        $request = [Text.Encoding]::ASCII.GetBytes(
+            "GET /ready HTTP/1.1`r`nHost: 127.0.0.1`r`nConnection: close`r`n`r`n"
+        )
+        $stream.Write($request, 0, $request.Length)
+        $buffer = [byte[]]::new(16)
+        try {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            return $read -eq 0 -or [Text.Encoding]::ASCII.GetString($buffer, 0, $read) -notmatch '^HTTP/'
+        } catch [System.IO.IOException] {
+            return $true
+        }
+    } catch [System.Net.Sockets.SocketException] {
+        return $true
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function ConvertTo-SmokePem([string]$Label, [byte[]]$Der) {
+    $encoded = [Convert]::ToBase64String($Der)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    for ($offset = 0; $offset -lt $encoded.Length; $offset += 64) {
+        $count = [Math]::Min(64, $encoded.Length - $offset)
+        $lines.Add($encoded.Substring($offset, $count))
+    }
+    return "-----BEGIN $Label-----`n$($lines -join "`n")`n-----END $Label-----`n"
+}
+
+function Set-ExpiringControllerLeaf([object]$Config) {
+    $tlsDirectory = Join-Path $controllerRoot "tls"
+    $rootCertificatePath = Join-Path $tlsDirectory "root-cert.der"
+    $protectedRootKeyPath = Join-Path $tlsDirectory "root-key.dpapi"
+    $rootCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [System.IO.File]::ReadAllBytes($rootCertificatePath)
+    )
+    $protectedRootKey = [System.IO.File]::ReadAllBytes($protectedRootKeyPath)
+    $rootKeyBytes = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $protectedRootKey,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+    )
+    $rootKey = [System.Security.Cryptography.ECDsa]::Create()
+    $consumed = 0
+    try {
+        $rootKey.ImportPkcs8PrivateKey($rootKeyBytes, [ref]$consumed)
+        if ($consumed -ne $rootKeyBytes.Length) { throw "controller_smoke_root_key_parse_failed" }
+        $leafKey = [System.Security.Cryptography.ECDsa]::Create()
+        $leafKey.KeySize = 256
+        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=Threads Controller lifecycle smoke leaf",
+            $leafKey,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256
+        )
+        $request.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new(
+                $false, $false, 0, $true
+            )
+        )
+        $request.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
+                [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature,
+                $true
+            )
+        )
+        $eku = [System.Security.Cryptography.OidCollection]::new()
+        $null = $eku.Add([System.Security.Cryptography.Oid]::new("1.3.6.1.5.5.7.3.1"))
+        $request.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new(
+                $eku, $false
+            )
+        )
+        $sans = [System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()
+        $sans.AddIpAddress([Net.IPAddress]::Parse([string]$Config.lanAddress))
+        $sans.AddIpAddress([Net.IPAddress]::Loopback)
+        $request.CertificateExtensions.Add($sans.Build())
+        $serial = [byte[]]::new(16)
+        $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $random.GetBytes($serial) }
+        finally { $random.Dispose() }
+        $now = [DateTimeOffset]::UtcNow
+        $signatureGenerator =
+            [System.Security.Cryptography.X509Certificates.X509SignatureGenerator]::CreateForECDsa(
+                $rootKey
+            )
+        $leaf = $request.Create(
+            $rootCertificate.SubjectName,
+            $signatureGenerator,
+            $now.AddMinutes(-5),
+            $now.AddDays(20),
+            $serial
+        )
+        $leafKeyBytes = $leafKey.ExportPkcs8PrivateKey()
+        try {
+            $protectedLeafKey = [System.Security.Cryptography.ProtectedData]::Protect(
+                $leafKeyBytes,
+                $null,
+                [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+            )
+            $leafDer = $leaf.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+            $rootDer = [System.IO.File]::ReadAllBytes($rootCertificatePath)
+            [System.IO.File]::WriteAllBytes((Join-Path $tlsDirectory "leaf-cert.der"), $leafDer)
+            [System.IO.File]::WriteAllBytes((Join-Path $tlsDirectory "leaf-key.dpapi"), $protectedLeafKey)
+            [System.IO.File]::WriteAllText(
+                (Join-Path $tlsDirectory "leaf-fullchain.pem"),
+                (ConvertTo-SmokePem "CERTIFICATE" $leafDer) + (ConvertTo-SmokePem "CERTIFICATE" $rootDer),
+                [System.Text.UTF8Encoding]::new($false)
+            )
+        } finally {
+            [Array]::Clear($leafKeyBytes, 0, $leafKeyBytes.Length)
+            $leafKey.Dispose()
+            $leaf.Dispose()
+        }
+    } finally {
+        [Array]::Clear($rootKeyBytes, 0, $rootKeyBytes.Length)
+        $rootKey.Dispose()
+        $rootCertificate.Dispose()
     }
 }
 
@@ -767,8 +959,53 @@ try {
 
     $desktop = Start-Desktop
     Invoke-Button $desktop.Id "Provision as Controller"
-    Wait-ControllerState $desktop.Id "Controller runtime is running" $null 420
+    Wait-ControllerState $desktop.Id "Configure Controller HTTPS" $null 420
+    $lanAddress = Get-LocalControllerIpv4
+    $selectedHttpsPort = Get-FreeHttpsPort
+    Set-LoginInput $desktop.Id "Stable LAN IPv4 address" $lanAddress
+    Set-LoginInput $desktop.Id "HTTPS port" ([string]$selectedHttpsPort)
+    Invoke-Button $desktop.Id "Configure HTTPS"
+    Wait-Until {
+        $configured = Get-ControllerConfig
+        return $configured.schemaVersion -eq 2 -and
+            $configured.lanAddress -ceq $lanAddress -and
+            $configured.endpointPort -eq $selectedHttpsPort
+    } 30 "controller_https_configuration_not_persisted"
+    Wait-Until {
+        $window = Get-Window $desktop.Id
+        return $null -ne (Find-Element $window "Set up first Owner" `
+            ([System.Windows.Automation.ControlType]::Button))
+    } 30 "controller_https_owner_bootstrap_boundary_not_ready"
     $config = Get-ControllerConfig
+    $rootCertificatePath = Join-Path (Join-Path $controllerRoot "tls") "root-cert.der"
+    $rootPrivateKeyPath = Join-Path (Join-Path $controllerRoot "tls") "root-key.dpapi"
+    $servingKeyPath = Join-Path (Join-Path (Join-Path $controllerRoot "tls") "serving") "leaf-key.pem"
+    if (-not (Test-Path -LiteralPath $rootCertificatePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $rootPrivateKeyPath -PathType Leaf) -or
+        (Test-Path -LiteralPath (Join-Path (Join-Path $controllerRoot "tls") "root-key.pem"))) {
+        throw "controller_tls_identity_custody_invalid"
+    }
+    $rootFingerprint = "SHA256:" + (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $fingerprintDisplay = Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint
+    $checks.controller_https_configuration_persisted =
+        $config.schemaVersion -eq 2 -and $config.lanAddress -ceq $lanAddress -and
+        $config.endpointPort -eq $selectedHttpsPort
+    $checks.controller_https_root_fingerprint_matches_ui = $null -ne $fingerprintDisplay
+    if (-not $checks.controller_https_configuration_persisted -or
+        -not $checks.controller_https_root_fingerprint_matches_ui) {
+        throw "controller_https_identity_summary_invalid"
+    }
+    $beforeOwnerProcesses = Get-ControllerProcesses
+    $beforeOwnerListeners = @(Get-ListenerAddresses ([int]$config.endpointPort))
+    $checks.no_lan_listener_before_local_owner_bootstrap =
+        $beforeOwnerProcesses.postgres.Count -eq 1 -and
+        $beforeOwnerProcesses.http.Count -eq 0 -and
+        $beforeOwnerProcesses.scheduler.Count -eq 0 -and
+        $beforeOwnerListeners.Count -eq 0 -and
+        -not (Test-Path -LiteralPath $servingKeyPath)
+    if (-not $checks.no_lan_listener_before_local_owner_bootstrap) {
+        throw "controller_lan_listener_started_before_owner_bootstrap"
+    }
     $controllerIdentity = [string]$config.controllerId
     $controllerAppData = [System.IO.Path]::GetFullPath($controllerRoot)
     if (-not $controllerAppData.StartsWith(
@@ -793,10 +1030,16 @@ try {
     $serializedConfig = Get-Content -LiteralPath (Join-Path $controllerRoot "controller.json") -Raw
     $checks.atomic_non_secret_config =
         $serializedConfig -notmatch '(?i)password|secret|databaseurl|authorization|token' -and
-        $config.schemaVersion -eq 1 -and $config.clusterInitialized -eq $true
+        $config.schemaVersion -eq 2 -and $config.clusterInitialized -eq $true -and
+        $config.lanAddress -ceq $lanAddress -and $config.endpointPort -eq $selectedHttpsPort
     if (-not $checks.atomic_non_secret_config) { throw "controller_config_contains_secret_or_invalid_state" }
 
-    Wait-Until { Test-Http $config } 60 "controller_http_readiness_failed"
+    Wait-Until { Test-ControllerHttps $config } 60 "controller_tls_readiness_failed"
+    $checks.local_readiness_uses_private_root = $true
+    if (-not (Test-PlaintextHttpRejected $config)) {
+        throw "controller_plaintext_health_listener_present"
+    }
+    $checks.plaintext_health_rejected = $true
     $owned = Assert-ControllerProcesses
     $httpPid = [int]$owned.http[0].ProcessId
     $schedulerPid = [int]$owned.scheduler[0].ProcessId
@@ -805,10 +1048,13 @@ try {
     $checks.separate_http_and_scheduler_processes = $true
     $dbListeners = @(Get-ListenerAddresses ([int]$config.databasePort))
     $httpListeners = @(Get-ListenerAddresses ([int]$config.endpointPort))
-    $loopbackOnly = $dbListeners.Count -eq 1 -and $dbListeners[0] -eq "127.0.0.1" -and
-        $httpListeners.Count -eq 1 -and $httpListeners[0] -eq "127.0.0.1"
-    Set-Check "loopback_only_database_and_endpoint" $loopbackOnly "controller_listener_not_loopback_only"
-    if (-not $loopbackOnly) { throw "controller_listener_not_loopback_only" }
+    $privateDatabaseAndWildcardTls =
+        $dbListeners.Count -eq 1 -and $dbListeners[0] -eq "127.0.0.1" -and
+        $httpListeners.Count -eq 1 -and $httpListeners[0] -eq "0.0.0.0" -and
+        (Test-Path -LiteralPath $servingKeyPath -PathType Leaf)
+    Set-Check "loopback_postgres_wildcard_https_listener" $privateDatabaseAndWildcardTls `
+        "controller_listener_topology_invalid"
+    if (-not $privateDatabaseAndWildcardTls) { throw "controller_listener_topology_invalid" }
 
     $databaseSystemIdentifier = Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();"
     $operatorUsersTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
@@ -833,7 +1079,7 @@ try {
     Wait-Until {
         $current = Get-ControllerProcesses
         return $current.postgres.Count -eq 1 -and $current.http.Count -eq 1 -and
-            $current.scheduler.Count -eq 1 -and (Test-Http $config)
+            $current.scheduler.Count -eq 1 -and (Test-ControllerHttps $config)
     } 15 "controller_runtime_stopped_when_window_hidden"
     Assert-DatabaseValue $config $sentinel
     $checks.x_hides_and_runtime_continues = $true
@@ -911,10 +1157,46 @@ try {
     }
     Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
     $checks.graceful_quit_stops_scheduler_http_then_postgres = $true
+    $rootFingerprintBeforeRestart =
+        (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $leafCertificatePath = Join-Path (Join-Path $controllerRoot "tls") "leaf-cert.der"
+    $leafFingerprintBeforeRenewal = (Get-FileHash -LiteralPath $leafCertificatePath -Algorithm SHA256).Hash
+    $checks.serving_leaf_key_cleaned_on_shutdown = -not (Test-Path -LiteralPath $servingKeyPath)
+    if (-not $checks.serving_leaf_key_cleaned_on_shutdown) {
+        throw "controller_serving_leaf_key_not_cleaned_on_shutdown"
+    }
+    [System.IO.File]::WriteAllText(
+        $servingKeyPath,
+        "STALE SERVING KEY MUST BE REMOVED BEFORE STARTUP",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Set-ExpiringControllerLeaf $config
 
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-Http $config } 60 "controller_relaunch_http_not_ready"
+    Wait-Until { Test-ControllerHttps $config } 60 "controller_leaf_renewal_https_not_ready"
+    $rootFingerprintAfterRestart =
+        (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $renewedLeaf = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [System.IO.File]::ReadAllBytes($leafCertificatePath)
+    )
+    $renewedLeafRemaining = $renewedLeaf.NotAfter.ToUniversalTime() - [DateTime]::UtcNow
+    $servingKeyContents = [System.IO.File]::ReadAllText($servingKeyPath)
+    $checks.root_identity_persists_across_restart =
+        $rootFingerprintAfterRestart -ceq $rootFingerprintBeforeRestart
+    $checks.leaf_renewal_preserves_root_identity =
+        $rootFingerprintAfterRestart -ceq $rootFingerprintBeforeRestart -and
+        (Get-FileHash -LiteralPath $leafCertificatePath -Algorithm SHA256).Hash -cne $leafFingerprintBeforeRenewal -and
+        $renewedLeafRemaining.TotalDays -gt 80
+    $checks.stale_serving_leaf_key_replaced_on_startup =
+        $servingKeyContents -match '^-----BEGIN PRIVATE KEY-----' -and
+        $servingKeyContents -notmatch 'STALE SERVING KEY MUST BE REMOVED'
+    $renewedLeaf.Dispose()
+    if (-not $checks.root_identity_persists_across_restart -or
+        -not $checks.leaf_renewal_preserves_root_identity -or
+        -not $checks.stale_serving_leaf_key_replaced_on_startup) {
+        throw "controller_tls_restart_or_renewal_evidence_invalid"
+    }
     Assert-DatabaseValue $config $sentinel
     $owned = Assert-ControllerProcesses
     if ($config.controllerId -cne $controllerIdentity -or
@@ -936,7 +1218,7 @@ try {
     Quit-Desktop $desktop.Id
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-Http $config } 60 "controller_database_crash_recovery_failed"
+    Wait-Until { Test-ControllerHttps $config } 60 "controller_database_crash_recovery_failed"
     Assert-DatabaseValue $config $sentinel
     if ([string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
         throw "controller_database_identity_changed_after_crash"
@@ -976,13 +1258,17 @@ try {
     } 25 "controller_job_object_left_runtime_after_parent_crash"
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-Http $config } 60 "controller_parent_crash_wal_recovery_failed"
+    Wait-Until { Test-ControllerHttps $config } 60 "controller_parent_crash_wal_recovery_failed"
     Assert-DatabaseValue $config $sentinel
     $owned = Assert-ControllerProcesses
+    $rootFingerprintAfterParentCrash =
+        (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($owned.scheduler.Count -ne 1 -or
-        [string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
+        [string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier -or
+        $rootFingerprintAfterParentCrash -cne $rootFingerprintBeforeRestart) {
         throw "controller_scheduler_or_database_duplicated_after_parent_crash"
     }
+    $checks.controller_root_identity_survives_crash_restart = $true
     $checks.desktop_parent_crash_owns_process_tree_and_recovers_wal = $true
 
     $currentMigration = Invoke-Psql $config "SELECT version_num FROM alembic_version;"
@@ -999,7 +1285,7 @@ try {
     Quit-Desktop $desktop.Id
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-Http $config } 60 "controller_migration_recovery_failed"
+    Wait-Until { Test-ControllerHttps $config } 60 "controller_migration_recovery_failed"
     Assert-DatabaseValue $config $sentinel
     $checks.failed_migration_preserves_existing_cluster = $true
 
@@ -1018,7 +1304,7 @@ try {
         $databaseReservation.Stop()
     }
 
-    $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, [int]$config.endpointPort)
+    $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, [int]$config.endpointPort)
     $endpointReservation.Start()
     try {
         $desktop = Start-Desktop

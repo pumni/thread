@@ -10,6 +10,8 @@ export type SupervisorState =
   | "starting_database"
   | "migrating"
   | "m1_bootstrap_boundary"
+  | "https_setup_required"
+  | "owner_bootstrap_required"
   | "starting_http"
   | "starting_scheduler"
   | "running"
@@ -60,6 +62,29 @@ export interface CreatedOperatorUser {
   temporaryPassword: string;
 }
 
+export interface ControllerHttpsSummary {
+  configured: boolean;
+  lanAddress: string | null;
+  httpsPort: number;
+  publicHttpsOrigin: string | null;
+  localHttpsOrigin: string;
+  rootFingerprint: string | null;
+  leafExpiresAt: string | null;
+}
+
+export interface TrustProbeSummary {
+  probeId: string;
+  endpoint: string;
+  rootFingerprint: string;
+  expiresAt: number;
+}
+
+export interface TrustedControllerSummary {
+  endpoint: string | null;
+  rootFingerprint: string | null;
+  trusted: boolean;
+}
+
 export const DESKTOP_COMMANDS = [
   "get_desktop_snapshot",
   "provision_role",
@@ -76,6 +101,11 @@ export const DESKTOP_COMMANDS = [
   "operator_create_user",
   "operator_update_user",
   "operator_change_password",
+  "controller_https_configure",
+  "controller_https_summary",
+  "controller_trust_probe",
+  "controller_trust_confirm",
+  "controller_trust_summary",
 ] as const;
 
 export function getDesktopSnapshot(): Promise<DesktopSnapshot> {
@@ -150,6 +180,32 @@ export function operatorUpdateUser(
 
 export function operatorChangePassword(newPassword: string): Promise<OperatorIdentity> {
   return invoke<OperatorIdentity>("operator_change_password", { newPassword });
+}
+
+export function controllerHttpsConfigure(
+  lanAddress: string,
+  port: number,
+): Promise<ControllerHttpsSummary> {
+  return invoke<ControllerHttpsSummary>("controller_https_configure", {
+    lanAddress,
+    port,
+  });
+}
+
+export function controllerHttpsSummary(): Promise<ControllerHttpsSummary> {
+  return invoke<ControllerHttpsSummary>("controller_https_summary");
+}
+
+export function controllerTrustProbe(endpoint: string): Promise<TrustProbeSummary> {
+  return invoke<TrustProbeSummary>("controller_trust_probe", { endpoint });
+}
+
+export function controllerTrustConfirm(probeId: string): Promise<TrustedControllerSummary> {
+  return invoke<TrustedControllerSummary>("controller_trust_confirm", { probeId });
+}
+
+export function controllerTrustSummary(endpoint: string): Promise<TrustedControllerSummary> {
+  return invoke<TrustedControllerSummary>("controller_trust_summary", { endpoint });
 }
 
 export function listenForTrayQuit(): Promise<() => void> {

@@ -755,6 +755,23 @@ input:focus-visible {
 .operator-user-create .button {
   justify-self: start;
 }
+.trust-panel {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #e5e6eb;
+  border-radius: 9px;
+  background: #fafbfc;
+}
+.trust-panel .runtime-facts {
+  margin: 0;
+}
+.trust-panel code,
+.runtime-facts code {
+  overflow-wrap: anywhere;
+  color: #39334f;
+  font-size: 10px;
+}
 .operator-users-card {
   margin-top: 18px;
 }

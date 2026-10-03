@@ -1,17 +1,35 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import UUID, uuid4
+
+import websockets
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
+from threads_platform import controller_tls_admin
+from threads_platform.workers.control_client import HttpWorkerControlClient
+from threads_platform.workers.key_store import WorkerDeviceIdentity
+
+_ROOT_CERT_PATH: Path | None = None
+_TLS_ADMIN_DIR = "/var/lib/threads/controller-tls-admin"
+_TLS_SERVING_DIR = "/var/lib/threads/controller-tls-serving"
+_SENSITIVE_VALUES: list[str] = []
 
 
 class SmokeFailure(RuntimeError):
@@ -97,7 +115,7 @@ asyncio.run(main())
 
 def _compose(*arguments: str, input_text: str | None = None, timeout: int = 180) -> str:
     environment = os.environ.copy()
-    environment["THREADS_PLATFORM_WORKER_TLS_REQUIRED"] = "false"
+    environment.setdefault("THREADS_PLATFORM_TLS_LAN_ADDRESS", "127.0.0.1")
     result = subprocess.run(
         ["docker", "compose", *arguments],
         capture_output=True,
@@ -111,6 +129,46 @@ def _compose(*arguments: str, input_text: str | None = None, timeout: int = 180)
         label = arguments[0] if arguments else "compose"
         raise SmokeFailure(f"Docker Compose {label} step failed (exit {result.returncode})")
     return result.stdout.strip()
+
+
+def _tls_context() -> ssl.SSLContext:
+    if _ROOT_CERT_PATH is None:
+        raise SmokeFailure("synthetic Controller root was not prepared")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    context.load_verify_locations(cafile=str(_ROOT_CERT_PATH))
+    return context
+
+
+def _prepare_tls_state(root_directory: Path) -> str:
+    global _ROOT_CERT_PATH
+    _compose("--profile", "tls-admin", "up", "tls-admin", timeout=90)
+    cli_fingerprint = _compose(
+        "run",
+        "--rm",
+        "--no-deps",
+        "tls-admin",
+        "python",
+        "-m",
+        "threads_platform.controller_tls_admin",
+        "fingerprint",
+        "--admin-dir",
+        _TLS_ADMIN_DIR,
+    )
+    root_path = root_directory / "root-cert.pem"
+    _compose(
+        "cp",
+        f"tls-admin:{_TLS_ADMIN_DIR}/root-cert.pem",
+        str(root_path),
+        timeout=30,
+    )
+    root = x509.load_pem_x509_certificate(root_path.read_bytes())
+    expected = "SHA256:" + hashlib.sha256(root.public_bytes(serialization.Encoding.DER)).hexdigest()
+    if cli_fingerprint != expected:
+        raise SmokeFailure("local TLS admin CLI fingerprint did not match the provisioned root DER")
+    _ROOT_CERT_PATH = root_path
+    return expected
 
 
 def _check_runtime_image() -> None:
@@ -141,6 +199,26 @@ if Path.home().joinpath('ThreadsOperations').exists():
     )
     if result.returncode != 0:
         raise SmokeFailure("runtime image user/content check failed")
+    image_config = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{json .Config.Cmd}}", image],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    command = image_config.stdout
+    if image_config.returncode != 0 or any(
+        required not in command
+        for required in (
+            "--ssl-certfile",
+            "--ssl-keyfile",
+            "--no-proxy-headers",
+            "--no-access-log",
+        )
+    ):
+        raise SmokeFailure("HTTP image does not require direct Uvicorn HTTPS")
+    if "root-key.pem" in command or "controller-tls-admin" in command:
+        raise SmokeFailure("HTTP image command exposes the root signing-key path")
 
 
 def _database_operation(operation: str, worker_id: UUID) -> None:
@@ -182,9 +260,9 @@ def _get_json(
 ) -> tuple[int | None, dict[str, object] | None]:
     port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
     headers = {"Authorization": f"Bearer {bearer}"} if bearer is not None else {}
-    request = Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    request = Request(f"https://127.0.0.1:{port}{path}", headers=headers)
     try:
-        with urlopen(request, timeout=3) as response:
+        with urlopen(request, context=_tls_context(), timeout=3) as response:
             return response.status, _json_object(response.read())
     except HTTPError as error:
         return error.code, _json_object(error.read())
@@ -203,13 +281,13 @@ def _post_json(
     if bearer is not None:
         headers["Authorization"] = f"Bearer {bearer}"
     request = Request(
-        f"http://127.0.0.1:{port}{path}",
+        f"https://127.0.0.1:{port}{path}",
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",
     )
     try:
-        with urlopen(request, timeout=5) as response:
+        with urlopen(request, context=_tls_context(), timeout=5) as response:
             return response.status, _json_object(response.read()), response.headers
     except HTTPError as error:
         return error.code, _json_object(error.read()), error.headers
@@ -232,6 +310,7 @@ def _create_smoke_operator(owner_token: str, username: str, role: str) -> tuple[
     ):
         raise SmokeFailure("Operator user creation response was not one-time/no-store")
     temporary_password = cast(str, body["temporary_password"])
+    _SENSITIVE_VALUES.append(temporary_password)
     login_status, login, _ = _post_json(
         "/v1/operator/login",
         {"username": username, "password": temporary_password},
@@ -239,6 +318,7 @@ def _create_smoke_operator(owner_token: str, username: str, role: str) -> tuple[
     if login_status != 200 or login is None or not isinstance(login.get("access_token"), str):
         raise SmokeFailure("temporary Operator password did not authenticate")
     token = cast(str, login["access_token"])
+    _SENSITIVE_VALUES.append(token)
     password_status, _, _ = _post_json(
         "/v1/operator/me/password",
         {"new_password": f"{username} smoke passphrase 2026"},
@@ -246,11 +326,13 @@ def _create_smoke_operator(owner_token: str, username: str, role: str) -> tuple[
     )
     if password_status != 200:
         raise SmokeFailure("temporary Operator password could not be changed")
+    _SENSITIVE_VALUES.append(f"{username} smoke passphrase 2026")
     return token, f"{username} smoke passphrase 2026"
 
 
-def _operator_bootstrap_api_parity() -> None:
+def _operator_bootstrap_api_parity() -> str:
     bootstrap_password = "synthetic local owner passphrase"
+    _SENSITIVE_VALUES.append(bootstrap_password)
     output = _compose(
         "exec",
         "-T",
@@ -279,6 +361,7 @@ def _operator_bootstrap_api_parity() -> None:
     ):
         raise SmokeFailure("Linux/Docker first Owner could not log in through the Operator API")
     owner_token = cast(str, login["access_token"])
+    _SENSITIVE_VALUES.append(owner_token)
     owner_status, owner = _get_json("/v1/operator/me", bearer=owner_token)
     if owner_status != 200 or owner is None or owner.get("role") != "OWNER":
         raise SmokeFailure("Operator /me role did not match the Linux/Docker first Owner")
@@ -332,12 +415,203 @@ def _operator_bootstrap_api_parity() -> None:
     )
     if repeat.returncode == 0 or "OPERATOR_BOOTSTRAP_ALREADY_COMPLETED" not in repeat.stderr:
         raise SmokeFailure("repeat Owner bootstrap was not explicitly rejected")
+    return owner_token
+
+
+def _assert_tls_isolation() -> None:
+    config = _json_object(
+        _compose("--profile", "tls-admin", "config", "--format", "json").encode("utf-8")
+    )
+    services = config.get("services") if config is not None else None
+    if not isinstance(services, dict):
+        raise SmokeFailure("Compose TLS service configuration could not be inspected")
+    http = services.get("http")
+    scheduler = services.get("scheduler")
+    tls_admin = services.get("tls-admin")
+    if not all(isinstance(service, dict) for service in (http, scheduler, tls_admin)):
+        raise SmokeFailure("Compose TLS services are incomplete")
+    if "tls-admin" not in cast(dict[str, object], tls_admin).get("profiles", []):
+        raise SmokeFailure("TLS administration must require its explicit Compose profile")
+    dependencies = cast(dict[str, object], http).get("depends_on", {})
+    if not isinstance(dependencies, dict) or "tls-admin" in dependencies:
+        raise SmokeFailure("ordinary HTTP startup must not provision or replace the root")
+    http_volumes = cast(dict[str, object], http).get("volumes")
+    scheduler_volumes = cast(dict[str, object], scheduler).get("volumes")
+    admin_volumes = cast(dict[str, object], tls_admin).get("volumes")
+    if not isinstance(http_volumes, list) or not isinstance(admin_volumes, list):
+        raise SmokeFailure("Compose TLS volume boundaries could not be inspected")
+    if any("controller-tls-admin" in str(volume) for volume in http_volumes):
+        raise SmokeFailure("HTTP service has access to root-admin TLS state")
+    if any("controller-tls" in str(volume) for volume in scheduler_volumes or []):
+        raise SmokeFailure("scheduler service has a TLS private-key volume")
+    if not any("controller_tls_admin" in str(volume) for volume in admin_volumes):
+        raise SmokeFailure("one-shot TLS admin service has no root-admin volume")
+    http_environment = cast(dict[str, object], http).get("environment")
+    scheduler_environment = cast(dict[str, object], scheduler).get("environment")
+    if not isinstance(http_environment, dict) or not isinstance(scheduler_environment, dict):
+        raise SmokeFailure("Compose TLS service environments could not be inspected")
+    for environment in (http_environment, scheduler_environment):
+        for name, value in cast(dict[str, object], environment).items():
+            normalized_name = str(name).upper()
+            normalized_value = str(value).upper()
+            if (
+                any(
+                    marker in normalized_name
+                    for marker in ("ROOT_KEY", "ROOT_PRIVATE_KEY", "PRIVATE_KEY_BYTES")
+                )
+                or ("-----BEGIN " + "PRIVATE KEY" + "-----") in normalized_value
+            ):
+                raise SmokeFailure("Compose environment contains root private-key material")
+    if (
+        http_environment.get("THREADS_PLATFORM_TLS_CERTFILE")
+        != f"{_TLS_SERVING_DIR}/leaf-fullchain.pem"
+        or http_environment.get("THREADS_PLATFORM_TLS_KEYFILE")
+        != f"{_TLS_SERVING_DIR}/leaf-key.pem"
+    ):
+        raise SmokeFailure("HTTP service TLS paths do not point to the serving leaf")
+    if any("TLS_" in str(name) for name in scheduler_environment):
+        raise SmokeFailure("scheduler environment contains TLS configuration")
+    if any(
+        "THREADS_PLATFORM_WORKER_TLS_REQUIRED"
+        in cast(dict[str, object], service).get("environment", {})
+        for service in (http, scheduler)
+    ):
+        raise SmokeFailure("Compose still exposes the Worker TLS bypass setting")
+
+    _compose(
+        "exec",
+        "-T",
+        "http",
+        "python",
+        "-c",
+        "from pathlib import Path; assert not Path("
+        "'/var/lib/threads/controller-tls-admin/root-key.pem').exists()",
+    )
+    _compose(
+        "exec",
+        "-T",
+        "scheduler",
+        "python",
+        "-c",
+        "from pathlib import Path; assert not Path("
+        "'/var/lib/threads/controller-tls-serving/leaf-key.pem').exists()",
+    )
+    _compose(
+        "exec",
+        "-T",
+        "http",
+        "python",
+        "-c",
+        "import pathlib; p=pathlib.Path('/proc/1/cmdline').read_bytes()+"
+        "pathlib.Path('/proc/1/environ').read_bytes(); "
+        "assert b'root-key.pem' not in p and b'controller-tls-admin' not in p",
+    )
+
+
+def _assert_secret_free_logs() -> None:
+    logs = _compose("logs", "--no-color", timeout=60)
+    if "-----BEGIN PRIVATE KEY-----" in logs or "-----BEGIN EC PRIVATE KEY-----" in logs:
+        raise SmokeFailure("a private key appeared in Compose logs")
+    if any(secret and secret in logs for secret in _SENSITIVE_VALUES):
+        raise SmokeFailure("an Operator or Worker credential appeared in Compose logs")
+
+
+async def _exercise_worker_https_wss(owner_token: str, scratch: Path) -> None:
+    if _ROOT_CERT_PATH is None:
+        raise SmokeFailure("verified private root is unavailable")
+    enrollment_status, enrollment, _ = _post_json("/v1/workers/enrollments", {}, bearer=owner_token)
+    if (
+        enrollment_status != 200
+        or enrollment is None
+        or not isinstance(enrollment.get("enrollment_code"), str)
+    ):
+        raise SmokeFailure("synthetic Worker enrollment could not be created")
+    _SENSITIVE_VALUES.append(cast(str, enrollment["enrollment_code"]))
+
+    port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
+    worker_id = uuid4()
+    client = HttpWorkerControlClient(
+        f"https://127.0.0.1:{port}",
+        private_root_certificate=_ROOT_CERT_PATH,
+    )
+    try:
+        await client.authenticate(
+            worker_id,
+            WorkerDeviceIdentity.generate(),
+            enrollment_pending=True,
+            enrollment_code=cast(str, enrollment["enrollment_code"]),
+            display_name="DX-06 synthetic Worker",
+            hostname="dx06-smoke-worker",
+            max_concurrent_jobs=1,
+            max_browser_sessions=1,
+        )
+        await client.hello(
+            worker_id,
+            agent_version="dx06-smoke",
+            capabilities=(),
+            max_concurrent_jobs=1,
+            max_browser_sessions=1,
+            active_browser_sessions=0,
+        )
+        bearer = client._access_token
+        if not bearer:
+            raise SmokeFailure("Worker HTTPS authentication did not create a session")
+        _SENSITIVE_VALUES.append(bearer)
+
+        uri = f"wss://127.0.0.1:{port}/v1/workers/connect"
+        context = _tls_context()
+        async with websockets.connect(
+            uri,
+            ssl=context,
+            additional_headers={"Authorization": f"Bearer {bearer}"},
+            proxy=None,
+            open_timeout=5,
+        ) as websocket:
+            await websocket.send(
+                json.dumps(
+                    {"type": "worker.heartbeat", "healthy": True, "active_browser_sessions": 0}
+                )
+            )
+            message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
+            if message != {"type": "worker.heartbeat.accepted", "status": "ONLINE"}:
+                raise SmokeFailure("verified WSS Worker heartbeat was not accepted")
+
+        try:
+            async with websockets.connect(
+                uri.replace("wss://", "ws://", 1), proxy=None, open_timeout=3
+            ):
+                raise SmokeFailure("plaintext ws unexpectedly connected to the HTTPS listener")
+        except OSError, TimeoutError, websockets.exceptions.WebSocketException:
+            pass
+
+        wrong_admin = scratch / "wrong-root-admin"
+        wrong_serving = scratch / "wrong-root-serving"
+        controller_tls_admin.provision(wrong_admin, wrong_serving, "127.0.0.1")
+        wrong_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        wrong_context.verify_mode = ssl.CERT_REQUIRED
+        wrong_context.check_hostname = True
+        wrong_context.load_verify_locations(cafile=str(wrong_admin / "root-cert.pem"))
+        try:
+            async with websockets.connect(
+                uri,
+                ssl=wrong_context,
+                additional_headers={"Authorization": f"Bearer {bearer}"},
+                proxy=None,
+                open_timeout=3,
+            ):
+                raise SmokeFailure("WSS accepted a connection under the wrong Controller root")
+        except OSError, TimeoutError, websockets.exceptions.WebSocketException:
+            pass
+    finally:
+        await client._client.aclose()
 
 
 def _get_metrics() -> tuple[int | None, str | None, str | None]:
     port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
     try:
-        with urlopen(f"http://127.0.0.1:{port}/metrics", timeout=3) as response:
+        with urlopen(
+            f"https://127.0.0.1:{port}/metrics", context=_tls_context(), timeout=3
+        ) as response:
             return (
                 response.status,
                 response.read().decode("utf-8"),
@@ -515,7 +789,7 @@ def _expect_database_ready() -> dict[str, object]:
     return body
 
 
-def _run_smoke() -> None:
+def _run_smoke(scratch: Path) -> None:
     port = os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"]
     if not port.isdecimal() or not 1 <= int(port) <= 65535:
         raise SmokeFailure("THREADS_PLATFORM_SMOKE_HTTP_PORT must be a valid TCP port")
@@ -523,10 +797,13 @@ def _run_smoke() -> None:
     _compose("build", timeout=900)
     _check_runtime_image()
     print("PASS image build, non-root identity, and runtime-content boundary")
+    fingerprint = _prepare_tls_state(scratch)
+    print(f"PASS TLS admin provisioning and local CLI fingerprint {fingerprint}")
 
     _compose("up", "--detach", "--wait", "postgres", timeout=180)
     _compose("up", "--force-recreate", "migrate", timeout=240)
     _compose("up", "--detach", "http", "scheduler", timeout=180)
+    _assert_tls_isolation()
     _expect_live()
     initial_metrics, _ = _wait_http_metrics()
     if _metric_value(initial_metrics, "threads_platform_database_up") != 1.0:
@@ -538,8 +815,10 @@ def _run_smoke() -> None:
         or _assert_bounded_readiness(ready)["total"] != 0
     ):
         raise SmokeFailure("initial readiness did not report an empty Worker fleet")
-    _operator_bootstrap_api_parity()
+    owner_token = _operator_bootstrap_api_parity()
     print("PASS local stdin first-Owner bootstrap and Linux/Docker Operator API parity")
+    asyncio.run(_exercise_worker_https_wss(owner_token, scratch))
+    print("PASS private-root Worker HTTPS, verified WSS, ws rejection, and wrong-root rejection")
 
     http_id = _compose("ps", "-q", "http")
     scheduler_id = _compose("ps", "-q", "scheduler")
@@ -631,6 +910,8 @@ def _run_smoke() -> None:
     _database_operation("wait-expired", recovered_worker_id)
     _compose("up", "--detach", "scheduler")
     print("PASS /health liveness and /ready database outage recovery")
+    _assert_secret_free_logs()
+    print("PASS TLS key and credential log inspection")
 
 
 def main() -> int:
@@ -642,14 +923,16 @@ def main() -> int:
         "THREADS_PLATFORM_IMAGE", f"threads-control-plane:smoke-{uuid4().hex[:10]}"
     )
     os.environ.setdefault("THREADS_PLATFORM_SCHEDULER_POLL_INTERVAL_SECONDS", "0.25")
+    os.environ["THREADS_PLATFORM_TLS_LAN_ADDRESS"] = "127.0.0.1"
     if "THREADS_PLATFORM_SMOKE_HTTP_PORT" not in os.environ:
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             os.environ["THREADS_PLATFORM_SMOKE_HTTP_PORT"] = str(listener.getsockname()[1])
 
     failure: str | None = None
+    scratch = tempfile.TemporaryDirectory(prefix="threads-dx06-compose-")
     try:
-        _run_smoke()
+        _run_smoke(Path(scratch.name))
     except SmokeFailure as error:
         failure = str(error)
     except (OSError, subprocess.SubprocessError) as error:
@@ -659,6 +942,9 @@ def main() -> int:
     except SmokeFailure, OSError, subprocess.SubprocessError:
         if failure is None:
             failure = "Docker Compose cleanup failed"
+    scratch.cleanup()
+    global _ROOT_CERT_PATH
+    _ROOT_CERT_PATH = None
 
     if failure is not None:
         print(f"Control Plane Compose smoke failed: {failure}", file=sys.stderr)

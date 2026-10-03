@@ -2,7 +2,6 @@ x-control-plane-environment: &control-plane-environment
   THREADS_PLATFORM_DATABASE_URL: postgresql+asyncpg://threads_platform@postgres:5432/threads_platform
   THREADS_PLATFORM_THREADS_TOKEN_PROVIDER_MODE: disabled
   THREADS_PLATFORM_TRACING_ENABLED: "false"
-  THREADS_PLATFORM_WORKER_TLS_REQUIRED: ${THREADS_PLATFORM_WORKER_TLS_REQUIRED:-true}
   THREADS_PLATFORM_HTTP_HOST: ${THREADS_PLATFORM_HTTP_HOST:-0.0.0.0}
   THREADS_PLATFORM_HTTP_PORT: ${THREADS_PLATFORM_CONTAINER_PORT:-8000}
 
@@ -39,18 +38,31 @@ services:
 
   http:
     <<: *control-plane-runtime
+    environment:
+      <<: *control-plane-environment
+      THREADS_PLATFORM_TLS_CERTFILE: /var/lib/threads/controller-tls-serving/leaf-fullchain.pem
+      THREADS_PLATFORM_TLS_KEYFILE: /var/lib/threads/controller-tls-serving/leaf-key.pem
+    volumes:
+      - controller_tls_serving:/var/lib/threads/controller-tls-serving:ro
     ports:
-      - "127.0.0.1:${THREADS_PLATFORM_SMOKE_HTTP_PORT:-8000}:${THREADS_PLATFORM_CONTAINER_PORT:-8000}"
+      - "${THREADS_PLATFORM_TLS_LAN_ADDRESS:?set THREADS_PLATFORM_TLS_LAN_ADDRESS}:${THREADS_PLATFORM_SMOKE_HTTP_PORT:-8000}:${THREADS_PLATFORM_CONTAINER_PORT:-8000}"
     healthcheck:
       test:
         - CMD
         - python
         - -c
         - >-
-          import os, urllib.request;
+          import os, re, ssl, urllib.request;
+          certs = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',
+          open(os.environ['THREADS_PLATFORM_TLS_CERTFILE'], encoding='ascii').read(), re.S);
+          assert len(certs) == 2;
+          tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT);
+          tls.check_hostname = True;
+          tls.verify_mode = ssl.CERT_REQUIRED;
+          tls.load_verify_locations(cadata=certs[-1]);
           urllib.request.urlopen(
-          f"http://127.0.0.1:{os.environ.get('THREADS_PLATFORM_HTTP_PORT', '8000')}/health",
-          timeout=2).read()
+          f"https://127.0.0.1:{os.environ.get('THREADS_PLATFORM_HTTP_PORT', '8000')}/health",
+          context=tls, timeout=2).read()
       interval: 5s
       timeout: 3s
       retries: 12
@@ -74,5 +86,26 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  tls-admin:
+    <<: *control-plane-runtime
+    profiles: ["tls-admin"]
+    command:
+      - python
+      - -m
+      - threads_platform.controller_tls_admin
+      - provision
+      - --admin-dir
+      - /var/lib/threads/controller-tls-admin
+      - --serving-dir
+      - /var/lib/threads/controller-tls-serving
+      - --lan-address
+      - ${THREADS_PLATFORM_TLS_LAN_ADDRESS:?set THREADS_PLATFORM_TLS_LAN_ADDRESS}
+    restart: "no"
+    volumes:
+      - controller_tls_admin:/var/lib/threads/controller-tls-admin
+      - controller_tls_serving:/var/lib/threads/controller-tls-serving
+
 volumes:
   postgres_data:
+  controller_tls_admin:
+  controller_tls_serving:

@@ -1,7 +1,7 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::PathBuf,
+    net::TcpListener,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         mpsc::{self, Receiver},
@@ -11,7 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{controller_store::ControllerStore, ProvisionedRole};
+use crate::{
+    controller_store::ControllerStore,
+    controller_tls::{self, ControllerTlsSummary},
+    ProvisionedRole,
+};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 const MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -57,6 +61,8 @@ enum Lifecycle {
     StartingDatabase,
     Migrating,
     M1BootstrapBoundary,
+    HttpsSetupRequired,
+    OwnerBootstrapRequired,
     StartingHttp,
     StartingScheduler,
     Running,
@@ -74,6 +80,8 @@ impl Lifecycle {
             Self::StartingDatabase => "starting_database",
             Self::Migrating => "migrating",
             Self::M1BootstrapBoundary => "m1_bootstrap_boundary",
+            Self::HttpsSetupRequired => "https_setup_required",
+            Self::OwnerBootstrapRequired => "owner_bootstrap_required",
             Self::StartingHttp => "starting_http",
             Self::StartingScheduler => "starting_scheduler",
             Self::Running => "running",
@@ -182,8 +190,51 @@ impl Supervisor {
             .as_mut()
             .ok_or_else(|| "controller_runtime_unavailable".to_string())?;
         controller
-            .bootstrap_owner(username, password)
-            .map_err(|code| code.to_string())
+            .bootstrap_owner(username, password, &mut self.lifecycle)
+            .map_err(|code| {
+                self.diagnostic_code = Some(code);
+                code.to_string()
+            })
+    }
+
+    pub fn configure_https(
+        &mut self,
+        lan_address: &str,
+        port: u16,
+    ) -> Result<ControllerTlsSummary, String> {
+        let controller = self
+            .controller
+            .as_mut()
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())?;
+        controller
+            .configure_https(lan_address, port, &mut self.lifecycle)
+            .map_err(|code| {
+                self.diagnostic_code = Some(code);
+                code.to_string()
+            })
+    }
+
+    pub fn controller_https_summary(&self) -> Result<ControllerTlsSummary, String> {
+        self.controller
+            .as_ref()
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())?
+            .https_summary()
+            .map_err(str::to_string)
+    }
+
+    pub fn local_controller_endpoint(&self) -> Result<String, &'static str> {
+        self.controller
+            .as_ref()
+            .ok_or("controller_runtime_unavailable")?
+            .store
+            .local_endpoint()
+    }
+
+    pub fn controller_tls_root(&self) -> Result<Vec<u8>, &'static str> {
+        self.controller
+            .as_ref()
+            .ok_or("controller_runtime_unavailable")?
+            .tls_root()
     }
 
     pub fn restart(&mut self, role: ProvisionedRole) -> Result<(), String> {
@@ -212,8 +263,14 @@ impl Supervisor {
             .start(&mut self.lifecycle);
         match result {
             Ok(()) => {
-                self.lifecycle = Lifecycle::Running;
-                self.diagnostic_code = None;
+                if self
+                    .controller
+                    .as_ref()
+                    .is_some_and(ControllerRuntime::is_serving)
+                {
+                    self.lifecycle = Lifecycle::Running;
+                    self.diagnostic_code = None;
+                }
                 Ok(())
             }
             Err(code) => Err(self.fail(code)),
@@ -454,15 +511,33 @@ impl ControllerRuntime {
         self.scheduler.as_ref().map(Child::id)
     }
 
+    fn is_serving(&self) -> bool {
+        self.http.is_some()
+    }
+
+    fn https_summary(&self) -> Result<ControllerTlsSummary, &'static str> {
+        controller_tls::summary(
+            self.store.data_root(),
+            self.store.config().lan_address,
+            self.store.config().endpoint_port,
+        )
+    }
+
+    fn tls_root(&self) -> Result<Vec<u8>, &'static str> {
+        let lan_address = self
+            .store
+            .config()
+            .lan_address
+            .ok_or("controller_https_configuration_required")?;
+        controller_tls::root_certificate(self.store.data_root(), lan_address)
+    }
+
     fn start(&mut self, lifecycle: &mut Lifecycle) -> Result<(), &'static str> {
+        controller_tls::cleanup_leaf_key(self.store.data_root())?;
         *lifecycle = Lifecycle::StartingDatabase;
         ensure_port_available(
             self.store.config().database_port,
             "controller_database_port_in_use",
-        )?;
-        ensure_port_available(
-            self.store.config().endpoint_port,
-            "controller_endpoint_port_in_use",
         )?;
 
         if self.store.needs_initialization() {
@@ -476,14 +551,154 @@ impl ControllerRuntime {
         self.run_migration()?;
         *lifecycle = Lifecycle::M1BootstrapBoundary;
         // M1 deliberately crosses this boundary without creating Workspace or Owner rows.
+        let Some(lan_address) = self.store.config().lan_address else {
+            *lifecycle = Lifecycle::HttpsSetupRequired;
+            return Ok(());
+        };
+        self.validate_configured_endpoint(lan_address)?;
+        self.ensure_tls_identity(lan_address)?;
+        if self.owner_exists()? {
+            self.start_https_services(lifecycle)?;
+        } else {
+            *lifecycle = Lifecycle::OwnerBootstrapRequired;
+        }
+        Ok(())
+    }
 
+    fn configure_https(
+        &mut self,
+        lan_address: &str,
+        port: u16,
+        lifecycle: &mut Lifecycle,
+    ) -> Result<ControllerTlsSummary, &'static str> {
+        self.store.configure_https(lan_address, port)?;
+        let address = self
+            .store
+            .config()
+            .lan_address
+            .ok_or("controller_https_configuration_required")?;
+        self.validate_configured_endpoint(address)?;
+        self.ensure_tls_identity(address)?;
+        if self.owner_exists()? {
+            self.start_https_services(lifecycle)?;
+        } else {
+            *lifecycle = Lifecycle::OwnerBootstrapRequired;
+        }
+        self.https_summary()
+    }
+
+    fn validate_configured_endpoint(
+        &self,
+        lan_address: std::net::Ipv4Addr,
+    ) -> Result<(), &'static str> {
+        TcpListener::bind((lan_address, 0)).map_err(|_| "controller_lan_address_unavailable")?;
+        ensure_ipv4_wildcard_port_available(
+            self.store.config().endpoint_port,
+            "controller_endpoint_port_in_use",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_tls_identity(&mut self, lan_address: std::net::Ipv4Addr) -> Result<(), &'static str> {
+        if self.store.config().tls_identity_provisioned {
+            controller_tls::load_validate_or_renew(self.store.data_root(), lan_address)?;
+        } else {
+            controller_tls::provision_initial(self.store.data_root(), lan_address)?;
+            self.store.mark_tls_identity_provisioned()?;
+        }
+        Ok(())
+    }
+
+    fn owner_exists(&mut self) -> Result<bool, &'static str> {
+        let mut command = Command::new(self.store.runtime_executable());
+        command.arg("owner-status");
+        self.set_runtime_environment(&mut command);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| "controller_owner_status_unavailable")?;
+        if self.job.assign(&child).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("controller_process_job_assign_failed");
+        }
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("controller_owner_status_unavailable");
+        };
+        let status = wait_for_child(&mut child, Duration::from_secs(10))
+            .map_err(|_| "controller_owner_status_unavailable")?;
+        if !status.success() {
+            return Err("controller_owner_status_unavailable");
+        }
+        let mut output = String::new();
+        stdout
+            .read_to_string(&mut output)
+            .map_err(|_| "controller_owner_status_unavailable")?;
+        match output.trim() {
+            "OWNER_PRESENT" => Ok(true),
+            "OWNER_ABSENT" => Ok(false),
+            _ => Err("controller_owner_status_unavailable"),
+        }
+    }
+
+    fn start_https_services(&mut self, lifecycle: &mut Lifecycle) -> Result<(), &'static str> {
+        if self.http.is_some() {
+            *lifecycle = Lifecycle::Running;
+            return Ok(());
+        }
+        let lan_address = self
+            .store
+            .config()
+            .lan_address
+            .ok_or("controller_https_configuration_required")?;
+        self.validate_configured_endpoint(lan_address)?;
+        if !self.store.config().tls_identity_provisioned {
+            return Err("controller_tls_identity_invalid");
+        }
+        controller_tls::load_validate_or_renew(self.store.data_root(), lan_address)?;
+        let (certfile, keyfile) =
+            controller_tls::materialize_leaf_key(self.store.data_root(), lan_address)?;
         *lifecycle = Lifecycle::StartingHttp;
-        self.http = Some(self.spawn_runtime("http")?);
-        self.wait_for_http()?;
+        let http = match self.spawn_runtime("http", Some((&certfile, &keyfile))) {
+            Ok(http) => http,
+            Err(error) => {
+                controller_tls::cleanup_leaf_key(self.store.data_root())?;
+                return Err(error);
+            }
+        };
+        self.http = Some(http);
+        if let Err(error) = self.wait_for_http() {
+            stop_child(&mut self.http).map_err(|_| "controller_http_stop_failed")?;
+            controller_tls::cleanup_leaf_key(self.store.data_root())?;
+            return Err(error);
+        }
 
         *lifecycle = Lifecycle::StartingScheduler;
-        self.scheduler = Some(self.spawn_runtime("scheduler")?);
-        self.wait_for_scheduler()?;
+        self.scheduler = Some(match self.spawn_runtime("scheduler", None) {
+            Ok(scheduler) => scheduler,
+            Err(error) => {
+                stop_child(&mut self.http).map_err(|_| "controller_http_stop_failed")?;
+                controller_tls::cleanup_leaf_key(self.store.data_root())?;
+                return Err(error);
+            }
+        });
+        if let Err(error) = self.wait_for_scheduler() {
+            stop_child(&mut self.scheduler).map_err(|_| "controller_scheduler_stop_failed")?;
+            stop_child(&mut self.http).map_err(|_| "controller_http_stop_failed")?;
+            controller_tls::cleanup_leaf_key(self.store.data_root())?;
+            return Err(error);
+        }
+        *lifecycle = Lifecycle::Running;
         Ok(())
     }
 
@@ -612,7 +827,21 @@ impl ControllerRuntime {
         self.run_one_shot(command, MIGRATION_TIMEOUT, "controller_migration_failed")
     }
 
-    fn bootstrap_owner(&mut self, username: &str, password: &str) -> Result<(), &'static str> {
+    fn bootstrap_owner(
+        &mut self,
+        username: &str,
+        password: &str,
+        lifecycle: &mut Lifecycle,
+    ) -> Result<(), &'static str> {
+        let lan_address = self
+            .store
+            .config()
+            .lan_address
+            .ok_or("controller_https_configuration_required")?;
+        if !self.store.config().tls_identity_provisioned {
+            return Err("controller_tls_identity_invalid");
+        }
+        controller_tls::load_validate_or_renew(self.store.data_root(), lan_address)?;
         let mut command = Command::new(self.store.runtime_executable());
         command
             .arg("bootstrap-owner")
@@ -653,20 +882,34 @@ impl ControllerRuntime {
         let status = wait_for_child(&mut child, Duration::from_secs(60))
             .map_err(|_| "operator_owner_bootstrap_failed")?;
         if status.success() {
-            Ok(())
+            if !self.owner_exists()? {
+                return Err("operator_owner_bootstrap_failed");
+            }
+            self.start_https_services(lifecycle)
         } else {
             Err("operator_owner_bootstrap_failed")
         }
     }
 
-    fn spawn_runtime(&mut self, mode: &str) -> Result<Child, &'static str> {
+    fn spawn_runtime(
+        &mut self,
+        mode: &str,
+        tls_files: Option<(&Path, &Path)>,
+    ) -> Result<Child, &'static str> {
         let mut command = Command::new(self.store.runtime_executable());
-        command
-            .arg(mode)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(self.store.config().endpoint_port.to_string());
+        command.arg(mode);
+        if mode == "http" {
+            let (certfile, keyfile) = tls_files.ok_or("controller_https_configuration_required")?;
+            command
+                .arg("--host")
+                .arg("0.0.0.0")
+                .arg("--port")
+                .arg(self.store.config().endpoint_port.to_string())
+                .arg("--ssl-certfile")
+                .arg(certfile)
+                .arg("--ssl-keyfile")
+                .arg(keyfile);
+        }
         self.set_runtime_environment(&mut command);
         self.spawn_attached(
             command,
@@ -679,30 +922,30 @@ impl ControllerRuntime {
     }
 
     fn set_runtime_environment(&self, command: &mut Command) {
-        command
-            .env(
-                "THREADS_PLATFORM_DATABASE_URL",
-                self.store.database_url().as_str(),
-            )
-            .env("THREADS_PLATFORM_WORKER_TLS_REQUIRED", "false")
-            .env("THREADS_PLATFORM_LOG_LEVEL", "WARNING");
+        apply_runtime_environment(command, self.store.database_url().as_str());
     }
 
     fn wait_for_http(&mut self) -> Result<(), &'static str> {
         let endpoint = self.store.config().endpoint_port;
+        let lan_address = self
+            .store
+            .config()
+            .lan_address
+            .ok_or("controller_https_configuration_required")?;
+        let root = controller_tls::root_certificate(self.store.data_root(), lan_address)?;
         let deadline = Instant::now() + READINESS_TIMEOUT;
         let mut delay = Duration::from_millis(150);
         while Instant::now() < deadline {
             if Self::child_exited(&mut self.http)? {
                 return Err("controller_http_start_failed");
             }
-            if http_ready(endpoint) {
+            if controller_tls::readiness_probe(&root, endpoint) {
                 return Ok(());
             }
             thread::sleep(delay);
             delay = (delay * 2).min(Duration::from_secs(1));
         }
-        Err("controller_http_readiness_timeout")
+        Err("controller_tls_readiness_timeout")
     }
 
     fn wait_for_scheduler(&mut self) -> Result<(), &'static str> {
@@ -737,10 +980,24 @@ impl ControllerRuntime {
             None
         };
         if let Some(code) = failure {
-            let _ = stop_child(&mut self.scheduler);
-            let _ = stop_child(&mut self.http);
+            let scheduler_stopped = stop_child(&mut self.scheduler).is_ok();
+            let http_stopped = stop_child(&mut self.http).is_ok();
+            let cleanup = if http_stopped {
+                controller_tls::cleanup_leaf_key(self.store.data_root())
+            } else {
+                Err("controller_tls_leaf_cleanup_failed")
+            };
             if !database_exited {
                 let _ = self.stop_database();
+            }
+            if !scheduler_stopped {
+                return Some("controller_scheduler_stop_failed");
+            }
+            if !http_stopped {
+                return Some("controller_http_stop_failed");
+            }
+            if cleanup.is_err() {
+                return Some("controller_tls_leaf_cleanup_failed");
             }
             return Some(code);
         }
@@ -750,6 +1007,7 @@ impl ControllerRuntime {
     fn stop(&mut self) -> Result<(), &'static str> {
         stop_child(&mut self.scheduler).map_err(|_| "controller_scheduler_stop_failed")?;
         stop_child(&mut self.http).map_err(|_| "controller_http_stop_failed")?;
+        controller_tls::cleanup_leaf_key(self.store.data_root())?;
         self.stop_database()
     }
 
@@ -959,28 +1217,26 @@ impl ProcessJob {
     }
 }
 
+fn apply_runtime_environment(command: &mut Command, database_url: &str) {
+    command
+        .env("THREADS_PLATFORM_DATABASE_URL", database_url)
+        .env("THREADS_PLATFORM_LOG_LEVEL", "WARNING");
+}
+
 fn ensure_port_available(port: u16, failure: &'static str) -> Result<(), &'static str> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|_| failure)?;
     drop(listener);
     Ok(())
 }
 
-fn http_ready(port: u16) -> bool {
-    let address = format!("127.0.0.1:{port}");
-    let Ok(mut stream) = TcpStream::connect(address) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    if stream
-        .write_all(b"GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut status = String::new();
-    BufReader::new(stream)
-        .read_line(&mut status)
-        .is_ok_and(|_| status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200"))
+fn ensure_ipv4_wildcard_port_available(
+    port: u16,
+    failure: &'static str,
+) -> Result<(), &'static str> {
+    let listener =
+        TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map_err(|_| failure)?;
+    drop(listener);
+    Ok(())
 }
 
 fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, &'static str> {
@@ -1043,9 +1299,39 @@ mod tests {
     }
 
     #[test]
-    fn controller_endpoints_are_loopback_only() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-        assert_eq!(listener.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+    fn database_listener_remains_loopback_and_controller_port_uses_ipv4_wildcard() {
+        let database = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback database");
+        assert_eq!(database.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+        let endpoint = TcpListener::bind(("0.0.0.0", 0)).expect("bind wildcard endpoint");
+        let port = endpoint.local_addr().unwrap().port();
+        assert_eq!(
+            ensure_ipv4_wildcard_port_available(port, "controller_endpoint_port_in_use"),
+            Err("controller_endpoint_port_in_use")
+        );
+    }
+
+    #[test]
+    fn runtime_environment_passes_no_private_tls_key() {
+        let mut command = Command::new("threads-runtime");
+        apply_runtime_environment(
+            &mut command,
+            "postgresql+asyncpg://threads_platform@127.0.0.1:5432/threads_platform",
+        );
+        let variable_names = command
+            .get_envs()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            variable_names,
+            std::collections::HashSet::from([
+                "THREADS_PLATFORM_DATABASE_URL".to_string(),
+                "THREADS_PLATFORM_LOG_LEVEL".to_string(),
+            ])
+        );
+        assert!(!variable_names
+            .iter()
+            .any(|name| { name.contains("TLS") || name.contains("KEY") || name.contains("CERT") }));
     }
 
     #[test]

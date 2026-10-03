@@ -161,7 +161,6 @@ async def test_operator_http_four_role_matrix_legacy_isolation_and_server_actor(
             database_url=None,
             worker_admin_token=SecretStr(legacy_token),
             crm_ingress_token=SecretStr(crm_token),
-            worker_tls_required=True,
         ),
         worker_control_service=control,
         operator_auth_service=operator_auth_service,

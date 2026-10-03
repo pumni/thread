@@ -58,7 +58,6 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
         Settings(
             worker_admin_token=SecretStr(admin_token),
             worker_admin_auth_profile="legacy_linux_it",
-            worker_tls_required=True,
         ),
         worker_control_service=control,
         worker_job_service=jobs,

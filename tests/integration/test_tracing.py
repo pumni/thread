@@ -80,7 +80,7 @@ async def test_http_command_spans_are_bounded_and_metrics_remain_process_local(
     exporter = InMemorySpanExporter()
     tracing = create_process_tracing(True, HTTP_SERVICE_NAME, exporter=exporter)
     application = create_app(
-        Settings(database_url=None, worker_tls_required=False),
+        Settings(database_url=None),
         command_runtime=runtime,
         authenticator=_Authenticator(),
         operational_metrics_probe=_MetricsProbe(),

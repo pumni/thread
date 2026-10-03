@@ -1,6 +1,6 @@
 # Desktop v1 — Fresh Session Handoff (start here)
 
-**Prepared:** 2026-10-01 after detailed pre-implementation audit. **Repository:** [pumni/thread](https://github.com/pumni/thread). **Planning PR:** [#93 — ACCEPTED/MERGED](https://github.com/pumni/thread/pull/93) at `ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`; use latest `main`. **Epic:** [#94](https://github.com/pumni/thread/issues/94), child issue map [#95–#108](ISSUE_MAP.md). The planning documents are on **main**. The issue-specific implementation security/feasibility gates are not accepted by planning merge.
+**Updated:** 2026-10-04 for authorized DX-06 implementation. **Repository:** [pumni/thread](https://github.com/pumni/thread). **Planning PR:** [#93 — ACCEPTED/MERGED](https://github.com/pumni/thread/pull/93) at `ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`. **Epic:** [#94](https://github.com/pumni/thread/issues/94), child issue map [#95–#108](ISSUE_MAP.md). Issue #100 coordinator authorization is comment `5973437416`; it authorizes DX-06 only from base `14942ddebb6322db049d61db83cd335b055a93b6`. The Draft exact-head checkpoint is not coordinator acceptance.
 
 ## 1. Read order; never start from old conversation reconstruction
 
@@ -12,11 +12,11 @@
 
 ## 2. Current work status as of this handoff
 
-- Backend main at the audit start: `73681a4b7a74826915ccea86eff918edf4497bd5`; **re-fetch** before any work because this SHA is an observation, not a permanent base.
-- #93 is **planning-only DRAFT**; architecture, detailed 14-slice roadmap and GitHub issue network have been written to its branch. New audit corrections and this handoff are also on that branch, **not accepted into main yet**.
-- All 14 DX issues #95–#108 were created under epic #94, each with scoped deliverables, prerequisites, acceptance criteria, failure tests and non-goals. **Issue existence is not implementation authorization.**
-- No Tauri/React/Rust/Desktop runtime code currently exists on the reviewed baseline. No clean Windows Desktop test/installer has been run. Planning document completeness does not prove feasibility.
-- Existing #3 Meta live gate, #80 reviewed discovery permission gate, #62 CRMResultSink dependency, #11 final release certification, #1 owner historical security follow-up remain separate/open unless **live GitHub** says otherwise.
+- DX-02 through DX-05 are implemented on the authorized dependency chain; issues #97/#98/#99 were accepted and closed before #100 authorization.
+- DX-06 #100 is the only authorized implementation scope for this checkpoint. Work proceeds from exact base `14942ddebb6322db049d61db83cd335b055a93b6` on `codex/dx06-controller-https-trust`, then Draft PR, Secret scan + PR Head Guard, and STOP for exact-head coordinator review.
+- Do not mark Ready, merge, rebase, run heavy hosted workflows, or start DX-07, DX-08, DX-09, or later issues from this checkpoint.
+- The one-app Tauri/Rust/React runtime and Python/PostgreSQL Controller implementation exist. A green local or Draft check is technical evidence, not coordinator acceptance.
+- Existing #3 Meta live gate, #80 discovery permission gate, #62 CRMResultSink dependency, #11 final release certification, and #1 owner historical security follow-up remain separate unless live GitHub says otherwise.
 
 ## 3. Product choices **confirmed** by owner — do not ask again
 
@@ -25,6 +25,9 @@
 - X/close hides window and leaves node running in tray. Explicit Quit confirms and orderly stops node. Autostarts when its **single dedicated Windows runtime user signs in**. Windows logout or reboot-before-login stops v1; no service-host mode or Windows auto-login workaround now.
 - Windows-first customer deployment but existing Linux/Docker Controller stays supported, same Python schema/API/protocol. One Controller = one Workspace, multiple Operator users/Workers.
 - Stable LAN IP (static/DHCP reservation), private trusted HTTPS, no LAN discovery in v1. Worker re-pair only via explicit drain/decommission/revoke; old Workspace Chromium profiles quarantined, not automatically reused.
+- **DX-06 topology:** Uvicorn itself is the sole TLS terminator; direct HTTPS/WSS shares one listener with Operator, Worker, health, readiness, and metrics. Bind `0.0.0.0:<persisted port>`, publish `https://<explicit LAN IPv4>:<port>`, use `https://127.0.0.1:<port>` locally, and disable proxy headers. Leaf SAN is exactly configured LAN IPv4 + `127.0.0.1`. No reverse proxy, discovery, plaintext health listener, or Windows CA-store installation.
+- Windows root/leaf keys are DPAPI CurrentUser protected; the root fingerprint hashes actual DER. First contact is TLS-only, two-stage verified, memory-pending for five minutes, then confirmed by opaque probe ID and persisted as application-private root DER + canonical endpoint/fingerprint. Credentials remain unavailable until out-of-band comparison and explicit confirmation.
+- Linux/Docker uses the Python TLS admin CLI and protected root-admin/leaf-serving volumes. HTTP receives leaf materials only; scheduler receives no TLS key. Linux/domain does not import Tauri or Windows DPAPI.
 - Human authentication mandatory on Controller PC, Worker PC and remote Console. Four fixed roles OWNER/ADMIN/OPERATOR/VIEWER. The #99 coordinator authorization freezes the matrix: all roles may view workspace/fleet/account summaries and read-only diagnostics; only OWNER may create/change OWNER or ADMIN and recovery-sensitive settings; OWNER/ADMIN may manage OPERATOR/VIEWER and provision/revoke/re-pair Workers, manage Accounts and attach APIs; OWNER/ADMIN/OPERATOR may drain assigned Workers, acknowledge interventions, handle browser re-login/challenges and submit approved Commands within scope. Worker-local OWNER/ADMIN login then Add Account and human Threads browser login; Controller owns Account UUID, assignment, policy/audit.
 - **Deferred and NOT in pilot:** portable backup/recovery and Owner Recovery Key, verified recovery email (Gmail or company email), automatic updates, Internet/relay, Windows Service before login, advanced SSO/HA/discovery/automatic browser profile migration.
 
@@ -35,23 +38,16 @@
 - **No pre-account browser open (DX-09 #103):** current `WorkerSessionService.account_context` and `LocalBrowserSessionManager.open` require Account + active assignment. Design isolated pending provisioning profile + reviewed human-login-state detection; no fake Threads ID, auto-scrape assumptions or WorkerJob before registration. Controller atomically creates Account + profile ref + assignment + consumed intent + audit. Recover lost response/Worker crash by idempotency. Additive Worker protocol capability must version-negotiate with v2.
 - **Pre-account network route (DX-09 #103):** existing `NetworkProfile` is account-scoped while the pending browser profile has no Account; current packaged Worker lacks a production proxy-secret provider. Decide and surface DIRECT-only onboarding vs reviewed pre-account proxy support **before browser launch**; do not silently ignore an expected proxy.
 - **M1 scope error corrected (DX-04 #98):** M1 is **disposable, loopback-only** packaging/runtime/tray/crash proof without real Owner, remote API or final installer. DX-05 adds real Owner/operator bootstrap (Windows **and Linux CLI**), DX-06 adds verified public HTTPS/WSS, DX-12 packages final one-installer artifact. No unprotected LAN endpoint or fake persisted Owner.
-- **TLS deployment gap (DX-06 #100):** existing `WorkerTransportTLSMiddleware` only checks `/v1/workers` ASGI scheme. Prove exact TLS termination, WSS upgrade, constrained forwarded headers and HTTPS enforcement on newly added public Operator endpoints; preserve isolated CA root private key.
+- **DX-06 #100 frozen contract:** `TransportSecurityMiddleware` enforces HTTPS for `/v1/operator/**` and `/v1/workers/**`, WSS for Worker WebSocket, and rejects forwarded-proto spoofing. Uvicorn is the direct terminator (`proxy_headers=False`). Windows private root/leaf custody, two-stage TLS-only probe, strict endpoint-bound DPAPI trust, and Linux/Docker private TLS parity are specified in [SECURITY_AND_PROTOCOLS.md](SECURITY_AND_PROTOCOLS.md). This checkpoint must test actual HTTPS and WSS sockets.
 - **Operational/data safety:** legacy Worker scheduled task can double-start with Desktop (#101); current-user DPAPI requires same runtime user and ACL/elevation handoff (#97/#98); parent kill-on-close is **abrupt** PostgreSQL stop and needs WAL test (#98); if Worker cannot reach Controller on Quit, never assert completed drain (#101); no customer production/irreplaceable data until future backup/recovery (#106–#108).
 - **Tray Quit without human Operator login (DX-05/DX-07):** deliberate Worker Quit/Restart requires OWNER/ADMIN/OPERATOR login; Controller stop/restart requires OWNER/ADMIN. No device self-drain route or hidden admin bearer. UI session lock leaves the node running; Windows forced shutdown is not a graceful drain.
 - **Linux/Docker secure Controller parity (DX-05/DX-06):** current-user Windows DPAPI/private-CA wizard cannot run on Linux. Specify protected Linux trust-key custody, HTTPS/WSS ingress and independently verifiable CLI fingerprint with the **same** Operator API and Worker protocol.
 
 Read [audit findings A-01…A-18](PREIMPLEMENTATION_AUDIT.md) before changing any roadmap design.
 
-## 5. First correct action in the next new session
+## 5. DX-06 checkpoint boundary
 
-**If planning acceptance or an issue's authorization is disputed by live GitHub:**
-1. Verify PR exact head and base, contents and issue links. Review updated planning docs against latest backend code and PR review comments.
-2. Run a documentation-consistency audit; verify every linked DX issue/body was updated with its applicable audit blocker and dependency.
-3. State any remaining BLOCKER/MAJOR and concrete fix. If evidence is sufficient, record exact-head technical **PASS**, then require explicit independent coordinator **ACCEPTED** of #93/#95. Do **not** merge without that acceptance and unchanged-head CI check.
-4. Only after plan acceptance and explicit user/coordinator authorization, start **DX-02 #96** (Tauri foundation) and **DX-03 #97** (Windows Python/PostgreSQL bundle feasibility). Those are parallelizable if resourced. DX-03 is a hard feasibility stop; DX-04 #98 needs **both accepted**.
-5. Next: DX-05 (#99) RBAC + Linux local bootstrap -> DX-06 (#100) TLS; DX-07 (#101) Worker Desktop host; DX-08 (#102) secure pairing; DX-09 (#103) account onboarding; DX-10/11; DX-12/13/14. See [issue dependency DAG](ISSUE_MAP.md).
-
-**Since #93 was accepted and merged:** use live merged main/ADR and current issue bodies rather than this PR branch as authority; start only the specifically authorized DX issue, rechecking tests/CI and base SHA.
+Complete the authorized DX-06 implementation locally, commit it, verify `origin/main` still equals `14942ddebb6322db049d61db83cd335b055a93b6`, push the Draft PR, and wait only for Secret scan + PR Head Guard. Report exact-head evidence and stop. A hosted failure is a hard stop; do not rerun the same SHA or push a speculative fix. Coordinator exact-head review determines any correction or next transition. For later work, reread live GitHub issue status and authorization; this handoff never authorizes a subsequent DX issue.
 
 ## 6. Coordinator quality/merge policy
 

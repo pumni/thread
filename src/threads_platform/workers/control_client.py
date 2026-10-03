@@ -1,14 +1,18 @@
 import base64
 import os
 import re
+import ssl
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx2
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
@@ -37,6 +41,7 @@ class HttpWorkerControlClient:
         *,
         transport: httpx2.AsyncBaseTransport | None = None,
         timeout_seconds: float = 10.0,
+        private_root_certificate: bytes | Path | None = None,
     ) -> None:
         parsed = urlsplit(control_plane_url)
         if (
@@ -44,16 +49,63 @@ class HttpWorkerControlClient:
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
+            or parsed.path not in {"", "/"}
             or parsed.query
             or parsed.fragment
         ):
             raise ValueError("Worker Control Plane URL must be an HTTPS origin without credentials")
+        tls_context: ssl.SSLContext | bool = True
+        trust_env = True
+        if private_root_certificate is not None:
+            try:
+                certificate_bytes = (
+                    private_root_certificate.read_bytes()
+                    if isinstance(private_root_certificate, Path)
+                    else private_root_certificate
+                )
+                if certificate_bytes.lstrip().startswith(b"-----BEGIN CERTIFICATE-----"):
+                    certificates = x509.load_pem_x509_certificates(certificate_bytes)
+                    if len(certificates) != 1:
+                        raise ValueError
+                    certificate = certificates[0]
+                    trust_data: str | bytes = certificate_bytes.decode("ascii")
+                else:
+                    certificate = x509.load_der_x509_certificate(certificate_bytes)
+                    trust_data = certificate_bytes
+                constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints)
+                usage = certificate.extensions.get_extension_for_class(x509.KeyUsage)
+                signature_hash = certificate.signature_hash_algorithm
+                public_key = certificate.public_key()
+                now = datetime.now(UTC)
+                if (
+                    not constraints.value.ca
+                    or constraints.value.path_length != 0
+                    or not usage.value.key_cert_sign
+                    or not usage.value.crl_sign
+                    or certificate.issuer != certificate.subject
+                    or signature_hash is None
+                    or signature_hash.name != "sha256"
+                    or not isinstance(public_key, ec.EllipticCurvePublicKey)
+                    or not isinstance(public_key.curve, ec.SECP256R1)
+                    or certificate.not_valid_before_utc > now
+                    or certificate.not_valid_after_utc <= now
+                ):
+                    raise ValueError
+                certificate.verify_directly_issued_by(certificate)
+                tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                tls_context.check_hostname = True
+                tls_context.verify_mode = ssl.CERT_REQUIRED
+                tls_context.load_verify_locations(cadata=trust_data)
+                trust_env = False
+            except Exception as error:
+                raise ValueError("controller_trust_store_invalid") from error
+
         self._client = httpx2.AsyncClient(
             base_url=control_plane_url.rstrip("/"),
             timeout=httpx2.Timeout(timeout_seconds),
             follow_redirects=False,
-            verify=True,
-            trust_env=True,
+            verify=tls_context,
+            trust_env=trust_env,
             transport=transport,
         )
         self._access_token: str | None = None
