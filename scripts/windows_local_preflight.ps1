@@ -56,11 +56,12 @@ function Get-FreeLoopbackPort {
 }
 
 $runId = [guid]::NewGuid().ToString("N")
+$shortRunId = $runId.Substring(0, 12)
 $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 if ([string]::IsNullOrWhiteSpace($localAppData)) {
     throw "windows_local_preflight_local_app_data_unavailable"
 }
-$runRoot = Join-Path $localAppData "ThreadsOperationsLocalCi/$runId"
+$runRoot = Join-Path $localAppData "TOCI/$shortRunId"
 $tempRoot = Join-Path $runRoot "temp"
 $pytestBaseTemp = Join-Path $runRoot "pytest"
 $dataRoot = Join-Path $runRoot "postgres-data"
@@ -87,6 +88,7 @@ $previous = [ordered]@{
 }
 
 $postgresStarted = $false
+$cleanupFailed = $false
 $passed = $false
 
 try {
@@ -150,10 +152,25 @@ try {
         try {
             & $pgCtl stop -D $dataRoot -m fast -w
             if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Disposable PostgreSQL stop returned exit code $LASTEXITCODE"
+                Write-Warning "Disposable PostgreSQL fast stop returned exit code $LASTEXITCODE; retrying immediate stop."
+                & $pgCtl stop -D $dataRoot -m immediate -w
+                if ($LASTEXITCODE -ne 0) {
+                    $cleanupFailed = $true
+                    Write-Warning "Disposable PostgreSQL immediate stop returned exit code $LASTEXITCODE"
+                }
             }
         } catch {
-            Write-Warning "Disposable PostgreSQL cleanup failed: $($_.Exception.Message)"
+            Write-Warning "Disposable PostgreSQL fast stop raised: $($_.Exception.Message); retrying immediate stop."
+            try {
+                & $pgCtl stop -D $dataRoot -m immediate -w
+                if ($LASTEXITCODE -ne 0) {
+                    $cleanupFailed = $true
+                    Write-Warning "Disposable PostgreSQL immediate stop returned exit code $LASTEXITCODE"
+                }
+            } catch {
+                $cleanupFailed = $true
+                Write-Warning "Disposable PostgreSQL immediate cleanup failed: $($_.Exception.Message)"
+            }
         }
     }
 
@@ -167,9 +184,13 @@ try {
 
     Remove-Item -LiteralPath $passwordFile -Force -ErrorAction SilentlyContinue
 
-    if ($passed -and -not $KeepArtifacts) {
+    if ($passed -and -not $cleanupFailed -and -not $KeepArtifacts) {
         Remove-Item -LiteralPath $runRoot -Recurse -Force -ErrorAction SilentlyContinue
     } else {
         Write-Host "LOCAL_CI_ARTIFACTS=$runRoot"
+    }
+
+    if ($passed -and $cleanupFailed) {
+        throw "windows_local_preflight_postgres_cleanup_failed"
     }
 }
