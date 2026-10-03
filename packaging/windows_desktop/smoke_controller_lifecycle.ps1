@@ -24,6 +24,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../../")).Path
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Security
+Add-Type -AssemblyName System.Windows.Forms
 if (-not ("ThreadsControllerSmoke.NativeMethods" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -98,9 +99,13 @@ $checks = [ordered]@{
     atomic_non_secret_config = $false
     loopback_only_database_and_endpoint = $false
     no_owner_or_lan_bootstrap = $false
+    local_first_owner_bootstrap = $false
     separate_http_and_scheduler_processes = $false
     x_hides_and_runtime_continues = $false
     reopen_keeps_one_runtime_and_database_identity = $false
+    reopen_requires_operator_sign_in = $false
+    owner_reauthenticated_after_reopen = $false
+    active_session_verified_before_privileged_quit = $false
     graceful_quit_stops_scheduler_http_then_postgres = $false
     relaunch_preserves_database_and_endpoint = $false
     database_crash_fails_closed_and_recovers_wal = $false
@@ -121,6 +126,8 @@ $controllerIdentity = $null
 $databaseSystemIdentifier = $null
 $shutdownExitOrder = $null
 $sentinel = [Guid]::NewGuid().ToString("N")
+$script:smokeOwnerUsername = "dx05owner" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
+$script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
 $processEvidence = [ordered]@{}
 $rootWasMoved = $false
 $parentCrashPids = @()
@@ -224,12 +231,60 @@ function Get-TrackedProcess([int]$ProcessId, [string]$ExpectedPath) {
     }
 }
 
+function Get-ProcessIfPresent([int]$ProcessId) {
+    try {
+        return Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch {
+        if ($_.FullyQualifiedErrorId -like "NoProcessFoundForGivenId,*") { return $null }
+        throw
+    }
+}
+
+function Test-ElementUnavailable([System.Exception]$Exception) {
+    while ($null -ne $Exception) {
+        if ($Exception -is [System.Windows.Automation.ElementNotAvailableException]) {
+            return $true
+        }
+        $Exception = $Exception.InnerException
+    }
+    return $false
+}
+
+function Test-ProcessExitRace(
+    [System.Exception]$Exception,
+    [System.Diagnostics.Process]$Process
+) {
+    $processAccessFailure = $false
+    while ($null -ne $Exception) {
+        if ($Exception -is [System.InvalidOperationException] -or
+            $Exception -is [System.ComponentModel.Win32Exception]) {
+            $processAccessFailure = $true
+            break
+        }
+        $Exception = $Exception.InnerException
+    }
+    if (-not $processAccessFailure) { return $false }
+    try { return $Process.HasExited } catch { return $false }
+}
+
 function Get-Window([int]$ProcessId) {
-    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    $process = Get-ProcessIfPresent $ProcessId
     if (-not $process) { return $null }
-    $process.Refresh()
-    if ($process.MainWindowHandle -eq [IntPtr]::Zero) { return $null }
-    return [System.Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
+    try {
+        try {
+            $process.Refresh()
+            if ($process.HasExited) { return $null }
+            $windowHandle = $process.MainWindowHandle
+            if ($windowHandle -eq [IntPtr]::Zero) { return $null }
+            return [System.Windows.Automation.AutomationElement]::FromHandle($windowHandle)
+        } catch {
+            if (Test-ElementUnavailable $_.Exception) { return $null }
+            if (Test-ProcessExitRace $_.Exception $process) { return $null }
+            throw
+        }
+    } finally {
+        $process.Dispose()
+    }
 }
 
 function Find-Element(
@@ -247,36 +302,153 @@ function Find-Element(
         )
     )
     $condition = [System.Windows.Automation.AndCondition]::new($conditions)
-    return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    try {
+        return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
+    }
+}
+
+function Get-ElementName([System.Windows.Automation.AutomationElement]$Element) {
+    if (-not $Element) { return $null }
+    try {
+        return [string]$Element.Current.Name
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
+    }
 }
 
 function Find-TextContaining([System.Windows.Automation.AutomationElement]$Root, [string]$Text) {
     if (-not $Root) { return $null }
-    $elements = $Root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        [System.Windows.Automation.Condition]::TrueCondition
-    )
-    foreach ($element in $elements) {
-        $name = [string]$element.Current.Name
-        if ($name.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            return $element
+    try {
+        $elements = $Root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition
+        )
+        foreach ($element in $elements) {
+            $name = Get-ElementName $element
+            if ($name -and
+                $name.IndexOf($Text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $element
+            }
         }
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
     }
     return $null
 }
 
-function Invoke-Button([int]$ProcessId, [string]$Name) {
+function Invoke-Button([int]$ProcessId, [string]$Name, [scriptblock]$BeforeInvoke) {
+    $window = Get-Window $ProcessId
+    if ($window) {
+        try { $window.SetFocus() } catch { }
+    }
     Wait-Until {
         $button = Find-Element (Get-Window $ProcessId) $Name `
             ([System.Windows.Automation.ControlType]::Button)
         if (-not $button) { return $false }
         try {
             $pattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-            if (-not $pattern) { return $false }
+        } catch { return $false }
+        if (-not $pattern) { return $false }
+        if ($BeforeInvoke) { & $BeforeInvoke }
+        try {
             $pattern.Invoke()
             return $true
         } catch { return $false }
     } 20 "desktop_button_unavailable_$($Name -replace '\W+', '_')"
+}
+
+function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
+    $input = Find-Element (Get-Window $ProcessId) $Name `
+        ([System.Windows.Automation.ControlType]::Edit)
+    if (-not $input) { throw "desktop_login_input_unavailable" }
+    $input.SetFocus()
+    Start-Sleep -Milliseconds 100
+    [System.Windows.Forms.SendKeys]::SendWait("^a")
+    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    if ($Name -eq "Username") {
+        Wait-Until {
+            $current = Find-Element (Get-Window $ProcessId) $Name `
+                ([System.Windows.Automation.ControlType]::Edit)
+            if (-not $current) { return $false }
+            try {
+                $valuePattern = $current.GetCurrentPattern(
+                    [System.Windows.Automation.ValuePattern]::Pattern
+                )
+                return $valuePattern.Current.Value -ceq $Value
+            } catch { return $false }
+        } 5 "desktop_login_username_not_populated"
+    }
+}
+
+function Get-ActiveOwnerSessionCount([object]$Config) {
+    $username = $script:smokeOwnerUsername
+    $count = Invoke-Psql $Config `
+        "SELECT COUNT(*) FROM public.operator_sessions s JOIN public.operator_users u ON u.id = s.operator_user_id WHERE u.username = '$username' AND s.revoked_at IS NULL AND s.expires_at > now();"
+    if ($count -notmatch '^\d+$') { throw "controller_operator_session_count_invalid" }
+    return [int]$count
+}
+
+function Assert-OneActiveOwnerSession([object]$Config) {
+    $activeSessions = Get-ActiveOwnerSessionCount $Config
+    $processEvidence.operator_session_preflight = [ordered]@{
+        active_sessions = [string]$activeSessions
+    }
+    if ($activeSessions -ne 1) {
+        throw "controller_active_owner_session_count_not_one_$activeSessions"
+    }
+    $checks.active_session_verified_before_privileged_quit = $true
+}
+
+function Test-FirstOwnerSetupFailed([int]$ProcessId) {
+    return $null -ne (Find-TextContaining (Get-Window $ProcessId) "First Owner setup failed")
+}
+
+function Bootstrap-ControllerOwner([int]$ProcessId) {
+    Invoke-Button $ProcessId "Set up first Owner"
+    Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
+    Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
+    Invoke-Button $ProcessId "Create first Owner"
+    Wait-Until {
+        $config = Get-ControllerConfig
+        $ownerCount = Invoke-Psql $config `
+            "SELECT COUNT(*) FROM public.operator_users WHERE username = '$script:smokeOwnerUsername' AND role = 'OWNER' AND enabled;"
+        ($ownerCount -eq "1" -and (Get-ActiveOwnerSessionCount $config) -eq 1) -or
+            (Test-FirstOwnerSetupFailed $ProcessId)
+    } 30 "controller_first_owner_setup_no_response"
+    if (Test-FirstOwnerSetupFailed $ProcessId) {
+        $ownerCount = Invoke-Psql (Get-ControllerConfig) `
+            "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
+        throw "controller_first_owner_setup_rejected_enabled_owners_$ownerCount"
+    }
+}
+
+function Ensure-ControllerOwner([int]$ProcessId, [switch]$ForceReauthentication) {
+    $config = Get-ControllerConfig
+    if ($ForceReauthentication) {
+        Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 0 } 15 `
+            "controller_owner_session_not_revoked_on_lock"
+    } else {
+        $activeSessions = Get-ActiveOwnerSessionCount $config
+        if ($activeSessions -eq 1) { return }
+        if ($activeSessions -ne 0) {
+            throw "controller_active_owner_session_count_not_one"
+        }
+    }
+    Wait-Until {
+        $window = Get-Window $ProcessId
+        return $null -ne (Find-Element $window "Username" ([System.Windows.Automation.ControlType]::Edit)) -and
+            $null -ne (Find-Element $window "Password" ([System.Windows.Automation.ControlType]::Edit)) -and
+            $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
+    } 15 "controller_operator_reauthentication_not_ready"
+    Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
+    Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
+    Invoke-Button $ProcessId "Sign in"
+    Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 1 } 30 "controller_owner_login_failed"
 }
 
 function Start-Desktop([int]$WindowTimeout = 30) {
@@ -371,6 +543,25 @@ function Invoke-Psql([object]$Config, [string]$Sql) {
     }
 }
 
+function Get-OperatorSessionEvidence([object]$Config) {
+    try {
+        $username = $script:smokeOwnerUsername
+        $activeSessions = Invoke-Psql $Config `
+            "SELECT COUNT(*) FROM public.operator_sessions s JOIN public.operator_users u ON u.id = s.operator_user_id WHERE u.username = '$username' AND s.revoked_at IS NULL AND s.expires_at > now();"
+        $recentEvents = Invoke-Psql $Config `
+            "SELECT COALESCE(string_agg(event_type, ',' ORDER BY created_at DESC), '') FROM (SELECT event_type, created_at FROM public.workspace_audit_events WHERE actor_username = '$username' ORDER BY created_at DESC LIMIT 8) recent;"
+        return [ordered]@{
+            active_sessions = $activeSessions
+            recent_auth_events = $recentEvents
+        }
+    } catch {
+        return [ordered]@{
+            active_sessions = "unavailable"
+            recent_auth_events = "unavailable"
+        }
+    }
+}
+
 function Get-ListenerAddresses([int]$Port) {
     @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty LocalAddress -Unique)
@@ -393,10 +584,87 @@ function Assert-ControllerProcesses {
 }
 
 function Quit-Desktop([int]$ProcessId) {
-    Invoke-Button $ProcessId "Quit…"
-    Invoke-Button $ProcessId "Stop node and quit"
-    Wait-Until { -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } `
-        55 "desktop_graceful_quit_timeout"
+    $owned = Get-ControllerProcesses
+    if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
+        Ensure-ControllerOwner $ProcessId
+        Invoke-Button $ProcessId "Quit…"
+        Invoke-Button $ProcessId "Stop node and quit" -BeforeInvoke {
+            Assert-OneActiveOwnerSession (Get-ControllerConfig)
+        }
+        try {
+            Wait-Until {
+                $desktopProcess = Get-ProcessIfPresent $ProcessId
+                if (-not $desktopProcess) { return $true }
+                $desktopProcess.Dispose()
+                $window = Get-Window $ProcessId
+                if (-not $window) { return $false }
+                if (Find-TextContaining $window "An active Operator session with permission to stop this node is required") {
+                    throw "controller_stop_operator_authorization_denied"
+                }
+                if (Find-TextContaining $window "Sign in again before stopping this node") {
+                    throw "controller_stop_operator_session_required"
+                }
+                if (Find-TextContaining $window "This Operator session expired or was revoked") {
+                    throw "controller_stop_operator_session_revoked"
+                }
+                if (Find-TextContaining $window "Only an Owner or Admin can stop this Controller") {
+                    throw "controller_stop_operator_role_forbidden"
+                }
+                if (Find-TextContaining $window "Change your Workspace password before stopping this node") {
+                    throw "controller_stop_operator_password_change_required"
+                }
+                if (Find-TextContaining $window "The Controller could not verify Operator access") {
+                    throw "controller_stop_operator_verification_failed"
+                }
+                if (Find-TextContaining $window "Operator access changed. Sign in again") {
+                    throw "controller_stop_operator_session_revoked"
+                }
+                if (Find-TextContaining $window "The node could not stop cleanly") {
+                    throw "controller_stop_shutdown_failed"
+                }
+                return $false
+            } 55 "desktop_graceful_quit_timeout"
+        } catch {
+            $remaining = Get-ControllerProcesses
+            $window = Get-Window $ProcessId
+            $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
+            $diagnosticName = Get-ElementName $diagnosticElement
+            $diagnosticCode = if ($diagnosticName) {
+                $diagnosticName -replace '^.*Diagnostic code:\s*', ''
+            } else { $null }
+            $processEvidence.graceful_quit_failure = [ordered]@{
+                postgres = $remaining.postgres.Count
+                http = $remaining.http.Count
+                scheduler = $remaining.scheduler.Count
+                diagnostic_code = $diagnosticCode
+                runtime_failed_visible = $null -ne (Find-TextContaining $window "Controller runtime failed")
+                operator_auth_error = $null -ne (Find-TextContaining `
+                    $window "An active Operator session with permission to stop this node is required"
+                )
+                operator_session_revoked = $null -ne (Find-TextContaining `
+                    $window "Operator access changed. Sign in again"
+                )
+                shutdown_error = $null -ne (Find-TextContaining $window "The node could not stop cleanly")
+                operator_session_state = Get-OperatorSessionEvidence (Get-ControllerConfig)
+            }
+            throw
+        }
+        return
+    }
+
+    # The smoke fixture cannot authenticate when a failed runtime has no healthy Operator API.
+    # Stop only this test-owned Desktop process; healthy Controller stops above always use OWNER auth.
+    if ($ProcessId -notin $desktopPids) { throw "controller_smoke_desktop_process_not_owned" }
+    $tracked = Get-TrackedProcess $ProcessId $DesktopExecutable
+    if (-not $tracked) { throw "controller_smoke_desktop_process_unavailable" }
+    try {
+        $tracked.Kill()
+        if (-not $tracked.WaitForExit(10000)) { throw "controller_smoke_failed_runtime_cleanup_timeout" }
+    } finally {
+        $tracked.Dispose()
+    }
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 20 `
+        "controller_smoke_failed_runtime_processes_remain"
 }
 
 function Get-ProcessExitTime(
@@ -520,10 +788,15 @@ try {
     if (-not $loopbackOnly) { throw "controller_listener_not_loopback_only" }
 
     $databaseSystemIdentifier = Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();"
-    $ownerTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NULL;"
-    $checks.no_owner_or_lan_bootstrap = $ownerTable -eq "t" -and
+    $operatorUsersTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
+    $operatorUserCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users;"
+    $checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and $operatorUserCount -eq "0" -and
         $config.endpointPort -gt 0 -and $config.databasePort -gt 0
     if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
+    Bootstrap-ControllerOwner $desktop.Id
+    $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
+    $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
+    if (-not $checks.local_first_owner_bootstrap) { throw "controller_local_first_owner_bootstrap_invalid" }
     Invoke-Psql $config "CREATE TABLE dx04_runtime_evidence (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO dx04_runtime_evidence (id, marker) VALUES (1, '$sentinel');" | Out-Null
     Assert-DatabaseValue $config $sentinel
 
@@ -547,6 +820,14 @@ try {
     Wait-Until { $second.HasExited } 20 "second_desktop_launch_did_not_converge"
     Wait-Until { [ThreadsControllerSmoke.NativeMethods]::IsWindowVisible($window.MainWindowHandle) } `
         10 "controller_reopen_did_not_restore_window"
+    Wait-Until {
+        $window = Get-Window $desktop.Id
+        return $null -ne (Find-TextContaining $window "Session locked") -and
+            $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
+    } 15 "controller_reopen_did_not_require_operator_sign_in"
+    $checks.reopen_requires_operator_sign_in = $true
+    Ensure-ControllerOwner $desktop.Id -ForceReauthentication
+    $checks.owner_reauthenticated_after_reopen = $true
     $owned = Assert-ControllerProcesses
     if ([int]$owned.postgres[0].ProcessId -ne $postgresPid -or
         [int]$owned.http[0].ProcessId -ne $httpPid -or

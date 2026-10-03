@@ -1,13 +1,27 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   decommissionDevice,
   getDesktopSnapshot,
   listenForTrayQuit,
+  operatorBootstrapOwner,
+  operatorChangePassword,
+  operatorCreateUser,
+  operatorCurrent,
+  operatorListUsers,
+  operatorLock,
+  operatorLogin,
+  operatorLogout,
+  operatorUpdateUser,
   provisionRole,
   resetUiPreferences,
   requestQuit,
+  requestRestart,
+  type CreatedOperatorUser,
   type DesktopSnapshot,
+  type OperatorIdentity,
+  type OperatorRole,
+  type OperatorUser,
   type ProvisionedRole,
 } from "./desktop";
 import { SessionGate } from "./SessionGate";
@@ -29,6 +43,17 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 };
 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
+const operatorAccessMessages: Record<string, string> = {
+  operator_authentication_required: "Sign in again before stopping this node.",
+  operator_session_revoked:
+    "This Operator session expired or was revoked. Sign in again before stopping this node.",
+  operator_password_change_required: "Change your Workspace password before stopping this node.",
+  operator_forbidden: "Only an Owner or Admin can stop this Controller.",
+  operator_api_unavailable:
+    "The Controller could not verify Operator access. Try again when it is available.",
+  operator_request_failed: "The Controller could not verify Operator access. Try again.",
+  operator_response_invalid: "The Controller returned an invalid Operator response. Try again.",
+};
 
 function App() {
   const queryClient = useQueryClient();
@@ -36,12 +61,101 @@ function App() {
   const [resetRequested, setResetRequested] = useState(false);
   const [resetPhrase, setResetPhrase] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
+  const [operator, setOperator] = useState<OperatorIdentity | null>(null);
+  const [operatorLoaded, setOperatorLoaded] = useState(false);
+  const [sessionLocked, setSessionLocked] = useState(false);
+  const [apiUrl, setApiUrl] = useState("");
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [firstOwnerSetup, setFirstOwnerSetup] = useState(false);
+  const [restartRequested, setRestartRequested] = useState(false);
+  const [operatorUsers, setOperatorUsers] = useState<OperatorUser[]>([]);
+  const [newOperatorUsername, setNewOperatorUsername] = useState("");
+  const [newOperatorRole, setNewOperatorRole] = useState<OperatorRole>("VIEWER");
+  const [createdOperatorUser, setCreatedOperatorUser] = useState<CreatedOperatorUser | null>(null);
+  const [newPassword, setNewPassword] = useState("");
+  const loginGeneration = useRef(0);
+  const nativeLockNotification = useRef(0);
   const snapshotQuery = useQuery({
     queryKey: ["desktop-snapshot"],
     queryFn: getDesktopSnapshot,
     refetchInterval: 1_000,
     retry: false,
   });
+
+  const handleNativeSessionLock = useCallback(async () => {
+    const notification = ++nativeLockNotification.current;
+    const generation = ++loginGeneration.current;
+    setSessionLocked(true);
+    let current: OperatorIdentity | null = null;
+    try {
+      current = await operatorCurrent();
+    } catch {
+      // A revoked or unavailable session must stay hidden behind the sign-in form.
+    }
+    if (notification !== nativeLockNotification.current || generation !== loginGeneration.current) {
+      return;
+    }
+    if (current) {
+      setOperator(current);
+      setOperatorLoaded(true);
+      setSessionLocked(false);
+      return;
+    }
+    setOperator(null);
+    setOperatorLoaded(true);
+    setOperatorUsers([]);
+    setCreatedOperatorUser(null);
+    setNewOperatorUsername("");
+    setLoginUsername("");
+    setFirstOwnerSetup(false);
+    setNewPassword("");
+    setLoginPassword("");
+    setActionError(null);
+    setSessionLocked(true);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const generation = loginGeneration.current;
+    void operatorCurrent()
+      .then((current) => {
+        if (mounted && generation === loginGeneration.current) setOperator(current ?? null);
+      })
+      .catch(() => {
+        if (mounted && generation === loginGeneration.current) setOperator(null);
+      })
+      .finally(() => {
+        if (mounted && generation === loginGeneration.current) setOperatorLoaded(true);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (snapshotQuery.data?.role === "CONTROLLER" && snapshotQuery.data.supervisor.endpoint) {
+      setApiUrl(snapshotQuery.data.supervisor.endpoint);
+    }
+  }, [snapshotQuery.data?.role, snapshotQuery.data?.supervisor.endpoint]);
+
+  useEffect(() => {
+    if (!operator || operator.mustChangePassword || !["OWNER", "ADMIN"].includes(operator.role)) {
+      setOperatorUsers([]);
+      return;
+    }
+    let mounted = true;
+    void operatorListUsers()
+      .then((users) => {
+        if (mounted) setOperatorUsers(users);
+      })
+      .catch(() => {
+        if (mounted) setActionError("Operator access changed. Sign in again to continue.");
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [operator]);
 
   useEffect(() => {
     let mounted = true;
@@ -51,13 +165,16 @@ function App() {
       else stopListening();
     });
     const requestQuitFromTray = () => setQuitRequested(true);
+    const lockSessionFromTray = () => void handleNativeSessionLock();
     window.addEventListener("threads-desktop:quit-requested", requestQuitFromTray);
+    window.addEventListener("threads-desktop:session-locked", lockSessionFromTray);
     return () => {
       mounted = false;
       unlisten?.();
       window.removeEventListener("threads-desktop:quit-requested", requestQuitFromTray);
+      window.removeEventListener("threads-desktop:session-locked", lockSessionFromTray);
     };
-  }, []);
+  }, [handleNativeSessionLock]);
 
   async function updateSnapshot(action: () => Promise<DesktopSnapshot>): Promise<boolean> {
     setActionError(null);
@@ -91,8 +208,132 @@ function App() {
     try {
       await requestQuit();
       setQuitRequested(false);
+    } catch (error) {
+      await handleOperatorLogout();
+      setQuitRequested(false);
+      const errorCode =
+        typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setActionError(
+        operatorAccessMessages[errorCode] ??
+          "The node could not stop cleanly. Check the runtime status before retrying.",
+      );
+    }
+  }
+
+  async function handleOperatorLogin() {
+    setActionError(null);
+    try {
+      const signedIn = firstOwnerSetup
+        ? await operatorBootstrapOwner(loginUsername, loginPassword)
+        : await operatorLogin(apiUrl, loginUsername, loginPassword);
+      loginGeneration.current += 1;
+      nativeLockNotification.current += 1;
+      setOperator(signedIn);
+      setOperatorLoaded(true);
+      setSessionLocked(false);
+      setLoginPassword("");
+      setFirstOwnerSetup(false);
     } catch {
-      setActionError("The runtime did not confirm shutdown. Threads Desktop is still open.");
+      setActionError(
+        firstOwnerSetup
+          ? "First Owner setup failed. Check the local Controller and try again."
+          : "Sign-in failed. Check the Controller address and credentials.",
+      );
+    }
+  }
+
+  async function handleOperatorLogout() {
+    setSessionLocked(true);
+    loginGeneration.current += 1;
+    nativeLockNotification.current += 1;
+    await operatorLogout();
+    clearProtectedOperatorState();
+  }
+
+  async function handleSessionLock() {
+    setSessionLocked(true);
+    loginGeneration.current += 1;
+    nativeLockNotification.current += 1;
+    try {
+      await operatorLock();
+    } catch {
+      setActionError("Session lock could not be confirmed. Sign in again to continue.");
+    }
+    clearProtectedOperatorState();
+    setActionError("Session locked. Sign in again to access protected data.");
+  }
+
+  function clearProtectedOperatorState() {
+    setOperator(null);
+    setOperatorLoaded(true);
+    setOperatorUsers([]);
+    setCreatedOperatorUser(null);
+    setNewOperatorUsername("");
+    setLoginUsername("");
+    setFirstOwnerSetup(false);
+    setNewPassword("");
+    setLoginPassword("");
+    setActionError(null);
+  }
+
+  async function handleOperatorCreateUser() {
+    if (!newOperatorUsername.trim()) return;
+    setActionError(null);
+    try {
+      const created = await operatorCreateUser(newOperatorUsername, newOperatorRole);
+      setCreatedOperatorUser(created);
+      setNewOperatorUsername("");
+      setOperatorUsers(await operatorListUsers());
+    } catch {
+      setActionError("The server denied the requested Operator user change.");
+    }
+  }
+
+  async function handleOperatorUserToggle(user: OperatorUser) {
+    setActionError(null);
+    try {
+      const changed = await operatorUpdateUser(user.id, null, !user.enabled);
+      setOperatorUsers((users) => users.map((item) => (item.id === changed.id ? changed : item)));
+    } catch {
+      setActionError("The server denied the requested Operator user change.");
+    }
+  }
+
+  async function handleOperatorRoleChange(user: OperatorUser, role: OperatorRole) {
+    setActionError(null);
+    try {
+      const changed = await operatorUpdateUser(user.id, role, null);
+      setOperatorUsers((users) => users.map((item) => (item.id === changed.id ? changed : item)));
+      const current = await operatorCurrent();
+      setOperator(current ?? null);
+    } catch {
+      setActionError("The server denied the requested Operator user change.");
+    }
+  }
+
+  async function handlePasswordChange() {
+    setActionError(null);
+    try {
+      setOperator(await operatorChangePassword(newPassword));
+      setNewPassword("");
+    } catch {
+      setActionError("Password change failed. Use at least 12 characters.");
+    }
+  }
+
+  async function handleRestart() {
+    setActionError(null);
+    try {
+      await requestRestart();
+      setRestartRequested(false);
+      await handleOperatorLogout();
+      await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+    } catch {
+      await handleOperatorLogout();
+      setRestartRequested(false);
+      setActionError(
+        "An active Operator session with permission to restart this node is required.",
+      );
     }
   }
 
@@ -119,6 +360,14 @@ function App() {
         >
           Try again
         </button>
+      </main>
+    );
+  }
+
+  if (!operatorLoaded) {
+    return (
+      <main className="boot-screen" aria-live="polite">
+        Checking Operator session…
       </main>
     );
   }
@@ -204,19 +453,31 @@ function App() {
           <div className="topbar-actions">
             <span className="environment-pill">
               <span className="environment-dot" />
-              M1 PRIVATE RUNTIME
+              LOCAL RUNTIME
             </span>
+            {snapshot.role && snapshot.role !== "CONSOLE" && !operator?.mustChangePassword && (
+              <button
+                type="button"
+                className="quiet-link"
+                onClick={() => setRestartRequested(true)}
+              >
+                Restart…
+              </button>
+            )}
             <button type="button" className="quiet-link" onClick={() => setQuitRequested(true)}>
               Quit…
             </button>
-            <button
-              type="button"
-              className="avatar-button"
-              aria-label="Operator session is not configured"
-              title="Operator sign-in is added in DX-05"
-            >
-              —
-            </button>
+            {operator ? (
+              <button
+                type="button"
+                className="avatar-button"
+                onClick={() => void handleOperatorLogout()}
+              >
+                {operator.username} · {operator.role}
+              </button>
+            ) : (
+              <span className="avatar-button">Signed out</span>
+            )}
           </div>
         </header>
 
@@ -274,8 +535,8 @@ function App() {
                   <strong>Internal M1 prototype — disposable test data only</strong>
                   <span>
                     The runtime is unavailable before this Windows user signs in. Windows logout is
-                    unsupported. M1 has no Owner account or LAN endpoint, portable backup, or
-                    production durability.
+                    unsupported. Operator login is local-only until DX-06 provisions HTTPS for LAN
+                    clients. M1 has no portable backup or production durability.
                   </span>
                 </section>
               )}
@@ -378,21 +639,256 @@ function App() {
                   <div className="card-heading">
                     <div>
                       <p className="eyebrow">OPERATOR ACCESS</p>
-                      <h2>Sign-in is not configured</h2>
+                      <h2>
+                        {operator
+                          ? `Signed in as ${operator.username}`
+                          : sessionLocked
+                            ? "Session locked"
+                            : "Sign in to this Workspace"}
+                      </h2>
                     </div>
                     <span className="lock-symbol" aria-hidden="true">
                       ⌑
                     </span>
                   </div>
-                  <SessionGate validSession={false} onUnlock={async () => false}>
-                    <p>Protected account data is hidden until a valid Operator session exists.</p>
-                  </SessionGate>
-                  <p className="card-copy">
-                    DX-02 stores no bearer or Operator credentials. Login and RBAC are delivered in
-                    DX-05.
-                  </p>
+                  {operator ? (
+                    <>
+                      <SessionGate
+                        validSession
+                        forceLocked={sessionLocked}
+                        idleTimeoutMs={5 * 60 * 1_000}
+                        onLock={handleSessionLock}
+                        onUnlock={async () => {
+                          try {
+                            return Boolean(await operatorCurrent());
+                          } catch {
+                            return false;
+                          }
+                        }}
+                      >
+                        <div className="runtime-facts">
+                          <div>
+                            <span>Workspace role</span>
+                            <strong>{operator.role}</strong>
+                          </div>
+                          <div>
+                            <span>Session expiry</span>
+                            <strong>{new Date(operator.expiresAt).toLocaleString()}</strong>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="quiet-link"
+                          onClick={() => void handleOperatorLogout()}
+                        >
+                          Sign out
+                        </button>
+                      </SessionGate>
+                      {operator.mustChangePassword && !sessionLocked && (
+                        <form
+                          className="operator-login-form"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            void handlePasswordChange();
+                          }}
+                        >
+                          <label>
+                            Set a new password
+                            <input
+                              type="password"
+                              autoComplete="new-password"
+                              minLength={12}
+                              value={newPassword}
+                              onChange={(event) => setNewPassword(event.target.value)}
+                              required
+                            />
+                          </label>
+                          <button type="submit" className="button button-primary">
+                            Change password
+                          </button>
+                        </form>
+                      )}
+                    </>
+                  ) : (
+                    <form
+                      className="operator-login-form"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void handleOperatorLogin();
+                      }}
+                    >
+                      {sessionLocked && (
+                        <p className="card-copy" role="status">
+                          Sign in again to access protected Operator data.
+                        </p>
+                      )}
+                      {snapshot.role !== "CONTROLLER" && (
+                        <label>
+                          Controller address
+                          <input
+                            type="url"
+                            autoComplete="url"
+                            placeholder="https://controller.example"
+                            value={apiUrl}
+                            onChange={(event) => setApiUrl(event.target.value)}
+                            required
+                          />
+                        </label>
+                      )}
+                      <label>
+                        Username
+                        <input
+                          type="text"
+                          autoComplete="username"
+                          value={loginUsername}
+                          onChange={(event) => setLoginUsername(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label>
+                        Password
+                        <input
+                          type="password"
+                          autoComplete="current-password"
+                          value={loginPassword}
+                          onChange={(event) => setLoginPassword(event.target.value)}
+                          required
+                        />
+                      </label>
+                      {snapshot.role === "CONTROLLER" && firstOwnerSetup && (
+                        <p className="card-copy">
+                          This creates the first Owner through the local native Controller process.
+                          The password is sent through stdin and never placed in command arguments.
+                        </p>
+                      )}
+                      <button type="submit" className="button button-primary">
+                        {firstOwnerSetup ? "Create first Owner" : "Sign in"}
+                      </button>
+                      {snapshot.role === "CONTROLLER" && (
+                        <button
+                          type="button"
+                          className="quiet-link"
+                          onClick={() => setFirstOwnerSetup((enabled) => !enabled)}
+                        >
+                          {firstOwnerSetup ? "Return to sign in" : "Set up first Owner"}
+                        </button>
+                      )}
+                    </form>
+                  )}
                 </article>
               </section>
+
+              {operator &&
+                !sessionLocked &&
+                !operator.mustChangePassword &&
+                ["OWNER", "ADMIN"].includes(operator.role) && (
+                  <section className="surface-card operator-users-card" aria-label="Operator users">
+                    <div className="card-heading">
+                      <div>
+                        <p className="eyebrow">WORKSPACE SECURITY</p>
+                        <h2>Operator users</h2>
+                      </div>
+                      <span className="freshness">Server-enforced roles</span>
+                    </div>
+                    {createdOperatorUser && (
+                      <div className="temporary-password" role="status">
+                        <strong>One-time password for {createdOperatorUser.user.username}</strong>
+                        <code>{createdOperatorUser.temporaryPassword}</code>
+                        <span>Share it securely now. It is not stored by Desktop.</span>
+                        <button
+                          type="button"
+                          className="quiet-link"
+                          onClick={() => setCreatedOperatorUser(null)}
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    )}
+                    <form
+                      className="operator-user-create"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void handleOperatorCreateUser();
+                      }}
+                    >
+                      <label>
+                        Username
+                        <input
+                          type="text"
+                          autoComplete="off"
+                          minLength={3}
+                          maxLength={100}
+                          value={newOperatorUsername}
+                          onChange={(event) => setNewOperatorUsername(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label>
+                        Role
+                        <select
+                          value={newOperatorRole}
+                          onChange={(event) =>
+                            setNewOperatorRole(event.target.value as OperatorRole)
+                          }
+                        >
+                          {operator.role === "OWNER" && <option value="OWNER">OWNER</option>}
+                          {operator.role === "OWNER" && <option value="ADMIN">ADMIN</option>}
+                          <option value="OPERATOR">OPERATOR</option>
+                          <option value="VIEWER">VIEWER</option>
+                        </select>
+                      </label>
+                      <button type="submit" className="button button-primary">
+                        Create user
+                      </button>
+                    </form>
+                    <div className="operator-user-list">
+                      {operatorUsers.map((user) => {
+                        const mayManage =
+                          operator.role === "OWNER" || !["OWNER", "ADMIN"].includes(user.role);
+                        const roleOptions: OperatorRole[] =
+                          operator.role === "OWNER"
+                            ? ["OWNER", "ADMIN", "OPERATOR", "VIEWER"]
+                            : ["OPERATOR", "VIEWER"];
+                        return (
+                          <div className="operator-user-row" key={user.id}>
+                            <div>
+                              <strong>{user.username}</strong>
+                              <span>{user.enabled ? "Enabled" : "Disabled"}</span>
+                            </div>
+                            <span className="role-chip">{user.role}</span>
+                            {mayManage && (
+                              <>
+                                <select
+                                  aria-label={`Role for ${user.username}`}
+                                  value={user.role}
+                                  onChange={(event) =>
+                                    void handleOperatorRoleChange(
+                                      user,
+                                      event.target.value as OperatorRole,
+                                    )
+                                  }
+                                >
+                                  {roleOptions.map((role) => (
+                                    <option key={role} value={role}>
+                                      {role}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  className="quiet-link"
+                                  onClick={() => void handleOperatorUserToggle(user)}
+                                >
+                                  {user.enabled ? "Disable" : "Enable"}
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
 
               <section className="surface-card diagnostics-card">
                 <div className="card-heading">
@@ -482,6 +978,46 @@ function App() {
                 onClick={() => void handleQuit()}
               >
                 Stop node and quit
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {restartRequested && (
+        <div className="dialog-backdrop" role="presentation">
+          <section
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="restart-title"
+          >
+            <div className="dialog-symbol" aria-hidden="true">
+              ↻
+            </div>
+            <h2 id="restart-title">
+              Restart {snapshot.role === "CONTROLLER" ? "Controller" : "Worker"}?
+            </h2>
+            <p>
+              {snapshot.role === "CONTROLLER"
+                ? "The Controller scheduler, HTTP process, and PostgreSQL database will stop and start again."
+                : "The Worker helper will stop and start again."}{" "}
+              An authorized Operator login is required.
+            </p>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                onClick={() => setRestartRequested(false)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="button button-primary"
+                onClick={() => void handleRestart()}
+              >
+                Authenticate and restart
               </button>
             </div>
           </section>

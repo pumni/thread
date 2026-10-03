@@ -52,7 +52,6 @@ $originalAutostart = @{ HKCU = @{}; HKLM = @{} }
 $autostartEvidence = [ordered]@{
     after_provision = $null
     after_restart = $null
-    after_decommission = $null
 }
 
 function ConvertTo-SafeAutostartCommand([string]$Command) {
@@ -102,7 +101,6 @@ $checks = [ordered]@{
     restart_test_transition_stopped_processes = $false
     restart_restores_role_without_duplicate_helper = $false
     force_killed_helper_is_reported_degraded = $false
-    decommission_removes_test_autostart = $false
 }
 $helperProcessIds = [System.Collections.Generic.List[int]]::new()
 $startedProcessIds = [System.Collections.Generic.List[int]]::new()
@@ -521,10 +519,14 @@ try {
         $startedProcessIds.Add($reopen.Id)
         Wait-Until { $reopen.HasExited } 20 "reopen_invocation_did_not_exit_after_focus"
         Wait-Until { [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "second_launch_did_not_reopen_hidden_window"
+        Wait-Until {
+            [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text))
+        } 10 "reopen_session_not_locked"
+        $reopenedHelpers = @(Get-HelperProcesses $primaryId)
+        $helperStayedAlive = $reopenedHelpers.Count -eq 1 -and [int]$reopenedHelpers[0].ProcessId -eq $helperId
         $reopenPassed =
-            [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text)) -and
-            (Get-HelperProcesses $primaryId).Count -eq 1 -and
-            [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
+            $helperStayedAlive
+        if (-not $helperStayedAlive) { Add-FailureCode "reopen_stopped_mock_helper" }
         Set-LifecycleCheck "tray_reopen_relocks_session_without_stopping_helper" $reopenPassed "reopen_did_not_relock_session_or_stopped_mock_helper"
     } catch {
         Set-LifecycleCheck "tray_reopen_relocks_session_without_stopping_helper" $false ([string]$_.Exception.Message)
@@ -641,42 +643,8 @@ try {
             Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false ([string]$_.Exception.Message)
         }
 
-        $decommissioned = $false
-        try {
-            Invoke-Button "Decommission device"
-            Wait-Until {
-                [bool](Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit))
-            } 20 "decommission_confirmation_input_unavailable"
-            $phraseInput = Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit)
-            if (-not $phraseInput) { throw "decommission_confirmation_input_unavailable" }
-            $phraseInput.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue("RESET THIS DEVICE")
-            Invoke-Button "Decommission"
-            Wait-Until {
-                if ((Get-HelperProcesses $primaryId).Count -ne 0) { return $false }
-                $decommissionConfig = Get-Content -LiteralPath $deviceConfigPath -Raw | ConvertFrom-Json
-                $decommissionEntries = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
-                return $null -eq $decommissionConfig.role -and
-                    $decommissionConfig.autostart_enabled -eq $false -and
-                    $decommissionEntries.Count -eq 0
-            } 15 "decommission_did_not_clear_device_or_autostart"
-            $decommissioned = $true
-        } catch {
-            Add-FailureCode ([string]$_.Exception.Message)
-        }
-        $postDecommissionHkcu = @(Get-BundleAutostartEntries $currentUserRunKeyPath)
-        $postDecommissionHklm = @(Get-BundleAutostartEntries $machineRunKeyPath)
-        $autostartEvidence.after_decommission = [ordered]@{
-            hkcu_matching_entries = @($postDecommissionHkcu | ForEach-Object {
-                [ordered]@{ value_name = $_.Name; command = ConvertTo-SafeAutostartCommand $_.Value }
-            })
-            hklm_matching_entries = @($postDecommissionHklm | ForEach-Object {
-                [ordered]@{ value_name = $_.Name; command = ConvertTo-SafeAutostartCommand $_.Value }
-            })
-        }
-        Set-LifecycleCheck "decommission_removes_test_autostart" ($decommissioned -and $postDecommissionHkcu.Count -eq 0) "decommission_left_autostart_registered"
     } else {
         Set-LifecycleCheck "force_killed_helper_is_reported_degraded" $false "failed_check_unavailable_after_restart_failure"
-        Set-LifecycleCheck "decommission_removes_test_autostart" $false "decommission_check_unavailable_after_restart_failure"
     }
 
     $failedChecks = @($checks.GetEnumerator() | Where-Object { -not $_.Value })
@@ -790,6 +758,7 @@ try {
         device_config_after_provision = $persistedConfigAfterProvision
         device_config_after_restart = $persistedConfigAfterRestart
         tray_shell_ui_automation = "NOT_GATED_ON_GITHUB_HOSTED"
+        operator_protected_decommission = "NOT_RUN_NO_OPERATOR_TEST_FIXTURE"
         restart_test_transition = if ($restartTestTransitionStoppedProcesses) {
             "forced_process_termination_not_graceful_quit"
         } else { "NOT_RUN" }

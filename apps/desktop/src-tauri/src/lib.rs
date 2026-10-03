@@ -1,4 +1,5 @@
 mod controller_store;
+mod operator_client;
 mod startup_gate;
 mod supervisor;
 
@@ -19,10 +20,34 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State,
 };
+use zeroize::Zeroizing;
+
+use operator_client::{CreatedOperatorUser, OperatorAuthState, OperatorIdentity, OperatorUser};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
 const SESSION_LOCKED_EVENT: &str = "desktop://session-locked";
+
+fn run_native_lock_boundary(detach: impl FnOnce(), notify: impl FnOnce()) {
+    detach();
+    notify();
+}
+
+fn run_window_reopen(is_visible: bool, lock: impl FnOnce(), show: impl FnOnce()) {
+    if !is_visible {
+        lock();
+    }
+    show();
+}
+
+fn native_session_lock(app: &AppHandle) {
+    run_native_lock_boundary(
+        || app.state::<OperatorAuthState>().lock_session(),
+        || {
+            let _ = app.emit(SESSION_LOCKED_EVENT, ());
+        },
+    );
+}
 
 fn autolaunch() -> Result<AutoLaunch, String> {
     let executable =
@@ -72,7 +97,7 @@ fn disable_autostart() -> Result<(), String> {
 #[cfg(windows)]
 mod windows_session_lock {
     use crate::SESSION_LOCKED_EVENT;
-    use tauri::{AppHandle, Emitter, WebviewWindow};
+    use tauri::{AppHandle, WebviewWindow};
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::RemoteDesktop::{
@@ -103,9 +128,9 @@ mod windows_session_lock {
         subclass_id: usize,
         reference_data: usize,
     ) -> LRESULT {
-        if let Some(event) = event_for_session_message(message, wparam) {
+        if event_for_session_message(message, wparam).is_some() {
             let app = &*(reference_data as *const AppHandle);
-            let _ = app.emit(event, ());
+            crate::native_session_lock(app);
         }
 
         if message == WM_NCDESTROY {
@@ -336,6 +361,59 @@ impl DeviceState {
             .map_err(|_| "state_unavailable".to_string())?;
         inner.supervisor.stop()
     }
+
+    fn role(&self) -> Result<Option<ProvisionedRole>, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        Ok(inner.config.role)
+    }
+
+    fn local_controller_url(&self) -> Result<String, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner.supervisor.refresh_health();
+        DesktopSnapshot::from(&*inner)
+            .supervisor
+            .endpoint
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())
+    }
+
+    fn bootstrap_owner(&self, username: &str, password: &str) -> Result<String, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner.supervisor.bootstrap_owner(username, password)?;
+        DesktopSnapshot::from(&*inner)
+            .supervisor
+            .endpoint
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())
+    }
+
+    fn restart(&self) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        let role = inner
+            .config
+            .role
+            .ok_or_else(|| "device_not_provisioned".to_string())?;
+        if role == ProvisionedRole::Console {
+            return Err("restart_not_available_for_console".to_string());
+        }
+        inner.supervisor.restart(role)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -390,13 +468,16 @@ fn reset_ui_preferences(state: State<'_, DeviceState>) -> Result<DesktopSnapshot
 }
 
 #[tauri::command]
-fn decommission_device(
+async fn decommission_device(
     state: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
     confirmation: String,
 ) -> Result<DesktopSnapshot, String> {
     if confirmation != "RESET THIS DEVICE" {
         return Err("decommission_confirmation_required".to_string());
     }
+    authorize_node_lifecycle(&state, &operator).await?;
+    operator.logout().await;
     disable_autostart()?;
     match state.decommission() {
         Ok(snapshot) => Ok(snapshot),
@@ -408,18 +489,138 @@ fn decommission_device(
 }
 
 #[tauri::command]
-fn request_quit(app: AppHandle, state: State<'_, DeviceState>) -> Result<(), String> {
+async fn request_quit(
+    app: AppHandle,
+    state: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+) -> Result<(), String> {
+    authorize_node_lifecycle(&state, &operator).await?;
+    operator.logout().await;
     state.stop()?;
     app.exit(0);
     Ok(())
 }
 
+#[tauri::command]
+async fn request_restart(
+    state: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+) -> Result<(), String> {
+    authorize_node_lifecycle(&state, &operator).await?;
+    operator.logout().await;
+    state.restart()
+}
+
+async fn authorize_node_lifecycle(
+    device: &DeviceState,
+    operator: &OperatorAuthState,
+) -> Result<(), String> {
+    match device.role()? {
+        Some(ProvisionedRole::Controller) => operator.authorize_node_lifecycle(true).await,
+        Some(ProvisionedRole::Worker) => operator.authorize_node_lifecycle(false).await,
+        Some(ProvisionedRole::Console) | None => Ok(()),
+    }
+}
+
+#[tauri::command]
+async fn operator_login(
+    device: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+    api_url: String,
+    username: String,
+    password: String,
+) -> Result<OperatorIdentity, String> {
+    let password = Zeroizing::new(password);
+    let endpoint = if device.role()? == Some(ProvisionedRole::Controller) {
+        device.local_controller_url()?
+    } else {
+        api_url
+    };
+    operator
+        .login(&endpoint, &username, password.as_str())
+        .await
+}
+
+#[tauri::command]
+async fn operator_bootstrap_owner(
+    device: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+    username: String,
+    password: String,
+) -> Result<OperatorIdentity, String> {
+    let password = Zeroizing::new(password);
+    let endpoint = device.bootstrap_owner(&username, password.as_str())?;
+    operator
+        .login(&endpoint, &username, password.as_str())
+        .await
+}
+
+#[tauri::command]
+async fn operator_current(
+    operator: State<'_, OperatorAuthState>,
+) -> Result<Option<OperatorIdentity>, String> {
+    operator.current().await
+}
+
+#[tauri::command]
+async fn operator_logout(operator: State<'_, OperatorAuthState>) -> Result<(), String> {
+    operator.logout().await;
+    Ok(())
+}
+
+#[tauri::command]
+fn operator_lock(operator: State<'_, OperatorAuthState>) {
+    operator.lock_session();
+}
+
+#[tauri::command]
+async fn operator_list_users(
+    operator: State<'_, OperatorAuthState>,
+) -> Result<Vec<OperatorUser>, String> {
+    operator.list_users().await
+}
+
+#[tauri::command]
+async fn operator_create_user(
+    operator: State<'_, OperatorAuthState>,
+    username: String,
+    role: String,
+) -> Result<CreatedOperatorUser, String> {
+    operator.create_user(&username, &role).await
+}
+
+#[tauri::command]
+async fn operator_update_user(
+    operator: State<'_, OperatorAuthState>,
+    user_id: String,
+    role: Option<String>,
+    enabled: Option<bool>,
+) -> Result<OperatorUser, String> {
+    operator
+        .update_user(&user_id, role.as_deref(), enabled)
+        .await
+}
+
+#[tauri::command]
+async fn operator_change_password(
+    operator: State<'_, OperatorAuthState>,
+    new_password: String,
+) -> Result<OperatorIdentity, String> {
+    let new_password = Zeroizing::new(new_password);
+    operator.change_password(new_password.as_str()).await
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.emit(SESSION_LOCKED_EVENT, ());
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        run_window_reopen(
+            window.is_visible().unwrap_or(false),
+            || native_session_lock(app),
+            || {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            },
+        );
     }
 }
 
@@ -479,7 +680,17 @@ pub fn run() {
             provision_role,
             reset_ui_preferences,
             decommission_device,
-            request_quit
+            request_quit,
+            request_restart,
+            operator_login,
+            operator_bootstrap_owner,
+            operator_current,
+            operator_logout,
+            operator_lock,
+            operator_list_users,
+            operator_create_user,
+            operator_update_user,
+            operator_change_password
         ])
         .setup(|app| {
             let path = config_path(app)?;
@@ -492,6 +703,7 @@ pub fn run() {
                 .map(|snapshot| snapshot.autostart_enabled)
                 .unwrap_or(false);
             app.manage(state);
+            app.manage(OperatorAuthState::default());
             if should_autostart && enable_autostart().is_err() {
                 app.state::<DeviceState>()
                     .mark_autostart_unavailable()
@@ -508,8 +720,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                native_session_lock(window.app_handle());
                 let _ = window.hide();
-                let _ = window.emit(SESSION_LOCKED_EVENT, ());
             }
         })
         .build(tauri::generate_context!())
@@ -653,5 +865,49 @@ mod tests {
         let snapshot = restored.snapshot().expect("read restored role");
         assert_eq!(snapshot.role, Some(ProvisionedRole::Console));
         assert_eq!(snapshot.supervisor.state, "not_applicable");
+    }
+}
+
+#[cfg(test)]
+mod operator_lock_boundary_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn native_lock_detaches_before_emitting_the_notification() {
+        let order = RefCell::new(Vec::new());
+
+        run_native_lock_boundary(
+            || order.borrow_mut().push("detach"),
+            || order.borrow_mut().push("notify"),
+        );
+
+        assert_eq!(*order.borrow(), ["detach", "notify"]);
+    }
+
+    #[test]
+    fn reopening_a_hidden_window_locks_before_showing_it() {
+        let order = RefCell::new(Vec::new());
+
+        run_window_reopen(
+            false,
+            || order.borrow_mut().push("lock"),
+            || order.borrow_mut().push("show"),
+        );
+
+        assert_eq!(*order.borrow(), ["lock", "show"]);
+    }
+
+    #[test]
+    fn showing_an_already_visible_window_does_not_lock_again() {
+        let order = RefCell::new(Vec::new());
+
+        run_window_reopen(
+            true,
+            || order.borrow_mut().push("lock"),
+            || order.borrow_mut().push("show"),
+        );
+
+        assert_eq!(*order.borrow(), ["show"]);
     }
 }

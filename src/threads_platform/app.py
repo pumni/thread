@@ -1,10 +1,16 @@
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import structlog
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry
 from pydantic import BaseModel
+from starlette.responses import JSONResponse
 
 from threads_platform.application.commands.runtime import CommandRuntime
 from threads_platform.application.operational_metrics import (
@@ -36,6 +42,7 @@ from threads_platform.infrastructure.persistence.readiness import (
     PostgresOperationalReadinessProbe,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
+from threads_platform.infrastructure.security.operator_auth import OperatorAuthService
 from threads_platform.infrastructure.threads_api.composition import compose_process_command_runtime
 from threads_platform.observability.logging import configure_logging
 from threads_platform.observability.metrics import ControlPlaneMetrics
@@ -47,6 +54,7 @@ from threads_platform.observability.tracing import (
 )
 from threads_platform.transport.http.auth import BearerTokenAuthenticator, CommandAuthenticator
 from threads_platform.transport.http.commands import create_command_router
+from threads_platform.transport.http.operators import create_operator_router
 from threads_platform.transport.http.worker_tls import WorkerTransportTLSMiddleware
 from threads_platform.transport.http.workers import create_worker_router
 
@@ -93,6 +101,7 @@ def create_app(
     worker_control_service: WorkerControlService | None = None,
     worker_job_service: WorkerJobService | None = None,
     worker_session_service: WorkerSessionService | None = None,
+    operator_auth_service: OperatorAuthService | None = None,
     worker_notifications: WorkerNotificationHub | None = None,
     readiness_probe: OperationalReadinessProbe | None = None,
     operational_metrics_probe: OperationalMetricsProbe | None = None,
@@ -125,6 +134,7 @@ def create_app(
     resolved_worker_service = worker_control_service
     resolved_job_service = worker_job_service
     resolved_session_service = worker_session_service
+    resolved_operator_auth = operator_auth_service
     resolved_readiness_probe = readiness_probe
     resolved_metrics_probe = operational_metrics_probe
     metrics = ControlPlaneMetrics(registry=metrics_registry)
@@ -135,6 +145,7 @@ def create_app(
         or resolved_worker_service is None
         or resolved_job_service is None
         or resolved_session_service is None
+        or resolved_operator_auth is None
         or resolved_metrics_probe is None
     ):
         engine = create_database_engine(resolved_settings.database_url)
@@ -169,6 +180,11 @@ def create_app(
             resolved_worker_service = WorkerControlService(unit_of_work_factory)
         if resolved_session_service is None:
             resolved_session_service = WorkerSessionService(unit_of_work_factory)
+        if resolved_operator_auth is None:
+            resolved_operator_auth = OperatorAuthService(
+                session_factory,
+                session_ttl=timedelta(seconds=resolved_settings.operator_session_ttl_seconds),
+            )
     if resolved_readiness_probe is None:
         resolved_readiness_probe = _DatabaseUnavailableReadinessProbe()
     if resolved_metrics_probe is None:
@@ -199,6 +215,21 @@ def create_app(
         lifespan=lifespan,
     )
 
+    async def operator_validation_error(request: Request, error: Exception) -> Response:
+        if isinstance(error, RequestValidationError) and request.url.path.startswith(
+            "/v1/operator/"
+        ):
+            details = [
+                {key: value for key, value in item.items() if key != "input"}
+                for item in error.errors()
+            ]
+            return JSONResponse(status_code=422, content={"detail": jsonable_encoder(details)})
+        if isinstance(error, RequestValidationError):
+            return await request_validation_exception_handler(request, error)
+        raise error
+
+    application.add_exception_handler(RequestValidationError, operator_validation_error)
+
     application.include_router(
         create_command_router(
             command_runtime,
@@ -217,8 +248,14 @@ def create_app(
             notifications,
             resolved_job_service,
             resolved_session_service,
+            resolved_operator_auth,
+            legacy_admin_compatibility=(
+                resolved_settings.worker_admin_auth_profile == "legacy_linux_it"
+                and sys.platform != "win32"
+            ),
         )
     )
+    application.include_router(create_operator_router(resolved_operator_auth, command_runtime))
 
     @application.get("/health", response_model=HealthResponse, tags=["health"])
     async def health() -> HealthResponse:

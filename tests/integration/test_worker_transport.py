@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -109,13 +110,21 @@ async def _authenticated_worker(
     return worker_id, session.access_token
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows intentionally disables the legacy static-admin-token path",
+)
 async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
     unit_of_work_factory: UnitOfWorkFactory,
 ) -> None:
     admin_token = "c1-test-worker-admin-token"
     service = WorkerControlService(unit_of_work_factory)
     app = create_app(
-        Settings(worker_admin_token=SecretStr(admin_token), worker_tls_required=True),
+        Settings(
+            worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
+            worker_tls_required=True,
+        ),
         worker_control_service=service,
     )
     transport = httpx2.ASGITransport(app=app)
@@ -256,6 +265,10 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
         assert set(heartbeat.json()) == set(hello.json())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows intentionally disables the legacy static-admin-token path",
+)
 async def test_durable_https_pull_recovers_job_without_wss_notification(
     unit_of_work_factory: UnitOfWorkFactory,
 ) -> None:
@@ -264,7 +277,11 @@ async def test_durable_https_pull_recovers_job_without_wss_notification(
     notifications = WorkerNotificationHub()
     jobs = WorkerJobService(unit_of_work_factory, notifications=notifications)
     app = create_app(
-        Settings(worker_admin_token=SecretStr(admin_token), worker_tls_required=True),
+        Settings(
+            worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
+            worker_tls_required=True,
+        ),
         worker_control_service=control,
         worker_job_service=jobs,
         worker_notifications=notifications,

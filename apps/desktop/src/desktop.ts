@@ -36,12 +36,46 @@ export interface DesktopSnapshot {
   };
 }
 
+export type OperatorRole = "OWNER" | "ADMIN" | "OPERATOR" | "VIEWER";
+
+export interface OperatorIdentity {
+  id: string;
+  username: string;
+  role: OperatorRole;
+  mustChangePassword: boolean;
+  expiresAt: string;
+}
+
+export interface OperatorUser {
+  id: string;
+  username: string;
+  role: OperatorRole;
+  enabled: boolean;
+  mustChangePassword: boolean;
+  createdAt: string;
+}
+
+export interface CreatedOperatorUser {
+  user: OperatorUser;
+  temporaryPassword: string;
+}
+
 export const DESKTOP_COMMANDS = [
   "get_desktop_snapshot",
   "provision_role",
   "reset_ui_preferences",
   "decommission_device",
   "request_quit",
+  "request_restart",
+  "operator_login",
+  "operator_bootstrap_owner",
+  "operator_current",
+  "operator_logout",
+  "operator_lock",
+  "operator_list_users",
+  "operator_create_user",
+  "operator_update_user",
+  "operator_change_password",
 ] as const;
 
 export function getDesktopSnapshot(): Promise<DesktopSnapshot> {
@@ -62,6 +96,60 @@ export function decommissionDevice(confirmation: string): Promise<DesktopSnapsho
 
 export function requestQuit(): Promise<void> {
   return invoke<void>("request_quit");
+}
+
+export function requestRestart(): Promise<void> {
+  return invoke<void>("request_restart");
+}
+
+export function operatorCurrent(): Promise<OperatorIdentity | null> {
+  return invoke<OperatorIdentity | null>("operator_current");
+}
+
+export function operatorLogin(
+  apiUrl: string,
+  username: string,
+  password: string,
+): Promise<OperatorIdentity> {
+  return invoke<OperatorIdentity>("operator_login", { apiUrl, username, password });
+}
+
+export function operatorBootstrapOwner(
+  username: string,
+  password: string,
+): Promise<OperatorIdentity> {
+  return invoke<OperatorIdentity>("operator_bootstrap_owner", { username, password });
+}
+
+export function operatorLogout(): Promise<void> {
+  return invoke<void>("operator_logout");
+}
+
+export function operatorLock(): Promise<void> {
+  return invoke<void>("operator_lock");
+}
+
+export function operatorListUsers(): Promise<OperatorUser[]> {
+  return invoke<OperatorUser[]>("operator_list_users");
+}
+
+export function operatorCreateUser(
+  username: string,
+  role: OperatorRole,
+): Promise<CreatedOperatorUser> {
+  return invoke<CreatedOperatorUser>("operator_create_user", { username, role });
+}
+
+export function operatorUpdateUser(
+  userId: string,
+  role: OperatorRole | null,
+  enabled: boolean | null,
+): Promise<OperatorUser> {
+  return invoke<OperatorUser>("operator_update_user", { userId, role, enabled });
+}
+
+export function operatorChangePassword(newPassword: string): Promise<OperatorIdentity> {
+  return invoke<OperatorIdentity>("operator_change_password", { newPassword });
 }
 
 export function listenForTrayQuit(): Promise<() => void> {

@@ -724,6 +724,94 @@ input:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.operator-login-form,
+.operator-user-create {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+.operator-login-form label,
+.operator-user-create label {
+  display: grid;
+  gap: 6px;
+  color: #737580;
+  font-size: 10px;
+}
+.operator-login-form input,
+.operator-user-create input,
+.operator-user-create select,
+.operator-user-row select {
+  min-width: 0;
+  height: 35px;
+  padding: 0 10px;
+  border: 1px solid #dedfe6;
+  border-radius: 7px;
+  color: #393b45;
+  background: #fff;
+  font: inherit;
+  font-size: 11px;
+}
+.operator-login-form .button,
+.operator-user-create .button {
+  justify-self: start;
+}
+.operator-users-card {
+  margin-top: 18px;
+}
+.operator-user-create {
+  grid-template-columns: minmax(150px, 1fr) minmax(130px, 0.7fr) auto;
+  align-items: end;
+}
+.temporary-password {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e7e1f7;
+  border-radius: 9px;
+  background: #fbfaff;
+  color: #555262;
+  font-size: 11px;
+}
+.temporary-password code {
+  overflow-wrap: anywhere;
+  color: #39334f;
+  font-size: 12px;
+  user-select: all;
+}
+div.temporary-password > span {
+  color: #85828e;
+  font-size: 10px;
+}
+.operator-user-list {
+  display: grid;
+  margin-top: 16px;
+  border-top: 1px solid #eff0f3;
+}
+.operator-user-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) auto minmax(120px, 0.7fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid #eff0f3;
+}
+.operator-user-row > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.operator-user-row > div > strong {
+  overflow: hidden;
+  color: #41434d;
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+.operator-user-row > div > span {
+  color: #8a8d98;
+  font-size: 10px;
+}
+
 @media (max-width: 900px) {
   .desktop-shell {
     grid-template-columns: 205px minmax(0, 1fr);
@@ -774,6 +862,19 @@ input:focus-visible {
   }
   .runtime-facts {
     grid-template-columns: 1fr;
+  }
+  .operator-user-create {
+    grid-template-columns: 1fr;
+  }
+  .operator-user-row {
+    grid-template-columns: minmax(90px, 1fr) auto;
+  }
+  .operator-user-row select {
+    grid-column: 1 / 2;
+  }
+  .operator-user-row .quiet-link {
+    grid-column: 2 / 3;
+    grid-row: 2;
   }
   .runtime-facts div {
     grid-template-columns: 1fr 1fr;

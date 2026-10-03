@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -359,6 +360,10 @@ async def test_abort_is_offline_recovery_and_worker_can_only_complete_itself(
     assert (await control.heartbeat(worker_id)).status is WorkerStatus.ONLINE
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows intentionally disables the legacy static-admin-token path",
+)
 async def test_drain_http_auth_boundaries_status_and_advisory(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
@@ -371,6 +376,7 @@ async def test_drain_http_auth_boundaries_status_and_advisory(
         Settings(
             database_url=None,
             worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
             worker_tls_required=True,
         ),
         worker_control_service=control,

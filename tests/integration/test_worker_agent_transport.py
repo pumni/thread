@@ -1,3 +1,4 @@
+import sys
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -32,6 +33,10 @@ from threads_platform.workers.key_store import WorkerDeviceIdentity
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows intentionally disables the legacy static-admin-token path",
+)
 async def test_protocol_v2_http_session_and_capacity_foundation(
     unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
 ) -> None:
@@ -50,7 +55,11 @@ async def test_protocol_v2_http_session_and_capacity_foundation(
     jobs = WorkerJobService(unit_of_work_factory)
     sessions = WorkerSessionService(unit_of_work_factory)
     app = create_app(
-        Settings(worker_admin_token=SecretStr(admin_token), worker_tls_required=True),
+        Settings(
+            worker_admin_token=SecretStr(admin_token),
+            worker_admin_auth_profile="legacy_linux_it",
+            worker_tls_required=True,
+        ),
         worker_control_service=control,
         worker_job_service=jobs,
         worker_session_service=sessions,

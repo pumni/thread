@@ -1,5 +1,5 @@
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
 import pytest_asyncio
@@ -14,6 +14,7 @@ from threads_platform.infrastructure.persistence.database import (
     create_session_factory,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
+from threads_platform.infrastructure.security.operator_auth import OperatorAuthService
 
 
 def _test_database_url() -> str:
@@ -60,7 +61,9 @@ async def unit_of_work_factory() -> AsyncIterator[SQLAlchemyUnitOfWorkFactory]:
     async with engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE TABLE lead_candidate_transitions, lead_candidate_evidence, "
+                "TRUNCATE TABLE workspace_audit_events, operator_login_throttles, "
+                "operator_sessions, operator_users, lead_candidate_transitions, "
+                "lead_candidate_evidence, "
                 "lead_candidates, discovery_source_evidence, discovery_run_cursors, "
                 "discovery_runs, discovered_threads, discovered_authors, "
                 "discovery_search_queries, discovery_campaigns, "
@@ -84,3 +87,20 @@ async def unit_of_work_factory() -> AsyncIterator[SQLAlchemyUnitOfWorkFactory]:
         )
     yield SQLAlchemyUnitOfWorkFactory(create_session_factory(engine))
     await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def operator_session_factory(
+    unit_of_work_factory: SQLAlchemyUnitOfWorkFactory,
+) -> AsyncIterator[Callable[[], AsyncSession]]:
+    del unit_of_work_factory
+    engine = create_database_engine(_test_database_url())
+    yield create_session_factory(engine)
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def operator_auth_service(
+    operator_session_factory: Callable[[], AsyncSession],
+) -> OperatorAuthService:
+    return OperatorAuthService(operator_session_factory)

@@ -176,6 +176,21 @@ impl Supervisor {
         }
     }
 
+    pub fn bootstrap_owner(&mut self, username: &str, password: &str) -> Result<(), String> {
+        let controller = self
+            .controller
+            .as_mut()
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())?;
+        controller
+            .bootstrap_owner(username, password)
+            .map_err(|code| code.to_string())
+    }
+
+    pub fn restart(&mut self, role: ProvisionedRole) -> Result<(), String> {
+        self.stop()?;
+        self.start(role)
+    }
+
     fn start_controller(&mut self) -> Result<(), String> {
         let data_root = self
             .data_root
@@ -595,6 +610,53 @@ impl ControllerRuntime {
         command.arg("migrate");
         self.set_runtime_environment(&mut command);
         self.run_one_shot(command, MIGRATION_TIMEOUT, "controller_migration_failed")
+    }
+
+    fn bootstrap_owner(&mut self, username: &str, password: &str) -> Result<(), &'static str> {
+        let mut command = Command::new(self.store.runtime_executable());
+        command
+            .arg("bootstrap-owner")
+            .arg("--username")
+            .arg(username)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.set_runtime_environment(&mut command);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| "operator_owner_bootstrap_failed")?;
+        if self.job.assign(&child).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("controller_process_job_assign_failed");
+        }
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("operator_owner_bootstrap_failed");
+        };
+        if stdin
+            .write_all(password.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .is_err()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("operator_owner_bootstrap_failed");
+        }
+        drop(stdin);
+        let status = wait_for_child(&mut child, Duration::from_secs(60))
+            .map_err(|_| "operator_owner_bootstrap_failed")?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("operator_owner_bootstrap_failed")
+        }
     }
 
     fn spawn_runtime(&mut self, mode: &str) -> Result<Child, &'static str> {
