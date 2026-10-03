@@ -288,8 +288,22 @@ function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
         ([System.Windows.Automation.ControlType]::Edit)
     if (-not $input) { throw "desktop_login_input_unavailable" }
     $input.SetFocus()
+    Start-Sleep -Milliseconds 100
     [System.Windows.Forms.SendKeys]::SendWait("^a")
     [System.Windows.Forms.SendKeys]::SendWait($Value)
+    if ($Name -eq "Username") {
+        Wait-Until {
+            $current = Find-Element (Get-Window $ProcessId) $Name `
+                ([System.Windows.Automation.ControlType]::Edit)
+            if (-not $current) { return $false }
+            try {
+                $valuePattern = $current.GetCurrentPattern(
+                    [System.Windows.Automation.ValuePattern]::Pattern
+                )
+                return $valuePattern.Current.Value -ceq $Value
+            } catch { return $false }
+        } 5 "desktop_login_username_not_populated"
+    }
 }
 
 function Test-ControllerOwnerSignedIn([int]$ProcessId) {
@@ -298,12 +312,23 @@ function Test-ControllerOwnerSignedIn([int]$ProcessId) {
         $null -ne (Find-TextContaining $window "OWNER")
 }
 
+function Test-FirstOwnerSetupFailed([int]$ProcessId) {
+    return $null -ne (Find-TextContaining (Get-Window $ProcessId) "First Owner setup failed")
+}
+
 function Bootstrap-ControllerOwner([int]$ProcessId) {
     Invoke-Button $ProcessId "Set up first Owner"
     Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
     Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
     Invoke-Button $ProcessId "Create first Owner"
-    Wait-Until { Test-ControllerOwnerSignedIn $ProcessId } 30 "controller_first_owner_bootstrap_failed"
+    Wait-Until {
+        (Test-ControllerOwnerSignedIn $ProcessId) -or (Test-FirstOwnerSetupFailed $ProcessId)
+    } 30 "controller_first_owner_setup_no_response"
+    if (Test-FirstOwnerSetupFailed $ProcessId) {
+        $ownerCount = Invoke-Psql (Get-ControllerConfig) `
+            "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
+        throw "controller_first_owner_setup_rejected_enabled_owners_$ownerCount"
+    }
 }
 
 function Ensure-ControllerOwner([int]$ProcessId) {
