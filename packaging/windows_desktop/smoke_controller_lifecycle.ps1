@@ -24,6 +24,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../../")).Path
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Security
+Add-Type -AssemblyName System.Windows.Forms
 if (-not ("ThreadsControllerSmoke.NativeMethods" -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -98,6 +99,7 @@ $checks = [ordered]@{
     atomic_non_secret_config = $false
     loopback_only_database_and_endpoint = $false
     no_owner_or_lan_bootstrap = $false
+    local_first_owner_bootstrap = $false
     separate_http_and_scheduler_processes = $false
     x_hides_and_runtime_continues = $false
     reopen_keeps_one_runtime_and_database_identity = $false
@@ -121,6 +123,8 @@ $controllerIdentity = $null
 $databaseSystemIdentifier = $null
 $shutdownExitOrder = $null
 $sentinel = [Guid]::NewGuid().ToString("N")
+$script:smokeOwnerUsername = "dx05owner" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
+$script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
 $processEvidence = [ordered]@{}
 $rootWasMoved = $false
 $parentCrashPids = @()
@@ -279,6 +283,37 @@ function Invoke-Button([int]$ProcessId, [string]$Name) {
     } 20 "desktop_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
+function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
+    $input = Find-Element (Get-Window $ProcessId) $Name `
+        ([System.Windows.Automation.ControlType]::Edit)
+    if (-not $input) { throw "desktop_login_input_unavailable" }
+    $input.SetFocus()
+    [System.Windows.Forms.SendKeys]::SendWait("^a")
+    [System.Windows.Forms.SendKeys]::SendWait($Value)
+}
+
+function Test-ControllerOwnerSignedIn([int]$ProcessId) {
+    $window = Get-Window $ProcessId
+    return $null -ne (Find-TextContaining $window "Signed in as $script:smokeOwnerUsername") -and
+        $null -ne (Find-TextContaining $window "OWNER")
+}
+
+function Bootstrap-ControllerOwner([int]$ProcessId) {
+    Invoke-Button $ProcessId "Set up first Owner"
+    Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
+    Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
+    Invoke-Button $ProcessId "Create first Owner"
+    Wait-Until { Test-ControllerOwnerSignedIn $ProcessId } 30 "controller_first_owner_bootstrap_failed"
+}
+
+function Ensure-ControllerOwner([int]$ProcessId) {
+    if (Test-ControllerOwnerSignedIn $ProcessId) { return }
+    Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
+    Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
+    Invoke-Button $ProcessId "Sign in"
+    Wait-Until { Test-ControllerOwnerSignedIn $ProcessId } 30 "controller_owner_login_failed"
+}
+
 function Start-Desktop([int]$WindowTimeout = 30) {
     $process = Start-Process -FilePath $DesktopExecutable -PassThru
     $desktopPids.Add([int]$process.Id)
@@ -393,10 +428,29 @@ function Assert-ControllerProcesses {
 }
 
 function Quit-Desktop([int]$ProcessId) {
-    Invoke-Button $ProcessId "Quit…"
-    Invoke-Button $ProcessId "Stop node and quit"
-    Wait-Until { -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } `
-        55 "desktop_graceful_quit_timeout"
+    $owned = Get-ControllerProcesses
+    if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
+        Ensure-ControllerOwner $ProcessId
+        Invoke-Button $ProcessId "Quit…"
+        Invoke-Button $ProcessId "Stop node and quit"
+        Wait-Until { -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } `
+            55 "desktop_graceful_quit_timeout"
+        return
+    }
+
+    # The smoke fixture cannot authenticate when a failed runtime has no healthy Operator API.
+    # Stop only this test-owned Desktop process; healthy Controller stops above always use OWNER auth.
+    if ($ProcessId -notin $desktopPids) { throw "controller_smoke_desktop_process_not_owned" }
+    $tracked = Get-TrackedProcess $ProcessId $DesktopExecutable
+    if (-not $tracked) { throw "controller_smoke_desktop_process_unavailable" }
+    try {
+        $tracked.Kill()
+        if (-not $tracked.WaitForExit(10000)) { throw "controller_smoke_failed_runtime_cleanup_timeout" }
+    } finally {
+        $tracked.Dispose()
+    }
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 20 `
+        "controller_smoke_failed_runtime_processes_remain"
 }
 
 function Get-ProcessExitTime(
@@ -525,6 +579,10 @@ try {
     $checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and $operatorUserCount -eq "0" -and
         $config.endpointPort -gt 0 -and $config.databasePort -gt 0
     if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
+    Bootstrap-ControllerOwner $desktop.Id
+    $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
+    $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
+    if (-not $checks.local_first_owner_bootstrap) { throw "controller_local_first_owner_bootstrap_invalid" }
     Invoke-Psql $config "CREATE TABLE dx04_runtime_evidence (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO dx04_runtime_evidence (id, marker) VALUES (1, '$sentinel');" | Out-Null
     Assert-DatabaseValue $config $sentinel
 
