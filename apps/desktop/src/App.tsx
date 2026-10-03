@@ -42,14 +42,15 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 };
 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
-const operatorAccessErrors = new Set([
-  "operator_authentication_required",
-  "operator_password_change_required",
-  "operator_forbidden",
-  "operator_api_unavailable",
-  "operator_request_failed",
-  "operator_response_invalid",
-]);
+const operatorAccessMessages: Record<string, string> = {
+  operator_authentication_required: "Sign in again before stopping this node.",
+  operator_password_change_required: "Change your Workspace password before stopping this node.",
+  operator_forbidden: "Only an Owner or Admin can stop this Controller.",
+  operator_api_unavailable:
+    "The Controller could not verify Operator access. Try again when it is available.",
+  operator_request_failed: "The Controller could not verify Operator access. Try again.",
+  operator_response_invalid: "The Controller returned an invalid Operator response. Try again.",
+};
 
 function App() {
   const queryClient = useQueryClient();
@@ -175,9 +176,8 @@ function App() {
       const errorCode =
         typeof error === "string" ? error : error instanceof Error ? error.message : "";
       setActionError(
-        operatorAccessErrors.has(errorCode)
-          ? "An active Operator session with permission to stop this node is required."
-          : "The node could not stop cleanly. Check the runtime status before retrying.",
+        operatorAccessMessages[errorCode] ??
+          "The node could not stop cleanly. Check the runtime status before retrying.",
       );
     }
   }

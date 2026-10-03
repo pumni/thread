@@ -471,6 +471,18 @@ function Quit-Desktop([int]$ProcessId) {
                 if (Find-TextContaining $window "An active Operator session with permission to stop this node is required") {
                     throw "controller_stop_operator_authorization_denied"
                 }
+                if (Find-TextContaining $window "Sign in again before stopping this node") {
+                    throw "controller_stop_operator_session_required"
+                }
+                if (Find-TextContaining $window "Only an Owner or Admin can stop this Controller") {
+                    throw "controller_stop_operator_role_forbidden"
+                }
+                if (Find-TextContaining $window "Change your Workspace password before stopping this node") {
+                    throw "controller_stop_operator_password_change_required"
+                }
+                if (Find-TextContaining $window "The Controller could not verify Operator access") {
+                    throw "controller_stop_operator_verification_failed"
+                }
                 if (Find-TextContaining $window "Operator access changed. Sign in again") {
                     throw "controller_stop_operator_session_revoked"
                 }

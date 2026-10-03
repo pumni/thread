@@ -166,6 +166,7 @@ describe("desktop provisioning", () => {
       username: "first-owner",
       password: "synthetic owner passphrase",
     });
+    expect(native.listen).toHaveBeenCalledTimes(2);
     expect(localStorage.length).toBe(0);
   });
 
@@ -292,6 +293,39 @@ describe("desktop provisioning", () => {
         "An active Operator session with permission to stop this node is required.",
       ),
     ).not.toBeInTheDocument();
+  });
+
+  it("explains when the current Operator role cannot stop a Controller", async () => {
+    const listeners: Record<string, (event: unknown) => void> = {};
+    native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {
+      listeners[event] = handler;
+      return () => undefined;
+    });
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        return {
+          id: "operator-id",
+          username: "current-operator",
+          role: "OPERATOR",
+          mustChangePassword: false,
+          expiresAt: "2026-10-03T18:00:00Z",
+        };
+      }
+      if (command === "operator_list_users" || command === "operator_logout") return [];
+      if (command === "request_quit") throw "operator_forbidden";
+      throw new Error("unknown command");
+    });
+
+    renderDesktop();
+    await screen.findByText("Signed in as current-operator");
+    await waitFor(() => expect(listeners["desktop://quit-requested"]).toBeDefined());
+    listeners["desktop://quit-requested"]({});
+    fireEvent.click(await screen.findByRole("button", { name: "Stop node and quit" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Only an Owner or Admin can stop this Controller.",
+    );
   });
 
   it("locks protected information when the native window loses focus", async () => {
