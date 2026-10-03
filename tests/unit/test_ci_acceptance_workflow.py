@@ -14,7 +14,7 @@ def test_heavy_pr_acceptance_runs_only_at_ready_boundaries() -> None:
         ".github/workflows/desktop.yml",
     ):
         workflow = _text(path)
-        assert "types: [opened, ready_for_review, reopened]" in workflow
+        assert "types: [ready_for_review, reopened]" in workflow
         assert "github.event.pull_request.draft == false" in workflow
         assert "synchronize" not in workflow.split("push:", 1)[0]
 
