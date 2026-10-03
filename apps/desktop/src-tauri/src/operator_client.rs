@@ -155,7 +155,7 @@ impl OperatorAuthState {
             .map_err(|_| "operator_api_unavailable".to_string())?;
         if response.status() == StatusCode::UNAUTHORIZED {
             self.clear_if_matches(&snapshot);
-            return Ok(None);
+            return Err("operator_session_revoked".to_string());
         }
         if !response.status().is_success() {
             return Err("operator_request_failed".to_string());

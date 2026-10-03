@@ -437,6 +437,25 @@ function Invoke-Psql([object]$Config, [string]$Sql) {
     }
 }
 
+function Get-OperatorSessionEvidence([object]$Config) {
+    try {
+        $username = $script:smokeOwnerUsername
+        $activeSessions = Invoke-Psql $Config `
+            "SELECT COUNT(*) FROM public.operator_sessions s JOIN public.operator_users u ON u.id = s.operator_user_id WHERE u.username = '$username' AND s.revoked_at IS NULL AND s.expires_at > now();"
+        $recentEvents = Invoke-Psql $Config `
+            "SELECT COALESCE(string_agg(event_type, ',' ORDER BY created_at DESC), '') FROM (SELECT event_type, created_at FROM public.workspace_audit_events WHERE actor_username = '$username' ORDER BY created_at DESC LIMIT 8) recent;"
+        return [ordered]@{
+            active_sessions = $activeSessions
+            recent_auth_events = $recentEvents
+        }
+    } catch {
+        return [ordered]@{
+            active_sessions = "unavailable"
+            recent_auth_events = "unavailable"
+        }
+    }
+}
+
 function Get-ListenerAddresses([int]$Port) {
     @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty LocalAddress -Unique)
@@ -462,6 +481,8 @@ function Quit-Desktop([int]$ProcessId) {
     $owned = Get-ControllerProcesses
     if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
         Ensure-ControllerOwner $ProcessId
+        $processEvidence.operator_session_before_quit =
+            Get-OperatorSessionEvidence (Get-ControllerConfig)
         Invoke-Button $ProcessId "Quit…"
         Invoke-Button $ProcessId "Stop node and quit"
         try {
@@ -473,6 +494,9 @@ function Quit-Desktop([int]$ProcessId) {
                 }
                 if (Find-TextContaining $window "Sign in again before stopping this node") {
                     throw "controller_stop_operator_session_required"
+                }
+                if (Find-TextContaining $window "This Operator session expired or was revoked") {
+                    throw "controller_stop_operator_session_revoked"
                 }
                 if (Find-TextContaining $window "Only an Owner or Admin can stop this Controller") {
                     throw "controller_stop_operator_role_forbidden"
@@ -511,6 +535,7 @@ function Quit-Desktop([int]$ProcessId) {
                     $window "Operator access changed. Sign in again"
                 )
                 shutdown_error = $null -ne (Find-TextContaining $window "The node could not stop cleanly")
+                operator_session_state = Get-OperatorSessionEvidence (Get-ControllerConfig)
             }
             throw
         }

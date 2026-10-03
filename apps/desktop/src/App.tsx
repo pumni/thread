@@ -44,6 +44,8 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
 const operatorAccessMessages: Record<string, string> = {
   operator_authentication_required: "Sign in again before stopping this node.",
+  operator_session_revoked:
+    "This Operator session expired or was revoked. Sign in again before stopping this node.",
   operator_password_change_required: "Change your Workspace password before stopping this node.",
   operator_forbidden: "Only an Owner or Admin can stop this Controller.",
   operator_api_unavailable:
@@ -598,7 +600,13 @@ function App() {
                         forceLocked={sessionLocked}
                         idleTimeoutMs={5 * 60 * 1_000}
                         onLock={handleSessionLock}
-                        onUnlock={async () => Boolean(await operatorCurrent())}
+                        onUnlock={async () => {
+                          try {
+                            return Boolean(await operatorCurrent());
+                          } catch {
+                            return false;
+                          }
+                        }}
                       >
                         <div className="runtime-facts">
                           <div>
