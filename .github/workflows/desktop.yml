@@ -5,39 +5,58 @@ on:
     paths:
       - "apps/desktop/**"
       - "packaging/windows_desktop/**"
-      - "docs/desktop/**"
       - "pyproject.toml"
       - "uv.lock"
       - "tests/unit/test_worker_control_client_httpx2.py"
       - "tests/unit/test_windows_desktop_evidence.py"
       - ".github/workflows/desktop.yml"
+      - "!**/*.md"
   push:
+    branches:
+      - main
     paths:
       - "apps/desktop/**"
       - "packaging/windows_desktop/**"
-      - "docs/desktop/**"
       - "pyproject.toml"
       - "uv.lock"
       - "tests/unit/test_worker_control_client_httpx2.py"
       - "tests/unit/test_windows_desktop_evidence.py"
       - ".github/workflows/desktop.yml"
+      - "!**/*.md"
   workflow_dispatch:
+    inputs:
+      runtime_layout:
+        description: Runtime layout to verify (split is the manual fallback gate)
+        type: choice
+        options:
+          - shared
+          - split
+        default: shared
+        required: true
 
 permissions:
   contents: read
 
+env:
+  DESKTOP_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+concurrency:
+  group: desktop-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   frontend:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.runtime_layout == 'shared' }}
     name: Bun frontend gates (Windows x64)
     runs-on: windows-2025
     defaults:
       run:
         working-directory: apps/desktop
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ env.DESKTOP_SOURCE_SHA }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
@@ -49,6 +68,7 @@ jobs:
       - run: bun run build
 
   native:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.runtime_layout == 'shared' }}
     name: Rust and Tauri release build (Windows x64)
     runs-on: windows-2025
     timeout-minutes: 90
@@ -56,13 +76,27 @@ jobs:
       run:
         working-directory: apps/desktop
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
+          ref: ${{ env.DESKTOP_SOURCE_SHA }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Read Rust compiler version for the cache key
+        id: rust-toolchain
+        shell: pwsh
+        run: |
+          $version = (rustc --version).Split(' ')[1]
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Cache Windows Cargo target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            apps/desktop/src-tauri/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-toolchain.outputs.version }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.toml', 'apps/desktop/src-tauri/Cargo.lock') }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
@@ -76,47 +110,43 @@ jobs:
         run: >-
           ../../packaging/windows_desktop/smoke_desktop_lifecycle.ps1
           -BundleExecutable "$env:GITHUB_WORKSPACE/apps/desktop/src-tauri/target/release/threads-desktop.exe"
-          -ExpectedSourceRevision $env:GITHUB_SHA
+          -ExpectedSourceRevision $env:DESKTOP_SOURCE_SHA
           -EvidencePath "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/desktop-lifecycle.json"
       - name: Upload exact-SHA Desktop lifecycle evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dx02-windows-lifecycle-${{ github.sha }}
+          name: dx02-windows-lifecycle-${{ env.DESKTOP_SOURCE_SHA }}
           path: build/windows-desktop/evidence/desktop-lifecycle.json
           if-no-files-found: warn
           retention-days: 14
       - name: Upload exact-SHA Desktop executable for Controller lifecycle smoke
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dx04-desktop-${{ github.sha }}
+          name: dx04-desktop-${{ env.DESKTOP_SOURCE_SHA }}
           path: apps/desktop/src-tauri/target/release/threads-desktop.exe
           if-no-files-found: error
           retention-days: 14
 
   windows-runtime-packaging:
-    name: DX-03 packaged runtimes on isolated Windows x64
+    name: Windows runtime packaging and isolated smoke
     runs-on: windows-2025
-    needs: native
     timeout-minutes: 90
+    env:
+      RUNTIME_LAYOUT: ${{ inputs.runtime_layout || 'shared' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
-      - name: Download exact-SHA Desktop executable
-        uses: actions/download-artifact@v4
-        with:
-          name: dx04-desktop-${{ github.sha }}
-          path: build/windows-desktop/desktop
+          ref: ${{ env.DESKTOP_SOURCE_SHA }}
       - name: Assert exact clean source revision
         shell: pwsh
         run: |
           $actual = (git rev-parse HEAD).Trim()
-          if ($actual -ne $env:GITHUB_SHA) { throw "checkout_sha_mismatch" }
+          if ($actual -ne $env:DESKTOP_SOURCE_SHA) { throw "checkout_sha_mismatch" }
           if (-not [Environment]::Is64BitOperatingSystem) { throw "runner_must_be_windows_x64" }
-          Write-Output "DX03_SOURCE_SHA=$actual"
-      - uses: astral-sh/setup-uv@v6
+          Write-Output "DESKTOP_SOURCE_SHA=$actual"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: 0.12.21
           enable-cache: true
@@ -130,41 +160,96 @@ jobs:
         run: uv run --locked pytest -q tests/unit/test_windows_desktop_evidence.py
       - name: Install locked runtime packaging dependencies
         run: uv sync --locked --no-dev --group packaging
-      - name: Build both pinned Windows runtime candidates
-        run: uv run --locked --no-dev --group packaging python packaging/windows_desktop/build_runtime.py --layout all
+      - name: Build pinned Windows runtime candidate
+        run: uv run --locked --no-dev --group packaging python packaging/windows_desktop/build_runtime.py --layout $env:RUNTIME_LAYOUT
       - name: Verify source, dependency, license and bundle checksums
         run: >-
           uv run --locked --no-dev --group packaging python
           packaging/windows_desktop/verify_runtime_evidence.py
           --candidate-root build/windows-desktop/candidates
-          --expected-source-revision $env:GITHUB_SHA
+          --layouts $env:RUNTIME_LAYOUT
+          --expected-source-revision $env:DESKTOP_SOURCE_SHA
           --uv-lock uv.lock
           --download-manifest packaging/windows_desktop/download-manifest.json
           --postgres-archive build/downloads/postgresql-17.11-4-windows-x64-binaries.zip
           --result-path build/windows-desktop/evidence/build-verification.json
-      - name: Smoke candidates and Controller as a non-administrator
+      - name: Smoke selected runtime as a non-administrator
         shell: pwsh
         run: >-
           ./packaging/windows_desktop/run_hosted_smoke.ps1
           -RepositoryRoot $env:GITHUB_WORKSPACE
-          -ExpectedSourceRevision $env:GITHUB_SHA
+          -ExpectedSourceRevision $env:DESKTOP_SOURCE_SHA
+          -RuntimeLayout $env:RUNTIME_LAYOUT
           -EvidenceOutput $env:GITHUB_WORKSPACE/build/windows-desktop/evidence/hosted
-          -ControllerDesktopExecutable "$env:GITHUB_WORKSPACE/build/windows-desktop/desktop/threads-desktop.exe"
-          -ControllerEvidenceOutput "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/controller-lifecycle.json"
-      - name: Upload exact-SHA runtime candidates
+      - name: Upload exact-SHA runtime candidate
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dx03-candidates-${{ github.sha }}
+          name: dx03-candidates-${{ env.DESKTOP_SOURCE_SHA }}
           path: build/windows-desktop/candidates
           if-no-files-found: warn
           compression-level: 0
           retention-days: 14
-      - name: Upload compact exact-SHA runtime evidence
+      - name: Upload exact-SHA runtime evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dx03-evidence-${{ github.sha }}
+          name: dx03-runtime-evidence-${{ env.DESKTOP_SOURCE_SHA }}
+          path: build/windows-desktop/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  controller-acceptance:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.runtime_layout == 'shared' }}
+    name: Shared Controller acceptance join (Windows x64)
+    runs-on: windows-2025
+    needs:
+      - native
+      - windows-runtime-packaging
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ env.DESKTOP_SOURCE_SHA }}
+      - name: Download exact-SHA Desktop executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dx04-desktop-${{ env.DESKTOP_SOURCE_SHA }}
+          path: build/windows-desktop/desktop
+      - name: Download exact-SHA shared runtime candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dx03-candidates-${{ env.DESKTOP_SOURCE_SHA }}
+          path: build/windows-desktop/candidates
+      - name: Download exact-SHA runtime smoke evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dx03-runtime-evidence-${{ env.DESKTOP_SOURCE_SHA }}
+          path: build/windows-desktop/evidence
+      - name: Assert exact clean source revision
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:DESKTOP_SOURCE_SHA) { throw "checkout_sha_mismatch" }
+          if (-not [Environment]::Is64BitOperatingSystem) { throw "runner_must_be_windows_x64" }
+          Write-Output "DESKTOP_SOURCE_SHA=$actual"
+      - name: Run shared Controller lifecycle smoke as a non-administrator
+        shell: pwsh
+        run: >-
+          ./packaging/windows_desktop/run_hosted_smoke.ps1
+          -RepositoryRoot $env:GITHUB_WORKSPACE
+          -ExpectedSourceRevision $env:DESKTOP_SOURCE_SHA
+          -RuntimeLayout shared
+          -ControllerOnly
+          -EvidenceOutput $env:GITHUB_WORKSPACE/build/windows-desktop/evidence/hosted
+          -ControllerDesktopExecutable "$env:GITHUB_WORKSPACE/build/windows-desktop/desktop/threads-desktop.exe"
+          -ControllerEvidenceOutput "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/controller-lifecycle.json"
+      - name: Upload exact-SHA Controller acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}
           path: build/windows-desktop/evidence
           if-no-files-found: warn
           retention-days: 14

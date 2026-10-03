@@ -112,3 +112,7 @@ Linux/Docker continues as an official IT/developer Controller profile: provide a
 ## 10. Operational rehearsal and signoff
 
 Use [Acceptance Matrix](ACCEPTANCE_MATRIX.md) as the canonical case list. Each run captures: image/build/version, Desktop and sidecar SHA256, Python/Rust/TS lock hashes, Windows version, Windows account context (non-secret), Controller root fingerprints (public), endpoint, test identity synthetic labels, test timestamps, exact PR commit head, outcomes with failure logs redacted. Store evidence in repo only when sanitized and approved. External real Threads/Meta activity must obey existing live-validation gate #3; synthetic browser fixture/login on test accounts does not prove production API capability. Notify Product Owner of no-backup/no-before-login limitations at each pilot signoff.
+
+## 11. Desktop CI routine and fallback gates
+
+Routine pull-request/push acceptance uses the selected `shared` runtime. Rust/Tauri and shared package verification run in parallel; a later join consumes their exact-SHA artifacts and runs the non-admin Controller lifecycle smoke. Markdown-only changes do not run the heavyweight Desktop workflow; a change that also touches executable/package inputs still runs the full gate. The `split` fallback is a separate `workflow_dispatch` runtime-only feasibility check and does not replace shared exact-head acceptance. Artifact names and workflow behavior are documented in the [Windows runtime packaging runbook](../../packaging/windows_desktop/README.md).

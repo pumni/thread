@@ -346,8 +346,14 @@ function Invoke-Button([string]$Name) {
         $window = Get-PrimaryWindow
         $button = Find-ElementByName $window $Name ([System.Windows.Automation.ControlType]::Button)
         if (-not $button) { return $false }
-        $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        return $true
+        try {
+            $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            return $true
+        } catch [System.Management.Automation.MethodInvocationException] {
+            # Hosted UI Automation can transiently return a stale COM element.
+            # Reacquire the semantic button on the next bounded poll.
+            return $false
+        }
     } 20 "lifecycle_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
