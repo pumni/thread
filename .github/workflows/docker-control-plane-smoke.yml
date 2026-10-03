@@ -2,6 +2,7 @@ name: Docker Control Plane smoke
 
 on:
   pull_request:
+    types: [opened, ready_for_review, reopened]
   push:
     branches: [main]
   workflow_dispatch:
@@ -11,6 +12,7 @@ permissions:
 
 jobs:
   compose-restart-smoke:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: Exact-head Docker and PostgreSQL restart smoke
     runs-on: ubuntu-latest
     timeout-minutes: 25
