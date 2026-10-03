@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -10,7 +12,109 @@ from typing import Any
 
 import pytest
 
-SCRIPT = Path(__file__).parents[2] / "packaging" / "windows_desktop" / "verify_runtime_evidence.py"
+REPO_ROOT = Path(__file__).parents[2]
+SCRIPT = REPO_ROOT / "packaging" / "windows_desktop" / "verify_runtime_evidence.py"
+CONTROLLER_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "smoke_controller_lifecycle.ps1"
+
+
+def test_controller_quit_wait_is_process_authoritative() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell AST parser is only available on Windows test hosts")
+
+    smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
+    assertion = f"""
+$smokePath = '{smoke_path}'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $smokePath, [ref]$tokens, [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) {{ throw "Controller smoke script did not parse" }}
+
+$waitFunctions = @($ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Wait-ForDesktopParentExit'
+}}, $true))
+if ($waitFunctions.Count -ne 1) {{ throw "Expected one process-exit helper" }}
+
+$waitBody = $waitFunctions[0].Body
+$waitCommands = @($waitBody.FindAll({{
+    param($node) $node -is [System.Management.Automation.Language.CommandAst]
+}}, $true) | ForEach-Object {{ $_.GetCommandName() }})
+foreach ($required in @('Wait-Until', 'Get-ProcessIfPresent')) {{
+    if ($waitCommands -notcontains $required) {{ throw "Missing process wait command: $required" }}
+}}
+$forbiddenCommands = @('Get-Window', 'Find-Element', 'Find-TextContaining', 'Get-ElementName')
+if (@($waitCommands | Where-Object {{ $forbiddenCommands -contains $_ }}).Count -gt 0) {{
+    throw "Process-exit helper depends on UI Automation"
+}}
+$waitTypes = @($waitBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.TypeExpressionAst] -and
+        $node.TypeName.FullName -like 'System.Windows.Automation.*'
+}}, $true))
+$waitMembers = @($waitBody.FindAll({{
+    param($node) $node -is [System.Management.Automation.Language.MemberExpressionAst]
+}}, $true) | ForEach-Object {{ $_.Member.Extent.Text }})
+$uiaWaitMembers = @($waitMembers | Where-Object {{
+    $_ -in @('FindAll', 'FindFirst', 'FromHandle', 'Current')
+}})
+if ($waitTypes.Count -gt 0 -or
+    $uiaWaitMembers.Count -gt 0) {{
+    throw "Process-exit helper uses UI Automation"
+}}
+
+$quitFunctions = @($ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Quit-Desktop'
+}}, $true))
+if ($quitFunctions.Count -ne 1) {{ throw "Expected one Quit-Desktop function" }}
+$stopCalls = @($quitFunctions[0].Body.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Invoke-Button' -and
+        $node.Extent.Text.Contains('Stop node and quit')
+}}, $true))
+$waitCalls = @($quitFunctions[0].Body.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Wait-ForDesktopParentExit'
+}}, $true))
+if ($stopCalls.Count -ne 1 -or $waitCalls.Count -ne 1 -or
+    $waitCalls[0].Extent.StartOffset -le $stopCalls[0].Extent.EndOffset) {{
+    throw "Quit must invoke the Stop button before waiting for parent exit"
+}}
+$waitTryBlocks = @($quitFunctions[0].Body.FindAll({{
+    param($node)
+    if ($node -isnot [System.Management.Automation.Language.TryStatementAst]) {{ return $false }}
+    $commands = @($node.Body.FindAll({{
+        param($child) $child -is [System.Management.Automation.Language.CommandAst]
+    }}, $true) | ForEach-Object {{ $_.GetCommandName() }})
+    return $commands -contains 'Wait-ForDesktopParentExit'
+}}, $true))
+if ($waitTryBlocks.Count -ne 1) {{ throw "Quit-Desktop must wait in one isolated process phase" }}
+$normalWaitCommands = @($waitTryBlocks[0].Body.FindAll({{
+    param($node) $node -is [System.Management.Automation.Language.CommandAst]
+}}, $true) | ForEach-Object {{ $_.GetCommandName() }})
+if ($normalWaitCommands.Count -ne 1 -or
+    $normalWaitCommands[0] -ne 'Wait-ForDesktopParentExit') {{
+    throw "Post-Stop success path must only wait for Desktop parent exit"
+}}
+"process-authoritative Controller Quit assertion PASS"
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "process-authoritative Controller Quit assertion PASS" in completed.stdout
 
 
 def _load_verifier() -> ModuleType:
