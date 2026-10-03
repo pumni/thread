@@ -2,7 +2,7 @@ name: Desktop CI
 
 on:
   pull_request:
-    types: [opened, ready_for_review, reopened]
+    types: [ready_for_review, reopened]
     paths:
       - "apps/desktop/**"
       - "packaging/windows_desktop/**"
