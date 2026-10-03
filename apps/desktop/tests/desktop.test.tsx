@@ -190,6 +190,7 @@ describe("desktop provisioning", () => {
       await waitFor(() => expect(listeners["desktop://session-locked"]).toBeDefined());
       act(() => listeners["desktop://session-locked"]({}));
 
+      expect(await screen.findByText("Session locked")).toBeInTheDocument();
       expect(screen.getByText(process)).toBeInTheDocument();
       expect(native.invoke.mock.calls.map(([command]) => command)).toEqual(
         expect.arrayContaining(["get_desktop_snapshot"]),

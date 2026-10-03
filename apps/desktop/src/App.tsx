@@ -51,6 +51,7 @@ function App() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [operator, setOperator] = useState<OperatorIdentity | null>(null);
   const [operatorLoaded, setOperatorLoaded] = useState(false);
+  const [sessionLocked, setSessionLocked] = useState(false);
   const [apiUrl, setApiUrl] = useState("");
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -117,11 +118,14 @@ function App() {
       else stopListening();
     });
     const requestQuitFromTray = () => setQuitRequested(true);
+    const lockSessionFromTray = () => setSessionLocked(true);
     window.addEventListener("threads-desktop:quit-requested", requestQuitFromTray);
+    window.addEventListener("threads-desktop:session-locked", lockSessionFromTray);
     return () => {
       mounted = false;
       unlisten?.();
       window.removeEventListener("threads-desktop:quit-requested", requestQuitFromTray);
+      window.removeEventListener("threads-desktop:session-locked", lockSessionFromTray);
     };
   }, []);
 
@@ -171,6 +175,7 @@ function App() {
         ? await operatorBootstrapOwner(loginUsername, loginPassword)
         : await operatorLogin(apiUrl, loginUsername, loginPassword);
       setOperator(signedIn);
+      setSessionLocked(false);
       setLoginPassword("");
       setFirstOwnerSetup(false);
     } catch {
@@ -192,6 +197,7 @@ function App() {
   }
 
   async function handleSessionLock() {
+    setSessionLocked(true);
     await handleOperatorLogout();
     setActionError("Session locked. Sign in again to access protected data.");
   }
@@ -562,7 +568,9 @@ function App() {
                       <h2>
                         {operator
                           ? `Signed in as ${operator.username}`
-                          : "Sign in to this Workspace"}
+                          : sessionLocked
+                            ? "Session locked"
+                            : "Sign in to this Workspace"}
                       </h2>
                     </div>
                     <span className="lock-symbol" aria-hidden="true">
@@ -628,6 +636,11 @@ function App() {
                         void handleOperatorLogin();
                       }}
                     >
+                      {sessionLocked && (
+                        <p className="card-copy" role="status">
+                          Sign in again to access protected Operator data.
+                        </p>
+                      )}
                       {snapshot.role !== "CONTROLLER" && (
                         <label>
                           Controller address

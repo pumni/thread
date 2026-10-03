@@ -521,10 +521,14 @@ try {
         $startedProcessIds.Add($reopen.Id)
         Wait-Until { $reopen.HasExited } 20 "reopen_invocation_did_not_exit_after_focus"
         Wait-Until { [ThreadsDesktopLifecycleSmoke.NativeMethods]::IsWindowVisible($primaryWindowHandle) } 10 "second_launch_did_not_reopen_hidden_window"
+        Wait-Until {
+            [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text))
+        } 10 "reopen_session_not_locked"
+        $reopenedHelpers = @(Get-HelperProcesses $primaryId)
+        $helperStayedAlive = $reopenedHelpers.Count -eq 1 -and [int]$reopenedHelpers[0].ProcessId -eq $helperId
         $reopenPassed =
-            [bool](Find-ElementByName (Get-PrimaryWindow) "Session locked" ([System.Windows.Automation.ControlType]::Text)) -and
-            (Get-HelperProcesses $primaryId).Count -eq 1 -and
-            [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId -eq $helperId
+            $helperStayedAlive
+        if (-not $helperStayedAlive) { Add-FailureCode "reopen_stopped_mock_helper" }
         Set-LifecycleCheck "tray_reopen_relocks_session_without_stopping_helper" $reopenPassed "reopen_did_not_relock_session_or_stopped_mock_helper"
     } catch {
         Set-LifecycleCheck "tray_reopen_relocks_session_without_stopping_helper" $false ([string]$_.Exception.Message)
