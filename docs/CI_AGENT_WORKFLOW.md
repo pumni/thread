@@ -35,7 +35,7 @@ powershell -NoProfile -File scripts/windows_local_preflight.ps1
 ```
 
 The script:
-- creates a fresh workspace-owned TEMP/TMP and pytest basetemp;
+- creates a fresh CurrentUser-owned TEMP/TMP and pytest basetemp under LocalApplicationData, outside the Git worktree;
 - starts a disposable PostgreSQL 17 cluster from the accepted bundled `shared/postgresql` tree;
 - creates a test database whose name ends in `_test`;
 - sets both Control Plane database URLs;

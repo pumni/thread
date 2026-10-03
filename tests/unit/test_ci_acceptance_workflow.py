@@ -38,4 +38,6 @@ def test_agent_and_windows_preflight_contract_is_repository_visible() -> None:
     assert "scripts/windows_local_preflight.ps1" in process
     assert "THREADS_PLATFORM_TEST_DATABASE_URL" in preflight
     assert "--basetemp=" in preflight
+    assert "SpecialFolder]::LocalApplicationData" in preflight
+    assert 'Join-Path $repoRoot "build/local-ci/' not in preflight
     assert "windows_local_preflight_requires_bundled_postgresql" in preflight
