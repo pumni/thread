@@ -22,7 +22,7 @@ authorized issue
 
 Heavy PR workflows intentionally do not run on every Draft synchronization. Secret scan may still run because it is cheap and prevents credential mistakes from accumulating.
 
-A hosted failure invalidates the acceptance checkpoint. The coding agent stops. The coordinator may return the PR to Draft, classify the evidence and authorize one bounded correction.
+A hosted failure is a hard stop for the coding agent and invalidates the acceptance checkpoint. The coordinator may return the PR to Draft, classify the evidence and authorize one bounded correction.
 
 ## 2. Local PASS means preflight only
 
