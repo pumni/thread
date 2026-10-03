@@ -35,12 +35,12 @@ powershell -NoProfile -File scripts/windows_local_preflight.ps1
 ```
 
 The script:
-- creates a fresh CurrentUser-owned TEMP/TMP and pytest basetemp under LocalApplicationData, outside the Git worktree;
+- creates a fresh short CurrentUser-owned TEMP/TMP and pytest basetemp under `LocalApplicationData/TOCI/<run-id>`, outside the Git worktree, so Chromium persistent-profile paths remain bounded on Windows;
 - starts a disposable PostgreSQL 17 cluster from the accepted bundled `shared/postgresql` tree;
 - creates a test database whose name ends in `_test`;
 - sets both Control Plane database URLs;
 - runs locked dependency sync, Ruff, formatting, Pyright, Alembic upgrade/check and pytest;
-- stops/removes only its own disposable PostgreSQL state.
+- stops/removes only its own disposable PostgreSQL state; cleanup tries fast stop first and may use immediate stop only for that disposable local cluster.
 
 If the accepted bundled PostgreSQL tree is missing, the script fails explicitly. Build the existing `shared` candidate first or provide `-BundleRoot`; do not let PostgreSQL integration tests skip and then report a full local PASS.
 
