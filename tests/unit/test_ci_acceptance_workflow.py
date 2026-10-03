@@ -34,7 +34,7 @@ def test_agent_and_windows_preflight_contract_is_repository_visible() -> None:
 
     assert "docs/CI_AGENT_WORKFLOW.md" in agents
     assert "two consecutive hosted attempts" in agents
-    assert "hosted failure is a hard stop" in process
+    assert "hosted failure is a hard stop" in process.lower()
     assert "scripts/windows_local_preflight.ps1" in process
     assert "THREADS_PLATFORM_TEST_DATABASE_URL" in preflight
     assert "--basetemp=" in preflight
