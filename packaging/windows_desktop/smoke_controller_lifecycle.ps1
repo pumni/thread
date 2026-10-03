@@ -103,6 +103,7 @@ $checks = [ordered]@{
     separate_http_and_scheduler_processes = $false
     x_hides_and_runtime_continues = $false
     reopen_keeps_one_runtime_and_database_identity = $false
+    reopen_requires_operator_sign_in = $false
     graceful_quit_stops_scheduler_http_then_postgres = $false
     relaunch_preserves_database_and_endpoint = $false
     database_crash_fails_closed_and_recovers_wal = $false
@@ -309,7 +310,8 @@ function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
 function Test-ControllerOwnerSignedIn([int]$ProcessId) {
     $window = Get-Window $ProcessId
     return $null -ne (Find-TextContaining $window "Signed in as $script:smokeOwnerUsername") -and
-        $null -ne (Find-TextContaining $window "OWNER")
+        $null -ne (Find-TextContaining $window "OWNER") -and
+        $null -ne (Find-Element $window "Sign out" ([System.Windows.Automation.ControlType]::Button))
 }
 
 function Test-FirstOwnerSetupFailed([int]$ProcessId) {
@@ -333,6 +335,10 @@ function Bootstrap-ControllerOwner([int]$ProcessId) {
 
 function Ensure-ControllerOwner([int]$ProcessId) {
     if (Test-ControllerOwnerSignedIn $ProcessId) { return }
+    Wait-Until {
+        $window = Get-Window $ProcessId
+        return $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
+    } 15 "controller_operator_reauthentication_not_ready"
     Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
     Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
     Invoke-Button $ProcessId "Sign in"
@@ -468,6 +474,9 @@ function Quit-Desktop([int]$ProcessId) {
                 if (Find-TextContaining $window "Operator access changed. Sign in again") {
                     throw "controller_stop_operator_session_revoked"
                 }
+                if (Find-TextContaining $window "The node could not stop cleanly") {
+                    throw "controller_stop_shutdown_failed"
+                }
                 return $false
             } 55 "desktop_graceful_quit_timeout"
         } catch {
@@ -489,6 +498,7 @@ function Quit-Desktop([int]$ProcessId) {
                 operator_session_revoked = $null -ne (Find-TextContaining `
                     $window "Operator access changed. Sign in again"
                 )
+                shutdown_error = $null -ne (Find-TextContaining $window "The node could not stop cleanly")
             }
             throw
         }
@@ -663,6 +673,12 @@ try {
     Wait-Until { $second.HasExited } 20 "second_desktop_launch_did_not_converge"
     Wait-Until { [ThreadsControllerSmoke.NativeMethods]::IsWindowVisible($window.MainWindowHandle) } `
         10 "controller_reopen_did_not_restore_window"
+    Wait-Until {
+        $window = Get-Window $desktop.Id
+        return $null -ne (Find-TextContaining $window "Session locked") -and
+            $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
+    } 15 "controller_reopen_did_not_require_operator_sign_in"
+    $checks.reopen_requires_operator_sign_in = $true
     $owned = Assert-ControllerProcesses
     if ([int]$owned.postgres[0].ProcessId -ne $postgresPid -or
         [int]$owned.http[0].ProcessId -ne $httpPid -or

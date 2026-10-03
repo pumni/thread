@@ -42,6 +42,14 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 };
 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
+const operatorAccessErrors = new Set([
+  "operator_authentication_required",
+  "operator_password_change_required",
+  "operator_forbidden",
+  "operator_api_unavailable",
+  "operator_request_failed",
+  "operator_response_invalid",
+]);
 
 function App() {
   const queryClient = useQueryClient();
@@ -161,10 +169,16 @@ function App() {
     try {
       await requestQuit();
       setQuitRequested(false);
-    } catch {
+    } catch (error) {
       await handleOperatorLogout();
       setQuitRequested(false);
-      setActionError("An active Operator session with permission to stop this node is required.");
+      const errorCode =
+        typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setActionError(
+        operatorAccessErrors.has(errorCode)
+          ? "An active Operator session with permission to stop this node is required."
+          : "The node could not stop cleanly. Check the runtime status before retrying.",
+      );
     }
   }
 

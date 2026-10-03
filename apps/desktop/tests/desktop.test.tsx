@@ -264,6 +264,36 @@ describe("desktop provisioning", () => {
     await waitFor(() => expect(native.invoke).toHaveBeenCalledWith("request_quit"));
   });
 
+  it("reports a Controller shutdown failure separately from Operator access denial", async () => {
+    const listeners: Record<string, (event: unknown) => void> = {};
+    native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {
+      listeners[event] = handler;
+      return () => undefined;
+    });
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") return null;
+      if (command === "operator_logout") return undefined;
+      if (command === "request_quit") throw "controller_database_stop_failed";
+      throw new Error("unknown command");
+    });
+
+    renderDesktop();
+    await screen.findByRole("heading", { name: "Your Controller" });
+    await waitFor(() => expect(listeners["desktop://quit-requested"]).toBeDefined());
+    listeners["desktop://quit-requested"]({});
+    fireEvent.click(await screen.findByRole("button", { name: "Stop node and quit" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The node could not stop cleanly. Check the runtime status before retrying.",
+    );
+    expect(
+      screen.queryByText(
+        "An active Operator session with permission to stop this node is required.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
   it("locks protected information when the native window loses focus", async () => {
     const onUnlock = vi.fn().mockResolvedValue(false);
     render(
