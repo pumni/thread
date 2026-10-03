@@ -68,7 +68,8 @@ Also run task-specific migration, PostgreSQL, concurrency, protocol, recovery, o
 Before opening/advancing a PR or reacting to hosted CI, read `docs/CI_AGENT_WORKFLOW.md`.
 
 - Local PASS is preflight, never hosted acceptance. Do not call local validation complete if a required PostgreSQL/Alembic gate was skipped for missing environment.
-- Keep implementation PRs Draft while iterating. Heavy PR acceptance is coordinator-triggered by moving the PR to Ready; do not use automatic PR CI as a remote debugger.
+- Keep implementation PRs Draft while iterating. Draft pushes run only Secret scan and PR Head Guard; Ready starts one merge-authoritative PR Acceptance gate, and main pushes start one Main Verification gate. Do not use hosted CI as a remote debugger.
+- Reusable CI components must check out the exact `source_sha`. Desktop manual diagnostics require an explicit source SHA; reopening a PR does not start heavy acceptance.
 - Any hosted failure is a hard stop for the coding agent. Download/read the evidence, record the exact primary failure signature, classify it as product/harness/environment, then report. Do not push or rerun a corrective hosted attempt without coordinator authorization.
 - If two consecutive hosted attempts have the same primary failure signature, do not make a third attempt. Escalate to the coordinator with both artifacts and the changed hypothesis.
 - UI/control presence is not proof of authentication/session/process truth when authoritative server/database/native-process evidence exists.

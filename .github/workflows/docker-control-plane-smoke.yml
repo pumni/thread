@@ -1,20 +1,20 @@
-name: Docker Control Plane smoke
+name: Docker Control Plane Component
 
 on:
-  pull_request:
-    types: [ready_for_review, reopened]
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact source commit to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   compose-restart-smoke:
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     name: Exact-head Docker and PostgreSQL restart smoke
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       THREADS_PLATFORM_SMOKE_PROJECT_NAME: threads-cp-smoke-${{ github.run_id }}-${{ github.run_attempt }}
@@ -22,16 +22,27 @@ jobs:
       THREADS_PLATFORM_IMAGE: threads-control-plane:smoke-${{ github.run_id }}-${{ github.run_attempt }}
       THREADS_PLATFORM_SMOKE_HTTP_PORT: "18000"
     steps:
-      - name: Check out exact PR head without persisted credentials
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
 
+      - name: Assert exact source revision
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$SOURCE_SHA" ]]; then
+            echo "checkout_sha_mismatch: expected $SOURCE_SHA, got $actual" >&2
+            exit 1
+          fi
+
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.7"
+          version: "0.12.21"
 
       - name: Build image and run Compose restart/recovery smoke
         run: uv run --no-project --python 3.14 python scripts/control_plane_compose_smoke.py

@@ -1,40 +1,18 @@
-name: Windows Worker package
+name: Windows Worker Package Component
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/windows-worker-package.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "packaging/windows_worker/**"
-      - "src/threads_platform/workers/**"
-      - "src/threads_platform/infrastructure/worker_agent/**"
-      - "src/threads_platform/infrastructure/browser/**"
-      - "tests/unit/test_worker_package.py"
-      - "tests/unit/test_worker_host_config.py"
-      - "tests/unit/test_worker_control_client_httpx2.py"
-      - "tests/unit/test_browser_adapter.py"
-      - "README.md"
-      - "docs/ARCHITECTURE.md"
-      - "docs/PROJECT_STATE_HANDOFF.md"
-      - "docs/WORKER_AGENT_WINDOWS.md"
-      - "docs/WORKER_UPDATE_RUNBOOK.md"
-      - "docs/WORK_BREAKDOWN.md"
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/windows-worker-package.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "packaging/windows_worker/**"
-      - "src/threads_platform/workers/**"
-      - "src/threads_platform/infrastructure/worker_agent/**"
-      - "src/threads_platform/infrastructure/browser/**"
-      - "tests/unit/test_worker_package.py"
-      - "tests/unit/test_worker_host_config.py"
-      - "tests/unit/test_worker_control_client_httpx2.py"
-      - "tests/unit/test_browser_adapter.py"
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact source commit to package and test
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit to package and test
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -42,20 +20,28 @@ permissions:
 jobs:
   package:
     name: Windows x64 Worker package and smoke
-    runs-on: windows-latest
+    runs-on: windows-2025
     env:
       PYTHONHASHSEED: "1"
     steps:
       - name: Check out exact source without persisted credentials
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
 
+      - name: Assert exact source revision
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) { throw "checkout_sha_mismatch" }
+
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.7"
+          version: "0.12.21"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -205,9 +191,9 @@ jobs:
           Write-Output "VERIFIED_SHA256 $actualDigest"
 
       - name: Upload unsigned internal/test artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-worker-package-${{ github.run_id }}
+          name: windows-worker-package-${{ inputs.source_sha }}
           path: |
             ${{ runner.temp }}/worker-release/*.zip
             ${{ runner.temp }}/worker-release/*.zip.sha256
@@ -218,21 +204,29 @@ jobs:
 
   browser-tests:
     name: Windows Playwright browser adapter tests
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 30
     env:
       PYTHONHASHSEED: "1"
     steps:
       - name: Check out exact source without persisted credentials
-        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
 
+      - name: Assert exact source revision
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) { throw "checkout_sha_mismatch" }
+
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.7"
+          version: "0.12.21"
           enable-cache: true
           cache-dependency-glob: uv.lock
 

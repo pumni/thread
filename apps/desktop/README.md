@@ -30,7 +30,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The path-filtered `Desktop CI` workflow installs the frozen `bun.lock` and runs frontend checks, native Rust checks, the Windows tray lifecycle smoke, DX-03 package feasibility checks, and the DX-04 Controller lifecycle smoke on GitHub-hosted Windows x64. The DX-04 smoke uses disposable synthetic database state; its artifact contains evidence only, never a PostgreSQL data directory.
+The reusable `Desktop Diagnostic` component installs the frozen `bun.lock` and runs frontend checks, native Rust checks, the Windows tray lifecycle smoke, DX-03 package feasibility checks, and the DX-04 Controller lifecycle smoke on GitHub-hosted Windows x64. `PR Acceptance` and `Main Verification` call it with an exact source SHA. The DX-04 smoke uses disposable synthetic database state; its artifact contains evidence only, never a PostgreSQL data directory.
 
 ## Contract boundary
 

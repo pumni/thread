@@ -1,0 +1,153 @@
+name: Main Verification
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-verification
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Classify Worker paths
+    runs-on: ubuntu-24.04
+    outputs:
+      worker: ${{ steps.classify.outputs.worker }}
+    steps:
+      - name: Check out exact main commit and full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify Worker-relevant changes
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/ci_changed_paths.py \
+            --mode main \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$SOURCE_SHA"
+
+  python-quality:
+    name: Python Quality Component
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_sha: ${{ github.sha }}
+    permissions:
+      contents: read
+
+  docker-control-plane:
+    name: Docker Control Plane Component
+    uses: ./.github/workflows/docker-control-plane-smoke.yml
+    with:
+      source_sha: ${{ github.sha }}
+    permissions:
+      contents: read
+
+  desktop:
+    name: Desktop Diagnostic Component
+    uses: ./.github/workflows/desktop.yml
+    with:
+      source_sha: ${{ github.sha }}
+      runtime_layout: shared
+    permissions:
+      contents: read
+
+  worker-package:
+    name: Windows Worker Package Component
+    needs: changes
+    if: ${{ needs.changes.outputs.worker == 'true' }}
+    uses: ./.github/workflows/windows-worker-package.yml
+    with:
+      source_sha: ${{ github.sha }}
+    permissions:
+      contents: read
+
+  main-secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact main commit with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Determine whether the pushed commit range is available
+        id: scan-range
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            && [[ ! "$BASE_SHA" =~ ^0{40}$ ]] \
+            && [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            && git cat-file -e "${BASE_SHA}^{commit}" \
+            && git cat-file -e "${SOURCE_SHA}^{commit}"; then
+            echo "scan=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "scan=false" >> "$GITHUB_OUTPUT"
+            echo "Main commit range is unavailable; current-tree secret scan still runs."
+          fi
+      - name: Scan for secrets
+        uses: ./.github/actions/gitleaks
+        with:
+          base_sha: ${{ github.event.before }}
+          head_sha: ${{ github.sha }}
+          scan_commit_range: ${{ steps.scan-range.outputs.scan }}
+
+  main-verification-gate:
+    name: Main Verification
+    if: always()
+    needs:
+      - changes
+      - python-quality
+      - docker-control-plane
+      - desktop
+      - worker-package
+      - main-secret-scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a complete exact-head verification set
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          WORKER_NEEDED: ${{ needs.changes.outputs.worker }}
+          PYTHON_RESULT: ${{ needs.python-quality.result }}
+          DOCKER_RESULT: ${{ needs.docker-control-plane.result }}
+          DESKTOP_RESULT: ${{ needs.desktop.result }}
+          WORKER_RESULT: ${{ needs.worker-package.result }}
+          SECRET_RESULT: ${{ needs.main-secret-scan.result }}
+        run: |
+          set -euo pipefail
+          printf 'source_sha=%s\nchanges=%s\npython=%s\ndocker=%s\ndesktop=%s\nworker_needed=%s\nworker=%s\nsecret_scan=%s\n' \
+            "$SOURCE_SHA" "$CHANGES_RESULT" "$PYTHON_RESULT" \
+            "$DOCKER_RESULT" "$DESKTOP_RESULT" "$WORKER_NEEDED" \
+            "$WORKER_RESULT" "$SECRET_RESULT"
+
+          for result in "$CHANGES_RESULT" "$PYTHON_RESULT" "$DOCKER_RESULT" "$DESKTOP_RESULT" "$SECRET_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              echo "required_main_verification_component_not_successful: $result" >&2
+              exit 1
+            fi
+          done
+          if [[ "$WORKER_NEEDED" == "true" ]]; then
+            [[ "$WORKER_RESULT" == "success" ]] || {
+              echo "worker_component_required_but_not_successful: $WORKER_RESULT" >&2
+              exit 1
+            }
+          elif [[ "$WORKER_RESULT" != "skipped" ]]; then
+            echo "worker_component_should_be_skipped: $WORKER_RESULT" >&2
+            exit 1
+          fi

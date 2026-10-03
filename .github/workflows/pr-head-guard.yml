@@ -1,0 +1,66 @@
+name: PR Head Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, converted_to_draft]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Actionlint and Ready-head guard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact PR head without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Assert exact PR head
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$SOURCE_SHA" ]]; then
+            echo "checkout_sha_mismatch: expected $SOURCE_SHA, got $actual" >&2
+            exit 1
+          fi
+
+      - name: Install and verify actionlint v1.7.12
+        shell: bash
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          base_url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          archive_path="${RUNNER_TEMP}/${archive}"
+          checksums_path="${RUNNER_TEMP}/actionlint_checksums.txt"
+          install_dir="${RUNNER_TEMP}/actionlint-bin"
+
+          curl --fail --location --silent --show-error \
+            "${base_url}/${archive}" --output "$archive_path"
+          curl --fail --location --silent --show-error \
+            "${base_url}/actionlint_${ACTIONLINT_VERSION}_checksums.txt" \
+            --output "$checksums_path"
+
+          checksum_line="$(awk -v file="$archive" '$2 == file { print; count++ } END { if (count != 1) exit 1 }' "$checksums_path")"
+          printf '%s\n' "$checksum_line" | (cd "$RUNNER_TEMP" && sha256sum --check --status)
+          mkdir -p "$install_dir"
+          tar -xzf "$archive_path" -C "$install_dir" actionlint
+          "$install_dir/actionlint" -version
+
+      - name: Lint every workflow
+        shell: bash
+        run: |
+          "${RUNNER_TEMP}/actionlint-bin/actionlint" .github/workflows/*.yml
+
+      - name: Reject head changes while Ready for Review
+        if: ${{ github.event.action == 'synchronize' && github.event.pull_request.draft == false }}
+        shell: bash
+        run: |
+          echo "::error::PR head changed while Ready for Review. Return it to Draft, classify the previous acceptance state, complete local diagnostics, then let the coordinator mark the final head Ready again."
+          exit 1
