@@ -104,6 +104,8 @@ $checks = [ordered]@{
     x_hides_and_runtime_continues = $false
     reopen_keeps_one_runtime_and_database_identity = $false
     reopen_requires_operator_sign_in = $false
+    owner_reauthenticated_after_reopen = $false
+    active_session_verified_before_privileged_quit = $false
     graceful_quit_stops_scheduler_http_then_postgres = $false
     relaunch_preserves_database_and_endpoint = $false
     database_crash_fails_closed_and_recovers_wal = $false
@@ -270,7 +272,7 @@ function Find-TextContaining([System.Windows.Automation.AutomationElement]$Root,
     return $null
 }
 
-function Invoke-Button([int]$ProcessId, [string]$Name) {
+function Invoke-Button([int]$ProcessId, [string]$Name, [scriptblock]$BeforeInvoke) {
     $window = Get-Window $ProcessId
     if ($window) {
         try { $window.SetFocus() } catch { }
@@ -281,7 +283,10 @@ function Invoke-Button([int]$ProcessId, [string]$Name) {
         if (-not $button) { return $false }
         try {
             $pattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-            if (-not $pattern) { return $false }
+        } catch { return $false }
+        if (-not $pattern) { return $false }
+        if ($BeforeInvoke) { & $BeforeInvoke }
+        try {
             $pattern.Invoke()
             return $true
         } catch { return $false }
@@ -311,11 +316,23 @@ function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
     }
 }
 
-function Test-ControllerOwnerSignedIn([int]$ProcessId) {
-    $window = Get-Window $ProcessId
-    return $null -ne (Find-TextContaining $window "Signed in as $script:smokeOwnerUsername") -and
-        $null -ne (Find-TextContaining $window "OWNER") -and
-        $null -ne (Find-Element $window "Sign out" ([System.Windows.Automation.ControlType]::Button))
+function Get-ActiveOwnerSessionCount([object]$Config) {
+    $username = $script:smokeOwnerUsername
+    $count = Invoke-Psql $Config `
+        "SELECT COUNT(*) FROM public.operator_sessions s JOIN public.operator_users u ON u.id = s.operator_user_id WHERE u.username = '$username' AND s.revoked_at IS NULL AND s.expires_at > now();"
+    if ($count -notmatch '^\d+$') { throw "controller_operator_session_count_invalid" }
+    return [int]$count
+}
+
+function Assert-OneActiveOwnerSession([object]$Config) {
+    $activeSessions = Get-ActiveOwnerSessionCount $Config
+    $processEvidence.operator_session_preflight = [ordered]@{
+        active_sessions = [string]$activeSessions
+    }
+    if ($activeSessions -ne 1) {
+        throw "controller_active_owner_session_count_not_one_$activeSessions"
+    }
+    $checks.active_session_verified_before_privileged_quit = $true
 }
 
 function Test-FirstOwnerSetupFailed([int]$ProcessId) {
@@ -328,7 +345,11 @@ function Bootstrap-ControllerOwner([int]$ProcessId) {
     Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
     Invoke-Button $ProcessId "Create first Owner"
     Wait-Until {
-        (Test-ControllerOwnerSignedIn $ProcessId) -or (Test-FirstOwnerSetupFailed $ProcessId)
+        $config = Get-ControllerConfig
+        $ownerCount = Invoke-Psql $config `
+            "SELECT COUNT(*) FROM public.operator_users WHERE username = '$script:smokeOwnerUsername' AND role = 'OWNER' AND enabled;"
+        ($ownerCount -eq "1" -and (Get-ActiveOwnerSessionCount $config) -eq 1) -or
+            (Test-FirstOwnerSetupFailed $ProcessId)
     } 30 "controller_first_owner_setup_no_response"
     if (Test-FirstOwnerSetupFailed $ProcessId) {
         $ownerCount = Invoke-Psql (Get-ControllerConfig) `
@@ -337,16 +358,28 @@ function Bootstrap-ControllerOwner([int]$ProcessId) {
     }
 }
 
-function Ensure-ControllerOwner([int]$ProcessId) {
-    if (Test-ControllerOwnerSignedIn $ProcessId) { return }
+function Ensure-ControllerOwner([int]$ProcessId, [switch]$ForceReauthentication) {
+    $config = Get-ControllerConfig
+    if ($ForceReauthentication) {
+        Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 0 } 15 `
+            "controller_owner_session_not_revoked_on_lock"
+    } else {
+        $activeSessions = Get-ActiveOwnerSessionCount $config
+        if ($activeSessions -eq 1) { return }
+        if ($activeSessions -ne 0) {
+            throw "controller_active_owner_session_count_not_one"
+        }
+    }
     Wait-Until {
         $window = Get-Window $ProcessId
-        return $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
+        return $null -ne (Find-Element $window "Username" ([System.Windows.Automation.ControlType]::Edit)) -and
+            $null -ne (Find-Element $window "Password" ([System.Windows.Automation.ControlType]::Edit)) -and
+            $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
     } 15 "controller_operator_reauthentication_not_ready"
     Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
     Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
     Invoke-Button $ProcessId "Sign in"
-    Wait-Until { Test-ControllerOwnerSignedIn $ProcessId } 30 "controller_owner_login_failed"
+    Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 1 } 30 "controller_owner_login_failed"
 }
 
 function Start-Desktop([int]$WindowTimeout = 30) {
@@ -484,11 +517,11 @@ function Assert-ControllerProcesses {
 function Quit-Desktop([int]$ProcessId) {
     $owned = Get-ControllerProcesses
     if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
-        $processEvidence.operator_session_preflight =
-            Get-OperatorSessionEvidence (Get-ControllerConfig)
         Ensure-ControllerOwner $ProcessId
         Invoke-Button $ProcessId "Quit…"
-        Invoke-Button $ProcessId "Stop node and quit"
+        Invoke-Button $ProcessId "Stop node and quit" -BeforeInvoke {
+            Assert-OneActiveOwnerSession (Get-ControllerConfig)
+        }
         try {
             Wait-Until {
                 if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }
@@ -720,6 +753,8 @@ try {
             $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
     } 15 "controller_reopen_did_not_require_operator_sign_in"
     $checks.reopen_requires_operator_sign_in = $true
+    Ensure-ControllerOwner $desktop.Id -ForceReauthentication
+    $checks.owner_reauthenticated_after_reopen = $true
     $owned = Assert-ControllerProcesses
     if ([int]$owned.postgres[0].ProcessId -ne $postgresPid -or
         [int]$owned.http[0].ProcessId -ne $httpPid -or
