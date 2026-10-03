@@ -33,7 +33,7 @@ if (
     $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
     $env:RUNNER_OS -ne "Windows" -or
     $env:RUNNER_ARCH -ne "X64" -or
-    $env:GITHUB_SHA -ne $ExpectedSourceRevision -or
+    $env:DESKTOP_SOURCE_SHA -ne $ExpectedSourceRevision -or
     $actualSourceRevision -ne $ExpectedSourceRevision -or
     $ExpectedSourceRevision -notmatch "^[0-9a-f]{40}$" -or
     $headExitCode -ne 0 -or
