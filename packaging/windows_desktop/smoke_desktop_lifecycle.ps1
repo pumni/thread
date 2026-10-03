@@ -644,6 +644,9 @@ try {
         $decommissioned = $false
         try {
             Invoke-Button "Decommission device"
+            Wait-Until {
+                [bool](Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit))
+            } 20 "decommission_confirmation_input_unavailable"
             $phraseInput = Find-FirstByControlType (Get-PrimaryWindow) ([System.Windows.Automation.ControlType]::Edit)
             if (-not $phraseInput) { throw "decommission_confirmation_input_unavailable" }
             $phraseInput.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue("RESET THIS DEVICE")
