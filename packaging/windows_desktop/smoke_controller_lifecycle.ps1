@@ -271,6 +271,10 @@ function Find-TextContaining([System.Windows.Automation.AutomationElement]$Root,
 }
 
 function Invoke-Button([int]$ProcessId, [string]$Name) {
+    $window = Get-Window $ProcessId
+    if ($window) {
+        try { $window.SetFocus() } catch { }
+    }
     Wait-Until {
         $button = Find-Element (Get-Window $ProcessId) $Name `
             ([System.Windows.Automation.ControlType]::Button)
