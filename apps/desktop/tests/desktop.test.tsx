@@ -295,6 +295,40 @@ describe("desktop provisioning", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("waits for session revocation before exposing the next sign-in form", async () => {
+    let completeLogout: (() => void) | undefined;
+    const logoutPending = new Promise<void>((resolve) => {
+      completeLogout = resolve;
+    });
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        return {
+          id: "owner-id",
+          username: "first-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2026-10-03T18:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      if (command === "operator_logout") return logoutPending;
+      throw new Error("unknown command");
+    });
+
+    renderDesktop();
+    await screen.findByRole("button", { name: "Sign out" });
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+
+    expect(
+      await screen.findByText("Authenticate again to view protected Operator data."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+
+    await act(async () => completeLogout?.());
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
   it("explains when the current Operator role cannot stop a Controller", async () => {
     const listeners: Record<string, (event: unknown) => void> = {};
     native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {

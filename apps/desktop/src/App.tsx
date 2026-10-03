@@ -202,12 +202,12 @@ function App() {
   }
 
   async function handleOperatorLogout() {
-    const revoke = operatorLogout();
+    setSessionLocked(true);
+    await operatorLogout();
     setOperator(null);
     setOperatorUsers([]);
     setCreatedOperatorUser(null);
     setNewPassword("");
-    await revoke;
   }
 
   async function handleSessionLock() {
@@ -595,6 +595,7 @@ function App() {
                     <>
                       <SessionGate
                         validSession
+                        forceLocked={sessionLocked}
                         idleTimeoutMs={5 * 60 * 1_000}
                         onLock={handleSessionLock}
                         onUnlock={async () => Boolean(await operatorCurrent())}

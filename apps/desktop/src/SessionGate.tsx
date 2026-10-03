@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 interface SessionGateProps {
   validSession: boolean;
+  forceLocked?: boolean;
   idleTimeoutMs?: number;
   onUnlock: () => Promise<boolean>;
   onLock?: () => void | Promise<void>;
@@ -11,6 +12,7 @@ interface SessionGateProps {
 
 export function SessionGate({
   validSession,
+  forceLocked = false,
   idleTimeoutMs,
   onUnlock,
   onLock,
@@ -83,7 +85,7 @@ export function SessionGate({
     }
   }
 
-  if (!validSession || locked) {
+  if (!validSession || locked || forceLocked) {
     return (
       <section className="session-lock" role="status" aria-live="polite">
         <span className="session-lock-icon" aria-hidden="true">
