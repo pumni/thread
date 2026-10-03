@@ -520,8 +520,9 @@ try {
     if (-not $loopbackOnly) { throw "controller_listener_not_loopback_only" }
 
     $databaseSystemIdentifier = Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();"
-    $ownerTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NULL;"
-    $checks.no_owner_or_lan_bootstrap = $ownerTable -eq "t" -and
+    $operatorUsersTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
+    $operatorUserCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users;"
+    $checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and $operatorUserCount -eq "0" -and
         $config.endpointPort -gt 0 -and $config.databasePort -gt 0
     if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
     Invoke-Psql $config "CREATE TABLE dx04_runtime_evidence (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO dx04_runtime_evidence (id, marker) VALUES (1, '$sentinel');" | Out-Null
