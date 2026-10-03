@@ -472,15 +472,22 @@ function Quit-Desktop([int]$ProcessId) {
             } 55 "desktop_graceful_quit_timeout"
         } catch {
             $remaining = Get-ControllerProcesses
+            $window = Get-Window $ProcessId
+            $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
+            $diagnosticCode = if ($diagnosticElement) {
+                ([string]$diagnosticElement.Current.Name) -replace '^.*Diagnostic code:\s*', ''
+            } else { $null }
             $processEvidence.graceful_quit_failure = [ordered]@{
                 postgres = $remaining.postgres.Count
                 http = $remaining.http.Count
                 scheduler = $remaining.scheduler.Count
+                diagnostic_code = $diagnosticCode
+                runtime_failed_visible = $null -ne (Find-TextContaining $window "Controller runtime failed")
                 operator_auth_error = $null -ne (Find-TextContaining `
-                    (Get-Window $ProcessId) "An active Operator session with permission to stop this node is required"
+                    $window "An active Operator session with permission to stop this node is required"
                 )
                 operator_session_revoked = $null -ne (Find-TextContaining `
-                    (Get-Window $ProcessId) "Operator access changed. Sign in again"
+                    $window "Operator access changed. Sign in again"
                 )
             }
             throw
