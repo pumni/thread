@@ -377,7 +377,7 @@ try {
         $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
         $env:RUNNER_OS -ne "Windows" -or
         $env:RUNNER_ARCH -ne "X64" -or
-        $env:GITHUB_SHA -ne $ExpectedSourceRevision
+        $env:DESKTOP_SOURCE_SHA -ne $ExpectedSourceRevision
     )) {
         throw "clean_windows_evidence_requires_exact_sha_github_hosted_windows_x64"
     }

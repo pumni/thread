@@ -417,6 +417,7 @@ try {
         throw "hosted_smoke_user_profile_unavailable"
     }
     $smokeUserEnvironment = @{
+        DESKTOP_SOURCE_SHA = $ExpectedSourceRevision
         USERPROFILE = $smokeProfileRoot
         APPDATA = Join-Path $smokeProfileRoot "AppData\Roaming"
         LOCALAPPDATA = Join-Path $smokeProfileRoot "AppData\Local"
