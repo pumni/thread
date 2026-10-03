@@ -71,6 +71,7 @@ export const DESKTOP_COMMANDS = [
   "operator_bootstrap_owner",
   "operator_current",
   "operator_logout",
+  "operator_lock",
   "operator_list_users",
   "operator_create_user",
   "operator_update_user",
@@ -122,6 +123,10 @@ export function operatorBootstrapOwner(
 
 export function operatorLogout(): Promise<void> {
   return invoke<void>("operator_logout");
+}
+
+export function operatorLock(): Promise<void> {
+  return invoke<void>("operator_lock");
 }
 
 export function operatorListUsers(): Promise<OperatorUser[]> {

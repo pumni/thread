@@ -28,6 +28,27 @@ const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
 const SESSION_LOCKED_EVENT: &str = "desktop://session-locked";
 
+fn run_native_lock_boundary(detach: impl FnOnce(), notify: impl FnOnce()) {
+    detach();
+    notify();
+}
+
+fn run_window_reopen(is_visible: bool, lock: impl FnOnce(), show: impl FnOnce()) {
+    if !is_visible {
+        lock();
+    }
+    show();
+}
+
+fn native_session_lock(app: &AppHandle) {
+    run_native_lock_boundary(
+        || app.state::<OperatorAuthState>().lock_session(),
+        || {
+            let _ = app.emit(SESSION_LOCKED_EVENT, ());
+        },
+    );
+}
+
 fn autolaunch() -> Result<AutoLaunch, String> {
     let executable =
         std::env::current_exe().map_err(|_| "autostart_executable_path_unavailable".to_string())?;
@@ -76,7 +97,7 @@ fn disable_autostart() -> Result<(), String> {
 #[cfg(windows)]
 mod windows_session_lock {
     use crate::SESSION_LOCKED_EVENT;
-    use tauri::{AppHandle, Emitter, WebviewWindow};
+    use tauri::{AppHandle, WebviewWindow};
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::RemoteDesktop::{
@@ -107,9 +128,9 @@ mod windows_session_lock {
         subclass_id: usize,
         reference_data: usize,
     ) -> LRESULT {
-        if let Some(event) = event_for_session_message(message, wparam) {
+        if event_for_session_message(message, wparam).is_some() {
             let app = &*(reference_data as *const AppHandle);
-            let _ = app.emit(event, ());
+            crate::native_session_lock(app);
         }
 
         if message == WM_NCDESTROY {
@@ -548,6 +569,11 @@ async fn operator_logout(operator: State<'_, OperatorAuthState>) -> Result<(), S
 }
 
 #[tauri::command]
+fn operator_lock(operator: State<'_, OperatorAuthState>) {
+    operator.lock_session();
+}
+
+#[tauri::command]
 async fn operator_list_users(
     operator: State<'_, OperatorAuthState>,
 ) -> Result<Vec<OperatorUser>, String> {
@@ -586,9 +612,15 @@ async fn operator_change_password(
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        run_window_reopen(
+            window.is_visible().unwrap_or(false),
+            || native_session_lock(app),
+            || {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            },
+        );
     }
 }
 
@@ -654,6 +686,7 @@ pub fn run() {
             operator_bootstrap_owner,
             operator_current,
             operator_logout,
+            operator_lock,
             operator_list_users,
             operator_create_user,
             operator_update_user,
@@ -687,8 +720,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                native_session_lock(window.app_handle());
                 let _ = window.hide();
-                let _ = window.emit(SESSION_LOCKED_EVENT, ());
             }
         })
         .build(tauri::generate_context!())
@@ -832,5 +865,49 @@ mod tests {
         let snapshot = restored.snapshot().expect("read restored role");
         assert_eq!(snapshot.role, Some(ProvisionedRole::Console));
         assert_eq!(snapshot.supervisor.state, "not_applicable");
+    }
+}
+
+#[cfg(test)]
+mod operator_lock_boundary_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn native_lock_detaches_before_emitting_the_notification() {
+        let order = RefCell::new(Vec::new());
+
+        run_native_lock_boundary(
+            || order.borrow_mut().push("detach"),
+            || order.borrow_mut().push("notify"),
+        );
+
+        assert_eq!(*order.borrow(), ["detach", "notify"]);
+    }
+
+    #[test]
+    fn reopening_a_hidden_window_locks_before_showing_it() {
+        let order = RefCell::new(Vec::new());
+
+        run_window_reopen(
+            false,
+            || order.borrow_mut().push("lock"),
+            || order.borrow_mut().push("show"),
+        );
+
+        assert_eq!(*order.borrow(), ["lock", "show"]);
+    }
+
+    #[test]
+    fn showing_an_already_visible_window_does_not_lock_again() {
+        let order = RefCell::new(Vec::new());
+
+        run_window_reopen(
+            true,
+            || order.borrow_mut().push("lock"),
+            || order.borrow_mut().push("show"),
+        );
+
+        assert_eq!(*order.borrow(), ["show"]);
     }
 }

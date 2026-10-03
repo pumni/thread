@@ -52,7 +52,6 @@ export function SessionGate({
     window.addEventListener("blur", lock);
     window.addEventListener("pointerdown", recordActivity);
     window.addEventListener("keydown", recordActivity);
-    window.addEventListener("threads-desktop:session-locked", lock);
     document.addEventListener("visibilitychange", onVisibilityChange);
 
     const timer =
@@ -69,7 +68,6 @@ export function SessionGate({
       window.removeEventListener("blur", lock);
       window.removeEventListener("pointerdown", recordActivity);
       window.removeEventListener("keydown", recordActivity);
-      window.removeEventListener("threads-desktop:session-locked", lock);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (timer !== undefined) window.clearInterval(timer);
     };

@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App";
-import { DESKTOP_COMMANDS, listenForTrayQuit, type DesktopSnapshot } from "../src/desktop";
+import { DESKTOP_COMMANDS, operatorLock, type DesktopSnapshot } from "../src/desktop";
 import { SessionGate } from "../src/SessionGate";
 
 const native = vi.hoisted(() => ({
@@ -68,6 +68,7 @@ describe("desktop provisioning", () => {
       "operator_bootstrap_owner",
       "operator_current",
       "operator_logout",
+      "operator_lock",
       "operator_list_users",
       "operator_create_user",
       "operator_update_user",
@@ -183,6 +184,7 @@ describe("desktop provisioning", () => {
       });
       native.invoke.mockImplementation(async (command: string) => {
         if (command === "get_desktop_snapshot") return snapshot(role);
+        if (command === "operator_current") return null;
         throw new Error(`unexpected native command: ${command}`);
       });
 
@@ -319,6 +321,8 @@ describe("desktop provisioning", () => {
     renderDesktop();
     await screen.findByRole("button", { name: "Sign out" });
     fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(native.invoke).toHaveBeenCalledWith("operator_logout");
+    expect(native.invoke).not.toHaveBeenCalledWith("operator_lock");
 
     expect(
       await screen.findByText("Authenticate again to view protected Operator data."),
@@ -377,40 +381,120 @@ describe("desktop provisioning", () => {
     expect(screen.getByText("Session locked")).toBeInTheDocument();
   });
 
-  it("routes the native session-lock event to the gate and stays locked after tray reopen", async () => {
+  it.each([
+    { role: "CONTROLLER" as const, process: "PID 4243" },
+    { role: "WORKER" as const, process: "PID 4242" },
+  ])(
+    "uses operator_lock once on $role blur without stopping its helper",
+    async ({ role, process }) => {
+      native.invoke.mockImplementation(async (command: string) => {
+        if (command === "get_desktop_snapshot") return snapshot(role);
+        if (command === "operator_current") {
+          return {
+            id: "owner-id",
+            username: "first-owner",
+            role: "OWNER",
+            mustChangePassword: false,
+            expiresAt: "2026-10-03T18:00:00Z",
+          };
+        }
+        if (command === "operator_list_users") return [];
+        if (command === "operator_lock") return undefined;
+        throw new Error(`unexpected native command: ${command}`);
+      });
+
+      renderDesktop();
+      await screen.findByText("Signed in as first-owner");
+      fireEvent.blur(window);
+
+      expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+      expect(screen.queryByText("Signed in as first-owner")).not.toBeInTheDocument();
+      expect(screen.getByText(process)).toBeInTheDocument();
+      expect(
+        native.invoke.mock.calls.filter(([command]) => command === "operator_lock"),
+      ).toHaveLength(1);
+      expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_logout");
+    },
+  );
+
+  it("clears Operator UI on a native lock when Rust has no current session", async () => {
     const listeners: Record<string, (event: unknown) => void> = {};
     native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {
       listeners[event] = handler;
       return () => undefined;
     });
-    const { unmount } = render(
-      <>
-        <p>Controller helper running</p>
-        <SessionGate validSession onUnlock={async () => false}>
-          <p>private account data</p>
-        </SessionGate>
-      </>,
-    );
-    const unlisten = await listenForTrayQuit();
+    let currentCalls = 0;
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        currentCalls += 1;
+        return currentCalls === 1
+          ? {
+              id: "owner-id",
+              username: "first-owner",
+              role: "OWNER",
+              mustChangePassword: false,
+              expiresAt: "2026-10-03T18:00:00Z",
+            }
+          : null;
+      }
+      if (command === "operator_list_users") return [];
+      throw new Error(`unexpected native command: ${command}`);
+    });
 
-    expect(screen.getByText("private account data")).toBeInTheDocument();
+    renderDesktop();
+    await screen.findByText("Signed in as first-owner");
+    await waitFor(() => expect(listeners["desktop://session-locked"]).toBeDefined());
     act(() => listeners["desktop://session-locked"]({}));
-    expect(screen.queryByText("private account data")).not.toBeInTheDocument();
-    expect(screen.getByText("Session locked")).toBeInTheDocument();
 
-    fireEvent.focus(window);
-    expect(screen.queryByText("private account data")).not.toBeInTheDocument();
-    expect(screen.getByText("Controller helper running")).toBeInTheDocument();
-    expect(native.invoke).not.toHaveBeenCalled();
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.queryByText("Signed in as first-owner")).not.toBeInTheDocument();
+    expect(
+      native.invoke.mock.calls.filter(([command]) => command === "operator_current"),
+    ).toHaveLength(2);
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_lock");
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_logout");
+  });
 
-    unlisten();
-    unmount();
+  it("ignores a stale native lock notification when a newer Rust session is current", async () => {
+    const listeners: Record<string, (event: unknown) => void> = {};
+    native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {
+      listeners[event] = handler;
+      return () => undefined;
+    });
+    let currentCalls = 0;
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        currentCalls += 1;
+        return {
+          id: currentCalls === 1 ? "owner-a" : "owner-b",
+          username: currentCalls === 1 ? "first-owner" : "new-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2026-10-03T18:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByText("Signed in as first-owner");
+    await waitFor(() => expect(listeners["desktop://session-locked"]).toBeDefined());
+    act(() => listeners["desktop://session-locked"]({}));
+
+    expect(await screen.findByText("Signed in as new-owner")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_lock");
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_logout");
   });
 
   it("locks on the configured inactivity timeout", async () => {
     vi.useFakeTimers();
+    const onLock = vi.fn(() => operatorLock());
     render(
-      <SessionGate validSession idleTimeoutMs={1_000} onUnlock={async () => false}>
+      <SessionGate validSession idleTimeoutMs={1_000} onUnlock={async () => false} onLock={onLock}>
         <p>private account data</p>
       </SessionGate>,
     );
@@ -421,6 +505,8 @@ describe("desktop provisioning", () => {
     });
     expect(screen.queryByText("private account data")).not.toBeInTheDocument();
     expect(screen.getByText("Session locked")).toBeInTheDocument();
+    expect(onLock).toHaveBeenCalledOnce();
+    expect(native.invoke).toHaveBeenCalledWith("operator_lock");
     vi.useRealTimers();
   });
 

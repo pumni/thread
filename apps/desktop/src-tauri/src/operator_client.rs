@@ -179,20 +179,19 @@ impl OperatorAuthState {
     }
 
     pub(crate) async fn logout(&self) {
-        let snapshot = self.session.lock().ok().and_then(|mut guard| {
-            guard.take().map(|session| SessionSnapshot {
-                base_url: session.base_url,
-                bearer: session.bearer,
-            })
-        });
-        if let Some(snapshot) = snapshot {
-            let _ = self
-                .client
-                .post(endpoint(&snapshot.base_url, "/v1/operator/logout"))
-                .bearer_auth(snapshot.bearer.as_str())
-                .send()
-                .await;
+        if let Some(snapshot) = self.detach_current_session() {
+            Self::revoke_snapshot(self.client.clone(), snapshot).await;
         }
+    }
+
+    pub(crate) fn lock_session(&self) {
+        let Some(snapshot) = self.detach_current_session() else {
+            return;
+        };
+        let client = self.client.clone();
+        tauri::async_runtime::spawn(async move {
+            Self::revoke_snapshot(client, snapshot).await;
+        });
     }
 
     pub(crate) async fn list_users(&self) -> Result<Vec<OperatorUser>, String> {
@@ -337,6 +336,25 @@ impl OperatorAuthState {
             .ok_or_else(|| "operator_authentication_required".to_string())
     }
 
+    fn detach_current_session(&self) -> Option<SessionSnapshot> {
+        self.session
+            .lock()
+            .ok()?
+            .take()
+            .map(|session| SessionSnapshot {
+                base_url: session.base_url,
+                bearer: session.bearer,
+            })
+    }
+
+    async fn revoke_snapshot(client: Client, snapshot: SessionSnapshot) {
+        let _ = client
+            .post(endpoint(&snapshot.base_url, "/v1/operator/logout"))
+            .bearer_auth(snapshot.bearer.as_str())
+            .send()
+            .await;
+    }
+
     fn clear_if_matches(&self, snapshot: &SessionSnapshot) {
         if let Ok(mut guard) = self.session.lock() {
             let matches = guard.as_ref().is_some_and(|session| {
@@ -397,6 +415,141 @@ fn lifecycle_session_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+    };
+
+    fn install_session(state: &OperatorAuthState, base_url: &str, bearer: &str) {
+        *state.session.lock().expect("Operator session mutex") = Some(Session {
+            base_url: base_url.to_string(),
+            bearer: Zeroizing::new(bearer.to_string()),
+            operator: OperatorIdentity {
+                id: "synthetic-owner-id".to_string(),
+                username: "synthetic-owner".to_string(),
+                role: "OWNER".to_string(),
+                must_change_password: false,
+                expires_at: "2026-10-03T18:00:00Z".to_string(),
+            },
+        });
+    }
+
+    fn logout_server() -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("logout request");
+            let mut request = Vec::new();
+            let mut buffer = [0; 2048];
+            loop {
+                let length = stream.read(&mut buffer).expect("read logout request");
+                if length == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..length]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let authorization = String::from_utf8_lossy(&request)
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                .unwrap_or_default()
+                .to_string();
+            sender.send(authorization).expect("authorization receiver");
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write logout response");
+        });
+        (format!("http://{address}"), receiver, server)
+    }
+
+    #[test]
+    fn detaching_operator_session_removes_it_before_revocation() {
+        let state = OperatorAuthState::default();
+        install_session(&state, "http://127.0.0.1:1", "synthetic-session-a");
+
+        let detached = state
+            .detach_current_session()
+            .expect("current session detached");
+
+        assert_eq!(detached.bearer.as_str(), "synthetic-session-a");
+        assert!(state
+            .session
+            .lock()
+            .expect("Operator session mutex")
+            .is_none());
+    }
+
+    #[test]
+    fn delayed_revocation_uses_only_the_detached_bearer_after_a_new_login() {
+        let (base_url, authorization, server) = logout_server();
+        let state = OperatorAuthState::default();
+        install_session(&state, &base_url, "synthetic-session-a");
+        let detached = state.detach_current_session().expect("session A detached");
+        install_session(&state, &base_url, "synthetic-session-b");
+
+        tauri::async_runtime::block_on(OperatorAuthState::revoke_snapshot(
+            state.client.clone(),
+            detached,
+        ));
+
+        assert_eq!(
+            authorization.recv().expect("captured logout bearer"),
+            "authorization: Bearer synthetic-session-a"
+        );
+        server.join().expect("logout server completed");
+        assert_eq!(
+            state
+                .session
+                .lock()
+                .expect("Operator session mutex")
+                .as_ref()
+                .expect("session B remains current")
+                .bearer
+                .as_str(),
+            "synthetic-session-b"
+        );
+    }
+
+    #[test]
+    fn repeated_lock_without_a_session_is_idempotent() {
+        let state = OperatorAuthState::default();
+
+        state.lock_session();
+        state.lock_session();
+
+        assert!(state
+            .session
+            .lock()
+            .expect("Operator session mutex")
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_logout_revokes_the_detached_current_bearer() {
+        let (base_url, authorization, server) = logout_server();
+        let state = OperatorAuthState::default();
+        install_session(&state, &base_url, "synthetic-logout-session");
+
+        tauri::async_runtime::block_on(state.logout());
+
+        assert_eq!(
+            authorization.recv().expect("captured logout bearer"),
+            "authorization: Bearer synthetic-logout-session"
+        );
+        server.join().expect("logout server completed");
+        assert!(state
+            .session
+            .lock()
+            .expect("Operator session mutex")
+            .is_none());
+    }
 
     #[test]
     fn node_lifecycle_role_matrix_is_fixed() {

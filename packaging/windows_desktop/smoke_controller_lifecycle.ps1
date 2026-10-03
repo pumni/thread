@@ -42,8 +42,6 @@ namespace ThreadsControllerSmoke {
         public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool IsWindowVisible(IntPtr window);
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern IntPtr GetForegroundWindow();
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetProcessTimes(
             IntPtr process,
@@ -127,13 +125,10 @@ $worktreeIsClean = $false
 $controllerIdentity = $null
 $databaseSystemIdentifier = $null
 $shutdownExitOrder = $null
-$sessionDiagnosticCheckpoints = [System.Collections.Generic.List[object]]::new()
 $sentinel = [Guid]::NewGuid().ToString("N")
 $script:smokeOwnerUsername = "dx05owner" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
 $script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
-$processEvidence = [ordered]@{
-    session_diagnostic_checkpoints = $sessionDiagnosticCheckpoints
-}
+$processEvidence = [ordered]@{}
 $rootWasMoved = $false
 $parentCrashPids = @()
 $parentCrashProcesses = @()
@@ -327,47 +322,6 @@ function Get-ActiveOwnerSessionCount([object]$Config) {
         "SELECT COUNT(*) FROM public.operator_sessions s JOIN public.operator_users u ON u.id = s.operator_user_id WHERE u.username = '$username' AND s.revoked_at IS NULL AND s.expires_at > now();"
     if ($count -notmatch '^\d+$') { throw "controller_operator_session_count_invalid" }
     return [int]$count
-}
-
-function Add-SessionDiagnosticCheckpoint([int]$ProcessId, [string]$Checkpoint) {
-    $config = Get-ControllerConfig
-    $activeOwnerSessionCount = Get-ActiveOwnerSessionCount $config
-    $window = Get-Window $ProcessId
-    $sessionLocked = $null -ne (Find-TextContaining $window "Session locked")
-    $username = Find-Element $window "Username" ([System.Windows.Automation.ControlType]::Edit)
-    $password = Find-Element $window "Password" ([System.Windows.Automation.ControlType]::Edit)
-    $signIn = Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button)
-    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
-    $mainWindowHandle = [IntPtr]::Zero
-    if ($process) {
-        $process.Refresh()
-        $mainWindowHandle = $process.MainWindowHandle
-    }
-    $checkpointEvidence = [ordered]@{
-        checkpoint = $Checkpoint
-        timestamp_utc = [DateTimeOffset]::UtcNow.ToString("o")
-        active_owner_session_count = $activeOwnerSessionCount
-        session_locked_visible = $sessionLocked
-        username_visible = $null -ne $username -and -not $username.Current.IsOffscreen
-        password_visible = $null -ne $password -and -not $password.Current.IsOffscreen
-        sign_in_visible = $null -ne $signIn -and -not $signIn.Current.IsOffscreen
-        main_window_visible = $mainWindowHandle -ne [IntPtr]::Zero -and
-            [ThreadsControllerSmoke.NativeMethods]::IsWindowVisible($mainWindowHandle)
-        main_window_focused = $mainWindowHandle -ne [IntPtr]::Zero -and
-            [ThreadsControllerSmoke.NativeMethods]::GetForegroundWindow() -eq $mainWindowHandle
-    }
-    $sessionDiagnosticCheckpoints.Add($checkpointEvidence)
-    return $checkpointEvidence
-}
-
-function Add-SessionCountDiagnosticCheckpoint([string]$Checkpoint, [int]$ActiveOwnerSessionCount) {
-    $checkpointEvidence = [ordered]@{
-        checkpoint = $Checkpoint
-        timestamp_utc = [DateTimeOffset]::UtcNow.ToString("o")
-        active_owner_session_count = $ActiveOwnerSessionCount
-    }
-    $sessionDiagnosticCheckpoints.Add($checkpointEvidence)
-    return $checkpointEvidence
 }
 
 function Assert-OneActiveOwnerSession([object]$Config) {
@@ -564,15 +518,8 @@ function Quit-Desktop([int]$ProcessId) {
     $owned = Get-ControllerProcesses
     if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
         Ensure-ControllerOwner $ProcessId
-        Add-SessionDiagnosticCheckpoint $ProcessId "C_before_quit_dialog" | Out-Null
         Invoke-Button $ProcessId "Quit…"
-        Wait-Until {
-            $null -ne (Find-Element (Get-Window $ProcessId) "Stop node and quit" `
-                ([System.Windows.Automation.ControlType]::Button))
-        } 20 "controller_quit_confirmation_not_visible"
-        Add-SessionDiagnosticCheckpoint $ProcessId "D_quit_confirmation_visible" | Out-Null
         Invoke-Button $ProcessId "Stop node and quit" -BeforeInvoke {
-            Add-SessionDiagnosticCheckpoint $ProcessId "E_before_privileged_stop" | Out-Null
             Assert-OneActiveOwnerSession (Get-ControllerConfig)
         }
         try {
@@ -807,31 +754,7 @@ try {
     } 15 "controller_reopen_did_not_require_operator_sign_in"
     $checks.reopen_requires_operator_sign_in = $true
     Ensure-ControllerOwner $desktop.Id -ForceReauthentication
-    $checkpointA = Add-SessionDiagnosticCheckpoint $desktop.Id "A_after_owner_reauthentication"
     $checks.owner_reauthenticated_after_reopen = $true
-    $diagnosticConfig = Get-ControllerConfig
-    $lastObservedActiveOwnerSessionCount = [int]$checkpointA.active_owner_session_count
-    $stabilityDeadline = [DateTimeOffset]::UtcNow.AddSeconds(5)
-    $sessionCountTransitionObserved = $false
-    while ([DateTimeOffset]::UtcNow -lt $stabilityDeadline) {
-        $remainingMilliseconds = [int][Math]::Ceiling(
-            ($stabilityDeadline - [DateTimeOffset]::UtcNow).TotalMilliseconds
-        )
-        Start-Sleep -Milliseconds ([Math]::Min(250, [Math]::Max(1, $remainingMilliseconds)))
-        if ([DateTimeOffset]::UtcNow -ge $stabilityDeadline) { break }
-        $activeOwnerSessionCount = Get-ActiveOwnerSessionCount $diagnosticConfig
-        if ($activeOwnerSessionCount -ne $lastObservedActiveOwnerSessionCount) {
-            Add-SessionCountDiagnosticCheckpoint "A2_active_owner_session_count_transition" `
-                $activeOwnerSessionCount | Out-Null
-            $sessionCountTransitionObserved = $true
-            break
-        }
-        $lastObservedActiveOwnerSessionCount = $activeOwnerSessionCount
-    }
-    if (-not $sessionCountTransitionObserved) {
-        Add-SessionCountDiagnosticCheckpoint "A2_stability_window_elapsed" `
-            $lastObservedActiveOwnerSessionCount | Out-Null
-    }
     $owned = Assert-ControllerProcesses
     if ([int]$owned.postgres[0].ProcessId -ne $postgresPid -or
         [int]$owned.http[0].ProcessId -ne $httpPid -or
@@ -862,7 +785,6 @@ try {
             }
             $shutdownProcessHandles[$name] = $nativeHandle
         }
-        Add-SessionDiagnosticCheckpoint $desktop.Id "B_before_quit_desktop" | Out-Null
         Quit-Desktop $desktop.Id
         $schedulerExit = Get-ProcessExitTime `
             $shutdownProcesses.scheduler $shutdownProcessHandles["scheduler"] `
@@ -1075,7 +997,6 @@ try {
     [System.IO.File]::WriteAllText($pgVersionPath, $pgVersionBackup)
 
     $processEvidence = [ordered]@{
-        session_diagnostic_checkpoints = $sessionDiagnosticCheckpoints
         initial_postgres_pid = $postgresPid
         initial_http_pid = $httpPid
         initial_scheduler_pid = $schedulerPid

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   decommissionDevice,
@@ -9,6 +9,7 @@ import {
   operatorCreateUser,
   operatorCurrent,
   operatorListUsers,
+  operatorLock,
   operatorLogin,
   operatorLogout,
   operatorUpdateUser,
@@ -73,6 +74,8 @@ function App() {
   const [newOperatorRole, setNewOperatorRole] = useState<OperatorRole>("VIEWER");
   const [createdOperatorUser, setCreatedOperatorUser] = useState<CreatedOperatorUser | null>(null);
   const [newPassword, setNewPassword] = useState("");
+  const loginGeneration = useRef(0);
+  const nativeLockNotification = useRef(0);
   const snapshotQuery = useQuery({
     queryKey: ["desktop-snapshot"],
     queryFn: getDesktopSnapshot,
@@ -80,17 +83,50 @@ function App() {
     retry: false,
   });
 
+  const handleNativeSessionLock = useCallback(async () => {
+    const notification = ++nativeLockNotification.current;
+    const generation = ++loginGeneration.current;
+    setSessionLocked(true);
+    let current: OperatorIdentity | null = null;
+    try {
+      current = await operatorCurrent();
+    } catch {
+      // A revoked or unavailable session must stay hidden behind the sign-in form.
+    }
+    if (notification !== nativeLockNotification.current || generation !== loginGeneration.current) {
+      return;
+    }
+    if (current) {
+      setOperator(current);
+      setOperatorLoaded(true);
+      setSessionLocked(false);
+      return;
+    }
+    setOperator(null);
+    setOperatorLoaded(true);
+    setOperatorUsers([]);
+    setCreatedOperatorUser(null);
+    setNewOperatorUsername("");
+    setLoginUsername("");
+    setFirstOwnerSetup(false);
+    setNewPassword("");
+    setLoginPassword("");
+    setActionError(null);
+    setSessionLocked(true);
+  }, []);
+
   useEffect(() => {
     let mounted = true;
+    const generation = loginGeneration.current;
     void operatorCurrent()
       .then((current) => {
-        if (mounted) setOperator(current ?? null);
+        if (mounted && generation === loginGeneration.current) setOperator(current ?? null);
       })
       .catch(() => {
-        if (mounted) setOperator(null);
+        if (mounted && generation === loginGeneration.current) setOperator(null);
       })
       .finally(() => {
-        if (mounted) setOperatorLoaded(true);
+        if (mounted && generation === loginGeneration.current) setOperatorLoaded(true);
       });
     return () => {
       mounted = false;
@@ -129,7 +165,7 @@ function App() {
       else stopListening();
     });
     const requestQuitFromTray = () => setQuitRequested(true);
-    const lockSessionFromTray = () => setSessionLocked(true);
+    const lockSessionFromTray = () => void handleNativeSessionLock();
     window.addEventListener("threads-desktop:quit-requested", requestQuitFromTray);
     window.addEventListener("threads-desktop:session-locked", lockSessionFromTray);
     return () => {
@@ -138,7 +174,7 @@ function App() {
       window.removeEventListener("threads-desktop:quit-requested", requestQuitFromTray);
       window.removeEventListener("threads-desktop:session-locked", lockSessionFromTray);
     };
-  }, []);
+  }, [handleNativeSessionLock]);
 
   async function updateSnapshot(action: () => Promise<DesktopSnapshot>): Promise<boolean> {
     setActionError(null);
@@ -190,7 +226,10 @@ function App() {
       const signedIn = firstOwnerSetup
         ? await operatorBootstrapOwner(loginUsername, loginPassword)
         : await operatorLogin(apiUrl, loginUsername, loginPassword);
+      loginGeneration.current += 1;
+      nativeLockNotification.current += 1;
       setOperator(signedIn);
+      setOperatorLoaded(true);
       setSessionLocked(false);
       setLoginPassword("");
       setFirstOwnerSetup(false);
@@ -205,17 +244,36 @@ function App() {
 
   async function handleOperatorLogout() {
     setSessionLocked(true);
+    loginGeneration.current += 1;
+    nativeLockNotification.current += 1;
     await operatorLogout();
-    setOperator(null);
-    setOperatorUsers([]);
-    setCreatedOperatorUser(null);
-    setNewPassword("");
+    clearProtectedOperatorState();
   }
 
   async function handleSessionLock() {
     setSessionLocked(true);
-    await handleOperatorLogout();
+    loginGeneration.current += 1;
+    nativeLockNotification.current += 1;
+    try {
+      await operatorLock();
+    } catch {
+      setActionError("Session lock could not be confirmed. Sign in again to continue.");
+    }
+    clearProtectedOperatorState();
     setActionError("Session locked. Sign in again to access protected data.");
+  }
+
+  function clearProtectedOperatorState() {
+    setOperator(null);
+    setOperatorLoaded(true);
+    setOperatorUsers([]);
+    setCreatedOperatorUser(null);
+    setNewOperatorUsername("");
+    setLoginUsername("");
+    setFirstOwnerSetup(false);
+    setNewPassword("");
+    setLoginPassword("");
+    setActionError(null);
   }
 
   async function handleOperatorCreateUser() {
@@ -626,7 +684,7 @@ function App() {
                           Sign out
                         </button>
                       </SessionGate>
-                      {operator.mustChangePassword && (
+                      {operator.mustChangePassword && !sessionLocked && (
                         <form
                           className="operator-login-form"
                           onSubmit={(event) => {
@@ -721,6 +779,7 @@ function App() {
               </section>
 
               {operator &&
+                !sessionLocked &&
                 !operator.mustChangePassword &&
                 ["OWNER", "ADMIN"].includes(operator.role) && (
                   <section className="surface-card operator-users-card" aria-label="Operator users">
