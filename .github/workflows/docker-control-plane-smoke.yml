@@ -2,7 +2,7 @@ name: Docker Control Plane smoke
 
 on:
   pull_request:
-    types: [opened, ready_for_review, reopened]
+    types: [ready_for_review, reopened]
   push:
     branches: [main]
   workflow_dispatch:
