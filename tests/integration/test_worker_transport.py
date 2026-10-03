@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -109,6 +110,10 @@ async def _authenticated_worker(
     return worker_id, session.access_token
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows intentionally disables the legacy static-admin-token path",
+)
 async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
     unit_of_work_factory: UnitOfWorkFactory,
 ) -> None:
@@ -260,6 +265,10 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
         assert set(heartbeat.json()) == set(hello.json())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows intentionally disables the legacy static-admin-token path",
+)
 async def test_durable_https_pull_recovers_job_without_wss_notification(
     unit_of_work_factory: UnitOfWorkFactory,
 ) -> None:
