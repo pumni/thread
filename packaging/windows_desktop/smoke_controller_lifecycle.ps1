@@ -458,8 +458,33 @@ function Quit-Desktop([int]$ProcessId) {
         Ensure-ControllerOwner $ProcessId
         Invoke-Button $ProcessId "Quit…"
         Invoke-Button $ProcessId "Stop node and quit"
-        Wait-Until { -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } `
-            55 "desktop_graceful_quit_timeout"
+        try {
+            Wait-Until {
+                if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }
+                $window = Get-Window $ProcessId
+                if (Find-TextContaining $window "An active Operator session with permission to stop this node is required") {
+                    throw "controller_stop_operator_authorization_denied"
+                }
+                if (Find-TextContaining $window "Operator access changed. Sign in again") {
+                    throw "controller_stop_operator_session_revoked"
+                }
+                return $false
+            } 55 "desktop_graceful_quit_timeout"
+        } catch {
+            $remaining = Get-ControllerProcesses
+            $processEvidence.graceful_quit_failure = [ordered]@{
+                postgres = $remaining.postgres.Count
+                http = $remaining.http.Count
+                scheduler = $remaining.scheduler.Count
+                operator_auth_error = $null -ne (Find-TextContaining `
+                    (Get-Window $ProcessId) "An active Operator session with permission to stop this node is required"
+                )
+                operator_session_revoked = $null -ne (Find-TextContaining `
+                    (Get-Window $ProcessId) "Operator access changed. Sign in again"
+                )
+            }
+            throw
+        }
         return
     }
 
