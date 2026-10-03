@@ -480,9 +480,9 @@ function Assert-ControllerProcesses {
 function Quit-Desktop([int]$ProcessId) {
     $owned = Get-ControllerProcesses
     if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
-        Ensure-ControllerOwner $ProcessId
-        $processEvidence.operator_session_before_quit =
+        $processEvidence.operator_session_preflight =
             Get-OperatorSessionEvidence (Get-ControllerConfig)
+        Ensure-ControllerOwner $ProcessId
         Invoke-Button $ProcessId "Quit…"
         Invoke-Button $ProcessId "Stop node and quit"
         try {
