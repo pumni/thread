@@ -44,6 +44,23 @@ function renderDesktop() {
   );
 }
 
+function fireHiddenVisibilityChange() {
+  const visibilityDescriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    value: "hidden",
+  });
+  try {
+    fireEvent(document, new Event("visibilitychange"));
+  } finally {
+    if (visibilityDescriptor) {
+      Object.defineProperty(document, "visibilityState", visibilityDescriptor);
+    } else {
+      Reflect.deleteProperty(document, "visibilityState");
+    }
+  }
+}
+
 describe("desktop provisioning", () => {
   afterEach(() => {
     cleanup();
@@ -366,56 +383,64 @@ describe("desktop provisioning", () => {
     );
   });
 
-  it("locks protected information when the native window loses focus", async () => {
-    const onUnlock = vi.fn().mockResolvedValue(false);
+  it("does not lock or revoke the session on generic window blur", () => {
+    const onLock = vi.fn();
     render(
-      <SessionGate validSession onUnlock={onUnlock}>
+      <SessionGate validSession onUnlock={async () => false} onLock={onLock}>
         <p>private account data</p>
       </SessionGate>,
     );
     expect(screen.getByText("private account data")).toBeInTheDocument();
     fireEvent.blur(window);
-    expect(screen.queryByText("private account data")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Re-authenticate" }));
-    await waitFor(() => expect(onUnlock).toHaveBeenCalledOnce());
-    expect(screen.getByText("Session locked")).toBeInTheDocument();
+    expect(screen.getByText("private account data")).toBeInTheDocument();
+    expect(screen.queryByText("Session locked")).not.toBeInTheDocument();
+    expect(onLock).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { role: "CONTROLLER" as const, process: "PID 4243" },
-    { role: "WORKER" as const, process: "PID 4242" },
-  ])(
-    "uses operator_lock once on $role blur without stopping its helper",
-    async ({ role, process }) => {
-      native.invoke.mockImplementation(async (command: string) => {
-        if (command === "get_desktop_snapshot") return snapshot(role);
-        if (command === "operator_current") {
-          return {
-            id: "owner-id",
-            username: "first-owner",
-            role: "OWNER",
-            mustChangePassword: false,
-            expiresAt: "2026-10-03T18:00:00Z",
-          };
-        }
-        if (command === "operator_list_users") return [];
-        if (command === "operator_lock") return undefined;
-        throw new Error(`unexpected native command: ${command}`);
-      });
+  it("does not lock or revoke the session on generic document visibility loss", () => {
+    const onLock = vi.fn();
+    render(
+      <SessionGate validSession onUnlock={async () => false} onLock={onLock}>
+        <p>private account data</p>
+      </SessionGate>,
+    );
+    fireHiddenVisibilityChange();
 
-      renderDesktop();
-      await screen.findByText("Signed in as first-owner");
-      fireEvent.blur(window);
+    expect(screen.getByText("private account data")).toBeInTheDocument();
+    expect(screen.queryByText("Session locked")).not.toBeInTheDocument();
+    expect(onLock).not.toHaveBeenCalled();
+  });
 
-      expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
-      expect(screen.queryByText("Signed in as first-owner")).not.toBeInTheDocument();
-      expect(screen.getByText(process)).toBeInTheDocument();
-      expect(
-        native.invoke.mock.calls.filter(([command]) => command === "operator_lock"),
-      ).toHaveLength(1);
-      expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_logout");
-    },
-  );
+  it("does not lock or sign out an Owner when Quit confirmation causes focus loss", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        return {
+          id: "owner-id",
+          username: "first-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2026-10-03T18:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      if (command === "operator_lock" || command === "operator_logout") return undefined;
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByText("Signed in as first-owner");
+    fireEvent.click(screen.getByRole("button", { name: "Quit…" }));
+    expect(
+      await screen.findByRole("dialog", { name: "Quit Threads Desktop?" }),
+    ).toBeInTheDocument();
+    fireEvent.blur(window);
+
+    expect(screen.getByRole("dialog", { name: "Quit Threads Desktop?" })).toBeInTheDocument();
+    expect(screen.getByText("Signed in as first-owner")).toBeInTheDocument();
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_lock");
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_logout");
+  });
 
   it("clears Operator UI on a native lock when Rust has no current session", async () => {
     const listeners: Record<string, (event: unknown) => void> = {};

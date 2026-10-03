@@ -45,14 +45,8 @@ export function SessionGate({
     const recordActivity = () => {
       if (!lockedRef.current) lastActivityAt.current = Date.now();
     };
-    const onVisibilityChange = () => {
-      if (document.visibilityState !== "visible") lock();
-    };
-
-    window.addEventListener("blur", lock);
     window.addEventListener("pointerdown", recordActivity);
     window.addEventListener("keydown", recordActivity);
-    document.addEventListener("visibilitychange", onVisibilityChange);
 
     const timer =
       idleTimeoutMs === undefined
@@ -65,10 +59,8 @@ export function SessionGate({
           );
 
     return () => {
-      window.removeEventListener("blur", lock);
       window.removeEventListener("pointerdown", recordActivity);
       window.removeEventListener("keydown", recordActivity);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
       if (timer !== undefined) window.clearInterval(timer);
     };
   }, [idleTimeoutMs, validSession]);
