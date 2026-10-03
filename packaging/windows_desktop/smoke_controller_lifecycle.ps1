@@ -267,6 +267,11 @@ function Test-ProcessExitRace(
     try { return $Process.HasExited } catch { return $false }
 }
 
+function Get-SafeExceptionTypeName([System.Exception]$Exception) {
+    if (-not $Exception) { return $null }
+    return [regex]::Replace($Exception.GetType().Name, "[^A-Za-z0-9_.+]", "_")
+}
+
 function Get-Window([int]$ProcessId) {
     $process = Get-ProcessIfPresent $ProcessId
     if (-not $process) { return $null }
@@ -583,6 +588,15 @@ function Assert-ControllerProcesses {
     return $owned
 }
 
+function Wait-ForDesktopParentExit([int]$ProcessId) {
+    Wait-Until {
+        $desktopProcess = Get-ProcessIfPresent $ProcessId
+        if (-not $desktopProcess) { return $true }
+        $desktopProcess.Dispose()
+        return $false
+    } 55 "desktop_graceful_quit_timeout"
+}
+
 function Quit-Desktop([int]$ProcessId) {
     $owned = Get-ControllerProcesses
     if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
@@ -592,62 +606,71 @@ function Quit-Desktop([int]$ProcessId) {
             Assert-OneActiveOwnerSession (Get-ControllerConfig)
         }
         try {
-            Wait-Until {
-                $desktopProcess = Get-ProcessIfPresent $ProcessId
-                if (-not $desktopProcess) { return $true }
-                $desktopProcess.Dispose()
-                $window = Get-Window $ProcessId
-                if (-not $window) { return $false }
-                if (Find-TextContaining $window "An active Operator session with permission to stop this node is required") {
-                    throw "controller_stop_operator_authorization_denied"
-                }
-                if (Find-TextContaining $window "Sign in again before stopping this node") {
-                    throw "controller_stop_operator_session_required"
-                }
-                if (Find-TextContaining $window "This Operator session expired or was revoked") {
-                    throw "controller_stop_operator_session_revoked"
-                }
-                if (Find-TextContaining $window "Only an Owner or Admin can stop this Controller") {
-                    throw "controller_stop_operator_role_forbidden"
-                }
-                if (Find-TextContaining $window "Change your Workspace password before stopping this node") {
-                    throw "controller_stop_operator_password_change_required"
-                }
-                if (Find-TextContaining $window "The Controller could not verify Operator access") {
-                    throw "controller_stop_operator_verification_failed"
-                }
-                if (Find-TextContaining $window "Operator access changed. Sign in again") {
-                    throw "controller_stop_operator_session_revoked"
-                }
-                if (Find-TextContaining $window "The node could not stop cleanly") {
-                    throw "controller_stop_shutdown_failed"
-                }
-                return $false
-            } 55 "desktop_graceful_quit_timeout"
+            Wait-ForDesktopParentExit $ProcessId
         } catch {
-            $remaining = Get-ControllerProcesses
-            $window = Get-Window $ProcessId
-            $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
-            $diagnosticName = Get-ElementName $diagnosticElement
-            $diagnosticCode = if ($diagnosticName) {
-                $diagnosticName -replace '^.*Diagnostic code:\s*', ''
-            } else { $null }
-            $processEvidence.graceful_quit_failure = [ordered]@{
-                postgres = $remaining.postgres.Count
-                http = $remaining.http.Count
-                scheduler = $remaining.scheduler.Count
-                diagnostic_code = $diagnosticCode
-                runtime_failed_visible = $null -ne (Find-TextContaining $window "Controller runtime failed")
-                operator_auth_error = $null -ne (Find-TextContaining `
-                    $window "An active Operator session with permission to stop this node is required"
-                )
-                operator_session_revoked = $null -ne (Find-TextContaining `
-                    $window "Operator access changed. Sign in again"
-                )
-                shutdown_error = $null -ne (Find-TextContaining $window "The node could not stop cleanly")
-                operator_session_state = Get-OperatorSessionEvidence (Get-ControllerConfig)
+            $primaryFailure = $_
+            $remaining = $null
+            $processDiagnosticExceptionType = $null
+            try {
+                $remaining = Get-ControllerProcesses
+            } catch {
+                $processDiagnosticExceptionType = Get-SafeExceptionTypeName $_.Exception
             }
-            throw
+            $operatorSessionState = $null
+            $sessionDiagnosticExceptionType = $null
+            try {
+                $operatorSessionState = Get-OperatorSessionEvidence (Get-ControllerConfig)
+            } catch {
+                $sessionDiagnosticExceptionType = Get-SafeExceptionTypeName $_.Exception
+            }
+            $uiDiagnostics = [ordered]@{
+                ui_diagnostics_available = $false
+                ui_diagnostics_exception_type = $null
+                diagnostic_code = $null
+                runtime_failed_visible = $null
+                operator_auth_error = $null
+                operator_session_revoked = $null
+                shutdown_error = $null
+            }
+            try {
+                $window = Get-Window $ProcessId
+                if ($window) {
+                    $diagnosticName = Get-ElementName (Find-TextContaining $window "Diagnostic code:")
+                    $uiDiagnostics.diagnostic_code = if ($diagnosticName) {
+                        $diagnosticName -replace '^.*Diagnostic code:\s*', ''
+                    } else { $null }
+                    $uiDiagnostics.runtime_failed_visible =
+                        $null -ne (Find-TextContaining $window "Controller runtime failed")
+                    $uiDiagnostics.operator_auth_error = $null -ne (Find-TextContaining `
+                        $window "An active Operator session with permission to stop this node is required"
+                    )
+                    $uiDiagnostics.operator_session_revoked = $null -ne (Find-TextContaining `
+                        $window "Operator access changed. Sign in again"
+                    )
+                    $uiDiagnostics.shutdown_error = $null -ne (
+                        Find-TextContaining $window "The node could not stop cleanly"
+                    )
+                    $uiDiagnostics.ui_diagnostics_available = $true
+                }
+            } catch {
+                $uiDiagnostics.ui_diagnostics_exception_type = Get-SafeExceptionTypeName $_.Exception
+            }
+            $processEvidence.graceful_quit_failure = [ordered]@{
+                postgres = if ($remaining) { $remaining.postgres.Count } else { $null }
+                http = if ($remaining) { $remaining.http.Count } else { $null }
+                scheduler = if ($remaining) { $remaining.scheduler.Count } else { $null }
+                process_diagnostics_exception_type = $processDiagnosticExceptionType
+                session_diagnostics_exception_type = $sessionDiagnosticExceptionType
+                operator_session_state = $operatorSessionState
+                ui_diagnostics_available = $uiDiagnostics.ui_diagnostics_available
+                ui_diagnostics_exception_type = $uiDiagnostics.ui_diagnostics_exception_type
+                diagnostic_code = $uiDiagnostics.diagnostic_code
+                runtime_failed_visible = $uiDiagnostics.runtime_failed_visible
+                operator_auth_error = $uiDiagnostics.operator_auth_error
+                operator_session_revoked = $uiDiagnostics.operator_session_revoked
+                shutdown_error = $uiDiagnostics.shutdown_error
+            }
+            throw $primaryFailure
         }
         return
     }
