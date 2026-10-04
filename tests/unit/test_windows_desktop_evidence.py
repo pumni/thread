@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -117,7 +118,33 @@ if ($normalWaitCommands.Count -ne 1 -or
     assert "process-authoritative Controller Quit assertion PASS" in completed.stdout
 
 
-def test_controller_input_uia_types_are_bounded_and_password_is_not_read_back() -> None:
+def test_controller_endpoint_inputs_have_unique_automation_ids() -> None:
+    app_source = (REPO_ROOT / "apps" / "desktop" / "src" / "App.tsx").read_text(encoding="utf-8")
+    input_tags = re.findall(r"<input\b[^>]*>", app_source, flags=re.DOTALL)
+    expected_inputs = {
+        "controller-lan-address": ("text", "Stable LAN IPv4 address"),
+        "controller-https-port": ("number", "HTTPS port"),
+    }
+
+    for automation_id, (input_type, accessible_name) in expected_inputs.items():
+        matching_tags = [
+            tag for tag in input_tags if re.search(rf'\bid="{re.escape(automation_id)}"', tag)
+        ]
+        assert len(matching_tags) == 1
+        assert re.search(rf'\btype="{input_type}"', matching_tags[0])
+        assert f'aria-label="{accessible_name}"' in matching_tags[0]
+        assert re.search(
+            rf"<label>\s*{re.escape(accessible_name)}\s*<input\b[^>]*\bid=\"{re.escape(automation_id)}\"",
+            app_source,
+            flags=re.DOTALL,
+        )
+
+    port_tag = next(tag for tag in input_tags if 'id="controller-https-port"' in tag)
+    assert re.search(r"\bmin=\{1\}", port_tag)
+    assert re.search(r"\bmax=\{65535\}", port_tag)
+
+
+def test_controller_input_uia_resolution_is_identity_safe_and_password_is_opaque() -> None:
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell AST parser is only available on Windows test hosts")
@@ -136,10 +163,12 @@ $functionNodes = @($ast.FindAll({{
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -in @('Set-LoginInput', 'Set-ControllerEndpointFields',
-            'Find-ElementByAllowedControlTypes', 'Find-ElementByName',
-            'Find-ElementByType')
+            'Find-ElementsByName', 'Find-ElementsByAutomationIdAndType',
+            'Find-ElementByType', 'Test-ElementSupportsPattern',
+            'Test-InteractiveInputElement', 'Resolve-InputControl',
+            'Get-InputLookupDiagnostics')
 }}, $true))
-if ($functionNodes.Count -ne 5) {{ throw "Expected the focused Controller input helpers" }}
+if ($functionNodes.Count -ne 9) {{ throw "Expected the focused Controller input helpers" }}
 $functions = @{{}}
 foreach ($functionNode in $functionNodes) {{ $functions[$functionNode.Name] = $functionNode }}
 $login = $functions['Set-LoginInput']
@@ -159,6 +188,13 @@ function Get-PatternCalls($body) {{
             $node.Member.Extent.Text -eq 'GetCurrentPattern'
     }}, $true))
 }}
+function Get-Invocations($body, [string]$memberName) {{
+    @($body.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $node.Member.Extent.Text -eq $memberName
+    }}, $true))
+}}
 
 $allowedParameter = @($loginBody.ParamBlock.Parameters | Where-Object {{
     $_.Name.VariablePath.UserPath -eq 'AllowedControlTypes'
@@ -169,30 +205,32 @@ if ($allowedParameter.Count -ne 1 -or
     throw "Default and text input control type must remain Edit-only"
 }}
 
-$allInputCalls = Get-Commands $ast 'Set-LoginInput'
-$customInputCalls = @($allInputCalls | Where-Object {{
-    $_.Extent.Text -match '-AllowedControlTypes'
-}})
-if ($customInputCalls.Count -ne 1 -or
-    $customInputCalls[0].Extent.Text -notmatch 'HTTPS port') {{
-    throw "Only the HTTPS port call may override allowed UIA control types"
-}}
-$portTypeNames = @([regex]::Matches(
-    $customInputCalls[0].Extent.Text, 'ControlType\]::(Spinner|Edit)'
-) | ForEach-Object {{ $_.Groups[1].Value }})
-if (($portTypeNames -join ',') -ne 'Spinner,Edit') {{
-    throw "HTTPS port must explicitly allow Spinner and Edit"
-}}
-
 $endpointBody = $functions['Set-ControllerEndpointFields'].Body
 $endpointCalls = Get-Commands $endpointBody 'Set-LoginInput'
 $addressCall = @(
     $endpointCalls | Where-Object {{ $_.Extent.Text -match 'Stable LAN IPv4 address' }}
 )
 $portCall = @($endpointCalls | Where-Object {{ $_.Extent.Text -match 'HTTPS port' }})
-if ($addressCall.Count -ne 1 -or $addressCall[0].Extent.Text -match '-AllowedControlTypes' -or
-    $portCall.Count -ne 1 -or $portCall[0].Extent.Text -notmatch '-AllowedControlTypes') {{
-    throw "Endpoint inputs must keep IPv4 on Edit and set explicit port types"
+if ($addressCall.Count -ne 1 -or
+    $addressCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-lan-address"' -or
+    $addressCall[0].Extent.Text -notmatch 'ControlType\]::Edit' -or
+    $portCall.Count -ne 1 -or
+    $portCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-https-port"') {{
+    throw "Endpoint helper must target its unique automation IDs"
+}}
+$portTypeNames = @([regex]::Matches(
+    $portCall[0].Extent.Text, 'ControlType\]::(Spinner|Edit)'
+) | ForEach-Object {{ $_.Groups[1].Value }})
+if (($portTypeNames -join ',') -ne 'Spinner,Edit') {{
+    throw "HTTPS port must explicitly allow Spinner and Edit"
+}}
+$allInputCalls = Get-Commands $ast 'Set-LoginInput'
+$customAutomationCalls = @($allInputCalls | Where-Object {{
+    $_.Extent.Text -match '-AutomationId'
+}})
+if ($customAutomationCalls.Count -ne 2 -or
+    @($allInputCalls | Where-Object {{ $_.Extent.Text -match 'HTTPS port' }}).Count -ne 1) {{
+    throw "Only the two endpoint controls use the endpoint AutomationIds"
 }}
 
 $commands = @($loginBody.FindAll({{
@@ -209,15 +247,48 @@ if ($waitCalls.Count -ne 2 -or $sendCalls.Count -ne 2 -or
     $waitCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset) {{
     throw "Input must use bounded UIA lookup before keyboard mutation"
 }}
-$allowedLookups = Get-Commands $loginBody 'Find-ElementByAllowedControlTypes'
-if ($allowedLookups.Count -ne 2 -or
+$resolverCalls = Get-Commands $loginBody 'Resolve-InputControl'
+$focusCalls = Get-Invocations $loginBody 'SetFocus'
+if ($resolverCalls.Count -lt 2 -or $focusCalls.Count -ne 1 -or
+    $resolverCalls[0].Extent.StartOffset -ge $focusCalls[0].Extent.StartOffset -or
+    $focusCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset -or
+    $sendCalls[0].Extent.StartOffset -ge $sendCalls[1].Extent.StartOffset -or
     $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode') {{
-    throw "Allowed exact-name UIA types must use the bounded field-specific lookup"
+    throw "Resolved interactive input must be focused and keyboard-mutated after bounded lookup"
 }}
-$inputHelper = $functions['Find-ElementByAllowedControlTypes'].Body.Extent.Text
-if ($inputHelper -notmatch 'foreach\s*\(\s*\$controlType\s+in\s+\$ControlTypes\s*\)' -or
-    $inputHelper -notmatch 'Find-Element\s+\$Root\s+\$Name\s+\$controlType') {{
-    throw "Allowed lookup must pair the exact name with each caller-approved type"
+$resolutionBody = $functions['Resolve-InputControl'].Body.Extent.Text
+$resolverBody = $functions['Resolve-InputControl'].Body
+$idLookup = Get-Commands $resolverBody 'Find-ElementsByAutomationIdAndType'
+$nameLookup = Get-Commands $resolverBody 'Find-ElementsByName'
+if ($idLookup.Count -ne 1 -or $nameLookup.Count -ne 1 -or
+    $idLookup[0].Extent.StartOffset -ge $nameLookup[0].Extent.StartOffset -or
+    $resolutionBody -notmatch '\$AllowedControlTypes\s*-contains\s*\$controlType' -or
+    $resolutionBody -notmatch 'Test-InteractiveInputElement\s+\$_\s+\$FieldId') {{
+    throw "AutomationId must be preferred; name fallback must filter interactive allowed controls"
+}}
+$idHelper = $functions['Find-ElementsByAutomationIdAndType'].Body.Extent.Text
+if ($idHelper -notmatch 'AutomationIdProperty' -or
+    $idHelper -notmatch 'ControlTypeProperty' -or
+    $idHelper -notmatch '\[System\.Windows\.Automation\.AndCondition\]::new' -or
+    $idHelper -notmatch '\$Root\.FindAll') {{
+    throw "AutomationId lookup must match the ID and allowed type exactly"
+}}
+$interactiveBody = $functions['Test-InteractiveInputElement'].Body.Extent.Text
+if ($interactiveBody -notmatch 'IsKeyboardFocusable' -or
+    $interactiveBody -notmatch 'IsEnabled' -or
+    $interactiveBody -notmatch 'ControlType\.Spinner' -or
+    $interactiveBody -notmatch 'ControlType\.Edit' -or
+    $interactiveBody -match 'ControlType\.Text' -or
+    $interactiveBody -notmatch 'RangeValuePattern' -or
+    $interactiveBody -notmatch 'ValuePattern') {{
+    throw "Name fallback must reject labels and require focusable enabled input patterns"
+}}
+$interactiveChildLookup = Get-Commands $functions['Test-InteractiveInputElement'].Body `
+    'Find-ElementByType'
+if ($interactiveChildLookup.Count -ne 1 -or
+    $interactiveChildLookup[0].Extent.Text -notmatch 'Find-ElementByType\s+\$Element' -or
+    $interactiveChildLookup[0].Extent.Text -notmatch 'ControlType\]::Edit') {{
+    throw "Spinner compatibility must find only an Edit child of that exact Spinner"
 }}
 
 $passwordGate = @($loginBody.FindAll({{
@@ -246,18 +317,32 @@ if ($spinnerBranch.Count -ne 1 -or
     throw "Spinner must verify RangeValue and keep any Edit fallback inside the named spinner"
 }}
 
-$namedTypeLookups = Get-Commands $loginBody 'Find-ElementByName'
+$diagnosticBody = $functions['Get-InputLookupDiagnostics'].Body.Extent.Text
+$nameFinderBody = $functions['Find-ElementsByName'].Body.Extent.Text
+if ($nameFinderBody -notmatch '\$Root\.FindAll' -or
+    $nameFinderBody -match '\$Root\.FindFirst' -or
+    $diagnosticBody -notmatch 'Find-ElementsByName' -or
+    $diagnosticBody -notmatch 'foreach\s*\(\s*\$element\s+in\s+\$elements\s*' -or
+    $diagnosticBody -notmatch 'automation_id' -or
+    $diagnosticBody -notmatch 'control_type' -or
+    $diagnosticBody -notmatch 'is_keyboard_focusable' -or
+    $diagnosticBody -notmatch 'is_enabled' -or
+    $diagnosticBody -notmatch 'supported_patterns' -or
+    $diagnosticBody -match 'Current\.Value') {{
+    throw "Failure diagnostics must enumerate structural metadata only"
+}}
+$namedTypeLookups = Get-Commands $loginBody 'Get-InputLookupDiagnostics'
 $diagnosticCatches = @($loginBody.FindAll({{
     param($node)
     $node -is [System.Management.Automation.Language.CatchClauseAst] -and
-    (Get-Commands $node.Body 'Find-ElementByName').Count -eq 1
+        (Get-Commands $node.Body 'Get-InputLookupDiagnostics').Count -eq 1
 }}, $true))
-$expectedFieldType = '$' + '{{fieldId}}_$' + '{{normalizedType}}'
-$expectedTypeCode = 'desktop_input_unexpected_control_type_' + $expectedFieldType
+$diagnosticFunction = $functions['Get-InputLookupDiagnostics']
+$diagPatternReads = Get-Commands $diagnosticFunction.Body 'Test-ElementSupportsPattern'
 if ($namedTypeLookups.Count -ne 1 -or $diagnosticCatches.Count -ne 1 -or
-    -not $diagnosticCatches[0].Extent.Text.Contains($expectedTypeCode) -or
-    $functions['Find-ElementByName'].Body.Extent.Text -notmatch '(?s)NameProperty.*\$Name') {{
-    throw "Untyped exact-name lookup must be diagnostic-only with a sanitized type error"
+    $diagnosticCatches[0].Extent.Text -notmatch 'input_lookup_diagnostics' -or
+    $diagPatternReads.Count -lt 4) {{
+    throw "Lookup failure must record safe pattern-presence diagnostics only"
 }}
 $childTypeLookups = Get-Commands $loginBody 'Find-ElementByType'
 if ($childTypeLookups.Count -ne 1 -or

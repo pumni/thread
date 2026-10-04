@@ -807,6 +807,7 @@ function App() {
                         <label>
                           Stable LAN IPv4 address
                           <input
+                            id="controller-lan-address"
                             type="text"
                             aria-label="Stable LAN IPv4 address"
                             inputMode="decimal"
@@ -819,6 +820,7 @@ function App() {
                         <label>
                           HTTPS port
                           <input
+                            id="controller-https-port"
                             type="number"
                             aria-label="HTTPS port"
                             min={1}

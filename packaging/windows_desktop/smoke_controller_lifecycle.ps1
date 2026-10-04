@@ -331,7 +331,7 @@ function Find-Element(
     }
 }
 
-function Find-ElementByName(
+function Find-ElementsByName(
     [System.Windows.Automation.AutomationElement]$Root,
     [string]$Name
 ) {
@@ -340,9 +340,32 @@ function Find-ElementByName(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name
     )
     try {
-        return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        return @($Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))
     } catch {
-        if (Test-ElementUnavailable $_.Exception) { return $null }
+        if (Test-ElementUnavailable $_.Exception) { return @() }
+        throw
+    }
+}
+
+function Find-ElementsByAutomationIdAndType(
+    [System.Windows.Automation.AutomationElement]$Root,
+    [string]$AutomationId,
+    [System.Windows.Automation.ControlType]$ControlType
+) {
+    if (-not $Root -or [string]::IsNullOrWhiteSpace($AutomationId)) { return @() }
+    $conditions = @(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, $AutomationId
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ControlType
+        )
+    )
+    $condition = [System.Windows.Automation.AndCondition]::new($conditions)
+    try {
+        return @($Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition))
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return @() }
         throw
     }
 }
@@ -363,16 +386,143 @@ function Find-ElementByType(
     }
 }
 
-function Find-ElementByAllowedControlTypes(
-    [System.Windows.Automation.AutomationElement]$Root,
-    [string]$Name,
-    [System.Windows.Automation.ControlType[]]$ControlTypes
+function Test-ElementSupportsPattern(
+    [System.Windows.Automation.AutomationElement]$Element,
+    [System.Windows.Automation.AutomationPattern]$Pattern
 ) {
-    foreach ($controlType in $ControlTypes) {
-        $candidate = Find-Element $Root $Name $controlType
-        if ($candidate) { return $candidate }
+    if (-not $Element) { return $false }
+    $patternObject = $null
+    try {
+        return [bool]$Element.TryGetCurrentPattern($Pattern, [ref]$patternObject)
+    } catch { return $false }
+}
+
+function Test-InteractiveInputElement(
+    [System.Windows.Automation.AutomationElement]$Element,
+    [string]$FieldId
+) {
+    if (-not $Element) { return $false }
+    try {
+        $current = $Element.Current
+        if (-not $current.IsKeyboardFocusable -or -not $current.IsEnabled) { return $false }
+        switch ($current.ControlType.ProgrammaticName) {
+            "ControlType.Spinner" {
+                $hasRangeValue = Test-ElementSupportsPattern $Element `
+                    ([System.Windows.Automation.RangeValuePattern]::Pattern)
+                if ($hasRangeValue) { return $true }
+                $childEdit = Find-ElementByType $Element `
+                    ([System.Windows.Automation.ControlType]::Edit)
+                if (-not $childEdit) { return $false }
+                $childCurrent = $childEdit.Current
+                return $childCurrent.IsKeyboardFocusable -and $childCurrent.IsEnabled -and `
+                    (Test-ElementSupportsPattern $childEdit `
+                        ([System.Windows.Automation.ValuePattern]::Pattern))
+            }
+            "ControlType.Edit" {
+                if ($FieldId -eq "password") { return $true }
+                return Test-ElementSupportsPattern $Element `
+                    ([System.Windows.Automation.ValuePattern]::Pattern)
+            }
+            default { return $false }
+        }
+    } catch { return $false }
+}
+
+function Resolve-InputControl(
+    [int]$ProcessId,
+    [string]$Name,
+    [string]$AutomationId,
+    [System.Windows.Automation.ControlType[]]$AllowedControlTypes,
+    [string]$FieldId
+) {
+    $window = Get-Window $ProcessId
+    if (-not $window) {
+        return [pscustomobject]@{ Control = $null; Ambiguous = $false }
     }
-    return $null
+
+    if (-not [string]::IsNullOrWhiteSpace($AutomationId)) {
+        $automationIdMatches = @(
+            foreach ($controlType in $AllowedControlTypes) {
+                Find-ElementsByAutomationIdAndType $window $AutomationId $controlType
+            }
+        )
+        $interactiveIdMatches = @($automationIdMatches | Where-Object {
+            Test-InteractiveInputElement $_ $FieldId
+        })
+        if ($interactiveIdMatches.Count -eq 1) {
+            return [pscustomobject]@{ Control = $interactiveIdMatches[0]; Ambiguous = $false }
+        }
+        if ($interactiveIdMatches.Count -gt 1) {
+            return [pscustomobject]@{ Control = $null; Ambiguous = $true }
+        }
+    }
+
+    $nameMatches = @(Find-ElementsByName $window $Name)
+    $interactiveNameMatches = @($nameMatches | Where-Object {
+        $controlType = $_.Current.ControlType
+        ($AllowedControlTypes -contains $controlType) -and
+            (Test-InteractiveInputElement $_ $FieldId)
+    })
+    if ($interactiveNameMatches.Count -eq 1) {
+        return [pscustomobject]@{ Control = $interactiveNameMatches[0]; Ambiguous = $false }
+    }
+    return [pscustomobject]@{
+        Control = $null
+        Ambiguous = $interactiveNameMatches.Count -gt 1
+    }
+}
+
+function Get-InputLookupDiagnostics(
+    [int]$ProcessId,
+    [string]$Name,
+    [string]$AutomationId,
+    [System.Windows.Automation.ControlType[]]$AllowedControlTypes
+) {
+    $window = Get-Window $ProcessId
+    $elements = @(Find-ElementsByName $window $Name)
+    $matches = @(
+        foreach ($element in $elements) {
+            $nameValue = $null
+            $automationIdValue = $null
+            $controlTypeName = "unknown"
+            $keyboardFocusable = $null
+            $enabled = $null
+            try {
+                $current = $element.Current
+                $nameValue = [string]$current.Name
+                $automationIdValue = [string]$current.AutomationId
+                $controlTypeName = [string]$current.ControlType.ProgrammaticName
+                $keyboardFocusable = [bool]$current.IsKeyboardFocusable
+                $enabled = [bool]$current.IsEnabled
+            } catch { }
+
+            [ordered]@{
+                name = $nameValue
+                automation_id = $automationIdValue
+                control_type = $controlTypeName
+                is_keyboard_focusable = $keyboardFocusable
+                is_enabled = $enabled
+                supported_patterns = [ordered]@{
+                    ValuePattern = Test-ElementSupportsPattern $element `
+                        ([System.Windows.Automation.ValuePattern]::Pattern)
+                    RangeValuePattern = Test-ElementSupportsPattern $element `
+                        ([System.Windows.Automation.RangeValuePattern]::Pattern)
+                    TextPattern = Test-ElementSupportsPattern $element `
+                        ([System.Windows.Automation.TextPattern]::Pattern)
+                    InvokePattern = Test-ElementSupportsPattern $element `
+                        ([System.Windows.Automation.InvokePattern]::Pattern)
+                    LegacyIAccessiblePattern = Test-ElementSupportsPattern $element `
+                        ([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+                }
+            }
+        }
+    )
+    return [ordered]@{
+        expected_name = $Name
+        expected_automation_id = $AutomationId
+        allowed_control_types = @($AllowedControlTypes | ForEach-Object { $_.ProgrammaticName })
+        exact_name_matches = $matches
+    }
 }
 
 function Get-ElementName([System.Windows.Automation.AutomationElement]$Element) {
@@ -432,6 +582,7 @@ function Set-LoginInput {
         [int]$ProcessId,
         [string]$Name,
         [string]$Value,
+        [string]$AutomationId,
         [System.Windows.Automation.ControlType[]]$AllowedControlTypes = @(
             [System.Windows.Automation.ControlType]::Edit
         )
@@ -454,27 +605,20 @@ function Set-LoginInput {
     $resolvedInput = [pscustomobject]@{ Control = $null }
     try {
         Wait-Until {
-            $candidate = Find-ElementByAllowedControlTypes `
-                (Get-Window $ProcessId) $Name $AllowedControlTypes
-            if (-not $candidate) { return $false }
-            $resolvedInput.Control = $candidate
+            $resolution = Resolve-InputControl `
+                $ProcessId $Name $AutomationId $AllowedControlTypes $fieldId
+            if (-not $resolution.Control) { return $false }
+            $resolvedInput.Control = $resolution.Control
             return $true
         } 20 $inputUnavailableCode
     } catch {
         if ($_.Exception.Message -eq $inputUnavailableCode) {
-            $namedControl = Find-ElementByName (Get-Window $ProcessId) $Name
-            if ($namedControl) {
-                $normalizedType = "unknown"
-                try {
-                    $controlTypeName = [string]$namedControl.Current.ControlType.ProgrammaticName
-                    $normalizedType = [regex]::Replace(
-                        $controlTypeName, "^ControlType\.", ""
-                    ).ToLowerInvariant()
-                    if ([string]::IsNullOrWhiteSpace($normalizedType)) {
-                        $normalizedType = "unknown"
-                    }
-                } catch { $normalizedType = "unknown" }
-                throw "desktop_input_unexpected_control_type_${fieldId}_${normalizedType}"
+            $failedResolution = Resolve-InputControl `
+                $ProcessId $Name $AutomationId $AllowedControlTypes $fieldId
+            $script:processEvidence["input_lookup_diagnostics"] = Get-InputLookupDiagnostics `
+                $ProcessId $Name $AutomationId $AllowedControlTypes
+            if ($failedResolution.Ambiguous) {
+                throw "desktop_input_ambiguous_interactive_controls_$fieldId"
             }
         }
         throw
@@ -486,8 +630,9 @@ function Set-LoginInput {
     [System.Windows.Forms.SendKeys]::SendWait($Value)
     if ($fieldId -ne "password") {
         Wait-Until {
-            $current = Find-ElementByAllowedControlTypes `
-                (Get-Window $ProcessId) $Name $AllowedControlTypes
+            $resolution = Resolve-InputControl `
+                $ProcessId $Name $AutomationId $AllowedControlTypes $fieldId
+            $current = $resolution.Control
             if (-not $current) { return $false }
 
             $controlTypeName = [string]$current.Current.ControlType.ProgrammaticName
@@ -909,11 +1054,17 @@ function Open-ControllerEndpointReconfiguration([int]$ProcessId) {
 }
 
 function Set-ControllerEndpointFields([int]$ProcessId, [string]$Address, [int]$Port) {
-    Set-LoginInput $ProcessId "Stable LAN IPv4 address" $Address
+    Set-LoginInput `
+        -ProcessId $ProcessId `
+        -Name "Stable LAN IPv4 address" `
+        -Value $Address `
+        -AutomationId "controller-lan-address" `
+        -AllowedControlTypes @([System.Windows.Automation.ControlType]::Edit)
     Set-LoginInput `
         -ProcessId $ProcessId `
         -Name "HTTPS port" `
         -Value ([string]$Port) `
+        -AutomationId "controller-https-port" `
         -AllowedControlTypes @(
             [System.Windows.Automation.ControlType]::Spinner,
             [System.Windows.Automation.ControlType]::Edit
@@ -1144,8 +1295,7 @@ try {
     Wait-ControllerState $desktop.Id "Configure Controller HTTPS" $null 420
     $lanAddress = Get-LocalControllerIpv4
     $selectedHttpsPort = Get-FreeHttpsPort
-    Set-LoginInput $desktop.Id "Stable LAN IPv4 address" $lanAddress
-    Set-LoginInput $desktop.Id "HTTPS port" ([string]$selectedHttpsPort)
+    Set-ControllerEndpointFields $desktop.Id $lanAddress $selectedHttpsPort
     Invoke-Button $desktop.Id "Configure HTTPS"
     Wait-Until {
         $configured = Get-ControllerConfig
