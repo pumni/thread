@@ -49,6 +49,7 @@ $smokeScript = Join-Path $RepositoryRoot "packaging\windows_desktop\smoke_runtim
 $verifierScript = Join-Path $RepositoryRoot "packaging\windows_desktop\verify_runtime_evidence.py"
 $lockPath = Join-Path $RepositoryRoot "uv.lock"
 $controllerSmokeScript = Join-Path $RepositoryRoot "packaging\windows_desktop\smoke_controller_lifecycle.ps1"
+$controllerHttpsProbeScript = Join-Path $RepositoryRoot "packaging\windows_desktop\controller_https_probe.ps1"
 $downloadManifestPath = Join-Path $RepositoryRoot "packaging\windows_desktop\download-manifest.json"
 $postgresArchivePath = Join-Path $RepositoryRoot "build\downloads\postgresql-17.11-4-windows-x64-binaries.zip"
 $EvidenceOutput = [System.IO.Path]::GetFullPath($EvidenceOutput)
@@ -73,6 +74,7 @@ $stageCandidates = Join-Path $stageRoot "candidates"
 $stageEvidence = Join-Path $stageRoot "evidence"
 $stageSmokeScript = Join-Path $stageRoot "smoke_runtime.ps1"
 $stageControllerSmokeScript = Join-Path $stageRoot "smoke_controller_lifecycle.ps1"
+$stageControllerHttpsProbeScript = Join-Path $stageRoot "controller_https_probe.ps1"
 $stageControllerDesktop = Join-Path $stageRoot "desktop\threads-desktop.exe"
 $stageControllerEvidence = Join-Path $stageEvidence "controller-lifecycle.json"
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -473,12 +475,16 @@ try {
         if (-not (Test-Path -LiteralPath $controllerSmokeScript -PathType Leaf)) {
             throw "hosted_controller_smoke_script_missing"
         }
+        if (-not (Test-Path -LiteralPath $controllerHttpsProbeScript -PathType Leaf)) {
+            throw "hosted_controller_https_probe_script_missing"
+        }
         if (-not (Test-Path -LiteralPath $ControllerDesktopExecutable -PathType Leaf)) {
             throw "hosted_controller_desktop_executable_missing"
         }
         New-Item -ItemType Directory -Path (Split-Path -Parent $stageControllerDesktop) -Force | Out-Null
         Copy-Item -LiteralPath $ControllerDesktopExecutable -Destination $stageControllerDesktop
         Copy-Item -LiteralPath $controllerSmokeScript -Destination $stageControllerSmokeScript
+        Copy-Item -LiteralPath $controllerHttpsProbeScript -Destination $stageControllerHttpsProbeScript
     }
 
     if (-not $ControllerOnly) {

@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::TcpListener,
+    net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
 };
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
-const CONFIG_SCHEMA_VERSION: u32 = 1;
+const CONFIG_SCHEMA_VERSION: u32 = 2;
 const MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
 const DATABASE_USER: &str = "threads_platform";
 
@@ -21,6 +21,10 @@ pub(super) struct ControllerConfig {
     pub cluster_initialized: bool,
     pub database_port: u16,
     pub endpoint_port: u16,
+    #[serde(default)]
+    pub lan_address: Option<Ipv4Addr>,
+    #[serde(default)]
+    pub tls_identity_provisioned: bool,
 }
 
 impl ControllerConfig {
@@ -42,9 +46,9 @@ impl ControllerConfig {
 
     fn load(path: &Path) -> Result<Self, &'static str> {
         let bytes = fs::read(path).map_err(|_| "controller_config_read_failed")?;
-        let config: Self =
+        let mut config: Self =
             serde_json::from_slice(&bytes).map_err(|_| "controller_config_invalid")?;
-        if config.schema_version != CONFIG_SCHEMA_VERSION
+        if !matches!(config.schema_version, 1 | CONFIG_SCHEMA_VERSION)
             || config.controller_id.len() != 32
             || !config
                 .controller_id
@@ -58,6 +62,10 @@ impl ControllerConfig {
         }
         if !config.cluster_initialized {
             return Err("controller_data_root_incomplete");
+        }
+        if config.schema_version == 1 {
+            config.schema_version = CONFIG_SCHEMA_VERSION;
+            config.save_atomic(path)?;
         }
         Ok(config)
     }
@@ -119,23 +127,22 @@ impl ControllerStore {
             verify_cluster_directory(&root)?;
             let protected =
                 fs::read(&credential_path).map_err(|_| "controller_credential_unavailable")?;
-            let password = Zeroizing::new(unprotect_current_user(&protected)?);
+            let password =
+                Zeroizing::new(crate::windows_crypto::unprotect_current_user(&protected)?);
             if password.len() != 64 || !password.iter().all(u8::is_ascii_hexdigit) {
                 return Err("controller_credential_invalid");
             }
             (config, password)
         } else {
             let mut password_random = Zeroizing::new([0u8; 32]);
-            fill_random(&mut *password_random)?;
+            crate::windows_crypto::fill_random(&mut *password_random)?;
             let password = Zeroizing::new(hex(&*password_random).into_bytes());
             let mut identity_random = Zeroizing::new([0u8; 16]);
-            fill_random(&mut *identity_random)?;
+            crate::windows_crypto::fill_random(&mut *identity_random)?;
             let controller_id = hex(&*identity_random);
 
             let database_socket = TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|_| "controller_database_port_unavailable")?;
-            let endpoint_socket = TcpListener::bind(("127.0.0.1", 0))
-                .map_err(|_| "controller_endpoint_port_unavailable")?;
             let config = ControllerConfig {
                 schema_version: CONFIG_SCHEMA_VERSION,
                 controller_id,
@@ -144,14 +151,13 @@ impl ControllerStore {
                     .local_addr()
                     .map_err(|_| "controller_database_port_unavailable")?
                     .port(),
-                endpoint_port: endpoint_socket
-                    .local_addr()
-                    .map_err(|_| "controller_endpoint_port_unavailable")?
-                    .port(),
+                endpoint_port: 8443,
+                lan_address: None,
+                tls_identity_provisioned: false,
             };
-            drop((database_socket, endpoint_socket));
+            drop(database_socket);
 
-            let protected = protect_current_user(&password)?;
+            let protected = crate::windows_crypto::protect_current_user(&password)?;
             atomic_write(
                 &credential_path,
                 &protected,
@@ -174,6 +180,47 @@ impl ControllerStore {
 
     pub fn config(&self) -> &ControllerConfig {
         &self.config
+    }
+
+    pub fn data_root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn local_endpoint(&self) -> Result<String, &'static str> {
+        if self.config.lan_address.is_none() {
+            return Err("controller_https_configuration_required");
+        }
+        Ok(format!("https://127.0.0.1:{}", self.config.endpoint_port))
+    }
+
+    pub fn configure_https(
+        &mut self,
+        lan_address: &str,
+        endpoint_port: u16,
+    ) -> Result<(), &'static str> {
+        let address = lan_address
+            .parse::<Ipv4Addr>()
+            .map_err(|_| "controller_lan_address_invalid")?;
+        if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+            return Err("controller_lan_address_invalid");
+        }
+        if endpoint_port == 0 {
+            return Err("controller_endpoint_port_invalid");
+        }
+        if endpoint_port == self.config.database_port {
+            return Err("controller_endpoint_port_in_use");
+        }
+        if self.config.lan_address == Some(address) && self.config.endpoint_port == endpoint_port {
+            return Ok(());
+        }
+        let previous = self.config.clone();
+        self.config.lan_address = Some(address);
+        self.config.endpoint_port = endpoint_port;
+        if let Err(error) = self.config.save_atomic(&self.config_path) {
+            self.config = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn needs_initialization(&self) -> bool {
@@ -200,6 +247,15 @@ impl ControllerStore {
             return Err(error);
         }
         self.new_root = false;
+        Ok(())
+    }
+
+    pub fn mark_tls_identity_provisioned(&mut self) -> Result<(), &'static str> {
+        self.config.tls_identity_provisioned = true;
+        if let Err(error) = self.config.save_atomic(&self.config_path) {
+            self.config.tls_identity_provisioned = false;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -251,7 +307,9 @@ impl ControllerStore {
     pub fn config_summary(&self) -> ControllerSummary {
         ControllerSummary {
             controller_id: self.config.controller_id.clone(),
-            endpoint: format!("http://127.0.0.1:{}", self.config.endpoint_port),
+            endpoint: self.config.lan_address.map_or_else(String::new, |address| {
+                format!("https://{address}:{}", self.config.endpoint_port)
+            }),
             database_port: self.config.database_port,
         }
     }
@@ -377,122 +435,41 @@ fn open_owner_lock(path: &Path) -> Result<File, &'static str> {
     }
 }
 
-fn fill_random(output: &mut [u8]) -> Result<(), &'static str> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Security::Cryptography::{
-            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        };
-        let status = unsafe {
-            BCryptGenRandom(
-                std::ptr::null_mut(),
-                output.as_mut_ptr(),
-                output.len() as u32,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err("controller_random_source_unavailable")
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = output;
-        Err("controller_platform_unsupported")
-    }
-}
-
-#[cfg(windows)]
-fn protect_current_user(plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
-    };
-
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: plaintext.len() as u32,
-        pbData: plaintext.as_ptr() as *mut u8,
-    };
-    let mut output = CRYPT_INTEGER_BLOB {
-        cbData: 0,
-        pbData: std::ptr::null_mut(),
-    };
-    let success = unsafe {
-        CryptProtectData(
-            &input,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    if success == 0 || output.pbData.is_null() {
-        return Err("controller_dpapi_protect_failed");
-    }
-    let protected =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe {
-        LocalFree(output.pbData.cast());
-    }
-    Ok(protected)
-}
-
-#[cfg(not(windows))]
-fn protect_current_user(_plaintext: &[u8]) -> Result<Vec<u8>, &'static str> {
-    Err("controller_platform_unsupported")
-}
-
-#[cfg(windows)]
-fn unprotect_current_user(ciphertext: &[u8]) -> Result<Vec<u8>, &'static str> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::Cryptography::{
-            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
-        },
-    };
-
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: ciphertext.len() as u32,
-        pbData: ciphertext.as_ptr() as *mut u8,
-    };
-    let mut output = CRYPT_INTEGER_BLOB {
-        cbData: 0,
-        pbData: std::ptr::null_mut(),
-    };
-    let success = unsafe {
-        CryptUnprotectData(
-            &input,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    if success == 0 || output.pbData.is_null() {
-        return Err("controller_dpapi_unprotect_failed");
-    }
-    let plaintext =
-        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
-    unsafe {
-        LocalFree(output.pbData.cast());
-    }
-    Ok(plaintext)
-}
-
-#[cfg(not(windows))]
-fn unprotect_current_user(_ciphertext: &[u8]) -> Result<Vec<u8>, &'static str> {
-    Err("controller_platform_unsupported")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configuration_store(root: &Path, endpoint_port: u16) -> ControllerStore {
+        fs::create_dir_all(root).expect("create temporary Controller root");
+        let config_path = root.join("controller.json");
+        let config = ControllerConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            controller_id: "0123456789abcdef0123456789abcdef".to_string(),
+            cluster_initialized: true,
+            database_port: 51_001,
+            endpoint_port,
+            lan_address: None,
+            tls_identity_provisioned: false,
+        };
+        config
+            .save_atomic(&config_path)
+            .expect("persist fixture config");
+        let owner_lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".owner.lock"))
+            .expect("create fixture owner lock");
+        ControllerStore {
+            root: root.to_path_buf(),
+            runtime_root: root.join("runtime"),
+            config_path,
+            config,
+            database_password: Zeroizing::new(Vec::new()),
+            new_root: false,
+            _owner_lock: owner_lock,
+        }
+    }
 
     #[test]
     fn low_free_space_fails_before_provisioning() {
@@ -554,13 +531,17 @@ mod tests {
             cluster_initialized: true,
             database_port: 51_001,
             endpoint_port: 51_002,
+            lan_address: None,
+            tls_identity_provisioned: false,
         };
         let value = serde_json::to_value(config).expect("serialize controller config");
         let object = value.as_object().expect("controller config object");
-        assert_eq!(object.len(), 5);
+        assert_eq!(object.len(), 7);
         assert!(object.contains_key("controllerId"));
         assert!(object.contains_key("databasePort"));
         assert!(object.contains_key("endpointPort"));
+        assert!(object.contains_key("lanAddress"));
+        assert_eq!(object["tlsIdentityProvisioned"], false);
         assert!(!object.contains_key("password"));
         assert!(!object.contains_key("databaseUrl"));
     }
@@ -575,6 +556,8 @@ mod tests {
             cluster_initialized: false,
             database_port: 51_001,
             endpoint_port: 51_002,
+            lan_address: None,
+            tls_identity_provisioned: false,
         };
         config.save_atomic(&path).expect("write incomplete config");
         assert_eq!(
@@ -600,10 +583,119 @@ mod tests {
             cluster_initialized: true,
             database_port: 51_001,
             endpoint_port: 51_002,
+            lan_address: None,
+            tls_identity_provisioned: false,
         };
         config.save_atomic(&path).expect("first atomic write");
         config.save_atomic(&path).expect("replace atomic state");
         assert_eq!(ControllerConfig::load(&path).unwrap().database_port, 51_001);
+    }
+
+    #[test]
+    fn tls_identity_provisioned_marker_persists_without_secret_material() {
+        let directory = tempfile::tempdir().expect("temporary Controller state");
+        let mut store = configuration_store(directory.path(), 51_002);
+
+        store
+            .mark_tls_identity_provisioned()
+            .expect("persist TLS identity marker");
+
+        let persisted = ControllerConfig::load(&directory.path().join("controller.json"))
+            .expect("reload Controller config");
+        assert!(persisted.tls_identity_provisioned);
+        let value = serde_json::to_value(persisted).expect("serialize persisted config");
+        assert!(value.get("rootKey").is_none());
+        assert!(value.get("leafKey").is_none());
+    }
+
+    #[test]
+    fn dx05_config_migrates_without_changing_persisted_endpoint_port() {
+        let directory = tempfile::tempdir().expect("temporary Controller root");
+        let path = directory.path().join("controller.json");
+        fs::write(
+            &path,
+            br#"{"schemaVersion":1,"controllerId":"0123456789abcdef0123456789abcdef","clusterInitialized":true,"databasePort":51001,"endpointPort":51002}"#,
+        )
+        .expect("write DX-05 config");
+
+        let migrated = ControllerConfig::load(&path).expect("migrate DX-05 config");
+
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(migrated.endpoint_port, 51_002);
+        assert_eq!(migrated.lan_address, None);
+        assert!(!migrated.tls_identity_provisioned);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read migrated config"))
+                .expect("parse migrated config");
+        assert_eq!(persisted["endpointPort"], 51_002);
+        assert!(persisted["lanAddress"].is_null());
+        assert_eq!(persisted["tlsIdentityProvisioned"], false);
+    }
+
+    #[test]
+    fn configured_endpoint_can_be_explicitly_replaced_and_persisted() {
+        let directory = tempfile::tempdir().expect("temporary Controller state");
+        let mut store = configuration_store(directory.path(), 51_002);
+
+        store
+            .configure_https("192.0.2.10", 54_321)
+            .expect("initial endpoint");
+        store
+            .configure_https("198.51.100.20", 54_322)
+            .expect("explicit endpoint change");
+        assert_eq!(
+            store.config().lan_address,
+            Some(Ipv4Addr::new(198, 51, 100, 20))
+        );
+        assert_eq!(store.config().endpoint_port, 54_322);
+        assert!(!store.config().tls_identity_provisioned);
+        let persisted = ControllerConfig::load(&directory.path().join("controller.json"))
+            .expect("reconfigured endpoint persisted");
+        assert_eq!(persisted.lan_address, Some(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(persisted.endpoint_port, 54_322);
+    }
+
+    #[test]
+    fn port_only_endpoint_reconfiguration_preserves_address_and_persists_port() {
+        let directory = tempfile::tempdir().expect("temporary Controller state");
+        let mut store = configuration_store(directory.path(), 51_002);
+        let address = "192.0.2.10";
+        store
+            .configure_https(address, 54_321)
+            .expect("initial endpoint");
+        store
+            .configure_https(address, 54_322)
+            .expect("port-only endpoint change");
+
+        let persisted = ControllerConfig::load(&directory.path().join("controller.json"))
+            .expect("port-only change persisted");
+        assert_eq!(
+            store.config().lan_address,
+            Some(Ipv4Addr::new(192, 0, 2, 10))
+        );
+        assert_eq!(store.config().endpoint_port, 54_322);
+        assert_eq!(persisted.lan_address, store.config().lan_address);
+        assert_eq!(persisted.endpoint_port, 54_322);
+    }
+
+    #[test]
+    fn endpoint_configuration_rejects_invalid_addresses_and_database_port() {
+        let directory = tempfile::tempdir().expect("temporary Controller state");
+        let mut store = configuration_store(directory.path(), 51_002);
+        assert_eq!(
+            store.configure_https("127.0.0.1", 54_321),
+            Err("controller_lan_address_invalid")
+        );
+        assert_eq!(
+            store.configure_https("192.0.2.10", 51_001),
+            Err("controller_endpoint_port_in_use")
+        );
+        assert_eq!(store.config().lan_address, None);
+        assert_eq!(store.config().endpoint_port, 51_002);
+        let persisted = ControllerConfig::load(&directory.path().join("controller.json"))
+            .expect("saved config remains unchanged");
+        assert_eq!(persisted.lan_address, None);
+        assert_eq!(persisted.endpoint_port, 51_002);
     }
 
     #[cfg(windows)]
@@ -629,7 +721,9 @@ mod tests {
             .expect("create current-user encrypted Controller state");
         let protected =
             fs::read(root.join("database-credential.dpapi")).expect("read protected credential");
-        let clear = Zeroizing::new(unprotect_current_user(&protected).expect("DPAPI unprotect"));
+        let clear = Zeroizing::new(
+            crate::windows_crypto::unprotect_current_user(&protected).expect("DPAPI unprotect"),
+        );
         assert_eq!(&*clear, store.database_password());
         assert!(
             !String::from_utf8_lossy(&fs::read(root.join("controller.json")).unwrap())

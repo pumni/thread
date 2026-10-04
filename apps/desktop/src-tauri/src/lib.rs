@@ -1,7 +1,10 @@
 mod controller_store;
+mod controller_tls;
+mod controller_trust;
 mod operator_client;
 mod startup_gate;
 mod supervisor;
+mod windows_crypto;
 
 use std::{
     fs,
@@ -13,6 +16,8 @@ use std::{
 #[cfg(windows)]
 use auto_launch::WindowsEnableMode;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
+use controller_tls::ControllerTlsSummary;
+use controller_trust::{ControllerTrustState, TrustProbeSummary, TrustedControllerSummary};
 use serde::{Deserialize, Serialize};
 use supervisor::{Supervisor, SupervisorSnapshot};
 use tauri::{
@@ -379,10 +384,10 @@ impl DeviceState {
             return Err("controller_runtime_unavailable".to_string());
         }
         inner.supervisor.refresh_health();
-        DesktopSnapshot::from(&*inner)
+        inner
             .supervisor
-            .endpoint
-            .ok_or_else(|| "controller_runtime_unavailable".to_string())
+            .local_controller_endpoint()
+            .map_err(str::to_string)
     }
 
     fn bootstrap_owner(&self, username: &str, password: &str) -> Result<String, String> {
@@ -394,10 +399,92 @@ impl DeviceState {
             return Err("controller_runtime_unavailable".to_string());
         }
         inner.supervisor.bootstrap_owner(username, password)?;
-        DesktopSnapshot::from(&*inner)
+        inner
             .supervisor
-            .endpoint
-            .ok_or_else(|| "controller_runtime_unavailable".to_string())
+            .local_controller_endpoint()
+            .map_err(str::to_string)
+    }
+
+    fn configure_https(
+        &self,
+        lan_address: &str,
+        port: u16,
+    ) -> Result<ControllerTlsSummary, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner.supervisor.configure_https(lan_address, port)
+    }
+
+    fn controller_owner_exists(&self) -> Result<bool, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner.supervisor.controller_owner_exists()
+    }
+
+    fn reconfigure_https(
+        &self,
+        lan_address: &str,
+        port: u16,
+        owner_authorized: bool,
+    ) -> Result<ControllerTlsSummary, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner
+            .supervisor
+            .reconfigure_https(lan_address, port, owner_authorized)
+    }
+
+    fn controller_https_summary(&self) -> Result<ControllerTlsSummary, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner.supervisor.controller_https_summary()
+    }
+
+    fn controller_tls_root(&self) -> Result<Vec<u8>, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner
+            .supervisor
+            .controller_tls_root()
+            .map_err(str::to_string)
+    }
+
+    fn trust_path(&self) -> PathBuf {
+        controller_trust::trust_path(
+            self.config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )
+    }
+
+    fn trusted_root_for_endpoint(&self, endpoint: &str) -> Result<Vec<u8>, String> {
+        controller_trust::trusted_root_for_endpoint(&self.trust_path(), endpoint)
+            .map_err(str::to_string)
     }
 
     fn restart(&self) -> Result<(), String> {
@@ -447,6 +534,81 @@ impl From<&DeviceStateInner> for DesktopSnapshot {
 #[tauri::command]
 fn get_desktop_snapshot(state: State<'_, DeviceState>) -> Result<DesktopSnapshot, String> {
     state.snapshot()
+}
+
+#[tauri::command]
+fn controller_https_configure(
+    state: State<'_, DeviceState>,
+    lan_address: String,
+    port: u16,
+) -> Result<ControllerTlsSummary, String> {
+    state.configure_https(&lan_address, port)
+}
+
+#[tauri::command]
+async fn controller_https_reconfigure(
+    state: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+    lan_address: String,
+    port: u16,
+) -> Result<ControllerTlsSummary, String> {
+    let owner_exists = state.controller_owner_exists()?;
+    if owner_exists {
+        authorize_node_lifecycle(&state, &operator)
+            .await
+            .map_err(|error| match error.as_str() {
+                "operator_authentication_required"
+                | "operator_forbidden"
+                | "operator_password_change_required" => {
+                    "controller_https_reconfiguration_unauthorized".to_string()
+                }
+                _ => error,
+            })?;
+    }
+    let summary = state.reconfigure_https(&lan_address, port, owner_exists)?;
+    if owner_exists {
+        operator.lock_session();
+    }
+    Ok(summary)
+}
+
+#[tauri::command]
+fn controller_https_summary(state: State<'_, DeviceState>) -> Result<ControllerTlsSummary, String> {
+    state.controller_https_summary()
+}
+
+#[tauri::command]
+async fn controller_trust_probe(
+    trust: State<'_, ControllerTrustState>,
+    endpoint: String,
+) -> Result<TrustProbeSummary, String> {
+    let trust = trust.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || trust.probe(&endpoint))
+        .await
+        .map_err(|_| "controller_trust_probe_failed".to_string())?
+        .map_err(str::to_string)
+}
+
+#[tauri::command]
+async fn controller_trust_confirm(
+    state: State<'_, DeviceState>,
+    trust: State<'_, ControllerTrustState>,
+    probe_id: String,
+) -> Result<TrustedControllerSummary, String> {
+    let trust = trust.inner().clone();
+    let trust_path = state.trust_path();
+    tauri::async_runtime::spawn_blocking(move || trust.confirm(&probe_id, &trust_path))
+        .await
+        .map_err(|_| "controller_trust_probe_failed".to_string())?
+        .map_err(str::to_string)
+}
+
+#[tauri::command]
+fn controller_trust_summary(
+    state: State<'_, DeviceState>,
+    endpoint: Option<String>,
+) -> Result<TrustedControllerSummary, String> {
+    controller_trust::summary(&state.trust_path(), endpoint.as_deref()).map_err(str::to_string)
 }
 
 #[tauri::command]
@@ -531,13 +693,16 @@ async fn operator_login(
     password: String,
 ) -> Result<OperatorIdentity, String> {
     let password = Zeroizing::new(password);
-    let endpoint = if device.role()? == Some(ProvisionedRole::Controller) {
-        device.local_controller_url()?
+    let (endpoint, root_certificate) = if device.role()? == Some(ProvisionedRole::Controller) {
+        (
+            device.local_controller_url()?,
+            device.controller_tls_root()?,
+        )
     } else {
-        api_url
+        (api_url.clone(), device.trusted_root_for_endpoint(&api_url)?)
     };
     operator
-        .login(&endpoint, &username, password.as_str())
+        .login(&endpoint, &root_certificate, &username, password.as_str())
         .await
 }
 
@@ -549,9 +714,11 @@ async fn operator_bootstrap_owner(
     password: String,
 ) -> Result<OperatorIdentity, String> {
     let password = Zeroizing::new(password);
-    let endpoint = device.bootstrap_owner(&username, password.as_str())?;
+    let _endpoint = device.bootstrap_owner(&username, password.as_str())?;
+    let endpoint = device.local_controller_url()?;
+    let root_certificate = device.controller_tls_root()?;
     operator
-        .login(&endpoint, &username, password.as_str())
+        .login(&endpoint, &root_certificate, &username, password.as_str())
         .await
 }
 
@@ -677,6 +844,12 @@ pub fn run() {
         }))
         .invoke_handler(tauri::generate_handler![
             get_desktop_snapshot,
+            controller_https_configure,
+            controller_https_reconfigure,
+            controller_https_summary,
+            controller_trust_probe,
+            controller_trust_confirm,
+            controller_trust_summary,
             provision_role,
             reset_ui_preferences,
             decommission_device,
@@ -704,6 +877,7 @@ pub fn run() {
                 .unwrap_or(false);
             app.manage(state);
             app.manage(OperatorAuthState::default());
+            app.manage(ControllerTrustState::default());
             if should_autostart && enable_autostart().is_err() {
                 app.state::<DeviceState>()
                     .mark_autostart_unavailable()

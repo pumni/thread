@@ -2,19 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import ipaddress
 import json
+import os
+import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
+import threading
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / "packaging" / "windows_desktop" / "verify_runtime_evidence.py"
 CONTROLLER_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "smoke_controller_lifecycle.ps1"
+CONTROLLER_HTTPS_PROBE = REPO_ROOT / "packaging" / "windows_desktop" / "controller_https_probe.ps1"
+HOSTED_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "run_hosted_smoke.ps1"
 
 
 def test_controller_quit_wait_is_process_authoritative() -> None:
@@ -23,7 +37,7 @@ def test_controller_quit_wait_is_process_authoritative() -> None:
         pytest.skip("PowerShell AST parser is only available on Windows test hosts")
 
     smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
-    assertion = f"""
+    assertion = rf"""
 $smokePath = '{smoke_path}'
 $tokens = $null
 $parseErrors = $null
@@ -115,6 +129,521 @@ if ($normalWaitCommands.Count -ne 1 -or
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
     assert "process-authoritative Controller Quit assertion PASS" in completed.stdout
+
+
+def test_controller_endpoint_inputs_have_unique_automation_ids() -> None:
+    app_source = (REPO_ROOT / "apps" / "desktop" / "src" / "App.tsx").read_text(encoding="utf-8")
+    input_tags = re.findall(r"<input\b[^>]*>", app_source, flags=re.DOTALL)
+    expected_inputs = {
+        "controller-lan-address": ("text", "Stable LAN IPv4 address"),
+        "controller-https-port": ("number", "HTTPS port"),
+    }
+
+    for automation_id, (input_type, accessible_name) in expected_inputs.items():
+        matching_tags = [
+            tag for tag in input_tags if re.search(rf'\bid="{re.escape(automation_id)}"', tag)
+        ]
+        assert len(matching_tags) == 1
+        assert re.search(rf'\btype="{input_type}"', matching_tags[0])
+        assert f'aria-label="{accessible_name}"' in matching_tags[0]
+        assert re.search(
+            rf"<label>\s*{re.escape(accessible_name)}\s*<input\b[^>]*\bid=\"{re.escape(automation_id)}\"",
+            app_source,
+            flags=re.DOTALL,
+        )
+
+    port_tag = next(tag for tag in input_tags if 'id="controller-https-port"' in tag)
+    assert re.search(r"\bmin=\{1\}", port_tag)
+    assert re.search(r"\bmax=\{65535\}", port_tag)
+
+
+def test_controller_input_uia_resolution_is_identity_safe_and_password_is_opaque() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell AST parser is only available on Windows test hosts")
+
+    smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
+    assertion = rf"""
+$smokePath = '{smoke_path}'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $smokePath, [ref]$tokens, [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) {{ throw "Controller smoke script did not parse" }}
+
+$functionNodes = @($ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -in @('Set-LoginInput', 'Set-ControllerEndpointFields',
+            'Find-ElementsByName', 'Find-ElementsByAutomationIdAndType',
+            'Find-ElementByType', 'Test-ElementSupportsPattern',
+            'Test-InteractiveInputElement', 'Resolve-InputControl',
+            'Get-InputLookupDiagnostics')
+}}, $true))
+if ($functionNodes.Count -ne 9) {{ throw "Expected the focused Controller input helpers" }}
+$functions = @{{}}
+foreach ($functionNode in $functionNodes) {{ $functions[$functionNode.Name] = $functionNode }}
+$login = $functions['Set-LoginInput']
+$loginBody = $login.Body
+
+function Get-Commands($body, [string]$name) {{
+    @($body.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq $name
+    }}, $true))
+}}
+function Get-PatternCalls($body) {{
+    @($body.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $node.Member.Extent.Text -eq 'GetCurrentPattern'
+    }}, $true))
+}}
+function Get-Invocations($body, [string]$memberName) {{
+    @($body.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $node.Member.Extent.Text -eq $memberName
+    }}, $true))
+}}
+
+$allowedParameter = @($loginBody.ParamBlock.Parameters | Where-Object {{
+    $_.Name.VariablePath.UserPath -eq 'AllowedControlTypes'
+}})
+if ($allowedParameter.Count -ne 1 -or
+    ($allowedParameter[0].DefaultValue.Extent.Text -replace '\s+', '') -ne
+        '@([System.Windows.Automation.ControlType]::Edit)') {{
+    throw "Default and text input control type must remain Edit-only"
+}}
+
+$endpointBody = $functions['Set-ControllerEndpointFields'].Body
+$endpointCalls = Get-Commands $endpointBody 'Set-LoginInput'
+$addressCall = @(
+    $endpointCalls | Where-Object {{ $_.Extent.Text -match 'Stable LAN IPv4 address' }}
+)
+$portCall = @($endpointCalls | Where-Object {{ $_.Extent.Text -match 'HTTPS port' }})
+if ($addressCall.Count -ne 1 -or
+    $addressCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-lan-address"' -or
+    $addressCall[0].Extent.Text -notmatch 'ControlType\]::Edit' -or
+    $portCall.Count -ne 1 -or
+    $portCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-https-port"') {{
+    throw "Endpoint helper must target its unique automation IDs"
+}}
+$portTypeNames = @([regex]::Matches(
+    $portCall[0].Extent.Text, 'ControlType\]::(Spinner|Edit)'
+) | ForEach-Object {{ $_.Groups[1].Value }})
+if (($portTypeNames -join ',') -ne 'Spinner,Edit') {{
+    throw "HTTPS port must explicitly allow Spinner and Edit"
+}}
+$allInputCalls = Get-Commands $ast 'Set-LoginInput'
+$customAutomationCalls = @($allInputCalls | Where-Object {{
+    $_.Extent.Text -match '-AutomationId'
+}})
+if ($customAutomationCalls.Count -ne 2 -or
+    @($allInputCalls | Where-Object {{ $_.Extent.Text -match 'HTTPS port' }}).Count -ne 1) {{
+    throw "Only the two endpoint controls use the endpoint AutomationIds"
+}}
+
+$commands = @($loginBody.FindAll({{
+    param($node) $node -is [System.Management.Automation.Language.CommandAst]
+}}, $true))
+$waitCalls = @($commands | Where-Object {{ $_.GetCommandName() -eq 'Wait-Until' }} |
+    Sort-Object {{ $_.Extent.StartOffset }})
+$sendCalls = @($loginBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Member.Extent.Text -eq 'SendWait'
+}}, $true))
+if ($waitCalls.Count -ne 2 -or $sendCalls.Count -ne 2 -or
+    $waitCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset) {{
+    throw "Input must use bounded UIA lookup before keyboard mutation"
+}}
+$resolverCalls = Get-Commands $loginBody 'Resolve-InputControl'
+$focusCalls = Get-Invocations $loginBody 'SetFocus'
+if ($resolverCalls.Count -lt 2 -or $focusCalls.Count -ne 1 -or
+    $resolverCalls[0].Extent.StartOffset -ge $focusCalls[0].Extent.StartOffset -or
+    $focusCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset -or
+    $sendCalls[0].Extent.StartOffset -ge $sendCalls[1].Extent.StartOffset -or
+    $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode') {{
+    throw "Resolved interactive input must be focused and keyboard-mutated after bounded lookup"
+}}
+$resolutionBody = $functions['Resolve-InputControl'].Body.Extent.Text
+$resolverBody = $functions['Resolve-InputControl'].Body
+$idLookup = Get-Commands $resolverBody 'Find-ElementsByAutomationIdAndType'
+$nameLookup = Get-Commands $resolverBody 'Find-ElementsByName'
+if ($idLookup.Count -ne 1 -or $nameLookup.Count -ne 1 -or
+    $idLookup[0].Extent.StartOffset -ge $nameLookup[0].Extent.StartOffset -or
+    $resolutionBody -notmatch '\$AllowedControlTypes\s*-contains\s*\$controlType' -or
+    $resolutionBody -notmatch 'Test-InteractiveInputElement\s+\$_\s+\$FieldId') {{
+    throw "AutomationId must be preferred; name fallback must filter interactive allowed controls"
+}}
+$idHelper = $functions['Find-ElementsByAutomationIdAndType'].Body.Extent.Text
+if ($idHelper -notmatch 'AutomationIdProperty' -or
+    $idHelper -notmatch 'ControlTypeProperty' -or
+    $idHelper -notmatch '\[System\.Windows\.Automation\.AndCondition\]::new' -or
+    $idHelper -notmatch '\$Root\.FindAll') {{
+    throw "AutomationId lookup must match the ID and allowed type exactly"
+}}
+$interactiveBody = $functions['Test-InteractiveInputElement'].Body.Extent.Text
+if ($interactiveBody -notmatch 'IsKeyboardFocusable' -or
+    $interactiveBody -notmatch 'IsEnabled' -or
+    $interactiveBody -notmatch 'ControlType\.Spinner' -or
+    $interactiveBody -notmatch 'ControlType\.Edit' -or
+    $interactiveBody -match 'ControlType\.Text' -or
+    $interactiveBody -notmatch 'RangeValuePattern' -or
+    $interactiveBody -notmatch 'ValuePattern') {{
+    throw "Name fallback must reject labels and require focusable enabled input patterns"
+}}
+$interactiveChildLookup = Get-Commands $functions['Test-InteractiveInputElement'].Body `
+    'Find-ElementByType'
+if ($interactiveChildLookup.Count -ne 1 -or
+    $interactiveChildLookup[0].Extent.Text -notmatch 'Find-ElementByType\s+\$Element' -or
+    $interactiveChildLookup[0].Extent.Text -notmatch 'ControlType\]::Edit') {{
+    throw "Spinner compatibility must find only an Edit child of that exact Spinner"
+}}
+
+$passwordGate = @($loginBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -match '\$fieldId\s*-ne\s*"password"'
+}}, $true))
+$verificationText = if ($passwordGate.Count -eq 1) {{ $passwordGate[0].Extent.Text }} else {{ '' }}
+if ($passwordGate.Count -ne 1 -or
+    $verificationText -notmatch '\[System\.Windows\.Automation\.RangeValuePattern\]::Pattern' -or
+    $verificationText -notmatch '\[System\.Windows\.Automation\.ValuePattern\]::Pattern' -or
+    $verificationText -notmatch '\[int\]::TryParse' -or
+    $verificationText -notmatch 'RangeValuePattern' -or
+    $verificationText -notmatch 'desktop_input_value_not_populated_\$fieldId') {{
+    throw "Non-secret read-back must be type-specific, numeric-safe, and password-gated"
+}}
+$spinnerBranch = @($passwordGate[0].FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -match '\$controlTypeName\s*-eq\s*"ControlType\.Spinner"'
+}}, $true))
+if ($spinnerBranch.Count -ne 1 -or
+    $spinnerBranch[0].Extent.Text -notmatch '\[double\]\$rangePattern\.Current\.Value' -or
+    $spinnerBranch[0].Extent.Text -notmatch 'Find-ElementByType\s+\$current' -or
+    $spinnerBranch[0].Extent.Text -notmatch '\[System\.Windows\.Automation\.ControlType\]::Edit') {{
+    throw "Spinner must verify RangeValue and keep any Edit fallback inside the named spinner"
+}}
+
+$diagnosticBody = $functions['Get-InputLookupDiagnostics'].Body.Extent.Text
+$nameFinderBody = $functions['Find-ElementsByName'].Body.Extent.Text
+if ($nameFinderBody -notmatch '\$Root\.FindAll' -or
+    $nameFinderBody -match '\$Root\.FindFirst' -or
+    $diagnosticBody -notmatch 'Find-ElementsByName' -or
+    $diagnosticBody -notmatch 'foreach\s*\(\s*\$element\s+in\s+\$elements\s*' -or
+    $diagnosticBody -notmatch 'automation_id' -or
+    $diagnosticBody -notmatch 'control_type' -or
+    $diagnosticBody -notmatch 'is_keyboard_focusable' -or
+    $diagnosticBody -notmatch 'is_enabled' -or
+    $diagnosticBody -notmatch 'supported_patterns' -or
+    $diagnosticBody -match 'Current\.Value') {{
+    throw "Failure diagnostics must enumerate structural metadata only"
+}}
+$namedTypeLookups = Get-Commands $loginBody 'Get-InputLookupDiagnostics'
+$diagnosticCatches = @($loginBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.CatchClauseAst] -and
+        (Get-Commands $node.Body 'Get-InputLookupDiagnostics').Count -eq 1
+}}, $true))
+$diagnosticFunction = $functions['Get-InputLookupDiagnostics']
+$diagPatternReads = Get-Commands $diagnosticFunction.Body 'Test-ElementSupportsPattern'
+if ($namedTypeLookups.Count -ne 1 -or $diagnosticCatches.Count -ne 1 -or
+    $diagnosticCatches[0].Extent.Text -notmatch 'input_lookup_diagnostics' -or
+    $diagPatternReads.Count -lt 4) {{
+    throw "Lookup failure must record safe pattern-presence diagnostics only"
+}}
+$childTypeLookups = Get-Commands $loginBody 'Find-ElementByType'
+if ($childTypeLookups.Count -ne 1 -or
+    $childTypeLookups[0].Extent.StartOffset -lt $spinnerBranch[0].Extent.StartOffset -or
+    $childTypeLookups[0].Extent.EndOffset -gt $spinnerBranch[0].Extent.EndOffset) {{
+    throw "Edit fallback must remain scoped to the exact named Spinner"
+}}
+
+$allPatternReads = Get-PatternCalls $loginBody
+$gatedPatternReads = Get-PatternCalls $passwordGate[0].Clauses[0].Item2
+if ($allPatternReads.Count -ne $gatedPatternReads.Count -or
+    $allPatternReads.Count -lt 3) {{
+    throw "Password must remain exempt from all UIA value-pattern read-back"
+}}
+"Typed bounded Controller input assertion PASS"
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "Typed bounded Controller input assertion PASS" in completed.stdout
+
+
+def _write_probe_identity(directory: Path, prefix: str, *, leaf_ip: str) -> tuple[Path, Path, Path]:
+    root_key = ec.generate_private_key(ec.SECP256R1())
+    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{prefix} synthetic root")])
+    now = datetime.now(UTC)
+    root_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(root_name)
+        .issuer_name(root_name)
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(
+            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{prefix} synthetic leaf")])
+        )
+        .issuer_name(root_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(leaf_ip))]),
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    root_path = directory / f"{prefix}-root.der"
+    certificate_path = directory / f"{prefix}-leaf.pem"
+    key_path = directory / f"{prefix}-leaf-key.pem"
+    root_path.write_bytes(root_certificate.public_bytes(serialization.Encoding.DER))
+    certificate_path.write_bytes(leaf_certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return root_path, certificate_path, key_path
+
+
+def _start_probe_http_server(
+    certificate_path: Path | None = None, key_path: Path | None = None
+) -> tuple[ThreadingHTTPServer, threading.Thread, int]:
+    class ProbeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            status = 200 if self.path == "/health" else 503
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    class QuietThreadingHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request: object, client_address: object) -> None:
+            return
+
+    server = QuietThreadingHTTPServer(("127.0.0.1", 0), ProbeHandler)
+    if certificate_path is not None and key_path is not None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(certificate_path), str(key_path))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, port
+
+
+def test_private_root_https_probe_classifies_real_tcp_tls_and_http_stages(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("the shared Controller probe is a Windows PowerShell runtime helper")
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("the shared Controller TLS probe requires PowerShell 7")
+
+    root_path, leaf_path, leaf_key_path = _write_probe_identity(
+        tmp_path, "controller-probe-valid", leaf_ip="127.0.0.1"
+    )
+    wrong_root_path, _, _ = _write_probe_identity(
+        tmp_path, "controller-probe-wrong-root", leaf_ip="127.0.0.1"
+    )
+    wrong_san_root_path, wrong_san_leaf_path, wrong_san_key_path = _write_probe_identity(
+        tmp_path, "controller-probe-wrong-san", leaf_ip="192.0.2.41"
+    )
+    tls_server, tls_thread, tls_port = _start_probe_http_server(leaf_path, leaf_key_path)
+    wrong_san_server, wrong_san_thread, wrong_san_port = _start_probe_http_server(
+        wrong_san_leaf_path, wrong_san_key_path
+    )
+    plaintext_server, plaintext_thread, plaintext_port = _start_probe_http_server()
+    with socket.socket() as unused_listener:
+        unused_listener.bind(("127.0.0.1", 0))
+        unused_port = int(unused_listener.getsockname()[1])
+
+    helper_path = str(CONTROLLER_HTTPS_PROBE).replace("'", "''")
+    root = str(root_path).replace("'", "''")
+    wrong_root = str(wrong_root_path).replace("'", "''")
+    wrong_san_root = str(wrong_san_root_path).replace("'", "''")
+    assertion = f"""
+. '{helper_path}'
+$results = @(
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {tls_port} -Path '/health' -RootCertificatePath '{root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {tls_port} -Path '/ready' -RootCertificatePath '{root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {tls_port} -Path '/health' -RootCertificatePath '{wrong_root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {wrong_san_port} -Path '/health' -RootCertificatePath '{wrong_san_root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {unused_port} -Path '/health' -RootCertificatePath '{root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {plaintext_port} -Path '/health' -RootCertificatePath '{root}')
+)
+$results | ConvertTo-Json -Depth 8 -Compress
+"""
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    finally:
+        for server, thread in (
+            (tls_server, tls_thread),
+            (wrong_san_server, wrong_san_thread),
+            (plaintext_server, plaintext_thread),
+        ):
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    probes = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert len(probes) == 6
+
+    healthy, not_ready, wrong_root, wrong_san, no_listener, plaintext = probes
+    assert all(isinstance(probe, dict) for probe in probes), repr(probes)
+    assert healthy["outcome"] == "PASS"
+    assert healthy["target_host"] == "127.0.0.1"
+    assert healthy["certificate_validation"] == {
+        "trust_mode": "CustomRootTrust",
+        "verification_flags": "NoFlag",
+        "revocation_mode": "NoCheck",
+    }
+    assert healthy["tcp_connect"]["outcome"] == "PASS"
+    assert healthy["tls_authentication"]["outcome"] == "PASS"
+    assert healthy["http_request_write"]["outcome"] == "PASS"
+    assert healthy["http_response"]["status_code"] == 200
+
+    assert not_ready["outcome"] == "HTTP_STATUS_NON_200"
+    assert not_ready["tls_authentication"]["outcome"] == "PASS"
+    assert not_ready["http_response"]["status_code"] == 503
+
+    for rejected in (wrong_root, wrong_san, plaintext):
+        assert rejected["outcome"] == "FAIL"
+        assert rejected["tls_authentication"]["outcome"] == "FAIL"
+        assert rejected["http_request_write"]["outcome"] == "NOT_RUN"
+    assert no_listener["tcp_connect"]["outcome"] in {"FAIL", "TIMEOUT"}
+    assert no_listener["tls_authentication"]["outcome"] == "NOT_RUN"
+
+    helper_source = CONTROLLER_HTTPS_PROBE.read_text(encoding="utf-8")
+    assert "RemoteCertificateValidationCallback" not in helper_source
+    assert "DangerousAcceptAnyServerCertificateValidator" not in helper_source
+    assert "X509Store" not in helper_source
+
+
+def test_post_owner_probe_snapshot_and_failure_taxonomy_are_preserved() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    hosted_source = HOSTED_SMOKE.read_text(encoding="utf-8")
+    assert "Test-ControllerHttps" not in source
+    assert "controller_tls_readiness_failed" not in source
+    assert '"controller_https_probe.ps1"' in hosted_source
+    assert "$stageControllerHttpsProbeScript" in hosted_source
+    assert "Copy-Item -LiteralPath $controllerHttpsProbeScript" in hosted_source
+
+    owner_call = source.index("Bootstrap-ControllerOwner $desktop.Id")
+    after_owner_probe = source.index("Wait-ForControllerHttps $config 60 -AfterOwnerBootstrap")
+    enabled_owner_check = source.index("$enabledOwnerCount = Invoke-Psql", owner_call)
+    assert owner_call < after_owner_probe < enabled_owner_check
+
+    snapshot_function = source[
+        source.index("function Get-PostOwnerRuntimeSnapshot") : source.index(
+            "function Save-PostOwnerRuntimeProbe"
+        )
+    ]
+    for evidence_field in (
+        "postgres_count",
+        "postgres_pids",
+        "http_count",
+        "http_pids",
+        "scheduler_count",
+        "scheduler_pids",
+        "endpoint_listener_count",
+        "endpoint_listener_addresses",
+        "serving_leaf_key_present",
+        "active_owner_session_count",
+    ):
+        assert evidence_field in snapshot_function
+
+    waiter = source[
+        source.index("function Wait-ForControllerHttps") : source.index(
+            "function Test-PlaintextHttpRejected"
+        )
+    ]
+    assert 'Invoke-ControllerHttpsProbe $Config "/health"' in waiter
+    assert 'Invoke-ControllerHttpsProbe $Config "/ready"' in waiter
+    assert "Save-PostOwnerRuntimeProbe" in waiter
+    for failure_code in (
+        "controller_post_owner_http_process_missing",
+        "controller_post_owner_scheduler_process_missing",
+        "controller_post_owner_endpoint_listener_absent",
+        "controller_tls_probe_tcp_connect_failed",
+        "controller_tls_probe_validation_failed",
+        "controller_https_health_status_",
+        "controller_https_readiness_status_",
+    ):
+        assert failure_code in source
+    assert "post_owner_runtime_probe = $postOwnerRuntimeProbe" in source
 
 
 def _load_verifier() -> ModuleType:

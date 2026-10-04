@@ -217,7 +217,7 @@ async def test_tracing_leaves_health_readiness_and_metrics_contract_unchanged() 
 
     async def fetch_metrics(*, tracing: object | None) -> tuple[str, int, int]:
         app = app_module.create_app(
-            Settings(worker_tls_required=False, database_url=None),
+            Settings(database_url=None),
             operational_metrics_probe=_EmptyMetricsProbe(),
             tracing_runtime=cast(tracing_module.ProcessTracing | None, tracing),
         )

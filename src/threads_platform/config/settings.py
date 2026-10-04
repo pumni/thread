@@ -36,7 +36,6 @@ class Settings(BaseSettings):
     worker_admin_token: SecretStr | None = None
     worker_admin_auth_profile: WorkerAdminAuthProfile = "operator_only"
     operator_session_ttl_seconds: int = Field(default=28_800, ge=60, le=86_400)
-    worker_tls_required: bool = True
     threads_api_base_url: AnyHttpUrl = AnyHttpUrl("https://graph.threads.net/v1.0/")
     threads_token_provider_mode: ThreadsTokenProviderMode = "disabled"
 

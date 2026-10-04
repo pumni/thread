@@ -26,7 +26,7 @@ function snapshot(role: DesktopSnapshot["role"] = null): DesktopSnapshot {
       httpProcessId: role === "CONTROLLER" ? 4244 : null,
       schedulerProcessId: role === "CONTROLLER" ? 4245 : null,
       controllerId: role === "CONTROLLER" ? "0123456789abcdef0123456789abcdef" : null,
-      endpoint: role === "CONTROLLER" ? "http://127.0.0.1:4246" : null,
+      endpoint: role === "CONTROLLER" ? "https://127.0.0.1:8443" : null,
       databasePort: role === "CONTROLLER" ? 4247 : null,
       diagnosticCode: null,
     },
@@ -90,7 +90,111 @@ describe("desktop provisioning", () => {
       "operator_create_user",
       "operator_update_user",
       "operator_change_password",
+      "controller_https_configure",
+      "controller_https_reconfigure",
+      "controller_https_summary",
+      "controller_trust_probe",
+      "controller_trust_confirm",
+      "controller_trust_summary",
     ]);
+  });
+
+  it("shows explicit initial HTTPS configuration when no identity is provisioned", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") return null;
+      if (command === "controller_https_summary") {
+        return {
+          configured: false,
+          lanAddress: null,
+          httpsPort: 8443,
+          publicHttpsOrigin: null,
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: null,
+          leafExpiresAt: null,
+        };
+      }
+      if (command === "controller_https_configure") {
+        return {
+          configured: true,
+          lanAddress: "192.0.2.20",
+          httpsPort: 8443,
+          publicHttpsOrigin: "https://192.0.2.20:8443",
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: "SHA256:1234567890abcdef",
+          leafExpiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByLabelText("Stable LAN IPv4 address");
+    expect(screen.getByLabelText("HTTPS port")).toHaveValue(8443);
+    fireEvent.change(screen.getByLabelText("Stable LAN IPv4 address"), {
+      target: { value: "192.0.2.20" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Configure HTTPS" }));
+
+    expect(await screen.findByText("https://192.0.2.20:8443")).toBeInTheDocument();
+    expect(screen.getByText("SHA256:1234567890abcdef")).toBeInTheDocument();
+    expect(native.invoke).toHaveBeenCalledWith("controller_https_configure", {
+      lanAddress: "192.0.2.20",
+      port: 8443,
+    });
+  });
+
+  it("requires an explicit reconfiguration action and reports native authorization errors", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        return {
+          id: "owner-id",
+          username: "controller-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      if (command === "controller_https_summary") {
+        return {
+          configured: true,
+          lanAddress: "192.0.2.20",
+          httpsPort: 8443,
+          publicHttpsOrigin: "https://192.0.2.20:8443",
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: "SHA256:1234567890abcdef",
+          leafExpiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      if (command === "controller_https_reconfigure") {
+        throw new Error("controller_https_reconfiguration_unauthorized");
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByRole("button", { name: "Reconfigure HTTPS endpoint…" });
+    expect(screen.queryByLabelText("Stable LAN IPv4 address")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure HTTPS endpoint…" }));
+    expect(screen.getByLabelText("Stable LAN IPv4 address")).toHaveValue("192.0.2.20");
+    expect(screen.getByLabelText("HTTPS port")).toHaveValue(8443);
+    fireEvent.change(screen.getByLabelText("Stable LAN IPv4 address"), {
+      target: { value: "198.51.100.30" },
+    });
+    fireEvent.change(screen.getByLabelText("HTTPS port"), { target: { value: "9443" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply endpoint change" }));
+
+    expect(
+      await screen.findByText(
+        "Only a signed-in Controller Owner or Admin can change this endpoint.",
+      ),
+    ).toBeInTheDocument();
+    expect(native.invoke).toHaveBeenCalledWith("controller_https_reconfigure", {
+      lanAddress: "198.51.100.30",
+      port: 9443,
+    });
   });
 
   it("provisions one Controller and shows its separate runtime processes", async () => {
@@ -108,7 +212,7 @@ describe("desktop provisioning", () => {
     expect(await screen.findByText("PID 4243")).toBeInTheDocument();
     expect(screen.getByText("PID 4244")).toBeInTheDocument();
     expect(screen.getByText("PID 4245")).toBeInTheDocument();
-    expect(screen.getByText("http://127.0.0.1:4246")).toBeInTheDocument();
+    expect(screen.getByText("https://127.0.0.1:8443")).toBeInTheDocument();
     expect(screen.getByText(/disposable test data only/i)).toBeInTheDocument();
     expect(native.invoke).toHaveBeenCalledWith("provision_role", { role: "CONTROLLER" });
   });
@@ -149,10 +253,90 @@ describe("desktop provisioning", () => {
     expect(screen.getByText("None")).toBeInTheDocument();
   });
 
+  it("requires an explicit native trust confirmation before remote Operator credentials", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONSOLE");
+      if (command === "operator_current") return null;
+      if (command === "controller_trust_probe") {
+        return {
+          probeId: "opaque-probe-id",
+          endpoint: "https://192.168.1.20:8443",
+          rootFingerprint: "SHA256:0123456789abcdef",
+          expiresAt: 1_800_000_000,
+        };
+      }
+      if (command === "controller_trust_confirm") {
+        return {
+          endpoint: "https://192.168.1.20:8443",
+          rootFingerprint: "SHA256:0123456789abcdef",
+          trusted: true,
+        };
+      }
+      if (command === "operator_login") {
+        return {
+          id: "operator-id",
+          username: "remote-operator",
+          role: "OPERATOR",
+          mustChangePassword: false,
+          expiresAt: "2026-10-04T18:00:00Z",
+        };
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByRole("heading", { name: "Your Console" });
+    fireEvent.change(screen.getByLabelText("Controller address"), {
+      target: { value: "https://192.168.1.20:8443" },
+    });
+    expect(screen.getByLabelText("Username")).toBeDisabled();
+    expect(screen.getByLabelText("Password")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Probe Controller identity" }));
+    expect(await screen.findByText("SHA256:0123456789abcdef")).toBeInTheDocument();
+    expect(screen.getByLabelText("Username")).toBeDisabled();
+    expect(native.invoke).not.toHaveBeenCalledWith("operator_login", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm matching fingerprint" }));
+    await waitFor(() => expect(screen.getByLabelText("Username")).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "remote-operator" },
+    });
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "synthetic password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByText("Signed in as remote-operator");
+    expect(native.invoke).toHaveBeenCalledWith("controller_trust_confirm", {
+      probeId: "opaque-probe-id",
+    });
+    expect(native.invoke).toHaveBeenCalledWith("operator_login", {
+      apiUrl: "https://192.168.1.20:8443",
+      username: "remote-operator",
+      password: "synthetic password",
+    });
+  });
+
   it("keeps the Operator bearer inside Rust during first-Owner login", async () => {
     const bearer = "SYNTHETIC_OPERATOR_BEARER_NEVER_RENDERED";
+    const controllerSnapshot = snapshot("CONTROLLER");
+    controllerSnapshot.supervisor.state = "owner_bootstrap_required";
+    controllerSnapshot.supervisor.httpProcessId = null;
+    controllerSnapshot.supervisor.schedulerProcessId = null;
     native.invoke.mockImplementation(async (command: string) => {
-      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "get_desktop_snapshot") return controllerSnapshot;
+      if (command === "controller_https_summary") {
+        return {
+          configured: true,
+          lanAddress: "192.168.1.20",
+          httpsPort: 8443,
+          publicHttpsOrigin: "https://192.168.1.20:8443",
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: "SHA256:0123456789abcdef",
+          leafExpiresAt: "2026-12-31T00:00:00Z",
+        };
+      }
       if (command === "operator_current") return null;
       if (command === "operator_bootstrap_owner") {
         return {

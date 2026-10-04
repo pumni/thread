@@ -22,7 +22,7 @@ from threads_platform.domain.workers import WorkerStatus
 
 
 async def test_worker_http_rejects_plain_http_before_authentication() -> None:
-    app = create_app(Settings(worker_tls_required=True))
+    app = create_app(Settings())
     transport = httpx2.ASGITransport(app=app)
     async with httpx2.AsyncClient(transport=transport, base_url="http://worker.test") as client:
         response = await client.post(
@@ -32,8 +32,34 @@ async def test_worker_http_rejects_plain_http_before_authentication() -> None:
     assert response.json() == {"detail": {"code": "HTTPS_REQUIRED"}}
 
 
+async def test_operator_http_rejects_plain_http_and_forwarded_proto_spoofing() -> None:
+    app = create_app(Settings())
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://controller.test") as client:
+        response = await client.post(
+            "/v1/operator/login",
+            headers={"X-Forwarded-Proto": "https"},
+            json={"username": "owner", "password": "synthetic-test-value"},
+        )
+    assert response.status_code == 426
+    assert response.json() == {"detail": {"code": "HTTPS_REQUIRED"}}
+
+
+async def test_worker_http_rejects_forwarded_proto_spoofing() -> None:
+    app = create_app(Settings())
+    transport = httpx2.ASGITransport(app=app)
+    async with httpx2.AsyncClient(transport=transport, base_url="http://worker.test") as client:
+        response = await client.post(
+            "/v1/workers/auth/challenges",
+            headers={"X-Forwarded-Proto": "https"},
+            json={"worker_id": str(uuid4())},
+        )
+    assert response.status_code == 426
+    assert response.json() == {"detail": {"code": "HTTPS_REQUIRED"}}
+
+
 def test_worker_websocket_rejects_plain_ws() -> None:
-    app = create_app(Settings(worker_tls_required=True))
+    app = create_app(Settings())
     with TestClient(app) as client:
         with pytest.raises(WebSocketDisconnect) as disconnect:
             with client.websocket_connect("ws://worker.test/v1/workers/connect"):
@@ -82,7 +108,7 @@ def test_authenticated_https_cancel_ack_is_narrow_and_rejects_extra_request_fiel
             )
 
     app = create_app(
-        Settings(worker_tls_required=True),
+        Settings(),
         worker_control_service=cast(WorkerControlService, FakeWorkerControl()),
         worker_job_service=cast(WorkerJobService, FakeWorkerJobService()),
     )
@@ -160,7 +186,7 @@ def test_wss_hello_and_heartbeat_are_advisory_presence_messages() -> None:
             return 0
 
     app = create_app(
-        Settings(worker_tls_required=True),
+        Settings(),
         worker_control_service=cast(WorkerControlService, FakeWorkerControl()),
     )
     test_client = TestClient(app, base_url="https://worker.test")
@@ -214,7 +240,7 @@ def test_wss_closes_when_the_authenticated_session_expires() -> None:
             return 0
 
     app = create_app(
-        Settings(worker_tls_required=True),
+        Settings(),
         worker_control_service=cast(WorkerControlService, ExpiredWorkerControl()),
     )
     test_client = TestClient(app, base_url="https://worker.test")
