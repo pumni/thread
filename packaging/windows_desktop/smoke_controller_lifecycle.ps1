@@ -384,14 +384,23 @@ function Invoke-Button([int]$ProcessId, [string]$Name, [scriptblock]$BeforeInvok
 }
 
 function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
-    $input = Find-Element (Get-Window $ProcessId) $Name `
-        ([System.Windows.Automation.ControlType]::Edit)
-    if (-not $input) { throw "desktop_login_input_unavailable" }
-    $input.SetFocus()
-    Start-Sleep -Milliseconds 100
+    $fieldId = [regex]::Replace($Name.Trim().ToLowerInvariant(), "[^a-z0-9]+", "_").Trim("_")
+    if ([string]::IsNullOrWhiteSpace($fieldId)) { $fieldId = "unknown" }
+    $inputUnavailableCode = "desktop_input_unavailable_$fieldId"
+    $resolvedInput = [pscustomobject]@{ Control = $null }
+    Wait-Until {
+        $candidate = Find-Element (Get-Window $ProcessId) $Name `
+            ([System.Windows.Automation.ControlType]::Edit)
+        if (-not $candidate) { return $false }
+        $resolvedInput.Control = $candidate
+        return $true
+    } 20 $inputUnavailableCode
+
+    $inputControl = $resolvedInput.Control
+    $inputControl.SetFocus()
     [System.Windows.Forms.SendKeys]::SendWait("^a")
     [System.Windows.Forms.SendKeys]::SendWait($Value)
-    if ($Name -eq "Username") {
+    if ($fieldId -ne "password") {
         Wait-Until {
             $current = Find-Element (Get-Window $ProcessId) $Name `
                 ([System.Windows.Automation.ControlType]::Edit)
@@ -402,7 +411,7 @@ function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
                 )
                 return $valuePattern.Current.Value -ceq $Value
             } catch { return $false }
-        } 5 "desktop_login_username_not_populated"
+        } 5 "desktop_input_value_not_populated_$fieldId"
     }
 }
 

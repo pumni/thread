@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import cast
 
@@ -48,3 +49,40 @@ def test_compose_http_waits_for_tls_prepare_and_keeps_keys_isolated() -> None:
             not any(marker in str(name).upper() for marker in ("ROOT_KEY", "PRIVATE_KEY_BYTES"))
             for name in environment_map
         )
+
+
+def test_compose_smoke_uses_docker_inspect_for_prepare_container_state() -> None:
+    smoke_path = Path(__file__).resolve().parents[2] / "scripts" / "control_plane_compose_smoke.py"
+    module = ast.parse(smoke_path.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    inspect_function = functions["_docker_inspect_tls_prepare"]
+    inspect_calls = [
+        node
+        for node in ast.walk(inspect_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ]
+    assert len(inspect_calls) == 1
+    command = inspect_calls[0].args[0]
+    assert isinstance(command, ast.List)
+    command_prefix = [
+        value.value if isinstance(value, ast.Constant) else None for value in command.elts[:2]
+    ]
+    assert command_prefix == ["docker", "inspect"]
+
+    prepare_check = functions["_assert_tls_prepare_completed"]
+    helper_calls = [
+        node
+        for node in ast.walk(prepare_check)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_docker_inspect_tls_prepare"
+    ]
+    assert len(helper_calls) == 1

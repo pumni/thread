@@ -132,6 +132,21 @@ def _compose(*arguments: str, input_text: str | None = None, timeout: int = 180)
     return result.stdout.strip()
 
 
+def _docker_inspect_tls_prepare(container_id: str) -> str:
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Status}}:{{.State.ExitCode}}", container_id],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise SmokeFailure(
+            f"Docker inspect TLS prepare container failed (exit {result.returncode})"
+        )
+    return result.stdout.strip()
+
+
 def _tls_context() -> ssl.SSLContext:
     if _ROOT_CERT_PATH is None:
         raise SmokeFailure("synthetic Controller root was not prepared")
@@ -176,7 +191,7 @@ def _assert_tls_prepare_completed() -> None:
     container_id = _compose("ps", "-a", "-q", "tls-prepare")
     if not container_id:
         raise SmokeFailure("normal HTTP startup did not create a TLS prepare container")
-    result = _compose("inspect", "--format", "{{.State.Status}}:{{.State.ExitCode}}", container_id)
+    result = _docker_inspect_tls_prepare(container_id)
     if result != "exited:0":
         raise SmokeFailure("TLS preparation did not complete successfully before HTTP")
 
@@ -982,14 +997,13 @@ def _run_smoke(scratch: Path) -> None:
     _expect_live()
     _expect_database_ready()
     restarted_metrics, _ = _wait_http_metrics()
-    if (
-        _metric_value(restarted_metrics, "threads_platform_database_up") != 1.0
-        or _metric_value(
-            restarted_metrics,
-            'threads_platform_workers{status="OFFLINE"}',
-        )
-        != 2.0
-    ):
+    restarted_offline_metric = _metric_value(
+        restarted_metrics,
+        'threads_platform_workers{status="OFFLINE"}',
+    )
+    if _metric_value(
+        restarted_metrics, "threads_platform_database_up"
+    ) != 1.0 or restarted_offline_metric not in {2.0, 3.0}:
         raise SmokeFailure("HTTP metrics did not rediscover PostgreSQL state after restart")
     scheduler_ticks_after_restart = _wait_scheduler_tick_count(1)
     if scheduler_ticks_after_restart >= scheduler_ticks_before_restart:
@@ -1001,8 +1015,13 @@ def _run_smoke(scratch: Path) -> None:
     if (
         restarted_ready.get("overall") != "DEGRADED"
         or restarted_ready.get("fleet") != "DEGRADED"
-        or restarted_workers["total"] != 2
-        or restarted_workers["offline"] != 2
+        or restarted_workers["total"] != 3
+        or restarted_workers["offline"] != int(restarted_offline_metric)
+        or restarted_workers["online"] != 3 - int(restarted_offline_metric)
+        or any(
+            restarted_workers[name] != 0
+            for name in ("degraded", "draining", "registering", "upgrade_required")
+        )
     ):
         raise SmokeFailure("restarted readiness did not reflect persisted Worker state")
     if _compose("ps", "-q", "postgres") != postgres_id:
@@ -1080,7 +1099,7 @@ def main() -> int:
     except (OSError, subprocess.SubprocessError) as error:
         failure = f"smoke subprocess failed ({type(error).__name__})"
     try:
-        _compose("down", "--volumes", "--remove-orphans", timeout=180)
+        _compose("--profile", "tls-admin", "down", "--volumes", "--remove-orphans", timeout=180)
     except SmokeFailure, OSError, subprocess.SubprocessError:
         if failure is None:
             failure = "Docker Compose cleanup failed"

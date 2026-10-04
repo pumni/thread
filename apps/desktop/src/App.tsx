@@ -808,6 +808,7 @@ function App() {
                           Stable LAN IPv4 address
                           <input
                             type="text"
+                            aria-label="Stable LAN IPv4 address"
                             inputMode="decimal"
                             autoComplete="off"
                             value={lanAddress}
@@ -819,6 +820,7 @@ function App() {
                           HTTPS port
                           <input
                             type="number"
+                            aria-label="HTTPS port"
                             min={1}
                             max={65535}
                             value={httpsPort}

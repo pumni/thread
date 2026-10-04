@@ -23,7 +23,7 @@ def test_controller_quit_wait_is_process_authoritative() -> None:
         pytest.skip("PowerShell AST parser is only available on Windows test hosts")
 
     smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
-    assertion = f"""
+    assertion = rf"""
 $smokePath = '{smoke_path}'
 $tokens = $null
 $parseErrors = $null
@@ -115,6 +115,72 @@ if ($normalWaitCommands.Count -ne 1 -or
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
     assert "process-authoritative Controller Quit assertion PASS" in completed.stdout
+
+
+def test_controller_login_input_waits_for_named_uia_edit() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell AST parser is only available on Windows test hosts")
+
+    smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
+    assertion = rf"""
+$smokePath = '{smoke_path}'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $smokePath, [ref]$tokens, [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) {{ throw "Controller smoke script did not parse" }}
+
+$loginFunctions = @($ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Set-LoginInput'
+}}, $true))
+if ($loginFunctions.Count -ne 1) {{ throw "Expected one Set-LoginInput function" }}
+$loginBody = $loginFunctions[0].Body
+$commands = @($loginBody.FindAll({{
+    param($node) $node -is [System.Management.Automation.Language.CommandAst]
+}}, $true))
+$waitCalls = @($commands | Where-Object {{ $_.GetCommandName() -eq 'Wait-Until' }} |
+    Sort-Object {{ $_.Extent.StartOffset }})
+$sendCalls = @($loginBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Member.Extent.Text -eq 'SendWait'
+}}, $true))
+if ($waitCalls.Count -lt 2 -or $sendCalls.Count -ne 2 -or
+    $waitCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset) {{
+    throw "Login input must wait for its Edit control before sending keys"
+}}
+$editCondition = $waitCalls[0].CommandElements[1].ScriptBlock
+$editLookups = @($editCondition.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Find-Element'
+}}, $true))
+if ($editLookups.Count -ne 1 -or
+    $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode') {{
+    throw "Named Edit lookup must use the bounded field-specific wait"
+}}
+$bodyText = $loginBody.Extent.Text
+if ($bodyText -notmatch '\$fieldId\s*=\s*\[regex\]::Replace' -or
+    $bodyText -notmatch 'desktop_input_unavailable_\$fieldId' -or
+    $bodyText -notmatch '\$fieldId\s*-ne\s*"password"') {{
+    throw "Input diagnostics must be normalized and password values must not be verified"
+}}
+"Bounded Controller login input assertion PASS"
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "Bounded Controller login input assertion PASS" in completed.stdout
 
 
 def _load_verifier() -> ModuleType:

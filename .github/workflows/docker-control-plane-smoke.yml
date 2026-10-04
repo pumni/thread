@@ -44,9 +44,12 @@ jobs:
         with:
           version: "0.12.21"
 
+      - name: Install locked smoke environment
+        run: uv sync --locked
+
       - name: Build image and run Compose restart/recovery smoke
-        run: uv run --no-project --python 3.14 python scripts/control_plane_compose_smoke.py
+        run: uv run --locked python scripts/control_plane_compose_smoke.py
 
       - name: Remove smoke containers and PostgreSQL volume
         if: always()
-        run: docker compose down --volumes --remove-orphans
+        run: docker compose --profile tls-admin down --volumes --remove-orphans
