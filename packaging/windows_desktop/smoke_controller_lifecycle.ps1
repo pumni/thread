@@ -98,6 +98,12 @@ $checks = [ordered]@{
     dpapi_current_user_round_trip = $false
     atomic_non_secret_config = $false
     controller_https_configuration_persisted = $false
+    endpoint_reconfigure_before_owner = $false
+    endpoint_unavailable_ip_rolls_back = $false
+    endpoint_collision_rolls_back = $false
+    endpoint_running_unavailable_ip_rolls_back = $false
+    endpoint_running_collision_rolls_back = $false
+    endpoint_running_transition_preserves_postgres = $false
     no_lan_listener_before_local_owner_bootstrap = $false
     loopback_postgres_wildcard_https_listener = $false
     controller_https_root_fingerprint_matches_ui = $false
@@ -742,6 +748,44 @@ function Get-FreeHttpsPort {
     finally { $listener.Stop() }
 }
 
+function Get-UnassignedControllerIpv4 {
+    $assigned = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    foreach ($item in Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop) {
+        $null = $assigned.Add([string]$item.IPAddress)
+    }
+    foreach ($candidate in @("192.0.2.254", "198.51.100.254", "203.0.113.254")) {
+        if (-not $assigned.Contains($candidate)) { return $candidate }
+    }
+    throw "controller_smoke_unassigned_ipv4_unavailable"
+}
+
+function Get-AlternateControllerIpv4([string]$CurrentAddress) {
+    $candidate = Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction Stop |
+        Where-Object {
+            $_.IPAddress -cne $CurrentAddress -and $_.IPAddress -notlike "127.*" -and
+            $_.IPAddress -notlike "169.254.*" -and $_.IPAddress -notlike "224.*" -and
+            $_.IPAddress -ne "255.255.255.255"
+        } |
+        Select-Object -First 1
+    if ($candidate) { return [string]$candidate.IPAddress }
+    return $null
+}
+
+function Open-ControllerEndpointReconfiguration([int]$ProcessId) {
+    Invoke-Button $ProcessId "Reconfigure HTTPS endpoint…"
+}
+
+function Set-ControllerEndpointFields([int]$ProcessId, [string]$Address, [int]$Port) {
+    Set-LoginInput $ProcessId "Stable LAN IPv4 address" $Address
+    Set-LoginInput $ProcessId "HTTPS port" ([string]$Port)
+}
+
+function Get-FileSha256([string]$Path) {
+    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
 function Test-ControllerHttps([object]$Config) {
     try {
         $rootPath = Join-Path (Join-Path $controllerRoot "tls") "root-cert.der"
@@ -995,6 +1039,99 @@ try {
         -not $checks.controller_https_root_fingerprint_matches_ui) {
         throw "controller_https_identity_summary_invalid"
     }
+    $leafCertificatePath = Join-Path (Join-Path $controllerRoot "tls") "leaf-cert.der"
+    $initialRootFingerprint = Get-FileSha256 $rootCertificatePath
+    $initialLeafFingerprint = Get-FileSha256 $leafCertificatePath
+    $initialPort = [int]$config.endpointPort
+
+    # Local setup can correct an explicitly selected endpoint before the first Owner exists.
+    Open-ControllerEndpointReconfiguration $desktop.Id
+    $unavailableAddress = Get-UnassignedControllerIpv4
+    Set-ControllerEndpointFields $desktop.Id $unavailableAddress $initialPort
+    Invoke-Button $desktop.Id "Apply endpoint change"
+    Wait-Until {
+        $null -ne (Find-TextContaining (Get-Window $desktop.Id) "not assigned to this PC")
+    } 15 "controller_unavailable_ip_error_not_visible"
+    $unchanged = Get-ControllerConfig
+    if ($unchanged.lanAddress -cne $lanAddress -or $unchanged.endpointPort -ne $initialPort -or
+        (Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
+        (Get-FileSha256 $leafCertificatePath) -cne $initialLeafFingerprint) {
+        throw "controller_unavailable_ip_changed_persisted_state"
+    }
+    $checks.endpoint_unavailable_ip_rolls_back = $true
+
+    $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
+    $endpointReservation.Start()
+    $collisionPort = ([System.Net.IPEndPoint]$endpointReservation.LocalEndpoint).Port
+    try {
+        Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort
+        Invoke-Button $desktop.Id "Apply endpoint change"
+        Wait-Until {
+            $null -ne (Find-TextContaining (Get-Window $desktop.Id) "already in use")
+        } 15 "controller_endpoint_collision_error_not_visible"
+        $unchanged = Get-ControllerConfig
+        if ($unchanged.lanAddress -cne $lanAddress -or $unchanged.endpointPort -ne $initialPort -or
+            (Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
+            (Get-FileSha256 $leafCertificatePath) -cne $initialLeafFingerprint) {
+            throw "controller_endpoint_collision_changed_persisted_state"
+        }
+        $checks.endpoint_collision_rolls_back = $true
+    } finally {
+        $endpointReservation.Stop()
+    }
+
+    $selectedHttpsPort = Get-FreeHttpsPort
+    Set-ControllerEndpointFields $desktop.Id $lanAddress $selectedHttpsPort
+    Invoke-Button $desktop.Id "Apply endpoint change"
+    Wait-Until {
+        $configured = Get-ControllerConfig
+        return $configured.lanAddress -ceq $lanAddress -and
+            $configured.endpointPort -eq $selectedHttpsPort
+    } 30 "controller_pre_owner_endpoint_reconfiguration_not_persisted"
+    $config = Get-ControllerConfig
+    $afterPreOwnerLeafFingerprint = Get-FileSha256 $leafCertificatePath
+    if ((Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
+        $afterPreOwnerLeafFingerprint -ceq $initialLeafFingerprint) {
+        throw "controller_pre_owner_reconfiguration_identity_invalid"
+    }
+    $alternateAddress = Get-AlternateControllerIpv4 $lanAddress
+    if ($alternateAddress) {
+        Open-ControllerEndpointReconfiguration $desktop.Id
+        Set-ControllerEndpointFields $desktop.Id $alternateAddress $selectedHttpsPort
+        Invoke-Button $desktop.Id "Apply endpoint change"
+        Wait-Until {
+            $updated = Get-ControllerConfig
+            return $updated.lanAddress -ceq $alternateAddress -and
+                $updated.endpointPort -eq $selectedHttpsPort
+        } 30 "controller_pre_owner_ip_reconfiguration_not_persisted"
+        $config = Get-ControllerConfig
+        $ipChangedLeafFingerprint = Get-FileSha256 $leafCertificatePath
+        if ((Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
+            $ipChangedLeafFingerprint -ceq $afterPreOwnerLeafFingerprint -or
+            (Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint) -eq $null) {
+            throw "controller_pre_owner_ip_reconfiguration_identity_invalid"
+        }
+        $lanAddress = $alternateAddress
+        $afterPreOwnerLeafFingerprint = $ipChangedLeafFingerprint
+        $processEvidence.endpoint_ip_reconfiguration = "PASS"
+    } else {
+        $processEvidence.endpoint_ip_reconfiguration = "UNAVAILABLE: no second assigned IPv4"
+    }
+    $beforeOwnerProcesses = Get-ControllerProcesses
+    if ($beforeOwnerProcesses.postgres.Count -ne 1 -or $beforeOwnerProcesses.http.Count -ne 0 -or
+        $beforeOwnerProcesses.scheduler.Count -ne 0 -or
+        @(Get-ListenerAddresses $initialPort).Count -ne 0 -or
+        @(Get-ListenerAddresses $selectedHttpsPort).Count -ne 0 -or
+        (Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint) -eq $null) {
+        throw "controller_pre_owner_reconfiguration_started_listener_or_changed_root"
+    }
+    $checks.endpoint_reconfigure_before_owner = $true
+    $checks.controller_https_configuration_persisted =
+        $config.schemaVersion -eq 2 -and $config.lanAddress -ceq $lanAddress -and
+        $config.endpointPort -eq $selectedHttpsPort
+    if (-not $checks.controller_https_configuration_persisted) {
+        throw "controller_https_configuration_not_persisted"
+    }
     $beforeOwnerProcesses = Get-ControllerProcesses
     $beforeOwnerListeners = @(Get-ListenerAddresses ([int]$config.endpointPort))
     $checks.no_lan_listener_before_local_owner_bootstrap =
@@ -1034,6 +1171,16 @@ try {
         $config.lanAddress -ceq $lanAddress -and $config.endpointPort -eq $selectedHttpsPort
     if (-not $checks.atomic_non_secret_config) { throw "controller_config_contains_secret_or_invalid_state" }
 
+    $databaseSystemIdentifier = Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();"
+    $operatorUsersTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
+    $operatorUserCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users;"
+    $checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and $operatorUserCount -eq "0" -and
+        $config.endpointPort -gt 0 -and $config.databasePort -gt 0
+    if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
+    Bootstrap-ControllerOwner $desktop.Id
+    $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
+    $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
+    if (-not $checks.local_first_owner_bootstrap) { throw "controller_local_first_owner_bootstrap_invalid" }
     Wait-Until { Test-ControllerHttps $config } 60 "controller_tls_readiness_failed"
     $checks.local_readiness_uses_private_root = $true
     if (-not (Test-PlaintextHttpRejected $config)) {
@@ -1055,19 +1202,124 @@ try {
     Set-Check "loopback_postgres_wildcard_https_listener" $privateDatabaseAndWildcardTls `
         "controller_listener_topology_invalid"
     if (-not $privateDatabaseAndWildcardTls) { throw "controller_listener_topology_invalid" }
-
-    $databaseSystemIdentifier = Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();"
-    $operatorUsersTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
-    $operatorUserCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users;"
-    $checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and $operatorUserCount -eq "0" -and
-        $config.endpointPort -gt 0 -and $config.databasePort -gt 0
-    if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
-    Bootstrap-ControllerOwner $desktop.Id
-    $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
-    $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
-    if (-not $checks.local_first_owner_bootstrap) { throw "controller_local_first_owner_bootstrap_invalid" }
     Invoke-Psql $config "CREATE TABLE dx04_runtime_evidence (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO dx04_runtime_evidence (id, marker) VALUES (1, '$sentinel');" | Out-Null
     Assert-DatabaseValue $config $sentinel
+
+    # Failed post-Owner attempts preserve the endpoint and both certificate identities.
+    $ownedBeforeEndpointChange = Assert-ControllerProcesses
+    $oldHttpsPort = [int]$config.endpointPort
+    $oldPostgresPid = [int]$ownedBeforeEndpointChange.postgres[0].ProcessId
+    $oldHttpPid = [int]$ownedBeforeEndpointChange.http[0].ProcessId
+    $oldSchedulerPid = [int]$ownedBeforeEndpointChange.scheduler[0].ProcessId
+    $rootBeforeEndpointChange = Get-FileSha256 $rootCertificatePath
+    $leafBeforeEndpointChange = Get-FileSha256 $leafCertificatePath
+
+    Open-ControllerEndpointReconfiguration $desktop.Id
+    Set-ControllerEndpointFields $desktop.Id $unavailableAddress $oldHttpsPort
+    Invoke-Button $desktop.Id "Apply endpoint change"
+    Wait-Until {
+        $null -ne (Find-TextContaining (Get-Window $desktop.Id) "not assigned to this PC")
+    } 15 "controller_running_unavailable_ip_error_not_visible"
+    if ((Get-ControllerConfig).endpointPort -ne $oldHttpsPort -or
+        (Get-FileSha256 $rootCertificatePath) -cne $rootBeforeEndpointChange -or
+        (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange -or
+        -not (Test-ControllerHttps $config)) {
+        throw "controller_running_unavailable_ip_changed_state"
+    }
+    $checks.endpoint_running_unavailable_ip_rolls_back = $true
+
+    $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
+    $endpointReservation.Start()
+    $collisionPort = ([System.Net.IPEndPoint]$endpointReservation.LocalEndpoint).Port
+    try {
+        Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort
+        Invoke-Button $desktop.Id "Apply endpoint change"
+        Wait-Until {
+            $null -ne (Find-TextContaining (Get-Window $desktop.Id) "already in use")
+        } 15 "controller_running_endpoint_collision_error_not_visible"
+        $afterCollisionProcesses = Assert-ControllerProcesses
+        if ((Get-ControllerConfig).endpointPort -ne $oldHttpsPort -or
+            (Get-FileSha256 $rootCertificatePath) -cne $rootBeforeEndpointChange -or
+            (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange -or
+            [int]$afterCollisionProcesses.postgres[0].ProcessId -ne $oldPostgresPid -or
+            [int]$afterCollisionProcesses.http[0].ProcessId -ne $oldHttpPid -or
+            [int]$afterCollisionProcesses.scheduler[0].ProcessId -ne $oldSchedulerPid -or
+            -not (Test-ControllerHttps $config)) {
+            throw "controller_running_endpoint_collision_changed_runtime_or_identity"
+        }
+        $checks.endpoint_running_collision_rolls_back = $true
+    } finally {
+        $endpointReservation.Stop()
+    }
+
+    $newHttpsPort = Get-FreeHttpsPort
+    $oldHttpTracked = Get-TrackedProcess $oldHttpPid $runtimeExecutable
+    $oldSchedulerTracked = Get-TrackedProcess $oldSchedulerPid $runtimeExecutable
+    if (-not $oldHttpTracked -or -not $oldSchedulerTracked) {
+        if ($oldHttpTracked) { $oldHttpTracked.Dispose() }
+        if ($oldSchedulerTracked) { $oldSchedulerTracked.Dispose() }
+        throw "controller_reconfiguration_process_handle_unavailable"
+    }
+    $schedulerExitHandle = [ThreadsControllerSmoke.NativeMethods]::OpenProcessForExitTime(
+        [uint32]$oldSchedulerPid
+    )
+    $httpExitHandle = [ThreadsControllerSmoke.NativeMethods]::OpenProcessForExitTime(
+        [uint32]$oldHttpPid
+    )
+    if ($schedulerExitHandle -eq [IntPtr]::Zero -or $httpExitHandle -eq [IntPtr]::Zero) {
+        if ($schedulerExitHandle -ne [IntPtr]::Zero) {
+            $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($schedulerExitHandle)
+        }
+        if ($httpExitHandle -ne [IntPtr]::Zero) {
+            $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($httpExitHandle)
+        }
+        $oldHttpTracked.Dispose()
+        $oldSchedulerTracked.Dispose()
+        throw "controller_reconfiguration_process_handle_unavailable"
+    }
+    try {
+        Set-ControllerEndpointFields $desktop.Id $lanAddress $newHttpsPort
+        Invoke-Button $desktop.Id "Apply endpoint change"
+        Wait-Until {
+            $updated = Get-ControllerConfig
+            return $updated.lanAddress -ceq $lanAddress -and $updated.endpointPort -eq $newHttpsPort
+        } 30 "controller_running_endpoint_reconfiguration_not_persisted"
+        $config = Get-ControllerConfig
+        Wait-Until { Test-ControllerHttps $config } 60 "controller_reconfigured_https_readiness_failed"
+        Wait-Until {
+            $current = Get-ControllerProcesses
+            return $current.postgres.Count -eq 1 -and $current.http.Count -eq 1 -and
+                $current.scheduler.Count -eq 1
+        } 20 "controller_reconfigured_processes_not_running"
+        $schedulerExited = Get-ProcessExitTime $oldSchedulerTracked $schedulerExitHandle `
+            "controller_old_scheduler_not_stopped_during_reconfiguration"
+        $httpExited = Get-ProcessExitTime $oldHttpTracked $httpExitHandle `
+            "controller_old_http_not_stopped_during_reconfiguration"
+        $newProcesses = Assert-ControllerProcesses
+        $newSchedulerStart = ([DateTime]$newProcesses.scheduler[0].CreationDate).ToUniversalTime()
+        $newHttpStart = ([DateTime]$newProcesses.http[0].CreationDate).ToUniversalTime()
+        $rootAfterEndpointChange = Get-FileSha256 $rootCertificatePath
+        $leafAfterEndpointChange = Get-FileSha256 $leafCertificatePath
+        if ($rootAfterEndpointChange -cne $rootBeforeEndpointChange -or
+            $leafAfterEndpointChange -ceq $leafBeforeEndpointChange -or
+            [int]$newProcesses.postgres[0].ProcessId -ne $oldPostgresPid -or
+            [int]$newProcesses.http[0].ProcessId -eq $oldHttpPid -or
+            [int]$newProcesses.scheduler[0].ProcessId -eq $oldSchedulerPid -or
+            $schedulerExited -ge $httpExited -or $newSchedulerStart -lt $newHttpStart -or
+            @(Get-ListenerAddresses $oldHttpsPort).Count -ne 0 -or
+            (Get-ListenerAddresses $newHttpsPort).Count -ne 1 -or
+            -not (Test-PlaintextHttpRejected $config)) {
+            throw "controller_running_endpoint_transition_invalid"
+        }
+        $checks.endpoint_running_transition_preserves_postgres = $true
+        $checks.plaintext_health_rejected = $true
+        Ensure-ControllerOwner $desktop.Id -ForceReauthentication
+    } finally {
+        $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($schedulerExitHandle)
+        $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($httpExitHandle)
+        $oldHttpTracked.Dispose()
+        $oldSchedulerTracked.Dispose()
+    }
 
     $window = Get-Process -Id $desktop.Id -ErrorAction Stop
     $window.Refresh()

@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   decommissionDevice,
   controllerHttpsConfigure,
+  controllerHttpsReconfigure,
   controllerHttpsSummary,
   controllerTrustConfirm,
   controllerTrustProbe,
@@ -52,11 +53,11 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
 const operatorAccessMessages: Record<string, string> = {
-  operator_authentication_required: "Sign in again before stopping this node.",
+  operator_authentication_required: "Sign in with a Controller Owner or Admin account to continue.",
   operator_session_revoked:
     "This Operator session expired or was revoked. Sign in again before stopping this node.",
   operator_password_change_required: "Change your Workspace password before stopping this node.",
-  operator_forbidden: "Only an Owner or Admin can stop this Controller.",
+  operator_forbidden: "Only a Controller Owner or Admin can perform this operation.",
   operator_api_unavailable:
     "The Controller could not verify Operator access. Try again when it is available.",
   operator_request_failed: "The Controller could not verify Operator access. Try again.",
@@ -66,6 +67,8 @@ const operatorAccessMessages: Record<string, string> = {
   controller_lan_address_invalid: "Enter a valid IPv4 address assigned to this PC.",
   controller_lan_address_unavailable: "That IPv4 address is not assigned to this PC.",
   controller_endpoint_port_in_use: "That HTTPS port is already in use. Choose another port.",
+  controller_https_reconfiguration_unauthorized:
+    "Only a signed-in Controller Owner or Admin can change this endpoint.",
   controller_tls_identity_invalid:
     "The saved Controller TLS identity is invalid. The Controller did not replace it.",
   controller_trust_required: "Verify and confirm this Controller before signing in.",
@@ -111,6 +114,7 @@ function App() {
   const [lanAddress, setLanAddress] = useState("");
   const [httpsPort, setHttpsPort] = useState("8443");
   const [tlsConfiguring, setTlsConfiguring] = useState(false);
+  const [tlsReconfigureOpen, setTlsReconfigureOpen] = useState(false);
   const [pendingTrustProbe, setPendingTrustProbe] = useState<TrustProbeSummary | null>(null);
   const [trustedController, setTrustedController] = useState<TrustedControllerSummary | null>(null);
   const [trustBusy, setTrustBusy] = useState(false);
@@ -303,8 +307,10 @@ function App() {
       const errorCode =
         typeof error === "string" ? error : error instanceof Error ? error.message : "";
       setActionError(
-        operatorAccessMessages[errorCode] ??
-          "The node could not stop cleanly. Check the runtime status before retrying.",
+        errorCode === "operator_forbidden" && snapshot?.role === "CONTROLLER"
+          ? "Only an Owner or Admin can stop this Controller."
+          : (operatorAccessMessages[errorCode] ??
+              "The node could not stop cleanly. Check the runtime status before retrying."),
       );
     }
   }
@@ -358,16 +364,23 @@ function App() {
     setTlsConfiguring(true);
     setActionError(null);
     try {
-      const configured = await controllerHttpsConfigure(lanAddress.trim(), port);
+      const configured = tlsReconfigureOpen
+        ? await controllerHttpsReconfigure(lanAddress.trim(), port)
+        : await controllerHttpsConfigure(lanAddress.trim(), port);
       setControllerHttps(configured);
       setLanAddress(configured.lanAddress ?? lanAddress.trim());
       setHttpsPort(String(configured.httpsPort));
+      if (tlsReconfigureOpen) {
+        setOperator(null);
+        setOperatorUsers([]);
+      }
+      setTlsReconfigureOpen(false);
       await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
     } catch (error) {
       const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
       setActionError(
         operatorAccessMessages[code] ??
-          "Controller HTTPS setup failed. Check the IPv4 address and port, then try again.",
+          "Controller HTTPS change failed. Check the IPv4 address and port, then try again.",
       );
     } finally {
       setTlsConfiguring(false);
@@ -555,6 +568,11 @@ function App() {
   const remoteTrustReady =
     trustedController?.trusted === true && trustedController.endpoint === canonicalEndpoint;
   const ownerBootstrapRequired = snapshot.supervisor.state === "owner_bootstrap_required";
+  const canReconfigureControllerEndpoint =
+    ownerBootstrapRequired ||
+    (operator !== null &&
+      !operator.mustChangePassword &&
+      (operator.role === "OWNER" || operator.role === "ADMIN"));
   const controllerLoginReady =
     snapshot.role !== "CONTROLLER" ||
     (controllerHttps?.configured === true &&
@@ -734,29 +752,46 @@ function App() {
                       </div>
                     </div>
                     {controllerHttps?.configured ? (
-                      <div className="runtime-facts">
-                        <div>
-                          <span>Public Controller address</span>
-                          <strong>{controllerHttps.publicHttpsOrigin}</strong>
-                        </div>
-                        <div>
-                          <span>Local HTTPS</span>
-                          <strong>{controllerHttps.localHttpsOrigin} · Verified</strong>
-                        </div>
-                        <div>
-                          <span>Controller root fingerprint</span>
-                          <code>{controllerHttps.rootFingerprint}</code>
-                        </div>
-                        {controllerHttps.leafExpiresAt && (
+                      <>
+                        <div className="runtime-facts">
                           <div>
-                            <span>Leaf certificate expires</span>
-                            <strong>
-                              {new Date(controllerHttps.leafExpiresAt).toLocaleString()}
-                            </strong>
+                            <span>Public Controller address</span>
+                            <strong>{controllerHttps.publicHttpsOrigin}</strong>
                           </div>
+                          <div>
+                            <span>Local HTTPS</span>
+                            <strong>{controllerHttps.localHttpsOrigin} · Verified</strong>
+                          </div>
+                          <div>
+                            <span>Controller root fingerprint</span>
+                            <code>{controllerHttps.rootFingerprint}</code>
+                          </div>
+                          {controllerHttps.leafExpiresAt && (
+                            <div>
+                              <span>Leaf certificate expires</span>
+                              <strong>
+                                {new Date(controllerHttps.leafExpiresAt).toLocaleString()}
+                              </strong>
+                            </div>
+                          )}
+                        </div>
+                        {!tlsReconfigureOpen && canReconfigureControllerEndpoint && (
+                          <button
+                            type="button"
+                            className="button button-secondary"
+                            onClick={() => {
+                              setLanAddress(controllerHttps.lanAddress ?? "");
+                              setHttpsPort(String(controllerHttps.httpsPort));
+                              setTlsReconfigureOpen(true);
+                              setActionError(null);
+                            }}
+                          >
+                            Reconfigure HTTPS endpoint…
+                          </button>
                         )}
-                      </div>
-                    ) : (
+                      </>
+                    ) : null}
+                    {(!controllerHttps?.configured || tlsReconfigureOpen) && (
                       <form
                         className="operator-login-form"
                         onSubmit={(event) => {
@@ -765,8 +800,9 @@ function App() {
                         }}
                       >
                         <p className="card-copy">
-                          Set the stable IPv4 address assigned to this PC. The Controller will keep
-                          this address and HTTPS port until you explicitly reconfigure it.
+                          {controllerHttps?.configured
+                            ? "Choose the new stable IPv4 address and HTTPS port. The Controller root identity stays the same and a new leaf certificate is issued."
+                            : "Set the stable IPv4 address assigned to this PC and explicitly choose its HTTPS port."}
                         </p>
                         <label>
                           Stable LAN IPv4 address
@@ -795,8 +831,26 @@ function App() {
                           className="button button-primary"
                           disabled={tlsConfiguring}
                         >
-                          {tlsConfiguring ? "Configuring…" : "Configure HTTPS"}
+                          {tlsConfiguring
+                            ? "Applying…"
+                            : tlsReconfigureOpen
+                              ? "Apply endpoint change"
+                              : "Configure HTTPS"}
                         </button>
+                        {tlsReconfigureOpen && (
+                          <button
+                            type="button"
+                            className="button button-secondary"
+                            disabled={tlsConfiguring}
+                            onClick={() => {
+                              setTlsReconfigureOpen(false);
+                              setLanAddress(controllerHttps?.lanAddress ?? "");
+                              setHttpsPort(String(controllerHttps?.httpsPort ?? 8443));
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        )}
                       </form>
                     )}
                   </section>

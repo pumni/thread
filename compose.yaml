@@ -71,6 +71,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      tls-prepare:
+        condition: service_completed_successfully
 
   scheduler:
     <<: *control-plane-runtime
@@ -103,6 +105,24 @@ services:
     restart: "no"
     volumes:
       - controller_tls_admin:/var/lib/threads/controller-tls-admin
+      - controller_tls_serving:/var/lib/threads/controller-tls-serving
+
+  tls-prepare:
+    <<: *control-plane-runtime
+    command:
+      - python
+      - -m
+      - threads_platform.controller_tls_admin
+      - ensure
+      - --admin-dir
+      - /var/lib/threads/controller-tls-admin
+      - --serving-dir
+      - /var/lib/threads/controller-tls-serving
+      - --lan-address
+      - ${THREADS_PLATFORM_TLS_LAN_ADDRESS:?set THREADS_PLATFORM_TLS_LAN_ADDRESS}
+    restart: "no"
+    volumes:
+      - controller_tls_admin:/var/lib/threads/controller-tls-admin:ro
       - controller_tls_serving:/var/lib/threads/controller-tls-serving
 
 volumes:

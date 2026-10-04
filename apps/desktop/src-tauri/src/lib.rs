@@ -420,6 +420,35 @@ impl DeviceState {
         inner.supervisor.configure_https(lan_address, port)
     }
 
+    fn controller_owner_exists(&self) -> Result<bool, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner.supervisor.controller_owner_exists()
+    }
+
+    fn reconfigure_https(
+        &self,
+        lan_address: &str,
+        port: u16,
+        owner_authorized: bool,
+    ) -> Result<ControllerTlsSummary, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Controller) {
+            return Err("controller_runtime_unavailable".to_string());
+        }
+        inner
+            .supervisor
+            .reconfigure_https(lan_address, port, owner_authorized)
+    }
+
     fn controller_https_summary(&self) -> Result<ControllerTlsSummary, String> {
         let inner = self
             .inner
@@ -514,6 +543,33 @@ fn controller_https_configure(
     port: u16,
 ) -> Result<ControllerTlsSummary, String> {
     state.configure_https(&lan_address, port)
+}
+
+#[tauri::command]
+async fn controller_https_reconfigure(
+    state: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+    lan_address: String,
+    port: u16,
+) -> Result<ControllerTlsSummary, String> {
+    let owner_exists = state.controller_owner_exists()?;
+    if owner_exists {
+        authorize_node_lifecycle(&state, &operator)
+            .await
+            .map_err(|error| match error.as_str() {
+                "operator_authentication_required"
+                | "operator_forbidden"
+                | "operator_password_change_required" => {
+                    "controller_https_reconfiguration_unauthorized".to_string()
+                }
+                _ => error,
+            })?;
+    }
+    let summary = state.reconfigure_https(&lan_address, port, owner_exists)?;
+    if owner_exists {
+        operator.lock_session();
+    }
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -789,6 +845,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_desktop_snapshot,
             controller_https_configure,
+            controller_https_reconfigure,
             controller_https_summary,
             controller_trust_probe,
             controller_trust_confirm,

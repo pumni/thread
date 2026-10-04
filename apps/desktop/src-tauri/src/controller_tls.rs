@@ -50,6 +50,19 @@ struct Paths {
     serving_key: PathBuf,
 }
 
+pub(super) struct PreparedLeafReissue {
+    leaf_der: Vec<u8>,
+    protected_key: Vec<u8>,
+    fullchain: Vec<u8>,
+    pub(super) root_fingerprint: String,
+}
+
+pub(super) struct LeafStateBackup {
+    leaf_der: Vec<u8>,
+    protected_key: Vec<u8>,
+    fullchain: Vec<u8>,
+}
+
 impl Paths {
     fn new(data_root: &Path) -> Self {
         let tls_dir = data_root.join("tls");
@@ -104,6 +117,38 @@ pub(super) fn load_validate_or_renew(
     load_summary(&paths, lan_address)?
         .root_fingerprint
         .ok_or("controller_tls_identity_invalid")
+}
+
+pub(super) fn validate_identity(
+    data_root: &Path,
+    lan_address: Ipv4Addr,
+) -> Result<String, &'static str> {
+    let paths = Paths::new(data_root);
+    if paths.durable_files().iter().any(|path| !path.is_file()) {
+        return Err("controller_tls_identity_invalid");
+    }
+    let root_der = fs::read(&paths.root_cert).map_err(|_| "controller_tls_identity_invalid")?;
+    let protected_root_key =
+        fs::read(&paths.root_key).map_err(|_| "controller_tls_identity_invalid")?;
+    let root_key_bytes = Zeroizing::new(
+        crate::windows_crypto::unprotect_current_user(&protected_root_key)
+            .map_err(|_| "controller_tls_root_key_unprotect_failed")?,
+    );
+    let root_key = KeyPair::try_from(root_key_bytes.as_slice())
+        .map_err(|_| "controller_tls_identity_invalid")?;
+    if root_key.algorithm() != &PKCS_ECDSA_P256_SHA256 {
+        return Err("controller_tls_identity_invalid");
+    }
+    validate_root(&root_der, root_key.subject_public_key_info().as_slice())?;
+    validate_leaf_durable(&paths, &root_der, lan_address)?;
+    fingerprint(&root_der)
+}
+
+pub(super) fn root_fingerprint(data_root: &Path) -> Result<String, &'static str> {
+    let root_der =
+        fs::read(Paths::new(data_root).root_cert).map_err(|_| "controller_tls_identity_invalid")?;
+    validate_trust_anchor(&root_der).map_err(|_| "controller_tls_identity_invalid")?;
+    fingerprint(&root_der)
 }
 
 pub(super) fn summary(
@@ -300,6 +345,14 @@ fn create_root(paths: &Paths) -> Result<(), &'static str> {
 }
 
 fn issue_leaf(paths: &Paths, lan_address: Ipv4Addr) -> Result<(), &'static str> {
+    let candidate = generate_leaf(paths, lan_address)?;
+    commit_leaf_material(paths, candidate).map(|_| ())
+}
+
+fn generate_leaf(
+    paths: &Paths,
+    lan_address: Ipv4Addr,
+) -> Result<PreparedLeafReissue, &'static str> {
     let root_der = fs::read(&paths.root_cert).map_err(|_| "controller_tls_identity_invalid")?;
     let protected_root_key =
         fs::read(&paths.root_key).map_err(|_| "controller_tls_identity_invalid")?;
@@ -346,10 +399,125 @@ fn issue_leaf(paths: &Paths, lan_address: Ipv4Addr) -> Result<(), &'static str> 
         certificate_pem("CERTIFICATE", leaf_der),
         certificate_pem("CERTIFICATE", &root_der)
     );
-    write_atomic(&paths.leaf_cert, leaf_der)?;
-    write_atomic(&paths.leaf_key, &protected)?;
-    write_atomic(&paths.fullchain, fullchain.as_bytes())?;
-    Ok(())
+    Ok(PreparedLeafReissue {
+        leaf_der: leaf_der.to_vec(),
+        protected_key: protected,
+        fullchain: fullchain.into_bytes(),
+        root_fingerprint: fingerprint(&root_der)?,
+    })
+}
+
+pub(super) fn prepare_leaf_reissue(
+    data_root: &Path,
+    current_lan_address: Ipv4Addr,
+    requested_lan_address: Ipv4Addr,
+) -> Result<PreparedLeafReissue, &'static str> {
+    let paths = Paths::new(data_root);
+    if paths.durable_files().iter().any(|path| !path.is_file()) {
+        return Err("controller_tls_identity_invalid");
+    }
+    let root_der = fs::read(&paths.root_cert).map_err(|_| "controller_tls_identity_invalid")?;
+    let root_key_protected =
+        fs::read(&paths.root_key).map_err(|_| "controller_tls_identity_invalid")?;
+    let root_key_bytes = Zeroizing::new(
+        crate::windows_crypto::unprotect_current_user(&root_key_protected)
+            .map_err(|_| "controller_tls_root_key_unprotect_failed")?,
+    );
+    let root_key = KeyPair::try_from(root_key_bytes.as_slice())
+        .map_err(|_| "controller_tls_identity_invalid")?;
+    if root_key.algorithm() != &PKCS_ECDSA_P256_SHA256 {
+        return Err("controller_tls_identity_invalid");
+    }
+    validate_root(&root_der, root_key.subject_public_key_info().as_slice())?;
+    validate_leaf_durable(&paths, &root_der, current_lan_address)?;
+    generate_leaf(&paths, requested_lan_address)
+}
+
+pub(super) fn commit_leaf_reissue(
+    data_root: &Path,
+    candidate: PreparedLeafReissue,
+) -> Result<LeafStateBackup, &'static str> {
+    let paths = Paths::new(data_root);
+    if paths.durable_files().iter().any(|path| !path.is_file()) {
+        return Err("controller_tls_identity_invalid");
+    }
+    let backup = LeafStateBackup {
+        leaf_der: fs::read(&paths.leaf_cert).map_err(|_| "controller_tls_identity_invalid")?,
+        protected_key: fs::read(&paths.leaf_key).map_err(|_| "controller_tls_identity_invalid")?,
+        fullchain: fs::read(&paths.fullchain).map_err(|_| "controller_tls_identity_invalid")?,
+    };
+    commit_leaf_material(&paths, candidate)?;
+    Ok(backup)
+}
+
+pub(super) fn restore_leaf_state(
+    data_root: &Path,
+    backup: LeafStateBackup,
+) -> Result<(), &'static str> {
+    let paths = Paths::new(data_root);
+    write_atomic(&paths.leaf_cert, &backup.leaf_der)
+        .and_then(|()| write_atomic(&paths.leaf_key, &backup.protected_key))
+        .and_then(|()| write_atomic(&paths.fullchain, &backup.fullchain))
+}
+
+#[cfg(test)]
+pub(super) fn reissue_leaf_same_root(
+    data_root: &Path,
+    current_lan_address: Ipv4Addr,
+    requested_lan_address: Ipv4Addr,
+) -> Result<String, &'static str> {
+    let candidate = prepare_leaf_reissue(data_root, current_lan_address, requested_lan_address)?;
+    let fingerprint = candidate.root_fingerprint.clone();
+    commit_leaf_reissue(data_root, candidate)?;
+    Ok(fingerprint)
+}
+
+fn commit_leaf_material(
+    paths: &Paths,
+    candidate: PreparedLeafReissue,
+) -> Result<Option<LeafStateBackup>, &'static str> {
+    let present = [
+        paths.leaf_cert.is_file(),
+        paths.leaf_key.is_file(),
+        paths.fullchain.is_file(),
+    ];
+    if present.iter().any(|value| *value) && present.iter().any(|value| !*value) {
+        return Err("controller_tls_identity_invalid");
+    }
+    let backup = if present.iter().all(|value| *value) {
+        Some(LeafStateBackup {
+            leaf_der: fs::read(&paths.leaf_cert).map_err(|_| "controller_tls_identity_invalid")?,
+            protected_key: fs::read(&paths.leaf_key)
+                .map_err(|_| "controller_tls_identity_invalid")?,
+            fullchain: fs::read(&paths.fullchain).map_err(|_| "controller_tls_identity_invalid")?,
+        })
+    } else {
+        None
+    };
+    let write_result = write_atomic(&paths.leaf_cert, &candidate.leaf_der)
+        .and_then(|()| write_atomic(&paths.leaf_key, &candidate.protected_key))
+        .and_then(|()| write_atomic(&paths.fullchain, &candidate.fullchain));
+    if let Err(error) = write_result {
+        let rollback = if let Some(backup) = backup.as_ref() {
+            write_atomic(&paths.leaf_cert, &backup.leaf_der)
+                .and_then(|()| write_atomic(&paths.leaf_key, &backup.protected_key))
+                .and_then(|()| write_atomic(&paths.fullchain, &backup.fullchain))
+        } else {
+            [&paths.leaf_cert, &paths.leaf_key, &paths.fullchain]
+                .into_iter()
+                .try_for_each(|path| {
+                    if path.exists() {
+                        fs::remove_file(path).map_err(|_| "controller_tls_identity_invalid")?;
+                    }
+                    Ok(())
+                })
+        };
+        if rollback.is_err() {
+            return Err("controller_tls_identity_invalid");
+        }
+        return Err(error);
+    }
+    Ok(backup)
 }
 
 fn validate_existing_or_renew(paths: &Paths, lan_address: Ipv4Addr) -> Result<(), &'static str> {
@@ -926,6 +1094,64 @@ mod tests {
         assert_eq!(
             fs::read(&paths.root_cert).expect("root DER after renewal"),
             root_der
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_root_endpoint_reissue_changes_leaf_key_and_exact_san() {
+        let directory = tempfile::tempdir().expect("temporary TLS state");
+        let old_address = Ipv4Addr::new(192, 0, 2, 10);
+        let new_address = Ipv4Addr::new(198, 51, 100, 20);
+        let old_fingerprint = provision_initial(directory.path(), old_address).expect("provision");
+        let paths = Paths::new(directory.path());
+        let root_before = fs::read(&paths.root_cert).expect("root DER");
+        let old_leaf = fs::read(&paths.leaf_cert).expect("old leaf DER");
+        let old_key = fs::read(&paths.leaf_key).expect("old protected leaf key");
+
+        let candidate =
+            prepare_leaf_reissue(directory.path(), old_address, new_address).expect("prepare leaf");
+        assert_eq!(fs::read(&paths.leaf_cert).unwrap(), old_leaf);
+        assert_eq!(fs::read(&paths.leaf_key).unwrap(), old_key);
+        assert_eq!(candidate.root_fingerprint, old_fingerprint);
+        commit_leaf_reissue(directory.path(), candidate).expect("commit reissue");
+
+        assert_eq!(fs::read(&paths.root_cert).unwrap(), root_before);
+        assert_eq!(root_fingerprint(directory.path()).unwrap(), old_fingerprint);
+        assert_ne!(fs::read(&paths.leaf_cert).unwrap(), old_leaf);
+        assert_ne!(fs::read(&paths.leaf_key).unwrap(), old_key);
+        assert_eq!(
+            validate_identity(directory.path(), new_address).unwrap(),
+            old_fingerprint
+        );
+        assert_eq!(
+            validate_identity(directory.path(), old_address),
+            Err("controller_tls_identity_invalid")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_ip_port_reissue_creates_a_new_leaf_under_the_same_root() {
+        let directory = tempfile::tempdir().expect("temporary TLS state");
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let fingerprint_before = provision_initial(directory.path(), address).expect("provision");
+        let paths = Paths::new(directory.path());
+        let root_before = fs::read(&paths.root_cert).expect("root DER");
+        let old_leaf = fs::read(&paths.leaf_cert).expect("old leaf DER");
+        let old_key = fs::read(&paths.leaf_key).expect("old leaf key");
+
+        assert_eq!(
+            reissue_leaf_same_root(directory.path(), address, address).expect("port-only reissue"),
+            fingerprint_before
+        );
+
+        assert_eq!(fs::read(&paths.root_cert).unwrap(), root_before);
+        assert_ne!(fs::read(&paths.leaf_cert).unwrap(), old_leaf);
+        assert_ne!(fs::read(&paths.leaf_key).unwrap(), old_key);
+        assert_eq!(
+            validate_identity(directory.path(), address).unwrap(),
+            fingerprint_before
         );
     }
 

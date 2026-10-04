@@ -5,6 +5,7 @@ import ipaddress
 import os
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -101,6 +102,35 @@ def _write(path: Path, payload: bytes, *, private: bool) -> None:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+        raise ValueError(_ERROR) from error
+
+
+def _replace(path: Path, payload: bytes, *, private: bool) -> None:
+    descriptor = -1
+    staging: Path | None = None
+    try:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        staging = Path(raw_path)
+        os.chmod(staging, 0o600 if private else 0o644)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staging, path)
+        if os.name == "posix":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except Exception as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if staging is not None:
+            staging.unlink(missing_ok=True)
         raise ValueError(_ERROR) from error
 
 
@@ -344,15 +374,78 @@ def _store_leaf(
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     )
-    _write(serving_dir / _LEAF_KEY, key_bytes, private=True)
-    _write(serving_dir / _LEAF_CERT, cert_bytes, private=False)
-    _write(
-        serving_dir / _FULLCHAIN,
-        cert_bytes + root.certificate.public_bytes(serialization.Encoding.PEM),
-        private=False,
-    )
     _validate_leaf(root, certificate, private_key, addresses)
+    _replace_leaf_bundle(
+        serving_dir,
+        root,
+        addresses,
+        cert_bytes,
+        key_bytes,
+        cert_bytes + root.certificate.public_bytes(serialization.Encoding.PEM),
+    )
     return certificate
+
+
+def _replace_leaf_bundle(
+    serving_dir: Path,
+    root: _Root,
+    addresses: tuple[ipaddress.IPv4Address, ...],
+    cert_bytes: bytes,
+    key_bytes: bytes,
+    fullchain_bytes: bytes,
+) -> None:
+    names = (_LEAF_CERT, _LEAF_KEY, _FULLCHAIN)
+    current = [serving_dir / name for name in names]
+    present = [path.exists() or path.is_symlink() for path in current]
+    if any(present) and not all(present):
+        raise ValueError(_ERROR)
+    for path in current:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError(_ERROR)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=".tls-candidate-", dir=serving_dir) as raw_stage:
+            stage = Path(raw_stage)
+            candidate = stage / "candidate"
+            candidate.mkdir(mode=0o700)
+            _write(candidate / _LEAF_CERT, cert_bytes, private=False)
+            _write(candidate / _LEAF_KEY, key_bytes, private=True)
+            _write(candidate / _FULLCHAIN, fullchain_bytes, private=False)
+            _load_leaf(candidate, root, addresses)
+
+            old = (
+                {name: path.read_bytes() for name, path in zip(names, current, strict=True)}
+                if all(present)
+                else None
+            )
+            try:
+                for name in names:
+                    os.replace(candidate / name, serving_dir / name)
+                if os.name == "posix":
+                    directory_fd = os.open(serving_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+            except Exception as error:
+                try:
+                    if old is None:
+                        for name in names:
+                            (serving_dir / name).unlink(missing_ok=True)
+                    else:
+                        for name, payload in old.items():
+                            _replace(
+                                serving_dir / name,
+                                payload,
+                                private=name == _LEAF_KEY,
+                            )
+                except Exception as rollback_error:
+                    raise ValueError(_ERROR) from rollback_error
+                raise ValueError(_ERROR) from error
+    except ValueError as error:
+        raise _invalid(error) from error
+    except Exception as error:
+        raise ValueError(_ERROR) from error
 
 
 def provision(admin_dir: Path, serving_dir: Path, lan_address: str) -> str:
@@ -400,9 +493,36 @@ def renew(admin_dir: Path, serving_dir: Path, lan_address: str) -> str:
     if not all(leaf_presence):
         raise ValueError(_ERROR)
     _load_leaf(serving_dir, root, addresses, allow_expired=True)
-    for name in (_LEAF_CERT, _LEAF_KEY, _FULLCHAIN):
-        (serving_dir / name).unlink(missing_ok=True)
     _store_leaf(serving_dir, root, addresses)
+    return _fingerprint(root.certificate)
+
+
+def ensure(admin_dir: Path, serving_dir: Path, lan_address: str) -> str:
+    """Validate normal serving state and renew only a still-valid leaf in its renewal window."""
+    addresses = _endpoint_addresses(lan_address)
+    _check_directory(admin_dir)
+    _check_directory(serving_dir)
+    root = _load_provisioned_root(admin_dir)
+    leaf = _load_leaf(serving_dir, root, addresses)
+    if leaf.not_valid_after_utc - _now() <= timedelta(days=30):
+        _store_leaf(serving_dir, root, addresses)
+    return _fingerprint(root.certificate)
+
+
+def reissue(
+    admin_dir: Path,
+    serving_dir: Path,
+    current_lan_address: str,
+    lan_address: str,
+) -> str:
+    """Explicitly issue new serving material for an endpoint under the existing root."""
+    current_addresses = _endpoint_addresses(current_lan_address)
+    requested_addresses = _endpoint_addresses(lan_address)
+    _check_directory(admin_dir)
+    _check_directory(serving_dir)
+    root = _load_provisioned_root(admin_dir)
+    _load_leaf(serving_dir, root, current_addresses)
+    _store_leaf(serving_dir, root, requested_addresses)
     return _fingerprint(root.certificate)
 
 
@@ -414,11 +534,16 @@ def fingerprint(admin_dir: Path) -> str:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="threads-platform-controller-tls")
     subparsers = parser.add_subparsers(dest="operation", required=True)
-    for operation in ("provision", "renew"):
+    for operation in ("provision", "renew", "ensure"):
         subparser = subparsers.add_parser(operation)
         subparser.add_argument("--admin-dir", type=Path, required=True)
         subparser.add_argument("--serving-dir", type=Path, required=True)
         subparser.add_argument("--lan-address", required=True)
+    reissue_parser = subparsers.add_parser("reissue")
+    reissue_parser.add_argument("--admin-dir", type=Path, required=True)
+    reissue_parser.add_argument("--serving-dir", type=Path, required=True)
+    reissue_parser.add_argument("--current-lan-address", required=True)
+    reissue_parser.add_argument("--lan-address", required=True)
     fingerprint_parser = subparsers.add_parser("fingerprint")
     fingerprint_parser.add_argument("--admin-dir", type=Path, required=True)
     return parser
@@ -431,6 +556,15 @@ def main(argv: list[str] | None = None) -> int:
             result = provision(args.admin_dir, args.serving_dir, args.lan_address)
         elif args.operation == "renew":
             result = renew(args.admin_dir, args.serving_dir, args.lan_address)
+        elif args.operation == "ensure":
+            result = ensure(args.admin_dir, args.serving_dir, args.lan_address)
+        elif args.operation == "reissue":
+            result = reissue(
+                args.admin_dir,
+                args.serving_dir,
+                args.current_lan_address,
+                args.lan_address,
+            )
         else:
             result = fingerprint(args.admin_dir)
     except Exception:

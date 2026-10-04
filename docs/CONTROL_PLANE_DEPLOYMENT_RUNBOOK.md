@@ -40,14 +40,33 @@ uv run python -m threads_platform.controller_tls_admin fingerprint `
   --admin-dir <controller-tls-admin>
 ```
 
-Use `renew` with the same directories and address to issue a same-root leaf.
-Keep `root-key.pem` in the administrator-only directory; mount only
+Use `ensure` at normal startup. It validates the provisioned root and serving
+leaf, keeps a leaf with more than 30 days remaining, renews a still-valid leaf
+at 30 days or less under the existing root, and fails closed for expired,
+not-yet-valid, corrupt, or partial identity state. Use `reissue` only for an
+explicit endpoint change; it validates the old SAN and issues a new exact SAN
+under the same root. Use `renew` for an explicit administrator-requested leaf
+replacement. Keep `root-key.pem` in the administrator-only directory; mount only
 `leaf-fullchain.pem` and `leaf-key.pem` read-only into the ordinary HTTP
 service. The scheduler receives no TLS key. Linux private-key files must be
 owned by the service administrator and mode `0600`; the admin command fails
 closed on broader modes. Compare the printed SHA-256 root DER fingerprint
 out-of-band with remote clients before they confirm private application trust.
 No product root is installed in an operating-system or browser CA store.
+
+The local commands for the normal-start check and explicit endpoint change are:
+
+```powershell
+uv run python -m threads_platform.controller_tls_admin ensure `
+  --admin-dir <controller-tls-admin> `
+  --serving-dir <controller-tls-serving> `
+  --lan-address <stable-ipv4>
+uv run python -m threads_platform.controller_tls_admin reissue `
+  --admin-dir <controller-tls-admin> `
+  --serving-dir <controller-tls-serving> `
+  --current-lan-address <old-ipv4> `
+  --lan-address <new-ipv4>
+```
 
 From the repository root:
 
@@ -60,12 +79,22 @@ docker compose up --force-recreate --no-deps migrate
 docker compose up -d http scheduler
 ```
 
-The `tls-admin` profile is an explicit one-shot provisioning operation; normal
-`docker compose up` never runs it. Its `identity-provisioned` fingerprint marker
-is retained with the root state, so missing or partial certificate state fails
-closed instead of generating a replacement root. Run the explicit `renew`
-command with the same private directories and address when rotating only the
-leaf.
+The `tls-admin` profile performs explicit first root provisioning; normal
+startup never creates a root. Its `identity-provisioned` fingerprint marker is
+retained with root state, so missing or partial state fails closed. Every
+ordinary HTTP creation is gated by the one-shot `tls-prepare` service, which
+mounts root-admin state read-only and serving state writable, runs `ensure`, and
+exits before HTTP starts. HTTP mounts only serving material; the scheduler has
+no TLS key volume. For an endpoint/SAN change, stop the application services
+and run the local `reissue` operation with both the currently configured and
+new IPv4 addresses, then recreate HTTP through Compose so `tls-prepare` runs
+again. To recreate HTTP, remove the completed prepare container first so the
+dependency executes again:
+
+```powershell
+docker compose rm --stop --force tls-prepare
+docker compose up -d --force-recreate http
+```
 
 The migration service runs `alembic upgrade head` once and exits. The HTTP and
 scheduler services depend on its successful completion; neither process runs

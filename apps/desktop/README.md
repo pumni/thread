@@ -15,6 +15,8 @@ Use `bun run tauri dev` to run the native shell. For Controller mode, set `THREA
 
 An unconfigured Controller has no LAN listener; setup explicitly persists a stable IPv4 and HTTPS port before provisioning TLS. The remote first-contact probe sends no HTTP application request or credentials. Operators compare the candidate root's SHA-256 DER fingerprint with the local Controller display, then confirm the opaque probe before credentials are enabled. Product trust is application-private and does not install a Windows CA. The runtime is unavailable before Windows sign-in; Windows logout is unsupported. Portable backup and production durability are not available.
 
+The configured endpoint can be explicitly reconfigured. Before first Owner setup, the local setup flow may correct it; after an Owner exists, native code requires an authenticated OWNER or ADMIN session. Reconfiguration preserves the root fingerprint, issues a fresh leaf for the exact new IP SAN, and keeps PostgreSQL running during the controlled listener/scheduler transition. Linux/Docker uses explicit `provision`, startup `ensure`, endpoint `reissue`, and local `fingerprint`; normal startup never creates or repairs root identity state.
+
 On Windows, startup is serialized by a named mutex and readiness event. The first process keeps startup ownership through Tauri plugin and application setup, then signals readiness. Later launches wait for that signal before entering the official `tauri-plugin-single-instance`, which remains the first Tauri plugin and forwards activation to the primary window. A startup owner that exits before readiness leaves an abandoned mutex for a waiting process to take over; timeout or an unready normal release fails closed.
 
 ## Checks

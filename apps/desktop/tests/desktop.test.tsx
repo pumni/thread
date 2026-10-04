@@ -91,11 +91,110 @@ describe("desktop provisioning", () => {
       "operator_update_user",
       "operator_change_password",
       "controller_https_configure",
+      "controller_https_reconfigure",
       "controller_https_summary",
       "controller_trust_probe",
       "controller_trust_confirm",
       "controller_trust_summary",
     ]);
+  });
+
+  it("shows explicit initial HTTPS configuration when no identity is provisioned", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") return null;
+      if (command === "controller_https_summary") {
+        return {
+          configured: false,
+          lanAddress: null,
+          httpsPort: 8443,
+          publicHttpsOrigin: null,
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: null,
+          leafExpiresAt: null,
+        };
+      }
+      if (command === "controller_https_configure") {
+        return {
+          configured: true,
+          lanAddress: "192.0.2.20",
+          httpsPort: 8443,
+          publicHttpsOrigin: "https://192.0.2.20:8443",
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: "SHA256:1234567890abcdef",
+          leafExpiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByLabelText("Stable LAN IPv4 address");
+    expect(screen.getByLabelText("HTTPS port")).toHaveValue(8443);
+    fireEvent.change(screen.getByLabelText("Stable LAN IPv4 address"), {
+      target: { value: "192.0.2.20" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Configure HTTPS" }));
+
+    expect(await screen.findByText("https://192.0.2.20:8443")).toBeInTheDocument();
+    expect(screen.getByText("SHA256:1234567890abcdef")).toBeInTheDocument();
+    expect(native.invoke).toHaveBeenCalledWith("controller_https_configure", {
+      lanAddress: "192.0.2.20",
+      port: 8443,
+    });
+  });
+
+  it("requires an explicit reconfiguration action and reports native authorization errors", async () => {
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        return {
+          id: "owner-id",
+          username: "controller-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      if (command === "controller_https_summary") {
+        return {
+          configured: true,
+          lanAddress: "192.0.2.20",
+          httpsPort: 8443,
+          publicHttpsOrigin: "https://192.0.2.20:8443",
+          localHttpsOrigin: "https://127.0.0.1:8443",
+          rootFingerprint: "SHA256:1234567890abcdef",
+          leafExpiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      if (command === "controller_https_reconfigure") {
+        throw new Error("controller_https_reconfiguration_unauthorized");
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByRole("button", { name: "Reconfigure HTTPS endpoint…" });
+    expect(screen.queryByLabelText("Stable LAN IPv4 address")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure HTTPS endpoint…" }));
+    expect(screen.getByLabelText("Stable LAN IPv4 address")).toHaveValue("192.0.2.20");
+    expect(screen.getByLabelText("HTTPS port")).toHaveValue(8443);
+    fireEvent.change(screen.getByLabelText("Stable LAN IPv4 address"), {
+      target: { value: "198.51.100.30" },
+    });
+    fireEvent.change(screen.getByLabelText("HTTPS port"), { target: { value: "9443" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply endpoint change" }));
+
+    expect(
+      await screen.findByText(
+        "Only a signed-in Controller Owner or Admin can change this endpoint.",
+      ),
+    ).toBeInTheDocument();
+    expect(native.invoke).toHaveBeenCalledWith("controller_https_reconfigure", {
+      lanAddress: "198.51.100.30",
+      port: 9443,
+    });
   });
 
   it("provisions one Controller and shows its separate runtime processes", async () => {

@@ -214,6 +214,44 @@ impl Supervisor {
             })
     }
 
+    pub fn controller_owner_exists(&mut self) -> Result<bool, String> {
+        self.controller
+            .as_mut()
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())?
+            .owner_exists()
+            .map_err(str::to_string)
+    }
+
+    pub fn reconfigure_https(
+        &mut self,
+        lan_address: &str,
+        port: u16,
+        owner_authorized: bool,
+    ) -> Result<ControllerTlsSummary, String> {
+        self.refresh_health();
+        if self.lifecycle == Lifecycle::Failed {
+            return Err(self
+                .diagnostic_code
+                .unwrap_or("controller_runtime_unavailable")
+                .to_string());
+        }
+        let controller = self
+            .controller
+            .as_mut()
+            .ok_or_else(|| "controller_runtime_unavailable".to_string())?;
+        match controller.reconfigure_https(lan_address, port, owner_authorized, &mut self.lifecycle)
+        {
+            Ok(summary) => Ok(summary),
+            Err(code) => {
+                if !is_non_mutating_reconfigure_error(code) {
+                    self.lifecycle = Lifecycle::Failed;
+                    self.diagnostic_code = Some(code);
+                }
+                Err(code.to_string())
+            }
+        }
+    }
+
     pub fn controller_https_summary(&self) -> Result<ControllerTlsSummary, String> {
         self.controller
             .as_ref()
@@ -571,13 +609,31 @@ impl ControllerRuntime {
         port: u16,
         lifecycle: &mut Lifecycle,
     ) -> Result<ControllerTlsSummary, &'static str> {
+        let address = parse_lan_address(lan_address)?;
+        if let Some(existing) = self.store.config().lan_address {
+            if existing != address || self.store.config().endpoint_port != port {
+                return Err("controller_https_reconfiguration_required");
+            }
+            if self.store.config().tls_identity_provisioned {
+                controller_tls::validate_identity(self.store.data_root(), existing)?;
+            } else {
+                validate_requested_endpoint(
+                    address,
+                    port,
+                    self.store.config().database_port,
+                    None,
+                )?;
+                self.ensure_tls_identity(address)?;
+                if self.owner_exists()? {
+                    self.start_https_services(lifecycle)?;
+                } else {
+                    *lifecycle = Lifecycle::OwnerBootstrapRequired;
+                }
+            }
+            return self.https_summary();
+        }
+        validate_requested_endpoint(address, port, self.store.config().database_port, None)?;
         self.store.configure_https(lan_address, port)?;
-        let address = self
-            .store
-            .config()
-            .lan_address
-            .ok_or("controller_https_configuration_required")?;
-        self.validate_configured_endpoint(address)?;
         self.ensure_tls_identity(address)?;
         if self.owner_exists()? {
             self.start_https_services(lifecycle)?;
@@ -587,16 +643,117 @@ impl ControllerRuntime {
         self.https_summary()
     }
 
+    fn reconfigure_https(
+        &mut self,
+        lan_address: &str,
+        port: u16,
+        owner_authorized: bool,
+        lifecycle: &mut Lifecycle,
+    ) -> Result<ControllerTlsSummary, &'static str> {
+        let old_address = self
+            .store
+            .config()
+            .lan_address
+            .ok_or("controller_https_configuration_required")?;
+        if !self.store.config().tls_identity_provisioned {
+            return Err("controller_tls_identity_invalid");
+        }
+        controller_tls::validate_identity(self.store.data_root(), old_address)?;
+
+        let new_address = parse_lan_address(lan_address)?;
+        if new_address == old_address && port == self.store.config().endpoint_port {
+            return self.https_summary();
+        }
+        let old_port = self.store.config().endpoint_port;
+        let owns_old_listener = self.http.is_some();
+        validate_requested_endpoint(
+            new_address,
+            port,
+            self.store.config().database_port,
+            owns_old_listener.then_some(old_port),
+        )?;
+
+        let owner_exists = self.owner_exists()?;
+        if owner_exists && !owner_authorized {
+            return Err("operator_authentication_required");
+        }
+
+        let candidate =
+            controller_tls::prepare_leaf_reissue(self.store.data_root(), old_address, new_address)?;
+        let expected_fingerprint = candidate.root_fingerprint.clone();
+        let was_http_running = self.http.is_some();
+        let was_scheduler_running = self.scheduler.is_some();
+        if was_http_running != was_scheduler_running {
+            return Err("controller_runtime_state_invalid");
+        }
+
+        if was_scheduler_running {
+            *lifecycle = Lifecycle::Stopping;
+            stop_child(&mut self.scheduler).map_err(|_| "controller_scheduler_stop_failed")?;
+        }
+        if was_http_running {
+            if stop_child(&mut self.http).is_err() {
+                if was_scheduler_running {
+                    self.scheduler = Some(self.spawn_runtime("scheduler", None)?);
+                    self.wait_for_scheduler()?;
+                    *lifecycle = Lifecycle::Running;
+                }
+                return Err("controller_http_stop_failed");
+            }
+            if let Err(error) = controller_tls::cleanup_leaf_key(self.store.data_root()) {
+                self.resume_old_https_services(lifecycle, was_http_running)?;
+                return Err(error);
+            }
+        }
+
+        let backup = match controller_tls::commit_leaf_reissue(self.store.data_root(), candidate) {
+            Ok(backup) => backup,
+            Err(error) => {
+                self.resume_old_https_services(lifecycle, was_http_running)?;
+                return Err(error);
+            }
+        };
+        let actual_fingerprint = controller_tls::root_fingerprint(self.store.data_root());
+        if !matches!(actual_fingerprint, Ok(ref value) if value == &expected_fingerprint) {
+            controller_tls::restore_leaf_state(self.store.data_root(), backup)?;
+            self.resume_old_https_services(lifecycle, was_http_running)?;
+            return Err("controller_tls_identity_invalid");
+        }
+        if let Err(error) = self.store.configure_https(lan_address, port) {
+            controller_tls::restore_leaf_state(self.store.data_root(), backup)?;
+            self.resume_old_https_services(lifecycle, was_http_running)?;
+            return Err(error);
+        }
+
+        if owner_exists {
+            self.start_https_services(lifecycle)?;
+        } else {
+            *lifecycle = Lifecycle::OwnerBootstrapRequired;
+        }
+        self.https_summary()
+    }
+
+    fn resume_old_https_services(
+        &mut self,
+        lifecycle: &mut Lifecycle,
+        was_http_running: bool,
+    ) -> Result<(), &'static str> {
+        if was_http_running {
+            self.start_https_services(lifecycle)?;
+        }
+        Ok(())
+    }
+
     fn validate_configured_endpoint(
         &self,
         lan_address: std::net::Ipv4Addr,
     ) -> Result<(), &'static str> {
-        TcpListener::bind((lan_address, 0)).map_err(|_| "controller_lan_address_unavailable")?;
-        ensure_ipv4_wildcard_port_available(
+        validate_requested_endpoint(
+            lan_address,
             self.store.config().endpoint_port,
-            "controller_endpoint_port_in_use",
-        )?;
-        Ok(())
+            self.store.config().database_port,
+            None,
+        )
     }
 
     fn ensure_tls_identity(&mut self, lan_address: std::net::Ipv4Addr) -> Result<(), &'static str> {
@@ -1239,6 +1396,50 @@ fn ensure_ipv4_wildcard_port_available(
     Ok(())
 }
 
+fn parse_lan_address(value: &str) -> Result<std::net::Ipv4Addr, &'static str> {
+    let address = value
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "controller_lan_address_invalid")?;
+    if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+        return Err("controller_lan_address_invalid");
+    }
+    Ok(address)
+}
+
+fn is_non_mutating_reconfigure_error(code: &str) -> bool {
+    matches!(
+        code,
+        "controller_lan_address_invalid"
+            | "controller_lan_address_unavailable"
+            | "controller_endpoint_port_invalid"
+            | "controller_endpoint_port_in_use"
+            | "controller_tls_leaf_issue_failed"
+            | "operator_authentication_required"
+    )
+}
+
+fn validate_requested_endpoint(
+    lan_address: std::net::Ipv4Addr,
+    port: u16,
+    database_port: u16,
+    owned_listener_port: Option<u16>,
+) -> Result<(), &'static str> {
+    if lan_address.is_loopback() || lan_address.is_unspecified() || lan_address.is_multicast() {
+        return Err("controller_lan_address_invalid");
+    }
+    TcpListener::bind((lan_address, 0)).map_err(|_| "controller_lan_address_unavailable")?;
+    if port == 0 {
+        return Err("controller_endpoint_port_invalid");
+    }
+    if port == database_port {
+        return Err("controller_endpoint_port_in_use");
+    }
+    if owned_listener_port != Some(port) {
+        ensure_ipv4_wildcard_port_available(port, "controller_endpoint_port_in_use")?;
+    }
+    Ok(())
+}
+
 fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, &'static str> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1275,6 +1476,96 @@ fn stop_child(child: &mut Option<Child>) -> Result<(), ()> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn runtime_with_provisioned_controller() -> (tempfile::TempDir, ControllerRuntime, u16) {
+        use std::fs;
+
+        let directory = tempfile::tempdir().expect("temporary Controller data root");
+        let runtime_root = directory.path().join("runtime");
+        for path in [
+            runtime_root.join("threads-runtime"),
+            runtime_root.join("postgresql").join("bin"),
+        ] {
+            fs::create_dir_all(path).expect("create runtime fixture directory");
+        }
+        for path in [
+            runtime_root
+                .join("threads-runtime")
+                .join("threads-runtime.exe"),
+            runtime_root
+                .join("postgresql")
+                .join("bin")
+                .join("initdb.exe"),
+            runtime_root
+                .join("postgresql")
+                .join("bin")
+                .join("postgres.exe"),
+            runtime_root
+                .join("postgresql")
+                .join("bin")
+                .join("pg_ctl.exe"),
+            runtime_root
+                .join("postgresql")
+                .join("bin")
+                .join("pg_isready.exe"),
+        ] {
+            fs::write(path, []).expect("write runtime fixture executable");
+        }
+
+        let data_root = directory.path().join("controller");
+        let mut store =
+            ControllerStore::open(data_root, runtime_root).expect("open new Controller store");
+        let old_port = loop {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve endpoint port");
+            let port = listener.local_addr().expect("read endpoint port").port();
+            if port != store.config().database_port {
+                drop(listener);
+                break port;
+            }
+        };
+        let old_address = std::net::Ipv4Addr::new(192, 0, 2, 10);
+        store
+            .configure_https(&old_address.to_string(), old_port)
+            .expect("persist initial endpoint");
+        crate::controller_tls::provision_initial(store.data_root(), old_address)
+            .expect("provision Controller TLS identity");
+        store
+            .mark_tls_identity_provisioned()
+            .expect("persist TLS identity marker");
+        let runtime = ControllerRuntime {
+            store,
+            job: ProcessJob::new().expect("create Controller process job"),
+            postgres: None,
+            postgres_stderr: None,
+            postgres_stderr_finished: None,
+            http: None,
+            scheduler: None,
+        };
+        (directory, runtime, old_port)
+    }
+
+    #[cfg(windows)]
+    fn reconfiguration_state(runtime: &ControllerRuntime) -> Vec<(String, Vec<u8>)> {
+        [
+            "controller.json",
+            "tls/root-cert.der",
+            "tls/root-key.dpapi",
+            "tls/leaf-cert.der",
+            "tls/leaf-key.dpapi",
+            "tls/leaf-fullchain.pem",
+        ]
+        .into_iter()
+        .map(|relative| {
+            (
+                relative.to_string(),
+                std::fs::read(runtime.store.data_root().join(relative))
+                    .expect("read persisted endpoint/TLS state"),
+            )
+        })
+        .collect()
+    }
+
     #[test]
     fn worker_mock_quit_keeps_fixed_orderly_control_path() {
         let mut lifecycle = Lifecycle::StartingScheduler;
@@ -1308,6 +1599,146 @@ mod tests {
             ensure_ipv4_wildcard_port_available(port, "controller_endpoint_port_in_use"),
             Err("controller_endpoint_port_in_use")
         );
+    }
+
+    #[test]
+    fn endpoint_preflight_distinguishes_unavailable_ip_and_external_port_collision() {
+        assert_eq!(
+            validate_requested_endpoint("192.0.2.254".parse().unwrap(), 54_321, 54_322, None,),
+            Err("controller_lan_address_unavailable")
+        );
+
+        let route = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("bind route probe");
+        route
+            .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 443))
+            .expect("select local interface");
+        let address = match route.local_addr().unwrap().ip() {
+            std::net::IpAddr::V4(address) => address,
+            _ => panic!("route probe must select IPv4"),
+        };
+        let occupied = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("reserve wildcard endpoint");
+        let port = occupied.local_addr().unwrap().port();
+        assert_eq!(
+            validate_requested_endpoint(address, port, 1, None),
+            Err("controller_endpoint_port_in_use")
+        );
+        assert!(validate_requested_endpoint(address, port, 1, Some(port)).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn occupied_endpoint_port_keeps_persisted_endpoint_and_tls_identity_unchanged() {
+        let (_directory, mut runtime, old_port) = runtime_with_provisioned_controller();
+        let before = reconfiguration_state(&runtime);
+        let route = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("bind route probe");
+        route
+            .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 443))
+            .expect("select local interface");
+        let new_address = match route.local_addr().expect("read route address").ip() {
+            std::net::IpAddr::V4(address) => address,
+            _ => panic!("route probe must select IPv4"),
+        };
+        let occupied = loop {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+                .expect("reserve external endpoint port");
+            let port = listener.local_addr().expect("read occupied port").port();
+            if port != runtime.store.config().database_port && port != old_port {
+                break listener;
+            }
+        };
+        let occupied_port = occupied.local_addr().expect("read occupied port").port();
+        let mut lifecycle = Lifecycle::Running;
+
+        assert!(matches!(
+            runtime.reconfigure_https(
+                &new_address.to_string(),
+                occupied_port,
+                true,
+                &mut lifecycle,
+            ),
+            Err("controller_endpoint_port_in_use")
+        ));
+
+        assert_eq!(lifecycle, Lifecycle::Running);
+        assert_eq!(
+            runtime.store.config().lan_address.unwrap().to_string(),
+            "192.0.2.10"
+        );
+        assert_eq!(runtime.store.config().endpoint_port, old_port);
+        assert_eq!(reconfiguration_state(&runtime), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unavailable_endpoint_ip_keeps_persisted_endpoint_and_tls_identity_unchanged() {
+        let (_directory, mut runtime, old_port) = runtime_with_provisioned_controller();
+        let before = reconfiguration_state(&runtime);
+        let mut lifecycle = Lifecycle::Running;
+
+        assert!(matches!(
+            runtime.reconfigure_https(
+                "192.0.2.254",
+                old_port.wrapping_add(1).max(1),
+                true,
+                &mut lifecycle,
+            ),
+            Err("controller_lan_address_unavailable")
+        ));
+
+        assert_eq!(lifecycle, Lifecycle::Running);
+        assert_eq!(
+            runtime.store.config().lan_address.unwrap().to_string(),
+            "192.0.2.10"
+        );
+        assert_eq!(runtime.store.config().endpoint_port, old_port);
+        assert_eq!(reconfiguration_state(&runtime), before);
+    }
+
+    #[test]
+    fn endpoint_preflight_rejects_non_lan_ipv4_addresses() {
+        for value in ["127.0.0.1", "0.0.0.0", "224.0.0.1", "2001:db8::1"] {
+            if let Ok(address) = value.parse() {
+                assert_eq!(
+                    parse_lan_address(value),
+                    Err("controller_lan_address_invalid")
+                );
+                assert_eq!(
+                    validate_requested_endpoint(address, 54_321, 54_322, None),
+                    Err("controller_lan_address_invalid")
+                );
+            } else {
+                assert_eq!(
+                    parse_lan_address(value),
+                    Err("controller_lan_address_invalid")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_reconfiguration_preflight_errors_do_not_fail_the_running_lifecycle() {
+        for error in [
+            "controller_lan_address_invalid",
+            "controller_lan_address_unavailable",
+            "controller_endpoint_port_invalid",
+            "controller_endpoint_port_in_use",
+            "controller_tls_leaf_issue_failed",
+            "operator_authentication_required",
+        ] {
+            assert!(is_non_mutating_reconfigure_error(error), "{error}");
+        }
+        assert!(is_non_mutating_reconfigure_error(
+            "controller_tls_leaf_issue_failed"
+        ));
+        assert!(!is_non_mutating_reconfigure_error(
+            "controller_tls_identity_invalid"
+        ));
+        assert!(!is_non_mutating_reconfigure_error(
+            "controller_http_start_failed"
+        ));
     }
 
     #[test]

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 from urllib.error import HTTPError, URLError
@@ -169,6 +170,96 @@ def _prepare_tls_state(root_directory: Path) -> str:
         raise SmokeFailure("local TLS admin CLI fingerprint did not match the provisioned root DER")
     _ROOT_CERT_PATH = root_path
     return expected
+
+
+def _assert_tls_prepare_completed() -> None:
+    container_id = _compose("ps", "-a", "-q", "tls-prepare")
+    if not container_id:
+        raise SmokeFailure("normal HTTP startup did not create a TLS prepare container")
+    result = _compose("inspect", "--format", "{{.State.Status}}:{{.State.ExitCode}}", container_id)
+    if result != "exited:0":
+        raise SmokeFailure("TLS preparation did not complete successfully before HTTP")
+
+
+def _serving_leaf_summary() -> dict[str, object]:
+    script = (
+        "import hashlib,json,sys; from cryptography import x509; "
+        "from cryptography.hazmat.primitives import serialization; "
+        "from pathlib import Path; "
+        "p=Path('/var/lib/threads/controller-tls-serving/leaf-fullchain.pem'); "
+        "c=x509.load_pem_x509_certificates(p.read_bytes()); "
+        "print(json.dumps({'leaf':hashlib.sha256(c[0].public_bytes(serialization.Encoding.DER)).hexdigest(),"
+        "'root':'SHA256:'+hashlib.sha256(c[1].public_bytes(serialization.Encoding.DER)).hexdigest(),"
+        "'not_after':c[0].not_valid_after_utc.isoformat()}))"
+    )
+    output = _compose("run", "--rm", "--no-deps", "tls-admin", "python", "-c", script)
+    try:
+        summary = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise SmokeFailure("TLS admin could not report serving certificate state") from error
+    if not isinstance(summary, dict):
+        raise SmokeFailure("TLS admin returned invalid serving certificate state")
+    return summary
+
+
+def _install_expiring_leaf_fixture() -> None:
+    script = r"""
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+admin = Path('/var/lib/threads/controller-tls-admin')
+serving = Path('/var/lib/threads/controller-tls-serving')
+root = x509.load_pem_x509_certificate((admin / 'root-cert.pem').read_bytes())
+root_key = serialization.load_pem_private_key((admin / 'root-key.pem').read_bytes(), password=None)
+key = ec.generate_private_key(ec.SECP256R1())
+now = datetime.now(UTC)
+leaf = (
+    x509.CertificateBuilder()
+    .subject_name(
+        x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'Smoke Controller')])
+    )
+    .issuer_name(root.subject)
+    .public_key(key.public_key())
+    .serial_number(x509.random_serial_number())
+    .not_valid_before(now - timedelta(minutes=5))
+    .not_valid_after(now + timedelta(days=20))
+    .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    .add_extension(
+        x509.KeyUsage(
+            digital_signature=True,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False,
+        ),
+        critical=True,
+    )
+    .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+    .add_extension(
+        x509.SubjectAlternativeName([
+            x509.IPAddress(__import__('ipaddress').IPv4Address(sys.argv[1])),
+            x509.IPAddress(__import__('ipaddress').IPv4Address('127.0.0.1')),
+        ]),
+        critical=False,
+    )
+    .sign(root_key, hashes.SHA256())
+)
+cert = leaf.public_bytes(serialization.Encoding.PEM)
+(serving / 'leaf-key.pem').write_bytes(key.private_bytes(serialization.Encoding.PEM,
+    serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+(serving / 'leaf-cert.pem').write_bytes(cert)
+(serving / 'leaf-fullchain.pem').write_bytes(cert + root.public_bytes(serialization.Encoding.PEM))
+"""
+    address = os.environ.get("THREADS_PLATFORM_TLS_LAN_ADDRESS", "127.0.0.1")
+    _compose("run", "--rm", "--no-deps", "tls-admin", "python", "-c", script, address)
 
 
 def _check_runtime_image() -> None:
@@ -428,24 +519,49 @@ def _assert_tls_isolation() -> None:
     http = services.get("http")
     scheduler = services.get("scheduler")
     tls_admin = services.get("tls-admin")
-    if not all(isinstance(service, dict) for service in (http, scheduler, tls_admin)):
+    tls_prepare = services.get("tls-prepare")
+    if not all(isinstance(service, dict) for service in (http, scheduler, tls_admin, tls_prepare)):
         raise SmokeFailure("Compose TLS services are incomplete")
     if "tls-admin" not in cast(dict[str, object], tls_admin).get("profiles", []):
         raise SmokeFailure("TLS administration must require its explicit Compose profile")
+    if cast(dict[str, object], tls_prepare).get("profiles"):
+        raise SmokeFailure("normal TLS preparation must not require an admin profile")
     dependencies = cast(dict[str, object], http).get("depends_on", {})
-    if not isinstance(dependencies, dict) or "tls-admin" in dependencies:
-        raise SmokeFailure("ordinary HTTP startup must not provision or replace the root")
+    prepare_dependency = dependencies.get("tls-prepare") if isinstance(dependencies, dict) else None
+    if (
+        not isinstance(dependencies, dict)
+        or "tls-admin" in dependencies
+        or not isinstance(prepare_dependency, dict)
+        or prepare_dependency.get("condition") != "service_completed_successfully"
+    ):
+        raise SmokeFailure("ordinary HTTP startup must wait for successful TLS preparation")
     http_volumes = cast(dict[str, object], http).get("volumes")
     scheduler_volumes = cast(dict[str, object], scheduler).get("volumes")
     admin_volumes = cast(dict[str, object], tls_admin).get("volumes")
+    prepare_volumes = cast(dict[str, object], tls_prepare).get("volumes")
     if not isinstance(http_volumes, list) or not isinstance(admin_volumes, list):
         raise SmokeFailure("Compose TLS volume boundaries could not be inspected")
+    if not isinstance(prepare_volumes, list):
+        raise SmokeFailure("TLS preparation volume boundaries could not be inspected")
     if any("controller-tls-admin" in str(volume) for volume in http_volumes):
         raise SmokeFailure("HTTP service has access to root-admin TLS state")
     if any("controller-tls" in str(volume) for volume in scheduler_volumes or []):
         raise SmokeFailure("scheduler service has a TLS private-key volume")
     if not any("controller_tls_admin" in str(volume) for volume in admin_volumes):
         raise SmokeFailure("one-shot TLS admin service has no root-admin volume")
+    if not any(
+        isinstance(volume, dict)
+        and volume.get("source") == "controller_tls_admin"
+        and volume.get("read_only") is True
+        for volume in prepare_volumes
+    ) or not any(
+        isinstance(volume, dict) and volume.get("source") == "controller_tls_serving"
+        for volume in prepare_volumes
+    ):
+        raise SmokeFailure("TLS preparation must read root-admin state and write serving state")
+    prepare_command = cast(dict[str, object], tls_prepare).get("command")
+    if not isinstance(prepare_command, list) or "ensure" not in prepare_command:
+        raise SmokeFailure("normal TLS preparation must execute the ensure operation")
     http_environment = cast(dict[str, object], http).get("environment")
     scheduler_environment = cast(dict[str, object], scheduler).get("environment")
     if not isinstance(http_environment, dict) or not isinstance(scheduler_environment, dict):
@@ -494,7 +610,8 @@ def _assert_tls_isolation() -> None:
         "python",
         "-c",
         "from pathlib import Path; assert not Path("
-        "'/var/lib/threads/controller-tls-serving/leaf-key.pem').exists()",
+        "'/var/lib/threads/controller-tls-serving/leaf-key.pem').exists(); "
+        "assert not Path('/var/lib/threads/controller-tls-admin/root-key.pem').exists()",
     )
     _compose(
         "exec",
@@ -803,6 +920,7 @@ def _run_smoke(scratch: Path) -> None:
     _compose("up", "--detach", "--wait", "postgres", timeout=180)
     _compose("up", "--force-recreate", "migrate", timeout=240)
     _compose("up", "--detach", "http", "scheduler", timeout=180)
+    _assert_tls_prepare_completed()
     _assert_tls_isolation()
     _expect_live()
     initial_metrics, _ = _wait_http_metrics()
@@ -820,6 +938,28 @@ def _run_smoke(scratch: Path) -> None:
     asyncio.run(_exercise_worker_https_wss(owner_token, scratch))
     print("PASS private-root Worker HTTPS, verified WSS, ws rejection, and wrong-root rejection")
 
+    initial_tls = _serving_leaf_summary()
+    _install_expiring_leaf_fixture()
+    expiring_tls = _serving_leaf_summary()
+    if initial_tls.get("root") != expiring_tls.get("root"):
+        raise SmokeFailure("expiring leaf fixture changed the Controller root")
+    _compose("rm", "--stop", "--force", "tls-prepare")
+    _compose("up", "--detach", "--force-recreate", "http", timeout=180)
+    _assert_tls_prepare_completed()
+    renewed_tls = _serving_leaf_summary()
+    if renewed_tls.get("root") != initial_tls.get("root") or renewed_tls.get(
+        "leaf"
+    ) == expiring_tls.get("leaf"):
+        raise SmokeFailure("startup ensure did not renew the leaf under the same Controller root")
+    renewed_expiry = renewed_tls.get("not_after")
+    if not isinstance(renewed_expiry, str):
+        raise SmokeFailure("renewed leaf expiry is unavailable")
+    if datetime.fromisoformat(renewed_expiry) - datetime.now(UTC) <= timedelta(days=80):
+        raise SmokeFailure("startup ensure did not issue a 90-day leaf")
+    _expect_live()
+    _expect_database_ready()
+    print("PASS normal TLS prepare renewed an expiring leaf under the same root before HTTP")
+
     http_id = _compose("ps", "-q", "http")
     scheduler_id = _compose("ps", "-q", "scheduler")
     postgres_id = _compose("ps", "-q", "postgres")
@@ -836,7 +976,9 @@ def _run_smoke(scratch: Path) -> None:
 
     recovered_worker_id = uuid4()
     _database_operation("seed-expired", recovered_worker_id)
-    _compose("up", "--detach", "--force-recreate", "--no-deps", "http", "scheduler")
+    _compose("rm", "--stop", "--force", "tls-prepare")
+    _compose("up", "--detach", "--force-recreate", "http", "scheduler")
+    _assert_tls_prepare_completed()
     _expect_live()
     _expect_database_ready()
     restarted_metrics, _ = _wait_http_metrics()

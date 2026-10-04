@@ -102,6 +102,7 @@ export const DESKTOP_COMMANDS = [
   "operator_update_user",
   "operator_change_password",
   "controller_https_configure",
+  "controller_https_reconfigure",
   "controller_https_summary",
   "controller_trust_probe",
   "controller_trust_confirm",
@@ -187,6 +188,16 @@ export function controllerHttpsConfigure(
   port: number,
 ): Promise<ControllerHttpsSummary> {
   return invoke<ControllerHttpsSummary>("controller_https_configure", {
+    lanAddress,
+    port,
+  });
+}
+
+export function controllerHttpsReconfigure(
+  lanAddress: string,
+  port: number,
+): Promise<ControllerHttpsSummary> {
+  return invoke<ControllerHttpsSummary>("controller_https_reconfigure", {
     lanAddress,
     port,
   });

@@ -28,6 +28,7 @@ This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PL
 - [#103 DX-09] Existing browser session requires Account/assignment. Build isolated pending local profile + reviewed login-state detector, atomic Controller registration and version-negotiated additive protocol.
 - [#98 DX-04] M1 is loopback-only disposable prototype without final installer or real Owner/remote HTTPS. First usable LAN requires #99 + #100; final customer installer is #106.
 - [#100 DX-06] Direct Uvicorn TLS is the sole terminator (`proxy_headers=False`); one HTTPS/WSS listener serves Operator, Worker, health, readiness, and metrics. Persist an explicit stable IPv4/port, exact two-IP SAN, DPAPI CurrentUser root/leaf keys, temporary leaf serving file, strict TLS-only first contact, endpoint-bound app-private trust, and Linux/Docker private TLS parity.
+- [#100 DX-06 correction] Windows endpoint changes are explicit, keep the existing root identity, issue a new leaf, and require local setup before first Owner or authenticated OWNER/ADMIN afterward. Linux/Docker uses explicit `provision`, startup `ensure`, explicit `reissue`, and local `fingerprint`; HTTP starts only after successful TLS preparation.
 - [#97 DX-03/#98 DX-04] Windows installer admin context vs single non-elevated runtime user and DPAPI must be proven. No data-root/identity surprises.
 
 - [#99 DX-05 / #101 DX-07] Deliberate Worker Quit/Restart requires OWNER/ADMIN/OPERATOR login; Controller stop/restart requires OWNER/ADMIN. No device self-drain endpoint or hidden admin bearer.

@@ -207,19 +207,11 @@ impl ControllerStore {
         if endpoint_port == 0 {
             return Err("controller_endpoint_port_invalid");
         }
-        if let Some(existing) = self.config.lan_address {
-            return if existing == address && self.config.endpoint_port == endpoint_port {
-                Ok(())
-            } else {
-                Err("controller_https_configuration_locked")
-            };
-        }
-        let _address_probe =
-            TcpListener::bind((address, 0)).map_err(|_| "controller_lan_address_unavailable")?;
-        let _port_probe = TcpListener::bind((Ipv4Addr::UNSPECIFIED, endpoint_port))
-            .map_err(|_| "controller_endpoint_port_in_use")?;
         if endpoint_port == self.config.database_port {
             return Err("controller_endpoint_port_in_use");
+        }
+        if self.config.lan_address == Some(address) && self.config.endpoint_port == endpoint_port {
+            return Ok(());
         }
         let previous = self.config.clone();
         self.config.lan_address = Some(address);
@@ -641,51 +633,61 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_controller_lan_address_fails_without_selecting_replacement() {
+    fn configured_endpoint_can_be_explicitly_replaced_and_persisted() {
         let directory = tempfile::tempdir().expect("temporary Controller state");
         let mut store = configuration_store(directory.path(), 51_002);
 
+        store
+            .configure_https("192.0.2.10", 54_321)
+            .expect("initial endpoint");
+        store
+            .configure_https("198.51.100.20", 54_322)
+            .expect("explicit endpoint change");
         assert_eq!(
-            store.configure_https("192.0.2.254", 54_321),
-            Err("controller_lan_address_unavailable")
+            store.config().lan_address,
+            Some(Ipv4Addr::new(198, 51, 100, 20))
         );
-        assert_eq!(store.config().lan_address, None);
-        assert_eq!(store.config().endpoint_port, 51_002);
-        assert_eq!(
-            store.local_endpoint(),
-            Err("controller_https_configuration_required")
-        );
+        assert_eq!(store.config().endpoint_port, 54_322);
+        assert!(!store.config().tls_identity_provisioned);
         let persisted = ControllerConfig::load(&directory.path().join("controller.json"))
-            .expect("saved config remains unconfigured");
-        assert_eq!(persisted.lan_address, None);
-        assert_eq!(persisted.endpoint_port, 51_002);
+            .expect("reconfigured endpoint persisted");
+        assert_eq!(persisted.lan_address, Some(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(persisted.endpoint_port, 54_322);
     }
 
     #[test]
-    fn endpoint_port_collision_fails_without_changing_persisted_endpoint_port() {
+    fn port_only_endpoint_reconfiguration_preserves_address_and_persists_port() {
         let directory = tempfile::tempdir().expect("temporary Controller state");
         let mut store = configuration_store(directory.path(), 51_002);
-        let route =
-            std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind route probe");
-        route
-            .connect((Ipv4Addr::new(192, 0, 2, 1), 443))
-            .expect("resolve the local interface without sending application data");
-        let address = match route.local_addr().expect("route probe local address").ip() {
-            std::net::IpAddr::V4(address)
-                if !address.is_loopback()
-                    && !address.is_unspecified()
-                    && !address.is_multicast() =>
-            {
-                address
-            }
-            _ => panic!("route probe did not select an eligible IPv4 interface"),
-        };
-        let occupied =
-            TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("reserve wildcard HTTPS port");
-        let port = occupied.local_addr().expect("reserved port").port();
+        let address = "192.0.2.10";
+        store
+            .configure_https(address, 54_321)
+            .expect("initial endpoint");
+        store
+            .configure_https(address, 54_322)
+            .expect("port-only endpoint change");
 
+        let persisted = ControllerConfig::load(&directory.path().join("controller.json"))
+            .expect("port-only change persisted");
         assert_eq!(
-            store.configure_https(&address.to_string(), port),
+            store.config().lan_address,
+            Some(Ipv4Addr::new(192, 0, 2, 10))
+        );
+        assert_eq!(store.config().endpoint_port, 54_322);
+        assert_eq!(persisted.lan_address, store.config().lan_address);
+        assert_eq!(persisted.endpoint_port, 54_322);
+    }
+
+    #[test]
+    fn endpoint_configuration_rejects_invalid_addresses_and_database_port() {
+        let directory = tempfile::tempdir().expect("temporary Controller state");
+        let mut store = configuration_store(directory.path(), 51_002);
+        assert_eq!(
+            store.configure_https("127.0.0.1", 54_321),
+            Err("controller_lan_address_invalid")
+        );
+        assert_eq!(
+            store.configure_https("192.0.2.10", 51_001),
             Err("controller_endpoint_port_in_use")
         );
         assert_eq!(store.config().lan_address, None);

@@ -41,6 +41,71 @@ def _simulate_posix_private_mode(
     monkeypatch.setattr(Path, "lstat", lstat)
 
 
+def _install_leaf_validity(
+    admin: Path,
+    serving: Path,
+    *,
+    address: str = "192.0.2.44",
+    not_before: datetime,
+    not_after: datetime,
+) -> None:
+    root = x509.load_pem_x509_certificate((admin / "root-cert.pem").read_bytes())
+    root_key = serialization.load_pem_private_key(
+        (admin / "root-key.pem").read_bytes(), password=None
+    )
+    if not isinstance(root_key, ec.EllipticCurvePrivateKey):
+        raise AssertionError("synthetic TLS fixture root is not ECDSA")
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([]))
+        .issuer_name(root.subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.IPAddress(ipaddress.IPv4Address(address)),
+                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                ]
+            ),
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    cert_bytes = certificate.public_bytes(serialization.Encoding.PEM)
+    key_bytes = leaf_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    (serving / "leaf-cert.pem").write_bytes(cert_bytes)
+    (serving / "leaf-key.pem").write_bytes(key_bytes)
+    (serving / "leaf-fullchain.pem").write_bytes(
+        cert_bytes + root.public_bytes(serialization.Encoding.PEM)
+    )
+
+
 def test_root_identity_persists_and_fingerprint_uses_actual_der(tmp_path: Path) -> None:
     admin, serving = _state(tmp_path)
     root_cert = x509.load_pem_x509_certificate((admin / "root-cert.pem").read_bytes())
@@ -174,6 +239,140 @@ def test_same_root_leaf_renewal_preserves_fingerprint(tmp_path: Path) -> None:
     assert fingerprint_after == fingerprint_before
     assert (serving / "leaf-cert.pem").read_bytes() != old_leaf
     tls_admin.provision(admin, serving, "192.0.2.44")
+
+
+def test_ensure_keeps_leaf_unchanged_with_more_than_30_days_remaining(tmp_path: Path) -> None:
+    admin, serving = _state(tmp_path)
+    before = {
+        name: (serving / name).read_bytes()
+        for name in ("leaf-cert.pem", "leaf-key.pem", "leaf-fullchain.pem")
+    }
+    fingerprint = tls_admin.fingerprint(admin)
+
+    assert tls_admin.ensure(admin, serving, "192.0.2.44") == fingerprint
+    assert {
+        name: (serving / name).read_bytes()
+        for name in ("leaf-cert.pem", "leaf-key.pem", "leaf-fullchain.pem")
+    } == before
+
+
+def test_ensure_renews_leaf_with_30_or_fewer_days_under_same_root(tmp_path: Path) -> None:
+    admin, serving = _state(tmp_path)
+    old_root = (admin / "root-cert.pem").read_bytes()
+    old_fingerprint = tls_admin.fingerprint(admin)
+    old_leaf = (serving / "leaf-cert.pem").read_bytes()
+    old_key = (serving / "leaf-key.pem").read_bytes()
+    now = datetime.now(UTC)
+    _install_leaf_validity(
+        admin,
+        serving,
+        not_before=now - timedelta(minutes=5),
+        not_after=now + timedelta(days=30),
+    )
+
+    assert tls_admin.ensure(admin, serving, "192.0.2.44") == old_fingerprint
+    renewed = x509.load_pem_x509_certificate((serving / "leaf-cert.pem").read_bytes())
+    assert (admin / "root-cert.pem").read_bytes() == old_root
+    assert (serving / "leaf-cert.pem").read_bytes() != old_leaf
+    assert (serving / "leaf-key.pem").read_bytes() != old_key
+    assert renewed.not_valid_after_utc - datetime.now(UTC) > timedelta(days=80)
+    san = renewed.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert list(san) == [
+        x509.IPAddress(ipaddress.IPv4Address("192.0.2.44")),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("not_before_offset", "not_after_offset"),
+    [(-2, -1), (1, 2)],
+    ids=("expired", "not-yet-valid"),
+)
+def test_ensure_fails_closed_for_expired_or_not_yet_valid_leaf(
+    tmp_path: Path,
+    not_before_offset: int,
+    not_after_offset: int,
+) -> None:
+    admin, serving = _state(tmp_path)
+    old_root = (admin / "root-cert.pem").read_bytes()
+    now = datetime.now(UTC)
+    _install_leaf_validity(
+        admin,
+        serving,
+        not_before=now + timedelta(days=not_before_offset),
+        not_after=now + timedelta(days=not_after_offset),
+    )
+    old_leaf = (serving / "leaf-cert.pem").read_bytes()
+
+    with pytest.raises(ValueError, match="controller_tls_identity_invalid"):
+        tls_admin.ensure(admin, serving, "192.0.2.44")
+
+    assert (admin / "root-cert.pem").read_bytes() == old_root
+    assert (serving / "leaf-cert.pem").read_bytes() == old_leaf
+
+
+def test_explicit_reissue_changes_ip_and_leaf_but_preserves_root(tmp_path: Path) -> None:
+    admin, serving = _state(tmp_path)
+    old_root = (admin / "root-cert.pem").read_bytes()
+    old_fingerprint = tls_admin.fingerprint(admin)
+    old_leaf = (serving / "leaf-cert.pem").read_bytes()
+    old_key = (serving / "leaf-key.pem").read_bytes()
+
+    assert tls_admin.reissue(admin, serving, "192.0.2.44", "198.51.100.28") == old_fingerprint
+
+    leaf = x509.load_pem_x509_certificate((serving / "leaf-cert.pem").read_bytes())
+    leaf_key = serialization.load_pem_private_key(
+        (serving / "leaf-key.pem").read_bytes(), password=None
+    )
+    san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert (admin / "root-cert.pem").read_bytes() == old_root
+    assert (serving / "leaf-cert.pem").read_bytes() != old_leaf
+    assert (serving / "leaf-key.pem").read_bytes() != old_key
+    assert list(san) == [
+        x509.IPAddress(ipaddress.IPv4Address("198.51.100.28")),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+    ]
+    leaf.verify_directly_issued_by(x509.load_pem_x509_certificate(old_root))
+    assert leaf.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    ) == leaf_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    [
+        "root-cert.pem",
+        "root-key.pem",
+        "identity-provisioned",
+        "leaf-cert.pem",
+        "leaf-key.pem",
+        "leaf-fullchain.pem",
+    ],
+)
+def test_ensure_fails_on_partial_state_without_regenerating_root(
+    tmp_path: Path, missing_name: str
+) -> None:
+    admin, serving = _state(tmp_path)
+    state_files = {
+        name: directory / name
+        for directory, names in (
+            (admin, ("root-cert.pem", "root-key.pem", "identity-provisioned")),
+            (serving, ("leaf-cert.pem", "leaf-key.pem", "leaf-fullchain.pem")),
+        )
+        for name in names
+    }
+    before = {name: path.read_bytes() for name, path in state_files.items()}
+    missing_path = state_files[missing_name]
+    missing_path.unlink()
+
+    with pytest.raises(ValueError, match="controller_tls_identity_invalid"):
+        tls_admin.ensure(admin, serving, "192.0.2.44")
+
+    assert {
+        name: path.read_bytes() if path.is_file() else None for name, path in state_files.items()
+    } == {name: None if name == missing_name else payload for name, payload in before.items()}
 
 
 def test_expired_leaf_can_be_explicitly_renewed_under_the_same_root(tmp_path: Path) -> None:

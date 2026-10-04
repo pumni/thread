@@ -752,6 +752,16 @@ mod tests {
     }
 
     #[test]
+    fn controller_endpoint_reconfiguration_uses_owner_admin_lifecycle_authorization() {
+        assert!(lifecycle_session_allowed("OWNER", false, true));
+        assert!(lifecycle_session_allowed("ADMIN", false, true));
+        assert!(!lifecycle_session_allowed("OPERATOR", false, true));
+        assert!(!lifecycle_session_allowed("VIEWER", false, true));
+        assert!(!lifecycle_session_allowed("OWNER", true, true));
+        assert!(!lifecycle_session_allowed("ADMIN", true, true));
+    }
+
+    #[test]
     fn operator_http_payloads_use_snake_case_and_tauri_dtos_use_camel_case() {
         let response: LoginResponse = serde_json::from_value(serde_json::json!({
             "access_token": "synthetic-session-value",
