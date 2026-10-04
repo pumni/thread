@@ -2,20 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import ipaddress
 import json
+import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
+import threading
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / "packaging" / "windows_desktop" / "verify_runtime_evidence.py"
 CONTROLLER_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "smoke_controller_lifecycle.ps1"
+CONTROLLER_HTTPS_PROBE = REPO_ROOT / "packaging" / "windows_desktop" / "controller_https_probe.ps1"
+HOSTED_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "run_hosted_smoke.ps1"
 
 
 def test_controller_quit_wait_is_process_authoritative() -> None:
@@ -369,6 +382,268 @@ if ($allPatternReads.Count -ne $gatedPatternReads.Count -or
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
     assert "Typed bounded Controller input assertion PASS" in completed.stdout
+
+
+def _write_probe_identity(directory: Path, prefix: str, *, leaf_ip: str) -> tuple[Path, Path, Path]:
+    root_key = ec.generate_private_key(ec.SECP256R1())
+    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{prefix} synthetic root")])
+    now = datetime.now(UTC)
+    root_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(root_name)
+        .issuer_name(root_name)
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(
+            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{prefix} synthetic leaf")])
+        )
+        .issuer_name(root_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(leaf_ip))]),
+            critical=False,
+        )
+        .sign(root_key, hashes.SHA256())
+    )
+    root_path = directory / f"{prefix}-root.der"
+    certificate_path = directory / f"{prefix}-leaf.pem"
+    key_path = directory / f"{prefix}-leaf-key.pem"
+    root_path.write_bytes(root_certificate.public_bytes(serialization.Encoding.DER))
+    certificate_path.write_bytes(leaf_certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return root_path, certificate_path, key_path
+
+
+def _start_probe_http_server(
+    certificate_path: Path | None = None, key_path: Path | None = None
+) -> tuple[ThreadingHTTPServer, threading.Thread, int]:
+    class ProbeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            status = 200 if self.path == "/health" else 503
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    class QuietThreadingHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request: object, client_address: object) -> None:
+            return
+
+    server = QuietThreadingHTTPServer(("127.0.0.1", 0), ProbeHandler)
+    if certificate_path is not None and key_path is not None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(certificate_path), str(key_path))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, port
+
+
+def test_private_root_https_probe_classifies_real_tcp_tls_and_http_stages(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("the shared Controller probe is a Windows PowerShell runtime helper")
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("the shared Controller TLS probe requires PowerShell 7")
+
+    root_path, leaf_path, leaf_key_path = _write_probe_identity(
+        tmp_path, "controller-probe-valid", leaf_ip="127.0.0.1"
+    )
+    wrong_root_path, _, _ = _write_probe_identity(
+        tmp_path, "controller-probe-wrong-root", leaf_ip="127.0.0.1"
+    )
+    wrong_san_root_path, wrong_san_leaf_path, wrong_san_key_path = _write_probe_identity(
+        tmp_path, "controller-probe-wrong-san", leaf_ip="192.0.2.41"
+    )
+    tls_server, tls_thread, tls_port = _start_probe_http_server(leaf_path, leaf_key_path)
+    wrong_san_server, wrong_san_thread, wrong_san_port = _start_probe_http_server(
+        wrong_san_leaf_path, wrong_san_key_path
+    )
+    plaintext_server, plaintext_thread, plaintext_port = _start_probe_http_server()
+    with socket.socket() as unused_listener:
+        unused_listener.bind(("127.0.0.1", 0))
+        unused_port = int(unused_listener.getsockname()[1])
+
+    helper_path = str(CONTROLLER_HTTPS_PROBE).replace("'", "''")
+    root = str(root_path).replace("'", "''")
+    wrong_root = str(wrong_root_path).replace("'", "''")
+    wrong_san_root = str(wrong_san_root_path).replace("'", "''")
+    assertion = f"""
+. '{helper_path}'
+$results = @(
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {tls_port} -Path '/health' -RootCertificatePath '{root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {tls_port} -Path '/ready' -RootCertificatePath '{root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {tls_port} -Path '/health' -RootCertificatePath '{wrong_root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {wrong_san_port} -Path '/health' -RootCertificatePath '{wrong_san_root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {unused_port} -Path '/health' -RootCertificatePath '{root}'),
+    (Invoke-PrivateRootHttpsProbe `
+        -Port {plaintext_port} -Path '/health' -RootCertificatePath '{root}')
+)
+$results | ConvertTo-Json -Depth 8 -Compress
+"""
+    try:
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    finally:
+        for server, thread in (
+            (tls_server, tls_thread),
+            (wrong_san_server, wrong_san_thread),
+            (plaintext_server, plaintext_thread),
+        ):
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    probes = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert len(probes) == 6
+
+    healthy, not_ready, wrong_root, wrong_san, no_listener, plaintext = probes
+    assert all(isinstance(probe, dict) for probe in probes), repr(probes)
+    assert healthy["outcome"] == "PASS"
+    assert healthy["target_host"] == "127.0.0.1"
+    assert healthy["certificate_validation"] == {
+        "trust_mode": "CustomRootTrust",
+        "verification_flags": "NoFlag",
+        "revocation_mode": "NoCheck",
+    }
+    assert healthy["tcp_connect"]["outcome"] == "PASS"
+    assert healthy["tls_authentication"]["outcome"] == "PASS"
+    assert healthy["http_request_write"]["outcome"] == "PASS"
+    assert healthy["http_response"]["status_code"] == 200
+
+    assert not_ready["outcome"] == "HTTP_STATUS_NON_200"
+    assert not_ready["tls_authentication"]["outcome"] == "PASS"
+    assert not_ready["http_response"]["status_code"] == 503
+
+    for rejected in (wrong_root, wrong_san, plaintext):
+        assert rejected["outcome"] == "FAIL"
+        assert rejected["tls_authentication"]["outcome"] == "FAIL"
+        assert rejected["http_request_write"]["outcome"] == "NOT_RUN"
+    assert no_listener["tcp_connect"]["outcome"] in {"FAIL", "TIMEOUT"}
+    assert no_listener["tls_authentication"]["outcome"] == "NOT_RUN"
+
+    helper_source = CONTROLLER_HTTPS_PROBE.read_text(encoding="utf-8")
+    assert "RemoteCertificateValidationCallback" not in helper_source
+    assert "DangerousAcceptAnyServerCertificateValidator" not in helper_source
+    assert "X509Store" not in helper_source
+
+
+def test_post_owner_probe_snapshot_and_failure_taxonomy_are_preserved() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    hosted_source = HOSTED_SMOKE.read_text(encoding="utf-8")
+    assert "Test-ControllerHttps" not in source
+    assert "controller_tls_readiness_failed" not in source
+    assert '"controller_https_probe.ps1"' in hosted_source
+    assert "$stageControllerHttpsProbeScript" in hosted_source
+    assert "Copy-Item -LiteralPath $controllerHttpsProbeScript" in hosted_source
+
+    owner_call = source.index("Bootstrap-ControllerOwner $desktop.Id")
+    after_owner_probe = source.index("Wait-ForControllerHttps $config 60 -AfterOwnerBootstrap")
+    enabled_owner_check = source.index("$enabledOwnerCount = Invoke-Psql", owner_call)
+    assert owner_call < after_owner_probe < enabled_owner_check
+
+    snapshot_function = source[
+        source.index("function Get-PostOwnerRuntimeSnapshot") : source.index(
+            "function Save-PostOwnerRuntimeProbe"
+        )
+    ]
+    for evidence_field in (
+        "postgres_count",
+        "postgres_pids",
+        "http_count",
+        "http_pids",
+        "scheduler_count",
+        "scheduler_pids",
+        "endpoint_listener_count",
+        "endpoint_listener_addresses",
+        "serving_leaf_key_present",
+        "active_owner_session_count",
+    ):
+        assert evidence_field in snapshot_function
+
+    waiter = source[
+        source.index("function Wait-ForControllerHttps") : source.index(
+            "function Test-PlaintextHttpRejected"
+        )
+    ]
+    assert 'Invoke-ControllerHttpsProbe $Config "/health"' in waiter
+    assert 'Invoke-ControllerHttpsProbe $Config "/ready"' in waiter
+    assert "Save-PostOwnerRuntimeProbe" in waiter
+    for failure_code in (
+        "controller_post_owner_http_process_missing",
+        "controller_post_owner_scheduler_process_missing",
+        "controller_post_owner_endpoint_listener_absent",
+        "controller_tls_probe_tcp_connect_failed",
+        "controller_tls_probe_validation_failed",
+        "controller_https_health_status_",
+        "controller_https_readiness_status_",
+    ):
+        assert failure_code in source
+    assert "post_owner_runtime_probe = $postOwnerRuntimeProbe" in source
 
 
 def _load_verifier() -> ModuleType:

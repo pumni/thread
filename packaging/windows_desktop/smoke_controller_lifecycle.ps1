@@ -16,6 +16,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
+$privateRootProbePath = Join-Path $PSScriptRoot "controller_https_probe.ps1"
+if (-not (Test-Path -LiteralPath $privateRootProbePath -PathType Leaf)) {
+    throw "controller_https_probe_script_missing"
+}
+. $privateRootProbePath
 $DesktopExecutable = (Resolve-Path -LiteralPath $DesktopExecutable).Path
 $RuntimeRoot = (Resolve-Path -LiteralPath $RuntimeRoot).Path
 $EvidencePath = [System.IO.Path]::GetFullPath($EvidencePath)
@@ -1075,44 +1080,196 @@ function Get-FileSha256([string]$Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Test-ControllerHttps([object]$Config) {
+function Invoke-ControllerHttpsProbe(
+    [object]$Config,
+    [ValidateSet("/health", "/ready")]
+    [string]$Path,
+    [int]$TimeoutMilliseconds = 3000
+) {
+    $rootPath = Join-Path (Join-Path $controllerRoot "tls") "root-cert.der"
+    return Invoke-PrivateRootHttpsProbe `
+        -Port ([int]$Config.endpointPort) `
+        -Path $Path `
+        -RootCertificatePath $rootPath `
+        -TimeoutMilliseconds $TimeoutMilliseconds
+}
+
+function Get-PostOwnerRuntimeSnapshot([object]$Config) {
+    $owned = $null
+    $processQueryOutcome = "PASS"
+    $processQueryExceptionType = $null
     try {
-        $rootPath = Join-Path (Join-Path $controllerRoot "tls") "root-cert.der"
-        $rootCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-            [System.IO.File]::ReadAllBytes($rootPath)
-        )
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.UseProxy = $false
-        $handler.ServerCertificateCustomValidationCallback = {
-            param($request, $certificate, $chain, $errors)
-            $nameOrMissing = [System.Net.Security.SslPolicyErrors]::RemoteCertificateNameMismatch -bor
-                [System.Net.Security.SslPolicyErrors]::RemoteCertificateNotAvailable
-            if (($errors -band $nameOrMissing) -ne 0) { return $false }
-            $chain.ChainPolicy.TrustMode =
-                [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
-            $chain.ChainPolicy.VerificationFlags =
-                [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
-            $chain.ChainPolicy.RevocationMode =
-                [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-            $null = $chain.ChainPolicy.CustomTrustStore.Add($rootCertificate)
-            return $chain.Build($certificate)
-        }.GetNewClosure()
-        $client = [System.Net.Http.HttpClient]::new($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds(3)
-        try {
-            $response = $client.GetAsync(
-                "https://127.0.0.1:$($Config.endpointPort)/ready"
-            ).GetAwaiter().GetResult()
-            try { return [int]$response.StatusCode -eq 200 }
-            finally { $response.Dispose() }
-        } finally {
-            $client.Dispose()
-            $handler.Dispose()
-            $rootCertificate.Dispose()
-        }
+        $owned = Get-ControllerProcesses
     } catch {
-        return $false
+        $processQueryOutcome = "FAIL"
+        $processQueryExceptionType = Get-SafeExceptionTypeName $_.Exception
     }
+
+    $listenerAddresses = @()
+    $listenerQueryOutcome = "PASS"
+    $listenerQueryExceptionType = $null
+    try {
+        $listenerAddresses = @(Get-ListenerAddresses ([int]$Config.endpointPort))
+    } catch {
+        $listenerQueryOutcome = "FAIL"
+        $listenerQueryExceptionType = Get-SafeExceptionTypeName $_.Exception
+    }
+
+    $ownerSessionCount = $null
+    $ownerSessionQueryOutcome = "PASS"
+    $ownerSessionExceptionType = $null
+    try {
+        $ownerSessionCount = Get-ActiveOwnerSessionCount $Config
+    } catch {
+        $ownerSessionQueryOutcome = "FAIL"
+        $ownerSessionExceptionType = Get-SafeExceptionTypeName $_.Exception
+    }
+
+    $servingKeyPath = Join-Path `
+        (Join-Path (Join-Path $controllerRoot "tls") "serving") "leaf-key.pem"
+    return [ordered]@{
+        captured_utc = [DateTimeOffset]::UtcNow.ToString("O")
+        endpoint_port = [int]$Config.endpointPort
+        process_query_outcome = $processQueryOutcome
+        process_query_exception_type = $processQueryExceptionType
+        postgres_count = if ($owned) { @($owned.postgres).Count } else { 0 }
+        postgres_pids = if ($owned) { @($owned.postgres | ForEach-Object { [int]$_.ProcessId }) } else { @() }
+        http_count = if ($owned) { @($owned.http).Count } else { 0 }
+        http_pids = if ($owned) { @($owned.http | ForEach-Object { [int]$_.ProcessId }) } else { @() }
+        scheduler_count = if ($owned) { @($owned.scheduler).Count } else { 0 }
+        scheduler_pids = if ($owned) { @($owned.scheduler | ForEach-Object { [int]$_.ProcessId }) } else { @() }
+        listener_query_outcome = $listenerQueryOutcome
+        listener_query_exception_type = $listenerQueryExceptionType
+        endpoint_listener_count = $listenerAddresses.Count
+        endpoint_listener_addresses = $listenerAddresses
+        serving_leaf_key_present = Test-Path -LiteralPath $servingKeyPath -PathType Leaf
+        owner_session_query_outcome = $ownerSessionQueryOutcome
+        owner_session_query_exception_type = $ownerSessionExceptionType
+        active_owner_session_count = $ownerSessionCount
+    }
+}
+
+function Save-PostOwnerRuntimeProbe(
+    [object]$Snapshot,
+    [switch]$BootstrapProcessSnapshot,
+    [switch]$AfterOwnerBootstrap,
+    [switch]$FailedProbe
+) {
+    if (-not $script:processEvidence.Contains("post_owner_runtime_probe")) {
+        $script:processEvidence["post_owner_runtime_probe"] = [ordered]@{
+            after_owner_bootstrap_process_snapshot = $null
+            after_owner_bootstrap = $null
+            latest_probe = $null
+            last_failed_probe = $null
+        }
+    }
+    $probeEvidence = $script:processEvidence["post_owner_runtime_probe"]
+    if ($BootstrapProcessSnapshot) {
+        $probeEvidence.after_owner_bootstrap_process_snapshot = $Snapshot
+    }
+    if ($AfterOwnerBootstrap) {
+        $probeEvidence.after_owner_bootstrap = $Snapshot
+    }
+    $probeEvidence.latest_probe = $Snapshot
+    if ($FailedProbe) {
+        $probeEvidence.last_failed_probe = $Snapshot
+    }
+}
+
+function Get-PostOwnerRuntimeFailureCode([object]$Snapshot) {
+    if ($Snapshot.process_query_outcome -ne "PASS") {
+        return "controller_post_owner_process_snapshot_failed"
+    }
+    if ($Snapshot.postgres_count -eq 0) { return "controller_post_owner_postgres_process_missing" }
+    if ($Snapshot.postgres_count -ne 1) { return "controller_post_owner_postgres_process_count_invalid" }
+    if ($Snapshot.http_count -eq 0) { return "controller_post_owner_http_process_missing" }
+    if ($Snapshot.http_count -ne 1) { return "controller_post_owner_http_process_count_invalid" }
+    if ($Snapshot.scheduler_count -eq 0) { return "controller_post_owner_scheduler_process_missing" }
+    if ($Snapshot.scheduler_count -ne 1) { return "controller_post_owner_scheduler_process_count_invalid" }
+    if ($Snapshot.listener_query_outcome -ne "PASS") {
+        return "controller_post_owner_listener_snapshot_failed"
+    }
+    if ($Snapshot.endpoint_listener_count -eq 0) {
+        return "controller_post_owner_endpoint_listener_absent"
+    }
+    if ($Snapshot.owner_session_query_outcome -ne "PASS") {
+        return "controller_post_owner_owner_session_snapshot_failed"
+    }
+    if ($Snapshot.active_owner_session_count -eq 0) {
+        return "controller_post_owner_active_owner_session_missing"
+    }
+    if ($Snapshot.active_owner_session_count -ne 1) {
+        return "controller_post_owner_active_owner_session_count_invalid"
+    }
+    return $null
+}
+
+function Get-ControllerHttpsProbeFailureCode([object]$Probe, [string]$Path) {
+    switch ([string]$Probe.failure_stage) {
+        "root_certificate_load" { return "controller_tls_probe_root_certificate_load_failed" }
+        "tcp_connect" {
+            if ($Probe.tcp_connect.outcome -eq "TIMEOUT") {
+                return "controller_tls_probe_tcp_connect_timeout"
+            }
+            return "controller_tls_probe_tcp_connect_failed"
+        }
+        "tls_authentication" { return "controller_tls_probe_validation_failed" }
+        "http_request_write" { return "controller_tls_probe_http_write_failed" }
+        "http_response" { return "controller_tls_probe_http_response_failed" }
+        "http_status" {
+            if ($Path -eq "/health") {
+                return "controller_https_health_status_$($Probe.http_response.status_code)"
+            }
+            return "controller_https_readiness_status_$($Probe.http_response.status_code)"
+        }
+        default { return "controller_tls_probe_failed" }
+    }
+}
+
+function Wait-ForControllerHttps(
+    [object]$Config,
+    [int]$TimeoutSeconds = 60,
+    [switch]$AfterOwnerBootstrap
+) {
+    $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($AfterOwnerBootstrap) {
+        $bootstrapSnapshot = Get-PostOwnerRuntimeSnapshot $Config
+        $bootstrapSnapshot["health_probe"] = [ordered]@{ outcome = "NOT_RUN" }
+        $bootstrapSnapshot["readiness_probe"] = [ordered]@{ outcome = "NOT_RUN" }
+        Save-PostOwnerRuntimeProbe $bootstrapSnapshot -BootstrapProcessSnapshot
+    }
+
+    $attempt = 0
+    $lastSnapshot = $null
+    do {
+        $attempt++
+        $healthProbe = Invoke-ControllerHttpsProbe $Config "/health"
+        $readinessProbe = Invoke-ControllerHttpsProbe $Config "/ready"
+        $lastSnapshot = Get-PostOwnerRuntimeSnapshot $Config
+        $lastSnapshot["attempt"] = $attempt
+        $lastSnapshot["elapsed_ms"] = $waitTimer.ElapsedMilliseconds
+        $lastSnapshot["health_probe"] = $healthProbe
+        $lastSnapshot["readiness_probe"] = $readinessProbe
+        $runtimeFailureCode = Get-PostOwnerRuntimeFailureCode $lastSnapshot
+        $failedProbe = $healthProbe.outcome -ne "PASS" -or
+            $readinessProbe.outcome -ne "PASS" -or $null -ne $runtimeFailureCode
+        Save-PostOwnerRuntimeProbe `
+            $lastSnapshot `
+            -AfterOwnerBootstrap:($AfterOwnerBootstrap -and $attempt -eq 1) `
+            -FailedProbe:$failedProbe
+
+        $probesPassed = $healthProbe.outcome -eq "PASS" -and $readinessProbe.outcome -eq "PASS"
+        if (-not $runtimeFailureCode -and $probesPassed) { return $lastSnapshot }
+        if ($waitTimer.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
+
+    $runtimeFailureCode = Get-PostOwnerRuntimeFailureCode $lastSnapshot
+    if ($runtimeFailureCode) { throw $runtimeFailureCode }
+    if ($healthProbe.outcome -ne "PASS") {
+        throw (Get-ControllerHttpsProbeFailureCode $healthProbe "/health")
+    }
+    throw (Get-ControllerHttpsProbeFailureCode $readinessProbe "/ready")
 }
 
 function Test-PlaintextHttpRejected([object]$Config) {
@@ -1466,10 +1623,10 @@ try {
         $config.endpointPort -gt 0 -and $config.databasePort -gt 0
     if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
     Bootstrap-ControllerOwner $desktop.Id
+    $null = Wait-ForControllerHttps $config 60 -AfterOwnerBootstrap
     $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
     $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
     if (-not $checks.local_first_owner_bootstrap) { throw "controller_local_first_owner_bootstrap_invalid" }
-    Wait-Until { Test-ControllerHttps $config } 60 "controller_tls_readiness_failed"
     $checks.local_readiness_uses_private_root = $true
     if (-not (Test-PlaintextHttpRejected $config)) {
         throw "controller_plaintext_health_listener_present"
@@ -1508,10 +1665,10 @@ try {
     Wait-Until {
         $null -ne (Find-TextContaining (Get-Window $desktop.Id) "not assigned to this PC")
     } 15 "controller_running_unavailable_ip_error_not_visible"
+    $null = Wait-ForControllerHttps $config 5
     if ((Get-ControllerConfig).endpointPort -ne $oldHttpsPort -or
         (Get-FileSha256 $rootCertificatePath) -cne $rootBeforeEndpointChange -or
-        (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange -or
-        -not (Test-ControllerHttps $config)) {
+        (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange) {
         throw "controller_running_unavailable_ip_changed_state"
     }
     $checks.endpoint_running_unavailable_ip_rolls_back = $true
@@ -1525,14 +1682,14 @@ try {
         Wait-Until {
             $null -ne (Find-TextContaining (Get-Window $desktop.Id) "already in use")
         } 15 "controller_running_endpoint_collision_error_not_visible"
+        $null = Wait-ForControllerHttps $config 5
         $afterCollisionProcesses = Assert-ControllerProcesses
         if ((Get-ControllerConfig).endpointPort -ne $oldHttpsPort -or
             (Get-FileSha256 $rootCertificatePath) -cne $rootBeforeEndpointChange -or
             (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange -or
             [int]$afterCollisionProcesses.postgres[0].ProcessId -ne $oldPostgresPid -or
             [int]$afterCollisionProcesses.http[0].ProcessId -ne $oldHttpPid -or
-            [int]$afterCollisionProcesses.scheduler[0].ProcessId -ne $oldSchedulerPid -or
-            -not (Test-ControllerHttps $config)) {
+            [int]$afterCollisionProcesses.scheduler[0].ProcessId -ne $oldSchedulerPid) {
             throw "controller_running_endpoint_collision_changed_runtime_or_identity"
         }
         $checks.endpoint_running_collision_rolls_back = $true
@@ -1573,7 +1730,7 @@ try {
             return $updated.lanAddress -ceq $lanAddress -and $updated.endpointPort -eq $newHttpsPort
         } 30 "controller_running_endpoint_reconfiguration_not_persisted"
         $config = Get-ControllerConfig
-        Wait-Until { Test-ControllerHttps $config } 60 "controller_reconfigured_https_readiness_failed"
+        $null = Wait-ForControllerHttps $config 60
         Wait-Until {
             $current = Get-ControllerProcesses
             return $current.postgres.Count -eq 1 -and $current.http.Count -eq 1 -and
@@ -1619,8 +1776,9 @@ try {
     Wait-Until {
         $current = Get-ControllerProcesses
         return $current.postgres.Count -eq 1 -and $current.http.Count -eq 1 -and
-            $current.scheduler.Count -eq 1 -and (Test-ControllerHttps $config)
+            $current.scheduler.Count -eq 1
     } 15 "controller_runtime_stopped_when_window_hidden"
+    $null = Wait-ForControllerHttps $config 5
     Assert-DatabaseValue $config $sentinel
     $checks.x_hides_and_runtime_continues = $true
 
@@ -1714,7 +1872,7 @@ try {
 
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-ControllerHttps $config } 60 "controller_leaf_renewal_https_not_ready"
+    $null = Wait-ForControllerHttps $config 60
     $rootFingerprintAfterRestart =
         (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $renewedLeaf = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
@@ -1758,7 +1916,7 @@ try {
     Quit-Desktop $desktop.Id
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-ControllerHttps $config } 60 "controller_database_crash_recovery_failed"
+    $null = Wait-ForControllerHttps $config 60
     Assert-DatabaseValue $config $sentinel
     if ([string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
         throw "controller_database_identity_changed_after_crash"
@@ -1798,7 +1956,7 @@ try {
     } 25 "controller_job_object_left_runtime_after_parent_crash"
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-ControllerHttps $config } 60 "controller_parent_crash_wal_recovery_failed"
+    $null = Wait-ForControllerHttps $config 60
     Assert-DatabaseValue $config $sentinel
     $owned = Assert-ControllerProcesses
     $rootFingerprintAfterParentCrash =
@@ -1825,7 +1983,7 @@ try {
     Quit-Desktop $desktop.Id
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
-    Wait-Until { Test-ControllerHttps $config } 60 "controller_migration_recovery_failed"
+    $null = Wait-ForControllerHttps $config 60
     Assert-DatabaseValue $config $sentinel
     $checks.failed_migration_preserves_existing_cluster = $true
 
@@ -1918,6 +2076,7 @@ try {
     Quit-Desktop $desktop.Id
     [System.IO.File]::WriteAllText($pgVersionPath, $pgVersionBackup)
 
+    $postOwnerRuntimeProbe = $processEvidence["post_owner_runtime_probe"]
     $processEvidence = [ordered]@{
         initial_postgres_pid = $postgresPid
         initial_http_pid = $httpPid
@@ -1928,6 +2087,7 @@ try {
         persisted_database_port = $config.databasePort
         persisted_endpoint_port = $config.endpointPort
         graceful_quit_exit_order = $shutdownExitOrder
+        post_owner_runtime_probe = $postOwnerRuntimeProbe
     }
     $result = if (@($checks.Values | Where-Object { -not $_ }).Count -eq 0 -and $failureCodes.Count -eq 0) {
         "PASS"
