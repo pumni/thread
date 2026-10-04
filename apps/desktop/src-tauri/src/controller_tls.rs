@@ -11,8 +11,8 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, PublicKeyData, SanType, PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -26,6 +26,8 @@ const LEAF_LIFETIME_DAYS: i64 = 90;
 const ROOT_LIFETIME_DAYS: i64 = 3650;
 const RENEWAL_WINDOW_DAYS: i64 = 30;
 const BACKDATE_SECONDS: i64 = 300;
+const CONTROLLER_ROOT_COMMON_NAME: &str = "Threads Controller Root CA";
+const CONTROLLER_LEAF_COMMON_NAME: &str = "Threads Controller TLS Server";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -322,9 +324,23 @@ pub(super) fn readiness_probe(root_der: &[u8], port: u16) -> bool {
         .is_ok_and(|_| status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200"))
 }
 
+// These names describe certificate roles only. Endpoint identity remains SAN-only.
+fn controller_root_distinguished_name() -> DistinguishedName {
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, CONTROLLER_ROOT_COMMON_NAME);
+    distinguished_name
+}
+
+fn controller_leaf_distinguished_name() -> DistinguishedName {
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, CONTROLLER_LEAF_COMMON_NAME);
+    distinguished_name
+}
+
 fn create_root(paths: &Paths) -> Result<(), &'static str> {
     let now = OffsetDateTime::now_utc();
     let mut params = CertificateParams::default();
+    params.distinguished_name = controller_root_distinguished_name();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.not_before = now - time::Duration::seconds(BACKDATE_SECONDS);
@@ -377,6 +393,7 @@ fn generate_leaf(
     ];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.distinguished_name = controller_leaf_distinguished_name();
     params.not_before = now - time::Duration::seconds(BACKDATE_SECONDS);
     params.not_after = now + time::Duration::days(LEAF_LIFETIME_DAYS);
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
@@ -618,7 +635,8 @@ fn load_summary(
 
 fn validate_root(der: &[u8], public_key: &[u8]) -> Result<(), &'static str> {
     let certificate = parse_certificate(der)?;
-    if certificate.tbs_certificate.subject != certificate.tbs_certificate.issuer
+    if !has_nonempty_distinguished_name(&certificate.tbs_certificate.subject)
+        || certificate.tbs_certificate.subject != certificate.tbs_certificate.issuer
         || certificate.tbs_certificate.subject_pki.raw != public_key
         || certificate.verify_signature(None).is_err()
         || !is_ecdsa_sha256(&certificate)
@@ -655,6 +673,13 @@ fn validate_leaf(
 ) -> Result<(), &'static str> {
     let certificate = parse_certificate(der)?;
     let root = parse_certificate(root_der)?;
+    validate_root(root_der, root.tbs_certificate.subject_pki.raw)?;
+    if !has_nonempty_distinguished_name(&certificate.tbs_certificate.subject)
+        || certificate.tbs_certificate.issuer != root.tbs_certificate.subject
+        || certificate.tbs_certificate.subject == certificate.tbs_certificate.issuer
+    {
+        return Err("controller_tls_identity_invalid");
+    }
     let constraints = certificate
         .basic_constraints()
         .map_err(|_| "controller_tls_identity_invalid")?
@@ -712,6 +737,20 @@ fn validate_leaf(
         return Err("controller_tls_identity_invalid");
     }
     Ok(())
+}
+
+fn has_nonempty_distinguished_name(name: &x509_parser::x509::X509Name<'_>) -> bool {
+    let mut has_attributes = false;
+    for attribute in name.iter_attributes() {
+        has_attributes = true;
+        if !attribute
+            .as_str()
+            .is_ok_and(|value| !value.trim().is_empty())
+        {
+            return false;
+        }
+    }
+    has_attributes
 }
 
 fn is_ecdsa_sha256(certificate: &X509Certificate<'_>) -> bool {
@@ -861,8 +900,18 @@ mod tests {
     use super::*;
 
     fn root_material() -> (Vec<u8>, Vec<u8>) {
+        root_material_with_subject(Some(CONTROLLER_ROOT_COMMON_NAME))
+    }
+
+    fn root_material_with_subject(common_name: Option<&str>) -> (Vec<u8>, Vec<u8>) {
         let now = OffsetDateTime::now_utc();
         let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        if let Some(common_name) = common_name {
+            params
+                .distinguished_name
+                .push(DnType::CommonName, common_name);
+        }
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = now - time::Duration::minutes(5);
@@ -879,10 +928,34 @@ mod tests {
         not_before: OffsetDateTime,
         not_after: OffsetDateTime,
     ) -> (Vec<u8>, Vec<u8>) {
+        leaf_material_with_subject(
+            root_der,
+            root_key_der,
+            san,
+            Some(CONTROLLER_LEAF_COMMON_NAME),
+            not_before,
+            not_after,
+        )
+    }
+
+    fn leaf_material_with_subject(
+        root_der: &[u8],
+        root_key_der: &[u8],
+        san: Ipv4Addr,
+        common_name: Option<&str>,
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+    ) -> (Vec<u8>, Vec<u8>) {
         let key = KeyPair::try_from(root_key_der).expect("parse root key");
         let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(root_der.to_vec()), key)
             .expect("parse Controller issuer");
         let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        if let Some(common_name) = common_name {
+            params
+                .distinguished_name
+                .push(DnType::CommonName, common_name);
+        }
         params.is_ca = IsCa::ExplicitNoCa;
         params.subject_alt_names = vec![
             SanType::IpAddress(san.into()),
@@ -897,6 +970,103 @@ mod tests {
             .signed_by(&leaf_key, &issuer)
             .expect("Controller-signed leaf");
         (leaf.der().as_ref().to_vec(), leaf_key.serialize_der())
+    }
+
+    fn assert_product_certificate_profile(root_der: &[u8], leaf_der: &[u8], address: Ipv4Addr) {
+        let root = parse_certificate(root_der).expect("parse Controller root");
+        let leaf = parse_certificate(leaf_der).expect("parse Controller leaf");
+        let root_subject = &root.tbs_certificate.subject;
+        let leaf_subject = &leaf.tbs_certificate.subject;
+
+        assert!(has_nonempty_distinguished_name(root_subject));
+        assert_eq!(root_subject, &root.tbs_certificate.issuer);
+        assert!(has_nonempty_distinguished_name(leaf_subject));
+        assert_eq!(&leaf.tbs_certificate.issuer, root_subject);
+        assert_ne!(leaf_subject, &leaf.tbs_certificate.issuer);
+        assert_eq!(
+            root_subject
+                .iter_common_name()
+                .next()
+                .and_then(|attribute| attribute.as_str().ok()),
+            Some(CONTROLLER_ROOT_COMMON_NAME)
+        );
+        assert_eq!(
+            leaf_subject
+                .iter_common_name()
+                .next()
+                .and_then(|attribute| attribute.as_str().ok()),
+            Some(CONTROLLER_LEAF_COMMON_NAME)
+        );
+
+        let root_constraints = root
+            .basic_constraints()
+            .expect("root basic constraints")
+            .expect("root basic constraints extension")
+            .value;
+        let root_usage = root
+            .key_usage()
+            .expect("root key usage")
+            .expect("root key usage extension")
+            .value;
+        assert!(root_constraints.ca);
+        assert_eq!(root_constraints.path_len_constraint, Some(0));
+        assert_eq!(root_usage.flags, (1 << 5 | 1 << 6));
+
+        let leaf_constraints = leaf
+            .basic_constraints()
+            .expect("leaf basic constraints")
+            .expect("leaf basic constraints extension")
+            .value;
+        let leaf_usage = leaf
+            .key_usage()
+            .expect("leaf key usage")
+            .expect("leaf key usage extension")
+            .value;
+        let leaf_eku = leaf
+            .extended_key_usage()
+            .expect("leaf extended key usage")
+            .expect("leaf extended key usage extension")
+            .value;
+        assert!(!leaf_constraints.ca);
+        assert_eq!(leaf_constraints.path_len_constraint, None);
+        assert_eq!(leaf_usage.flags, 1);
+        assert!(leaf_eku.server_auth);
+        assert!(!leaf_eku.any);
+        assert!(!leaf_eku.client_auth);
+        assert!(!leaf_eku.code_signing);
+        assert!(!leaf_eku.email_protection);
+        assert!(!leaf_eku.time_stamping);
+        assert!(!leaf_eku.ocsp_signing);
+        assert!(leaf_eku.other.is_empty());
+
+        let mut actual_sans = leaf
+            .subject_alternative_name()
+            .expect("leaf subject alternative name")
+            .expect("leaf subject alternative name extension")
+            .value
+            .general_names
+            .iter()
+            .map(|name| match name {
+                GeneralName::IPAddress(value) if value.len() == 4 => {
+                    Ipv4Addr::new(value[0], value[1], value[2], value[3])
+                }
+                _ => panic!("Controller leaf SAN must contain only IPv4 addresses"),
+            })
+            .collect::<Vec<_>>();
+        let mut expected_sans = vec![address, Ipv4Addr::LOCALHOST];
+        actual_sans.sort();
+        expected_sans.sort();
+        assert_eq!(actual_sans, expected_sans);
+
+        validate_root(root_der, root.tbs_certificate.subject_pki.raw)
+            .expect("Controller root profile validates");
+        validate_leaf(
+            leaf_der,
+            root_der,
+            leaf.tbs_certificate.subject_pki.raw,
+            address,
+        )
+        .expect("Controller leaf profile validates");
     }
 
     #[test]
@@ -1018,6 +1188,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validators_reject_empty_names_and_self_issued_end_entity_leaves() {
+        let (empty_root, empty_root_key) = root_material_with_subject(None);
+        let empty_root_key =
+            KeyPair::try_from(empty_root_key.as_slice()).expect("empty-name root key");
+        assert_eq!(
+            validate_root(
+                &empty_root,
+                empty_root_key.subject_public_key_info().as_slice()
+            ),
+            Err("controller_tls_identity_invalid")
+        );
+
+        let (root, root_key) = root_material();
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let now = OffsetDateTime::now_utc();
+        let (empty_leaf, empty_leaf_key) = leaf_material_with_subject(
+            &root,
+            &root_key,
+            address,
+            None,
+            now - time::Duration::minutes(5),
+            now + time::Duration::days(LEAF_LIFETIME_DAYS),
+        );
+        let empty_leaf_key =
+            KeyPair::try_from(empty_leaf_key.as_slice()).expect("empty-name leaf key");
+        assert_eq!(
+            validate_leaf(
+                &empty_leaf,
+                &root,
+                empty_leaf_key.subject_public_key_info().as_slice(),
+                address,
+            ),
+            Err("controller_tls_identity_invalid")
+        );
+
+        let (self_issued_leaf, self_issued_leaf_key) = leaf_material_with_subject(
+            &root,
+            &root_key,
+            address,
+            Some(CONTROLLER_ROOT_COMMON_NAME),
+            now - time::Duration::minutes(5),
+            now + time::Duration::days(LEAF_LIFETIME_DAYS),
+        );
+        let self_issued_leaf_key =
+            KeyPair::try_from(self_issued_leaf_key.as_slice()).expect("self-issued leaf key");
+        assert_eq!(
+            validate_leaf(
+                &self_issued_leaf,
+                &root,
+                self_issued_leaf_key.subject_public_key_info().as_slice(),
+                address,
+            ),
+            Err("controller_tls_identity_invalid")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_x509_chain_builds_actual_product_generated_controller_leaf() {
+        let directory = tempfile::tempdir().expect("temporary TLS state");
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let fingerprint_before =
+            provision_initial(directory.path(), address).expect("product TLS provisioning");
+        let paths = Paths::new(directory.path());
+        let root_der = fs::read(&paths.root_cert).expect("product root DER");
+        let leaf_der = fs::read(&paths.leaf_cert).expect("product leaf DER");
+
+        assert_product_certificate_profile(&root_der, &leaf_der, address);
+        assert_eq!(
+            fingerprint_before,
+            format!("SHA256:{}", lower_hex(&Sha256::digest(&root_der)))
+        );
+
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../packaging/windows_desktop/controller_x509_chain_test.ps1")
+            .canonicalize()
+            .expect("Windows X509Chain test helper");
+        let output = std::process::Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(helper)
+            .arg(&paths.root_cert)
+            .arg(&paths.leaf_cert)
+            .output()
+            .expect("PowerShell 7 is required for the Windows X509Chain proof");
+        assert!(
+            output.status.success(),
+            "Windows X509Chain rejected the product-generated Controller leaf; stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_dpapi_identity_persists_and_tampered_root_key_never_replaces_root() {
@@ -1095,6 +1365,7 @@ mod tests {
             fs::read(&paths.root_cert).expect("root DER after renewal"),
             root_der
         );
+        assert_product_certificate_profile(&root_der, &renewed_leaf, address);
     }
 
     #[cfg(windows)]
@@ -1118,8 +1389,10 @@ mod tests {
 
         assert_eq!(fs::read(&paths.root_cert).unwrap(), root_before);
         assert_eq!(root_fingerprint(directory.path()).unwrap(), old_fingerprint);
-        assert_ne!(fs::read(&paths.leaf_cert).unwrap(), old_leaf);
+        let new_leaf = fs::read(&paths.leaf_cert).unwrap();
+        assert_ne!(new_leaf, old_leaf);
         assert_ne!(fs::read(&paths.leaf_key).unwrap(), old_key);
+        assert_product_certificate_profile(&root_before, &new_leaf, new_address);
         assert_eq!(
             validate_identity(directory.path(), new_address).unwrap(),
             old_fingerprint
@@ -1147,12 +1420,56 @@ mod tests {
         );
 
         assert_eq!(fs::read(&paths.root_cert).unwrap(), root_before);
-        assert_ne!(fs::read(&paths.leaf_cert).unwrap(), old_leaf);
+        let new_leaf = fs::read(&paths.leaf_cert).unwrap();
+        assert_ne!(new_leaf, old_leaf);
         assert_ne!(fs::read(&paths.leaf_key).unwrap(), old_key);
+        assert_product_certificate_profile(&root_before, &new_leaf, address);
         assert_eq!(
             validate_identity(directory.path(), address).unwrap(),
             fingerprint_before
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_self_issued_leaf_fails_closed_without_root_rotation() {
+        let directory = tempfile::tempdir().expect("temporary TLS state");
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let fingerprint_before = provision_initial(directory.path(), address).expect("provision");
+        let paths = Paths::new(directory.path());
+        let root_before = fs::read(&paths.root_cert).expect("root DER");
+        let protected_root_key = fs::read(&paths.root_key).expect("protected root key");
+        let root_key = Zeroizing::new(
+            crate::windows_crypto::unprotect_current_user(&protected_root_key)
+                .expect("unprotect product root key for invalid-leaf fixture"),
+        );
+        let now = OffsetDateTime::now_utc();
+        let (invalid_leaf, invalid_leaf_key) = leaf_material_with_subject(
+            &root_before,
+            &root_key,
+            address,
+            Some(CONTROLLER_ROOT_COMMON_NAME),
+            now - time::Duration::minutes(5),
+            now + time::Duration::days(LEAF_LIFETIME_DAYS),
+        );
+        let protected_leaf_key = crate::windows_crypto::protect_current_user(&invalid_leaf_key)
+            .expect("protect self-issued leaf key");
+        let fullchain = format!(
+            "{}{}",
+            certificate_pem("CERTIFICATE", &invalid_leaf),
+            certificate_pem("CERTIFICATE", &root_before)
+        );
+        fs::write(&paths.leaf_cert, &invalid_leaf).expect("install invalid leaf");
+        fs::write(&paths.leaf_key, protected_leaf_key).expect("install protected invalid leaf key");
+        fs::write(&paths.fullchain, fullchain).expect("install invalid leaf fullchain");
+
+        assert_eq!(
+            load_validate_or_renew(directory.path(), address),
+            Err("controller_tls_identity_invalid")
+        );
+        assert_eq!(fs::read(&paths.root_cert).unwrap(), root_before);
+        assert_eq!(fs::read(&paths.leaf_cert).unwrap(), invalid_leaf);
+        assert_eq!(fingerprint(&root_before).unwrap(), fingerprint_before);
     }
 
     #[cfg(windows)]

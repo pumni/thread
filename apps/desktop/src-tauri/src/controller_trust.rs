@@ -426,8 +426,8 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
     use rcgen::{
-        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-        KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+        IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
     };
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
     use std::{io::Read, net::TcpListener, thread};
@@ -441,6 +441,10 @@ mod tests {
     fn tls_identity() -> TlsIdentity {
         let now = OffsetDateTime::now_utc();
         let mut root_params = CertificateParams::default();
+        root_params.distinguished_name = DistinguishedName::new();
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "Threads Controller Root CA");
         root_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         root_params.not_before = now - time::Duration::minutes(5);
@@ -453,6 +457,10 @@ mod tests {
         let issuer = Issuer::from_ca_cert_der(&CertificateDer::from(root_der.clone()), root_key)
             .expect("root issuer");
         let mut leaf_params = CertificateParams::default();
+        leaf_params.distinguished_name = DistinguishedName::new();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "Threads Controller TLS Server");
         leaf_params.subject_alt_names = vec![
             rcgen::SanType::IpAddress(Ipv4Addr::LOCALHOST.into()),
             rcgen::SanType::IpAddress(Ipv4Addr::LOCALHOST.into()),
