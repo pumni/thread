@@ -107,8 +107,12 @@ $checks = [ordered]@{
     endpoint_unavailable_ip_rolls_back = $false
     endpoint_collision_rolls_back = $false
     endpoint_running_unavailable_ip_rolls_back = $false
+    endpoint_running_unavailable_ip_preserves_owner_session = $false
     endpoint_running_collision_rolls_back = $false
+    endpoint_running_collision_preserves_owner_session = $false
     endpoint_running_transition_preserves_postgres = $false
+    endpoint_running_transition_revokes_owner_session = $false
+    endpoint_running_transition_reauthenticates_one_owner_session = $false
     no_lan_listener_before_local_owner_bootstrap = $false
     loopback_postgres_wildcard_https_listener = $false
     controller_https_root_fingerprint_matches_ui = $false
@@ -729,11 +733,23 @@ function Bootstrap-ControllerOwner([int]$ProcessId) {
     }
 }
 
-function Ensure-ControllerOwner([int]$ProcessId, [switch]$ForceReauthentication) {
+function Ensure-ControllerOwner(
+    [int]$ProcessId,
+    [switch]$ForceReauthentication,
+    [switch]$AfterEndpointReconfiguration
+) {
     $config = Get-ControllerConfig
     if ($ForceReauthentication) {
-        Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 0 } 15 `
+        $revocationFailure = if ($AfterEndpointReconfiguration) {
+            "controller_endpoint_reconfigure_session_not_revoked"
+        } else {
             "controller_owner_session_not_revoked_on_lock"
+        }
+        Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 0 } 15 `
+            $revocationFailure
+        if ($AfterEndpointReconfiguration) {
+            $checks.endpoint_running_transition_revokes_owner_session = $true
+        }
     } else {
         $activeSessions = Get-ActiveOwnerSessionCount $config
         if ($activeSessions -eq 1) { return }
@@ -741,16 +757,29 @@ function Ensure-ControllerOwner([int]$ProcessId, [switch]$ForceReauthentication)
             throw "controller_active_owner_session_count_not_one"
         }
     }
+    $readinessFailure = if ($AfterEndpointReconfiguration) {
+        "controller_endpoint_reconfigure_reauthentication_failed"
+    } else {
+        "controller_operator_reauthentication_not_ready"
+    }
     Wait-Until {
         $window = Get-Window $ProcessId
         return $null -ne (Find-Element $window "Username" ([System.Windows.Automation.ControlType]::Edit)) -and
             $null -ne (Find-Element $window "Password" ([System.Windows.Automation.ControlType]::Edit)) -and
             $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
-    } 15 "controller_operator_reauthentication_not_ready"
+    } 15 $readinessFailure
     Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
     Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
     Invoke-Button $ProcessId "Sign in"
-    Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 1 } 30 "controller_owner_login_failed"
+    $loginFailure = if ($AfterEndpointReconfiguration) {
+        "controller_endpoint_reconfigure_reauthentication_failed"
+    } else {
+        "controller_owner_login_failed"
+    }
+    Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 1 } 30 $loginFailure
+    if ($AfterEndpointReconfiguration) {
+        $checks.endpoint_running_transition_reauthenticates_one_owner_session = $true
+    }
 }
 
 function Start-Desktop([int]$WindowTimeout = 30) {
@@ -1671,7 +1700,11 @@ try {
         (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange) {
         throw "controller_running_unavailable_ip_changed_state"
     }
+    if ((Get-ActiveOwnerSessionCount $config) -ne 1) {
+        throw "controller_endpoint_reconfigure_session_lost_on_unavailable_ip"
+    }
     $checks.endpoint_running_unavailable_ip_rolls_back = $true
+    $checks.endpoint_running_unavailable_ip_preserves_owner_session = $true
 
     $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
     $endpointReservation.Start()
@@ -1692,7 +1725,11 @@ try {
             [int]$afterCollisionProcesses.scheduler[0].ProcessId -ne $oldSchedulerPid) {
             throw "controller_running_endpoint_collision_changed_runtime_or_identity"
         }
+        if ((Get-ActiveOwnerSessionCount $config) -ne 1) {
+            throw "controller_endpoint_reconfigure_session_lost_on_collision"
+        }
         $checks.endpoint_running_collision_rolls_back = $true
+        $checks.endpoint_running_collision_preserves_owner_session = $true
     } finally {
         $endpointReservation.Stop()
     }
@@ -1758,7 +1795,7 @@ try {
         }
         $checks.endpoint_running_transition_preserves_postgres = $true
         $checks.plaintext_health_rejected = $true
-        Ensure-ControllerOwner $desktop.Id -ForceReauthentication
+        Ensure-ControllerOwner $desktop.Id -ForceReauthentication -AfterEndpointReconfiguration
     } finally {
         $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($schedulerExitHandle)
         $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($httpExitHandle)

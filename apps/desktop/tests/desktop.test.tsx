@@ -197,6 +197,59 @@ describe("desktop provisioning", () => {
     });
   });
 
+  it("requires sign-in and refreshes the endpoint when cutover session revocation is unconfirmed", async () => {
+    let summaryReads = 0;
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("CONTROLLER");
+      if (command === "operator_current") {
+        return {
+          id: "owner-id",
+          username: "controller-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      if (command === "controller_https_summary") {
+        summaryReads += 1;
+        const port = summaryReads === 1 ? 8443 : 9443;
+        const address = summaryReads === 1 ? "192.0.2.20" : "198.51.100.30";
+        return {
+          configured: true,
+          lanAddress: address,
+          httpsPort: port,
+          publicHttpsOrigin: `https://${address}:${port}`,
+          localHttpsOrigin: `https://127.0.0.1:${port}`,
+          rootFingerprint: "SHA256:1234567890abcdef",
+          leafExpiresAt: "2027-01-01T00:00:00Z",
+        };
+      }
+      if (command === "controller_https_reconfigure") {
+        throw "controller_endpoint_reconfigure_session_not_revoked";
+      }
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    await screen.findByRole("button", { name: "Reconfigure HTTPS endpoint…" });
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure HTTPS endpoint…" }));
+    fireEvent.change(screen.getByLabelText("Stable LAN IPv4 address"), {
+      target: { value: "198.51.100.30" },
+    });
+    fireEvent.change(screen.getByLabelText("HTTPS port"), { target: { value: "9443" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply endpoint change" }));
+
+    expect(
+      await screen.findByText(
+        "The endpoint changed, but session revocation could not be confirmed. Sign in again to continue.",
+      ),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.getByText("https://198.51.100.30:9443")).toBeInTheDocument();
+    expect(screen.queryByText("Signed in as controller-owner")).not.toBeInTheDocument();
+  });
+
   it("provisions one Controller and shows its separate runtime processes", async () => {
     native.invoke.mockImplementation(async (command: string) => {
       if (command === "get_desktop_snapshot") return snapshot();

@@ -646,6 +646,55 @@ def test_post_owner_probe_snapshot_and_failure_taxonomy_are_preserved() -> None:
     assert "post_owner_runtime_probe = $postOwnerRuntimeProbe" in source
 
 
+def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_right_boundary() -> (
+    None
+):
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    unavailable_start = source.index(
+        "Set-ControllerEndpointFields $desktop.Id $unavailableAddress $oldHttpsPort"
+    )
+    unavailable_attempt = source[
+        unavailable_start : source.index("$endpointReservation =", unavailable_start)
+    ]
+    assert unavailable_attempt.index('"Apply endpoint change"') < unavailable_attempt.index(
+        "Get-ActiveOwnerSessionCount $config"
+    )
+    assert "controller_endpoint_reconfigure_session_lost_on_unavailable_ip" in unavailable_attempt
+    assert "$checks.endpoint_running_unavailable_ip_preserves_owner_session = $true" in (
+        unavailable_attempt
+    )
+
+    post_owner_start = source.index("# Failed post-Owner attempts")
+    collision_start = source.index(
+        "Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort",
+        post_owner_start,
+    )
+    collision_attempt = source[
+        collision_start : source.index("$endpointReservation.Stop()", collision_start)
+    ]
+    assert collision_attempt.index('"Apply endpoint change"') < collision_attempt.index(
+        "Get-ActiveOwnerSessionCount $config"
+    )
+    assert "controller_endpoint_reconfigure_session_lost_on_collision" in collision_attempt
+    assert "$checks.endpoint_running_collision_preserves_owner_session = $true" in collision_attempt
+
+    owner_helper = source[
+        source.index("function Ensure-ControllerOwner") : source.index("function Start-Desktop")
+    ]
+    transition_revoke = owner_helper.index('"controller_endpoint_reconfigure_session_not_revoked"')
+    transition_login = owner_helper.index('Set-LoginInput $ProcessId "Username"')
+    assert transition_revoke < transition_login
+    assert '"controller_endpoint_reconfigure_reauthentication_failed"' in owner_helper
+    assert "$checks.endpoint_running_transition_revokes_owner_session = $true" in owner_helper
+    assert "$checks.endpoint_running_transition_reauthenticates_one_owner_session = $true" in (
+        owner_helper
+    )
+    assert (
+        "Ensure-ControllerOwner $desktop.Id -ForceReauthentication -AfterEndpointReconfiguration"
+        in (source)
+    )
+
+
 def _load_verifier() -> ModuleType:
     spec = importlib.util.spec_from_file_location("windows_desktop_evidence_verifier", SCRIPT)
     assert spec is not None and spec.loader is not None

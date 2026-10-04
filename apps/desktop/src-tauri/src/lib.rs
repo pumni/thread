@@ -567,7 +567,10 @@ async fn controller_https_reconfigure(
     }
     let summary = state.reconfigure_https(&lan_address, port, owner_exists)?;
     if owner_exists {
-        operator.lock_session();
+        operator
+            .revoke_session_at(&summary.local_https_origin)
+            .await
+            .map_err(|_| "controller_endpoint_reconfigure_session_not_revoked".to_string())?;
     }
     Ok(summary)
 }

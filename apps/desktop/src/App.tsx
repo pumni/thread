@@ -69,6 +69,8 @@ const operatorAccessMessages: Record<string, string> = {
   controller_endpoint_port_in_use: "That HTTPS port is already in use. Choose another port.",
   controller_https_reconfiguration_unauthorized:
     "Only a signed-in Controller Owner or Admin can change this endpoint.",
+  controller_endpoint_reconfigure_session_not_revoked:
+    "The endpoint changed, but session revocation could not be confirmed. Sign in again to continue.",
   controller_tls_identity_invalid:
     "The saved Controller TLS identity is invalid. The Controller did not replace it.",
   controller_trust_required: "Verify and confirm this Controller before signing in.",
@@ -378,6 +380,27 @@ function App() {
       await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
     } catch (error) {
       const code = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      if (code === "controller_endpoint_reconfigure_session_not_revoked") {
+        loginGeneration.current += 1;
+        nativeLockNotification.current += 1;
+        setOperator(null);
+        setOperatorLoaded(true);
+        setOperatorUsers([]);
+        setCreatedOperatorUser(null);
+        setLoginUsername("");
+        setLoginPassword("");
+        setSessionLocked(true);
+        setTlsReconfigureOpen(false);
+        try {
+          const current = await controllerHttpsSummary();
+          setControllerHttps(current);
+          setLanAddress(current.lanAddress ?? "");
+          setHttpsPort(String(current.httpsPort));
+          await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+        } catch {
+          // Keep the reauthentication requirement even if summary refresh fails.
+        }
+      }
       setActionError(
         operatorAccessMessages[code] ??
           "Controller HTTPS change failed. Check the IPv4 address and port, then try again.",

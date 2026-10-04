@@ -183,6 +183,14 @@ impl OperatorAuthState {
         }
     }
 
+    pub(crate) async fn revoke_session_at(&self, base_url: &str) -> Result<(), String> {
+        let base_url = normalize_base_url(base_url)?;
+        let snapshot = self
+            .detach_current_session()
+            .ok_or_else(|| "operator_authentication_required".to_string())?;
+        Self::revoke_snapshot_at(snapshot, &base_url).await
+    }
+
     pub(crate) fn lock_session(&self) {
         let Some(snapshot) = self.detach_current_session() else {
             return;
@@ -348,12 +356,22 @@ impl OperatorAuthState {
     }
 
     async fn revoke_snapshot(snapshot: SessionSnapshot) {
-        let _ = snapshot
+        let base_url = snapshot.base_url.clone();
+        let _ = Self::revoke_snapshot_at(snapshot, &base_url).await;
+    }
+
+    async fn revoke_snapshot_at(snapshot: SessionSnapshot, base_url: &str) -> Result<(), String> {
+        let response = snapshot
             .client
-            .post(endpoint(&snapshot.base_url, "/v1/operator/logout"))
+            .post(endpoint(base_url, "/v1/operator/logout"))
             .bearer_auth(snapshot.bearer.as_str())
             .send()
-            .await;
+            .await
+            .map_err(|_| "operator_api_unavailable".to_string())?;
+        if !response.status().is_success() {
+            return Err("operator_logout_failed".to_string());
+        }
+        Ok(())
     }
 
     fn clear_if_matches(&self, snapshot: &SessionSnapshot) {
@@ -440,6 +458,7 @@ mod tests {
         sync::mpsc,
         sync::Arc,
         thread,
+        time::Instant,
     };
     use time::OffsetDateTime;
 
@@ -570,13 +589,35 @@ mod tests {
         (format!("https://{address}"), root_der, receiver, server)
     }
 
+    struct LogoutRequestEvidence {
+        target: String,
+        authorization: String,
+    }
+
     fn logout_server() -> (
         String,
         Client,
-        mpsc::Receiver<String>,
+        mpsc::Receiver<LogoutRequestEvidence>,
+        thread::JoinHandle<()>,
+    ) {
+        let (base_url, client, receiver, release_response, server) = logout_server_with_gate();
+        release_response
+            .send(())
+            .expect("release ordinary logout response");
+        (base_url, client, receiver, server)
+    }
+
+    fn logout_server_with_gate() -> (
+        String,
+        Client,
+        mpsc::Receiver<LogoutRequestEvidence>,
+        mpsc::Sender<()>,
         thread::JoinHandle<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("bounded test listener");
         let address = listener.local_addr().expect("listener address");
         let now = OffsetDateTime::now_utc();
         let mut root_params = CertificateParams::default();
@@ -619,8 +660,27 @@ mod tests {
                 .expect("test TLS identity");
         let client = private_root_client(root.der().as_ref()).expect("test private-root client");
         let (sender, receiver) = mpsc::channel();
+        let (release_response, response_released) = mpsc::channel();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("logout request");
+            let accept_deadline = Instant::now() + Duration::from_secs(10);
+            let (stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("bounded logout accept failed: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking accepted test stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bounded logout request read");
             let connection =
                 ServerConnection::new(Arc::new(server_config)).expect("test TLS server connection");
             let mut stream = StreamOwned::new(connection, stream);
@@ -636,19 +696,35 @@ mod tests {
                     break;
                 }
             }
-            let authorization = String::from_utf8_lossy(&request)
+            let request_text = String::from_utf8_lossy(&request);
+            let target = request_text.lines().next().unwrap_or_default().to_string();
+            let authorization = request_text
                 .lines()
                 .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
                 .unwrap_or_default()
                 .to_string();
-            sender.send(authorization).expect("authorization receiver");
+            sender
+                .send(LogoutRequestEvidence {
+                    target,
+                    authorization,
+                })
+                .expect("logout request receiver");
+            response_released
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release logout response");
             stream
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .expect("write logout response");
         });
-        (format!("https://{address}"), client, receiver, server)
+        (
+            format!("https://{address}"),
+            client,
+            receiver,
+            release_response,
+            server,
+        )
     }
 
     #[test]
@@ -669,19 +745,44 @@ mod tests {
     }
 
     #[test]
-    fn delayed_revocation_uses_only_the_detached_bearer_after_a_new_login() {
-        let (base_url, client, authorization, server) = logout_server();
-        let state = OperatorAuthState::default();
-        install_session_with_client(&state, &base_url, "synthetic-session-a", client.clone());
-        let detached = state.detach_current_session().expect("session A detached");
-        install_session_with_client(&state, &base_url, "synthetic-session-b", client);
+    fn endpoint_migration_revokes_detached_session_through_new_origin_after_old_is_offline() {
+        let (new_origin, client, request_receiver, release_response, server) =
+            logout_server_with_gate();
+        let old_listener = TcpListener::bind("127.0.0.1:0").expect("old HTTPS origin");
+        let old_address = old_listener.local_addr().expect("old HTTPS address");
+        let old_origin = format!("https://{old_address}");
+        drop(old_listener);
 
-        tauri::async_runtime::block_on(OperatorAuthState::revoke_snapshot(detached));
+        let state = Arc::new(OperatorAuthState::default());
+        install_session_with_client(&state, &old_origin, "synthetic-session-a", client.clone());
+        let revoke_state = Arc::clone(&state);
+        let revoke_origin = new_origin.clone();
+        let revoke = thread::spawn(move || {
+            tauri::async_runtime::block_on(revoke_state.revoke_session_at(&revoke_origin))
+        });
 
+        let request = request_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("new endpoint received logout");
+        assert_eq!(request.target, "POST /v1/operator/logout HTTP/1.1");
         assert_eq!(
-            authorization.recv().expect("captured logout bearer"),
+            request.authorization,
             "authorization: Bearer synthetic-session-a"
         );
+        assert!(
+            state
+                .session
+                .lock()
+                .expect("Operator session mutex")
+                .is_none(),
+            "old session is detached before the response completes"
+        );
+
+        install_session_with_client(&state, &new_origin, "synthetic-session-b", client);
+        release_response
+            .send(())
+            .expect("release delayed logout response");
+        assert_eq!(revoke.join().expect("logout task completed"), Ok(()));
         server.join().expect("logout server completed");
         assert_eq!(
             state
@@ -689,7 +790,7 @@ mod tests {
                 .lock()
                 .expect("Operator session mutex")
                 .as_ref()
-                .expect("session B remains current")
+                .expect("new session remains current")
                 .bearer
                 .as_str(),
             "synthetic-session-b"
@@ -719,7 +820,10 @@ mod tests {
         tauri::async_runtime::block_on(state.logout());
 
         assert_eq!(
-            authorization.recv().expect("captured logout bearer"),
+            authorization
+                .recv()
+                .expect("captured logout request")
+                .authorization,
             "authorization: Bearer synthetic-logout-session"
         );
         server.join().expect("logout server completed");
