@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Install", "Inspect", "Update", "Uninstall")]
+    [ValidateSet("Install", "Inspect", "InspectJson", "Disable", "Enable", "Start", "Update", "Uninstall")]
     [string] $Operation,
 
     [string] $ReleaseDirectory,
@@ -149,7 +149,7 @@ function Assert-EnrolledIdentity([string] $ConfigPath, [string] $ExecutablePath)
         ($configFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "invalid host config"
     }
-    & $ExecutablePath --validate-host-config $fullConfigPath | Out-Null
+    & $ExecutablePath --validate-host-config $fullConfigPath 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "invalid host config" }
     try {
         $config = Get-Content -Raw -LiteralPath $fullConfigPath | ConvertFrom-Json
@@ -200,6 +200,62 @@ function Assert-EnrolledIdentity([string] $ConfigPath, [string] $ExecutablePath)
         throw "identity not enrolled"
     }
     return $fullConfigPath
+}
+
+function Assert-HostConfig([string] $ConfigPath, [string] $ExecutablePath) {
+    $fullConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+    $configFile = Get-Item -LiteralPath $fullConfigPath -Force
+    if ($configFile.PSIsContainer -or
+        ($configFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "invalid host config"
+    }
+    $releasePrefix = [IO.Path]::GetFullPath($releaseRoot).TrimEnd('\') + '\'
+    if ($fullConfigPath.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "invalid host config"
+    }
+    & $ExecutablePath --validate-host-config $fullConfigPath 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "invalid host config" }
+    try {
+        $config = Get-Content -Raw -LiteralPath $fullConfigPath | ConvertFrom-Json
+        $script:failureStage = "DATA_ROOT_CONFIG_REQUIRED"
+        if ($null -eq $config.data_root -or
+            [string]::IsNullOrWhiteSpace([string] $config.data_root)) {
+            throw "invalid host config"
+        }
+        $script:failureStage = "DATA_ROOT_POLICY"
+        $dataRoot = [IO.Path]::GetFullPath([string] $config.data_root)
+        $dataItem = Get-Item -LiteralPath $dataRoot -Force
+    } catch {
+        throw "invalid host config"
+    }
+    if (!$dataItem.PSIsContainer -or
+        ($dataItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "invalid host config"
+    }
+    return $fullConfigPath
+}
+
+function Write-TaskInspectionJson(
+    [string] $State,
+    [bool] $SameUser,
+    [string] $DiagnosticCode,
+    [string] $ExecutablePath,
+    [string] $ConfigPath,
+    [string] $WorkingDirectory
+) {
+    [ordered]@{
+        state = $State
+        same_user = $SameUser
+        diagnostic_code = $DiagnosticCode
+        executable_path = $ExecutablePath
+        host_config_path = $ConfigPath
+        working_directory = $WorkingDirectory
+    } | ConvertTo-Json -Compress | ForEach-Object { [Console]::Out.WriteLine($_) }
+}
+
+function Write-TaskOperationJson([string] $Result) {
+    [ordered]@{ result = $Result } | ConvertTo-Json -Compress |
+        ForEach-Object { [Console]::Out.WriteLine($_) }
 }
 
 function New-WorkerTaskDefinition(
@@ -280,7 +336,7 @@ function Assert-TaskContract($Task, [string] $ExpectedUserSid) {
     if (![IO.Path]::IsPathRooted($configPath)) { throw "invalid task" }
     $script:failureStage = "VERIFY_TASK_CREDENTIALS"
     if ($taskXmlText -match '<LogonType>Password</LogonType>|<Password>' -or
-        $taskXmlText -match 'THREADS_WORKER_ENROLLMENT_CODE|access_token|session_token|private_key|proxy_credential|credential_ref') {
+        $taskXmlText -match 'THREADS_WORKER_ENROLLMENT_CODE|access[_-]?token|session[_-]?token|device[_-]?token|operator[_-]?token|private[_-]?key|proxy[_-]?credential|credential[_-]?ref|bearer[_-]?token|database[_-]?url|enrollment[_-]?code') {
         throw "invalid task"
     }
     return $configPath
@@ -292,6 +348,57 @@ try {
     Import-Module ScheduledTasks -ErrorAction Stop
     $failureStage = "READ_TASK"
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($Operation -eq "InspectJson") {
+        try {
+            $identity = Get-CurrentInteractiveIdentity
+            $currentUserSid = $identity.User.Value
+        } catch {
+            Write-TaskInspectionJson "INVALID" $false "worker_legacy_task_invalid" "" "" ""
+            exit 0
+        }
+        if ($null -eq $task) {
+            Write-TaskInspectionJson "NOT_REGISTERED" $true `
+                "worker_legacy_task_not_registered" "" "" ""
+            exit 0
+        }
+        try {
+            if ($task.TaskPath -ne "\") { throw "invalid task" }
+            $script:failureStage = "TASK_CONTRACT"
+            $configPath = Assert-TaskContract $task $currentUserSid
+            $executablePath = [IO.Path]::GetFullPath($task.Actions[0].Execute)
+            $workingDirectory = [IO.Path]::GetFullPath($task.Actions[0].WorkingDirectory)
+            $releasePath = Split-Path -Parent $executablePath
+            $script:failureStage = "PACKAGE_VALIDATION"
+            $null = Assert-ImmutableRelease $releasePath
+            $script:failureStage = "HOST_CONFIG_VALIDATION"
+            $configPath = Assert-HostConfig $configPath $executablePath
+            $script:failureStage = "TASK_STATE"
+            $taskState = switch ($task.State.ToString()) {
+                "Running" { "RUNNING"; break }
+                "Ready" { "READY"; break }
+                "Disabled" { "DISABLED"; break }
+                default { "INVALID" }
+            }
+            $principalSid = Convert-AccountToSid $task.Principal.UserId
+            $diagnosticCode = if ($taskState -eq "INVALID") {
+                "worker_legacy_task_invalid"
+            } else { $null }
+            Write-TaskInspectionJson $taskState ($principalSid -eq $currentUserSid) `
+                $diagnosticCode `
+                $executablePath $configPath $workingDirectory
+        } catch {
+            $diagnosticCode = switch ($failureStage) {
+                "PACKAGE_VALIDATION" { "worker_package_invalid" }
+                "HOST_CONFIG_VALIDATION" { "worker_host_config_invalid" }
+                "DATA_ROOT_CONFIG_REQUIRED" { "worker_host_configuration_required" }
+                "DATA_ROOT_POLICY" { "worker_host_configuration_required" }
+                default { "worker_legacy_task_invalid" }
+            }
+            Write-TaskInspectionJson "INVALID" $false $diagnosticCode "" "" ""
+        }
+        exit 0
+    }
+
     if ($Operation -eq "Inspect") {
         if ($null -eq $task) {
             Write-Output "THREADS_WORKER_TASK_NOT_REGISTERED"
@@ -316,6 +423,47 @@ try {
     $failureStage = "VALIDATE_PRINCIPAL"
     $identity = Get-CurrentInteractiveIdentity
     $currentUserSid = $identity.User.Value
+    if ($Operation -in @("Disable", "Enable", "Start")) {
+        if ($null -eq $task) { throw "task is not registered" }
+        if ($task.TaskPath -ne "\") { throw "invalid task" }
+        if ($Operation -eq "Disable" -and !$ConfirmDurableDrainOffline) {
+            throw "drain confirmation required"
+        }
+        $configPath = Assert-TaskContract $task $currentUserSid
+        $executablePath = [IO.Path]::GetFullPath($task.Actions[0].Execute)
+        $releasePath = Split-Path -Parent $executablePath
+        $null = Assert-ImmutableRelease $releasePath
+        $null = Assert-HostConfig $configPath $executablePath
+        switch ($Operation) {
+            "Disable" {
+                if ($task.State.ToString() -eq "Running") { throw "task is running" }
+                Disable-ScheduledTask -TaskName $taskName | Out-Null
+                $updatedTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                if ($updatedTask.State.ToString() -ne "Disabled") { throw "task disable failed" }
+                Write-TaskOperationJson "DISABLED"
+            }
+            "Enable" {
+                if ($task.State.ToString() -eq "Running") { throw "task is running" }
+                Enable-ScheduledTask -TaskName $taskName | Out-Null
+                $updatedTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                if ($updatedTask.State.ToString() -ne "Ready") { throw "task enable failed" }
+                Write-TaskOperationJson "READY"
+            }
+            "Start" {
+                if ($task.State.ToString() -ne "Ready") { throw "task is not ready" }
+                Start-ScheduledTask -TaskName $taskName
+                $deadline = [DateTime]::UtcNow.AddSeconds(30)
+                do {
+                    Start-Sleep -Milliseconds 200
+                    $updatedTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                } while ($updatedTask.State.ToString() -ne "Running" -and
+                    [DateTime]::UtcNow -lt $deadline)
+                if ($updatedTask.State.ToString() -ne "Running") { throw "task start failed" }
+                Write-TaskOperationJson "RUNNING"
+            }
+        }
+        exit 0
+    }
     if ($Operation -eq "Uninstall") {
         if (!$ConfirmDurableDrainOffline) { throw "drain confirmation required" }
         if ($null -eq $task) {

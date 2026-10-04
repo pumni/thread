@@ -17,6 +17,7 @@ $releaseRoot = Join-Path $programFiles "ThreadsWorker\releases"
 $testId = [guid]::NewGuid().ToString("N")
 $firstRelease = Join-Path $releaseRoot "task-smoke-$testId-a"
 $secondRelease = Join-Path $releaseRoot "task-smoke-$testId-b"
+$secretNamedRelease = Join-Path $releaseRoot "access_token-task-smoke-$testId"
 $testTempRoot = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
     [IO.Path]::GetTempPath()
 } else {
@@ -115,9 +116,12 @@ try {
     if (Get-ScheduledTask -TaskName $productionTaskName -ErrorAction SilentlyContinue) {
         throw "PRODUCTION_TASK_ALREADY_EXISTS"
     }
+    $notRegistered = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($notRegistered.state -eq "NOT_REGISTERED") "TASK_NOT_REGISTERED_STATE_INVALID"
     $productionTaskOwned = $true
     Copy-TestRelease $firstRelease
     Copy-TestRelease $secondRelease
+    Copy-TestRelease $secretNamedRelease
 
     New-Item -ItemType Directory -Path $hostDirectory -Force | Out-Null
     New-Item -ItemType Directory -Path $identityDirectory -Force | Out-Null
@@ -225,6 +229,63 @@ try {
     $inspectResult = Invoke-TaskManager @("-Operation", "Inspect")
     Assert-Condition ($inspectResult -eq "THREADS_WORKER_TASK_READY") "TASK_INSPECT_RESULT_INVALID"
 
+    $inspection = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($inspection.state -eq "READY") "TASK_INSPECT_JSON_STATE_INVALID"
+    Assert-Condition ($inspection.same_user -eq $true) "TASK_INSPECT_JSON_USER_INVALID"
+    Assert-Condition ($inspection.executable_path -eq $productionTask.Actions[0].Execute) `
+        "TASK_INSPECT_JSON_EXECUTABLE_INVALID"
+    Assert-Condition ($inspection.host_config_path -eq $hostConfigPath) `
+        "TASK_INSPECT_JSON_CONFIG_INVALID"
+    Assert-Condition ($inspection.working_directory -eq $firstRelease) `
+        "TASK_INSPECT_JSON_WORKING_DIRECTORY_INVALID"
+
+    $wrongArguments = New-ScheduledTaskAction `
+        -Execute $productionTask.Actions[0].Execute `
+        -Argument ($productionTask.Actions[0].Arguments + " --unexpected") `
+        -WorkingDirectory $productionTask.Actions[0].WorkingDirectory
+    Set-ScheduledTask -TaskName $productionTaskName -Action $wrongArguments | Out-Null
+    $invalidArguments = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($invalidArguments.state -eq "INVALID") "TASK_EXTRA_ARGUMENT_ACCEPTED"
+
+    $missingHostConfig = Join-Path $hostDirectory "missing-worker-host.json"
+    $wrongHostConfig = New-ScheduledTaskAction `
+        -Execute $productionTask.Actions[0].Execute `
+        -Argument ('--host-config "{0}"' -f $missingHostConfig) `
+        -WorkingDirectory $productionTask.Actions[0].WorkingDirectory
+    Set-ScheduledTask -TaskName $productionTaskName -Action $wrongHostConfig | Out-Null
+    $invalidHostConfig = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($invalidHostConfig.state -eq "INVALID") "TASK_WRONG_HOST_CONFIG_ACCEPTED"
+
+    $wrongExecutable = New-ScheduledTaskAction `
+        -Execute $env:ComSpec `
+        -Argument ('--host-config "{0}"' -f $hostConfigPath) `
+        -WorkingDirectory $firstRelease
+    Set-ScheduledTask -TaskName $productionTaskName -Action $wrongExecutable | Out-Null
+    $invalidExecutable = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($invalidExecutable.state -eq "INVALID") "TASK_WRONG_EXECUTABLE_ACCEPTED"
+
+    $secretBearingAction = New-ScheduledTaskAction `
+        -Execute (Join-Path $secretNamedRelease "threads-worker.exe") `
+        -Argument ('--host-config "{0}"' -f $hostConfigPath) `
+        -WorkingDirectory $secretNamedRelease
+    Set-ScheduledTask -TaskName $productionTaskName -Action $secretBearingAction | Out-Null
+    $secretBearingInspection = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($secretBearingInspection.state -eq "INVALID") "TASK_SECRET_BEARING_XML_ACCEPTED"
+    Assert-Condition (($secretBearingInspection | ConvertTo-Json -Compress) -notmatch "access_token") `
+        "TASK_SECRET_BEARING_XML_ECHOED"
+
+    Set-ScheduledTask -TaskName $productionTaskName -Action $productionTask.Actions[0] | Out-Null
+    $disableJson = Invoke-TaskManager @(
+        "-Operation", "Disable", "-ConfirmDurableDrainOffline"
+    ) | ConvertFrom-Json
+    Assert-Condition ($disableJson.result -eq "DISABLED") "TASK_DISABLE_JSON_RESULT_INVALID"
+    $disabledInspection = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($disabledInspection.state -eq "DISABLED") "TASK_DISABLED_STATE_NOT_REPORTED"
+    $enableJson = Invoke-TaskManager @("-Operation", "Enable") | ConvertFrom-Json
+    Assert-Condition ($enableJson.result -eq "READY") "TASK_ENABLE_JSON_RESULT_INVALID"
+    $readyInspection = Invoke-TaskManager @("-Operation", "InspectJson") | ConvertFrom-Json
+    Assert-Condition ($readyInspection.state -eq "READY") "TASK_READY_STATE_NOT_REPORTED"
+
     $hostConfig.Remove("data_root") | Out-Null
     Write-TestHostConfig $hostConfig
     $updateMissingDataRootResult = Invoke-TaskManager @(
@@ -316,7 +377,7 @@ try {
         (Get-ScheduledTask -TaskName $productionTaskName -ErrorAction SilentlyContinue)) {
         Unregister-ScheduledTask -TaskName $productionTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     }
-    foreach ($path in @($firstRelease, $secondRelease)) {
+    foreach ($path in @($firstRelease, $secondRelease, $secretNamedRelease)) {
         $fullPath = [IO.Path]::GetFullPath($path)
         $expectedPrefix = [IO.Path]::GetFullPath($releaseRoot).TrimEnd('\') + '\'
         if ($fullPath.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and

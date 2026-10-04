@@ -74,6 +74,20 @@ struct ChangePasswordRequest<'a> {
     new_password: &'a str,
 }
 
+#[derive(Serialize)]
+struct WorkerDrainRequest<'a> {
+    reason_code: &'a str,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
+pub(crate) struct WorkerDrainStatus {
+    pub status: String,
+    pub active_browser_sessions: u32,
+    pub running_worker_jobs: u32,
+    pub quiescent: bool,
+}
+
 struct Session {
     base_url: String,
     client: Client,
@@ -326,6 +340,101 @@ impl OperatorAuthState {
         Ok(())
     }
 
+    pub(crate) async fn request_local_worker_drain(
+        &self,
+        worker_id: &str,
+        reason_code: &str,
+    ) -> Result<WorkerDrainStatus, String> {
+        if !valid_worker_id(worker_id) || !valid_drain_reason(reason_code) {
+            return Err("worker_drain_request_failed".to_string());
+        }
+        let snapshot = self.require_worker_lifecycle_snapshot().await?;
+        let response = snapshot
+            .client
+            .post(endpoint(
+                &snapshot.base_url,
+                &format!("/v1/workers/{worker_id}/drain"),
+            ))
+            .bearer_auth(snapshot.bearer.as_str())
+            .json(&WorkerDrainRequest { reason_code })
+            .send()
+            .await
+            .map_err(|_| "worker_drain_unavailable".to_string())?;
+        if !response.status().is_success() {
+            return Err("worker_drain_request_failed".to_string());
+        }
+        response
+            .json()
+            .await
+            .map_err(|_| "worker_drain_response_invalid".to_string())
+    }
+
+    pub(crate) async fn local_worker_drain_status(
+        &self,
+        worker_id: &str,
+    ) -> Result<WorkerDrainStatus, String> {
+        if !valid_worker_id(worker_id) {
+            return Err("worker_drain_request_failed".to_string());
+        }
+        let snapshot = self.require_worker_lifecycle_snapshot().await?;
+        let response = snapshot
+            .client
+            .get(endpoint(
+                &snapshot.base_url,
+                &format!("/v1/workers/{worker_id}/drain"),
+            ))
+            .bearer_auth(snapshot.bearer.as_str())
+            .send()
+            .await
+            .map_err(|_| "worker_drain_unavailable".to_string())?;
+        if !response.status().is_success() {
+            return Err("worker_drain_unavailable".to_string());
+        }
+        response
+            .json()
+            .await
+            .map_err(|_| "worker_drain_response_invalid".to_string())
+    }
+
+    async fn require_worker_lifecycle_snapshot(&self) -> Result<SessionSnapshot, String> {
+        let snapshot = self.require_snapshot()?;
+        let response = snapshot
+            .client
+            .get(endpoint(&snapshot.base_url, "/v1/operator/me"))
+            .bearer_auth(snapshot.bearer.as_str())
+            .send()
+            .await
+            .map_err(|_| "operator_api_unavailable".to_string())?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.clear_if_matches(&snapshot);
+            return Err("operator_session_revoked".to_string());
+        }
+        if !response.status().is_success() {
+            return Err("operator_request_failed".to_string());
+        }
+        let operator: OperatorIdentity = response
+            .json()
+            .await
+            .map_err(|_| "operator_response_invalid".to_string())?;
+        if !lifecycle_session_allowed(&operator.role, operator.must_change_password, false) {
+            return Err(if operator.must_change_password {
+                "operator_password_change_required".to_string()
+            } else {
+                "operator_forbidden".to_string()
+            });
+        }
+        if let Ok(mut guard) = self.session.lock() {
+            if let Some(session) = guard.as_mut() {
+                if session.base_url == snapshot.base_url
+                    && session.bearer.as_str() == snapshot.bearer.as_str()
+                {
+                    session.operator = operator;
+                }
+            }
+        }
+        Ok(snapshot)
+    }
+
     fn snapshot(&self) -> Result<Option<SessionSnapshot>, String> {
         let guard = self
             .session
@@ -442,6 +551,25 @@ fn lifecycle_session_allowed(
     controller_node: bool,
 ) -> bool {
     !must_change_password && lifecycle_role_allowed(role, controller_node)
+}
+
+fn valid_worker_id(worker_id: &str) -> bool {
+    worker_id.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| worker_id.as_bytes()[index] == b'-')
+        && worker_id.bytes().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index)
+                || byte.is_ascii_digit()
+                || (b'a'..=b'f').contains(&byte)
+        })
+}
+
+fn valid_drain_reason(reason_code: &str) -> bool {
+    matches!(
+        reason_code,
+        "DESKTOP_QUIT" | "DESKTOP_RESTART" | "DESKTOP_LEGACY_CUTOVER" | "DESKTOP_ROLLBACK"
+    )
 }
 
 #[cfg(test)]
@@ -594,6 +722,12 @@ mod tests {
         authorization: String,
     }
 
+    struct WorkerDrainRequestEvidence {
+        target: String,
+        authorization: String,
+        body: String,
+    }
+
     fn logout_server() -> (
         String,
         Client,
@@ -727,6 +861,160 @@ mod tests {
         )
     }
 
+    fn worker_drain_api_server(
+        role: &'static str,
+    ) -> (
+        String,
+        Vec<u8>,
+        mpsc::Receiver<WorkerDrainRequestEvidence>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback Worker API listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking test listener");
+        let address = listener.local_addr().expect("Worker API listener address");
+        let now = OffsetDateTime::now_utc();
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        root_params.not_before = now - time::Duration::minutes(5);
+        root_params.not_after = now + time::Duration::days(365);
+        let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("test root key");
+        let root = root_params
+            .self_signed(&root_key)
+            .expect("test root certificate");
+        let issuer = Issuer::from_ca_cert_der(
+            &CertificateDer::from(root.der().as_ref().to_vec()),
+            root_key,
+        )
+        .expect("test root issuer");
+        let mut leaf_params =
+            CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("test leaf parameters");
+        leaf_params.is_ca = IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf_params.not_before = now - time::Duration::minutes(5);
+        leaf_params.not_after = now + time::Duration::days(90);
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("test leaf key");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("test leaf certificate");
+        let server_config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("test TLS versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![
+                        CertificateDer::from(leaf.der().as_ref().to_vec()),
+                        CertificateDer::from(root.der().as_ref().to_vec()),
+                    ],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+                )
+                .expect("test TLS identity");
+        let root_der = root.der().as_ref().to_vec();
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut drain_status_reads = 0;
+            for _ in 0..6 {
+                let accept_deadline = Instant::now() + Duration::from_secs(10);
+                let (socket, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < accept_deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("bounded Worker API accept failed: {error}"),
+                    }
+                };
+                socket
+                    .set_nonblocking(false)
+                    .expect("blocking accepted Worker API socket");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("bounded Worker API read");
+                let connection = ServerConnection::new(Arc::new(server_config.clone()))
+                    .expect("test TLS server connection");
+                let mut stream = StreamOwned::new(connection, socket);
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                loop {
+                    let length = stream.read(&mut buffer).expect("read Worker API request");
+                    if length == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..length]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                let request_line = request_text.lines().next().unwrap_or_default().to_string();
+                let authorization = request_text
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .unwrap_or_default()
+                    .to_string();
+                let header_end = request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .expect("HTTP request headers");
+                let body = String::from_utf8_lossy(&request[header_end + 4..]).to_string();
+                sender
+                    .send(WorkerDrainRequestEvidence {
+                        target: request_line.clone(),
+                        authorization,
+                        body,
+                    })
+                    .expect("Worker API request receiver");
+
+                let response_body = if request_line.starts_with("GET /v1/operator/me ") {
+                    format!(
+                        "{{\"id\":\"synthetic-operator\",\"username\":\"operator\",\"role\":\"{role}\",\"must_change_password\":false,\"expires_at\":\"2026-10-05T00:00:00Z\"}}"
+                    )
+                } else if request_line.starts_with("POST /v1/workers/") {
+                    r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string()
+                } else if request_line.starts_with("GET /v1/workers/") {
+                    drain_status_reads += 1;
+                    if drain_status_reads == 1 {
+                        r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string()
+                    } else {
+                        r#"{"status":"OFFLINE","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string()
+                    }
+                } else {
+                    panic!("unexpected test Worker API request: {request_line}");
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write Worker API response");
+            }
+        });
+        (format!("https://{address}"), root_der, receiver, server)
+    }
+
     #[test]
     fn detaching_operator_session_removes_it_before_revocation() {
         let state = OperatorAuthState::default();
@@ -853,6 +1141,82 @@ mod tests {
             assert!(!lifecycle_session_allowed(role, true, false));
             assert!(!lifecycle_session_allowed(role, true, true));
         }
+    }
+
+    #[test]
+    fn worker_drain_client_requests_once_then_polls_status_with_private_root_session() {
+        let (base_url, root_der, request_receiver, server) = worker_drain_api_server("OPERATOR");
+        let client = private_root_client(&root_der).expect("private-root Worker client");
+        let state = OperatorAuthState::default();
+        install_session_with_client(&state, &base_url, "synthetic-operator-bearer", client);
+        let worker_id = "12345678-1234-4234-8234-123456789abc";
+
+        let requested = tauri::async_runtime::block_on(
+            state.request_local_worker_drain(worker_id, "DESKTOP_LEGACY_CUTOVER"),
+        )
+        .expect("Operator-authorized drain request");
+        assert_eq!(requested.status, "DRAINING");
+        assert_eq!(requested.running_worker_jobs, 2);
+        assert!(!requested.quiescent);
+
+        let draining = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
+            .expect("first drain status poll");
+        assert_eq!(draining.status, "DRAINING");
+        let offline = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
+            .expect("second drain status poll");
+        assert_eq!(offline.status, "OFFLINE");
+        assert_eq!(offline.active_browser_sessions, 0);
+        assert_eq!(offline.running_worker_jobs, 0);
+        assert!(offline.quiescent);
+
+        let evidence = (0..6)
+            .map(|_| {
+                request_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("captured Worker API request")
+            })
+            .collect::<Vec<_>>();
+        server.join().expect("Worker API test server finished");
+        let drain_posts = evidence
+            .iter()
+            .filter(|request| request.target.starts_with("POST /v1/workers/"))
+            .collect::<Vec<_>>();
+        let drain_polls = evidence
+            .iter()
+            .filter(|request| request.target.starts_with("GET /v1/workers/"))
+            .collect::<Vec<_>>();
+        assert_eq!(drain_posts.len(), 1);
+        assert_eq!(drain_polls.len(), 2);
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|request| request.target.starts_with("GET /v1/operator/me "))
+                .count(),
+            3
+        );
+        assert!(evidence.iter().all(|request| {
+            request.authorization == "authorization: Bearer synthetic-operator-bearer"
+        }));
+        let post_body: serde_json::Value =
+            serde_json::from_str(&drain_posts[0].body).expect("drain request body");
+        assert_eq!(post_body["reason_code"], "DESKTOP_LEGACY_CUTOVER");
+        let serialized = serde_json::to_string(&offline).expect("safe drain status DTO");
+        assert!(!serialized.contains("synthetic-operator-bearer"));
+    }
+
+    #[test]
+    fn worker_drain_client_accepts_only_fixed_reasons_and_local_uuid() {
+        for reason in [
+            "DESKTOP_QUIT",
+            "DESKTOP_RESTART",
+            "DESKTOP_LEGACY_CUTOVER",
+            "DESKTOP_ROLLBACK",
+        ] {
+            assert!(valid_drain_reason(reason));
+        }
+        assert!(!valid_drain_reason("operator supplied text"));
+        assert!(valid_worker_id("12345678-1234-4234-8234-123456789abc"));
+        assert!(!valid_worker_id("../other-worker"));
     }
 
     #[test]

@@ -53,11 +53,12 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
 const operatorAccessMessages: Record<string, string> = {
-  operator_authentication_required: "Sign in with a Controller Owner or Admin account to continue.",
+  operator_authentication_required:
+    "Sign in with an Operator account authorized for this node to continue.",
   operator_session_revoked:
     "This Operator session expired or was revoked. Sign in again before stopping this node.",
   operator_password_change_required: "Change your Workspace password before stopping this node.",
-  operator_forbidden: "Only a Controller Owner or Admin can perform this operation.",
+  operator_forbidden: "This Operator account is not authorized to perform this node action.",
   operator_api_unavailable:
     "The Controller could not verify Operator access. Try again when it is available.",
   operator_request_failed: "The Controller could not verify Operator access. Try again.",

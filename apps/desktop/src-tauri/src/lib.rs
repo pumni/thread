@@ -5,6 +5,7 @@ mod operator_client;
 mod startup_gate;
 mod supervisor;
 mod windows_crypto;
+mod worker_host;
 
 use std::{
     fs,
@@ -27,7 +28,9 @@ use tauri::{
 };
 use zeroize::Zeroizing;
 
-use operator_client::{CreatedOperatorUser, OperatorAuthState, OperatorIdentity, OperatorUser};
+use operator_client::{
+    CreatedOperatorUser, OperatorAuthState, OperatorIdentity, OperatorUser, WorkerDrainStatus,
+};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
@@ -269,13 +272,24 @@ struct DeviceState {
 }
 
 impl DeviceState {
+    #[cfg(test)]
     fn load(
         config_path: PathBuf,
         controller_root: PathBuf,
         runtime_root: PathBuf,
     ) -> Result<Self, String> {
+        Self::load_with_worker_task_helper(config_path, controller_root, runtime_root, None)
+    }
+
+    fn load_with_worker_task_helper(
+        config_path: PathBuf,
+        controller_root: PathBuf,
+        runtime_root: PathBuf,
+        worker_task_helper: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let config = DeviceConfig::load(&config_path)?;
-        let mut supervisor = Supervisor::with_controller_paths(controller_root, runtime_root);
+        let mut supervisor = Supervisor::with_controller_paths(controller_root, runtime_root)
+            .with_worker_task_helper(worker_task_helper);
         if matches!(
             config.role,
             Some(ProvisionedRole::Controller | ProvisionedRole::Worker)
@@ -388,6 +402,17 @@ impl DeviceState {
             .supervisor
             .local_controller_endpoint()
             .map_err(str::to_string)
+    }
+
+    fn local_worker_id(&self) -> Result<String, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Worker) {
+            return Err("worker_host_configuration_required".to_string());
+        }
+        inner.supervisor.local_worker_id()
     }
 
     fn bootstrap_owner(&self, username: &str, password: &str) -> Result<String, String> {
@@ -780,6 +805,27 @@ async fn operator_change_password(
     operator.change_password(new_password.as_str()).await
 }
 
+#[tauri::command]
+async fn request_local_worker_drain(
+    device: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+    reason_code: String,
+) -> Result<WorkerDrainStatus, String> {
+    let worker_id = device.local_worker_id()?;
+    operator
+        .request_local_worker_drain(&worker_id, &reason_code)
+        .await
+}
+
+#[tauri::command]
+async fn local_worker_drain_status(
+    device: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+) -> Result<WorkerDrainStatus, String> {
+    let worker_id = device.local_worker_id()?;
+    operator.local_worker_drain_status(&worker_id).await
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         run_window_reopen(
@@ -835,6 +881,15 @@ fn runtime_root(app: &tauri::App) -> tauri::Result<PathBuf> {
     Ok(app.path().resource_dir()?.join("runtime"))
 }
 
+fn worker_task_helper_path(app: &tauri::App) -> Option<PathBuf> {
+    app.path()
+        .resolve(
+            "Manage-ThreadsWorkerTask.ps1",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .ok()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(windows)]
@@ -866,14 +921,21 @@ pub fn run() {
             operator_list_users,
             operator_create_user,
             operator_update_user,
-            operator_change_password
+            operator_change_password,
+            request_local_worker_drain,
+            local_worker_drain_status
         ])
         .setup(|app| {
             let path = config_path(app)?;
             let data_root = controller_root(app)?;
             let runtime = runtime_root(app)?;
-            let state =
-                DeviceState::load(path, data_root, runtime).map_err(std::io::Error::other)?;
+            let state = DeviceState::load_with_worker_task_helper(
+                path,
+                data_root,
+                runtime,
+                worker_task_helper_path(app),
+            )
+            .map_err(std::io::Error::other)?;
             let should_autostart = state
                 .snapshot()
                 .map(|snapshot| snapshot.autostart_enabled)
@@ -913,28 +975,6 @@ pub fn run() {
 
     // Keep the named-object handles alive for the lifetime of the event loop.
     app.run(|_app_handle, _event| {});
-}
-
-pub fn run_mock_runtime() {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    if writeln!(stdout, "READY")
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
-        return;
-    }
-
-    for line in stdin.lines() {
-        match line {
-            Ok(command) if command == "STOP" => {
-                let _ = writeln!(stdout, "STOPPED").and_then(|()| stdout.flush());
-                return;
-            }
-            Ok(_) => {}
-            Err(_) => return,
-        }
-    }
 }
 
 #[cfg(test)]

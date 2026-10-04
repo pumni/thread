@@ -1,8 +1,8 @@
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         mpsc::{self, Receiver},
         Arc, Mutex,
@@ -14,6 +14,7 @@ use std::{
 use crate::{
     controller_store::ControllerStore,
     controller_tls::{self, ControllerTlsSummary},
+    worker_host::{self, LegacyTaskState, WorkerHostBinding, WorkerOwnership},
     ProvisionedRole,
 };
 
@@ -34,6 +35,9 @@ pub(super) struct SupervisorSnapshot {
     pub endpoint: Option<String>,
     pub database_port: Option<u16>,
     pub diagnostic_code: Option<&'static str>,
+    pub worker_ownership: Option<&'static str>,
+    pub legacy_task_state: Option<&'static str>,
+    pub worker_id: Option<String>,
 }
 
 impl SupervisorSnapshot {
@@ -48,6 +52,9 @@ impl SupervisorSnapshot {
             endpoint: None,
             database_port: None,
             diagnostic_code: None,
+            worker_ownership: None,
+            legacy_task_state: None,
+            worker_id: None,
         }
     }
 }
@@ -92,15 +99,19 @@ impl Lifecycle {
     }
 }
 
-struct MockRuntime {
+struct WorkerRuntime {
     child: Child,
-    stdin: ChildStdin,
-    messages: Receiver<String>,
+    _job: ProcessJob,
+    _identity_guard: worker_host::IdentityFileGuard,
 }
 
 pub(super) struct Supervisor {
     lifecycle: Lifecycle,
-    mock_runtime: Option<MockRuntime>,
+    worker_runtime: Option<WorkerRuntime>,
+    worker_task_helper: Option<PathBuf>,
+    worker_ownership: Option<WorkerOwnership>,
+    legacy_task_state: Option<LegacyTaskState>,
+    worker_binding: Option<WorkerHostBinding>,
     controller: Option<ControllerRuntime>,
     data_root: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
@@ -111,7 +122,11 @@ impl Default for Supervisor {
     fn default() -> Self {
         Self {
             lifecycle: Lifecycle::Stopped,
-            mock_runtime: None,
+            worker_runtime: None,
+            worker_task_helper: None,
+            worker_ownership: None,
+            legacy_task_state: None,
+            worker_binding: None,
             controller: None,
             data_root: None,
             runtime_root: None,
@@ -129,12 +144,21 @@ impl Supervisor {
         }
     }
 
+    pub fn with_worker_task_helper(mut self, helper: Option<PathBuf>) -> Self {
+        self.worker_task_helper = helper;
+        self
+    }
+
     pub fn refresh_health(&mut self) {
-        if let Some(runtime) = &mut self.mock_runtime {
-            if matches!(runtime.child.try_wait(), Ok(Some(_))) {
-                self.mock_runtime = None;
-                self.lifecycle = Lifecycle::Degraded;
-                self.diagnostic_code = Some("mock_runtime_exited_unexpectedly");
+        if let Some(runtime) = &mut self.worker_runtime {
+            match runtime.child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    self.worker_runtime = None;
+                    self.lifecycle = Lifecycle::Degraded;
+                    self.worker_ownership = Some(WorkerOwnership::Blocked);
+                    self.diagnostic_code = Some("worker_process_exited");
+                }
+                Ok(None) => {}
             }
         }
 
@@ -151,7 +175,10 @@ impl Supervisor {
         let summary = controller.and_then(ControllerRuntime::summary);
         SupervisorSnapshot {
             state: self.lifecycle.label(),
-            process_id: self.mock_runtime.as_ref().map(|runtime| runtime.child.id()),
+            process_id: self
+                .worker_runtime
+                .as_ref()
+                .map(|runtime| runtime.child.id()),
             postgres_process_id: controller.and_then(ControllerRuntime::postgres_process_id),
             http_process_id: controller.and_then(ControllerRuntime::http_process_id),
             scheduler_process_id: controller.and_then(ControllerRuntime::scheduler_process_id),
@@ -159,11 +186,17 @@ impl Supervisor {
             endpoint: summary.as_ref().map(|item| item.endpoint.clone()),
             database_port: summary.map(|item| item.database_port),
             diagnostic_code: self.diagnostic_code,
+            worker_ownership: self.worker_ownership.map(WorkerOwnership::map_label),
+            legacy_task_state: self.legacy_task_state.map(LegacyTaskState::label),
+            worker_id: self
+                .worker_binding
+                .as_ref()
+                .map(|binding| binding.worker_id.clone()),
         }
     }
 
     pub fn start(&mut self, role: ProvisionedRole) -> Result<(), String> {
-        if self.mock_runtime.is_some() || self.controller.is_some() {
+        if self.worker_runtime.is_some() || self.controller.is_some() {
             return Ok(());
         }
 
@@ -175,7 +208,7 @@ impl Supervisor {
             }
             ProvisionedRole::Worker => {
                 self.lifecycle = Lifecycle::Starting;
-                self.start_mock_worker()
+                self.start_worker()
             }
             ProvisionedRole::Console => {
                 self.lifecycle = Lifecycle::Stopped;
@@ -315,77 +348,111 @@ impl Supervisor {
         }
     }
 
-    fn start_mock_worker(&mut self) -> Result<(), String> {
-        let executable = std::env::current_exe().map_err(|_| self.worker_start_failed())?;
-        let mut command = Command::new(executable);
+    fn start_worker(&mut self) -> Result<(), String> {
+        self.legacy_task_state = None;
+        self.worker_binding = None;
+        self.worker_ownership = Some(WorkerOwnership::Blocked);
+        let Some(helper) = self.worker_task_helper.clone() else {
+            return Err(self.fail_worker("worker_host_configuration_required"));
+        };
+        let inspection = match worker_host::inspect_legacy_task(&helper) {
+            Ok(inspection) => inspection,
+            Err(code) => return Err(self.fail_worker(code)),
+        };
+        self.legacy_task_state = Some(inspection.state);
+        let decision = worker_host::classify_task(inspection.state);
+        self.worker_ownership = Some(decision.ownership);
+        if matches!(
+            inspection.state,
+            LegacyTaskState::Invalid | LegacyTaskState::NotRegistered
+        ) {
+            let helper_diagnostic = match inspection.diagnostic_code.as_deref() {
+                Some("worker_legacy_task_not_registered") => {
+                    Some("worker_legacy_task_not_registered")
+                }
+                Some("worker_legacy_task_invalid") => Some("worker_legacy_task_invalid"),
+                Some("worker_package_invalid") => Some("worker_package_invalid"),
+                Some("worker_host_config_invalid") => Some("worker_host_config_invalid"),
+                Some("worker_host_configuration_required") => {
+                    Some("worker_host_configuration_required")
+                }
+                _ => None,
+            };
+            let code = helper_diagnostic
+                .or(decision.diagnostic_code)
+                .unwrap_or("worker_legacy_task_invalid");
+            self.lifecycle = Lifecycle::Degraded;
+            self.diagnostic_code = Some(code);
+            return Err(code.to_string());
+        }
+
+        let binding = match worker_host::validate_task_binding(&inspection) {
+            Ok(binding) => binding,
+            Err(code) => return Err(self.fail_worker(code)),
+        };
+        self.worker_binding = Some(binding.clone());
+        if let Some(code) = decision.diagnostic_code {
+            self.lifecycle = Lifecycle::Degraded;
+            self.diagnostic_code = Some(code);
+            return Err(code.to_string());
+        }
+        if let Err(code) = worker_host::process_lock_is_available(&binding.data_root) {
+            return Err(self.fail_worker(code));
+        }
+        let identity_guard = match worker_host::guard_identity_files(&binding) {
+            Ok(guard) => guard,
+            Err(code) => return Err(self.fail_worker(code)),
+        };
+        let job = match ProcessJob::new_worker() {
+            Ok(job) => job,
+            Err(code) => return Err(self.fail_worker(code)),
+        };
+        let mut command = worker_host::worker_launch_command(&binding);
         command
-            .arg("--threads-desktop-mock-runtime")
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
+            command.creation_flags(0x08000000 | 0x00000004);
         }
+        #[cfg(not(windows))]
+        return Err(self.fail_worker("worker_platform_unsupported"));
 
-        let mut child = command.spawn().map_err(|_| self.worker_start_failed())?;
-        let Some(stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(self.worker_start_failed());
-        };
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(self.worker_start_failed());
-        };
-
-        let (sender, messages) = mpsc::channel();
-        thread::Builder::new()
-            .name("threads-worker-mock-output".to_string())
-            .spawn(move || {
-                for line in BufReader::new(stdout).lines() {
-                    match line {
-                        Ok(line) => {
-                            if sender.send(line).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-            .map_err(|_| {
-                let _ = child.kill();
-                let _ = child.wait();
-                self.worker_start_failed()
-            })?;
-
-        match messages.recv_timeout(Duration::from_secs(3)) {
-            Ok(message) if message == "READY" => {
-                self.mock_runtime = Some(MockRuntime {
-                    child,
-                    stdin,
-                    messages,
-                });
-                self.lifecycle = Lifecycle::Running;
-                Ok(())
+        #[cfg(windows)]
+        {
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(_) => return Err(self.fail_worker("worker_process_start_failed")),
+            };
+            if let Err(code) = assign_and_resume_worker(&job, &mut child) {
+                return Err(self.fail_worker(code));
             }
-            _ => {
-                let _ = child.kill();
+            if !worker_host::binding_identity_unchanged(&binding) {
+                drop(job);
                 let _ = child.wait();
-                Err(self.worker_start_failed())
+                return Err(self.fail_worker("worker_identity_corrupt"));
             }
+            self.worker_runtime = Some(WorkerRuntime {
+                child,
+                _job: job,
+                _identity_guard: identity_guard,
+            });
+            self.worker_ownership = Some(WorkerOwnership::Desktop);
+            self.lifecycle = Lifecycle::Running;
+            self.diagnostic_code = None;
+            Ok(())
         }
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
-        self.lifecycle = Lifecycle::Stopping;
-        if let Some(runtime) = self.mock_runtime.take() {
-            return self.stop_mock(runtime);
+        if self.worker_runtime.is_some() {
+            self.lifecycle = Lifecycle::Degraded;
+            self.diagnostic_code = Some("worker_drain_unavailable");
+            return Err("worker_drain_unavailable".to_string());
         }
+        self.lifecycle = Lifecycle::Stopping;
         if let Some(controller) = &mut self.controller {
             if let Err(code) = controller.stop() {
                 self.lifecycle = Lifecycle::Failed;
@@ -399,48 +466,22 @@ impl Supervisor {
         Ok(())
     }
 
-    fn stop_mock(&mut self, mut runtime: MockRuntime) -> Result<(), String> {
-        let acknowledged = writeln!(runtime.stdin, "STOP")
-            .and_then(|()| runtime.stdin.flush())
-            .is_ok()
-            && matches!(
-                runtime.messages.recv_timeout(Duration::from_secs(3)),
-                Ok(message) if message == "STOPPED"
-            );
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut exited_cleanly = false;
-        while Instant::now() < deadline {
-            match runtime.child.try_wait() {
-                Ok(Some(status)) => {
-                    exited_cleanly = status.success();
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
-            }
-        }
-        if acknowledged && exited_cleanly {
-            self.lifecycle = Lifecycle::Stopped;
-            self.diagnostic_code = None;
-            return Ok(());
-        }
-        let _ = runtime.child.kill();
-        let _ = runtime.child.wait();
-        self.lifecycle = Lifecycle::Degraded;
-        self.diagnostic_code = Some("mock_runtime_stop_unconfirmed");
-        Err("mock_runtime_stop_unconfirmed".to_string())
-    }
-
-    fn worker_start_failed(&mut self) -> String {
-        self.lifecycle = Lifecycle::Degraded;
-        self.diagnostic_code = Some("mock_runtime_start_failed");
-        "mock_runtime_start_failed".to_string()
+    pub fn local_worker_id(&self) -> Result<String, String> {
+        self.worker_binding
+            .as_ref()
+            .map(|binding| binding.worker_id.clone())
+            .ok_or_else(|| "worker_host_configuration_required".to_string())
     }
 
     fn fail(&mut self, code: &'static str) -> String {
         self.lifecycle = Lifecycle::Failed;
         self.diagnostic_code = Some(code);
         code.to_string()
+    }
+
+    fn fail_worker(&mut self, code: &'static str) -> String {
+        self.worker_ownership = Some(WorkerOwnership::Blocked);
+        self.fail(code)
     }
 }
 
@@ -1306,6 +1347,23 @@ unsafe impl Send for ProcessJob {}
 #[cfg(windows)]
 impl ProcessJob {
     fn new() -> Result<Self, &'static str> {
+        Self::new_with_diagnostics(
+            "controller_process_job_create_failed",
+            "controller_process_job_configure_failed",
+        )
+    }
+
+    fn new_worker() -> Result<Self, &'static str> {
+        Self::new_with_diagnostics(
+            "worker_process_job_create_failed",
+            "worker_process_job_create_failed",
+        )
+    }
+
+    fn new_with_diagnostics(
+        create_failure: &'static str,
+        configure_failure: &'static str,
+    ) -> Result<Self, &'static str> {
         use windows_sys::Win32::{
             Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
             System::JobObjects::{
@@ -1316,7 +1374,7 @@ impl ProcessJob {
 
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err("controller_process_job_create_failed");
+            return Err(create_failure);
         }
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -1332,7 +1390,7 @@ impl ProcessJob {
             unsafe {
                 CloseHandle(handle);
             }
-            return Err("controller_process_job_configure_failed");
+            return Err(configure_failure);
         }
         Ok(Self(handle))
     }
@@ -1364,6 +1422,74 @@ impl Drop for ProcessJob {
     }
 }
 
+fn worker_job_assignment(result: Result<(), ()>) -> Result<(), &'static str> {
+    result.map_err(|()| "worker_process_job_assign_failed")
+}
+
+#[cfg(windows)]
+fn assign_and_resume_worker(job: &ProcessJob, child: &mut Child) -> Result<(), &'static str> {
+    if worker_job_assignment(job.assign(child)).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("worker_process_job_assign_failed");
+    }
+    if resume_suspended_process(child.id()).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("worker_process_start_failed");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(process_id: u32) -> Result<(), ()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
+                THREADENTRY32,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        return Err(());
+    }
+
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut thread_id = None;
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32OwnerProcessID == process_id {
+            thread_id = Some(entry.th32ThreadID);
+            break;
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+
+    let thread_id = thread_id.ok_or(())?;
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    if thread.is_null() {
+        return Err(());
+    }
+    let previous_suspend_count = unsafe { ResumeThread(thread) };
+    unsafe {
+        CloseHandle(thread);
+    }
+    if previous_suspend_count == u32::MAX {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(not(windows))]
 struct ProcessJob;
 
@@ -1371,6 +1497,10 @@ struct ProcessJob;
 impl ProcessJob {
     fn new() -> Result<Self, &'static str> {
         Err("controller_platform_unsupported")
+    }
+
+    fn new_worker() -> Result<Self, &'static str> {
+        Err("worker_platform_unsupported")
     }
 
     fn assign(&self, _child: &Child) -> Result<(), ()> {
@@ -1481,6 +1611,48 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    fn spawn_test_worker_process() -> Child {
+        use std::os::windows::process::CommandExt;
+
+        Command::new("ping.exe")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000 | 0x00000004)
+            .spawn()
+            .expect("spawn bounded Worker process fixture")
+    }
+
+    #[cfg(windows)]
+    fn worker_test_identity_guard() -> (tempfile::TempDir, worker_host::IdentityFileGuard) {
+        use sha2::{Digest, Sha256};
+
+        let directory = tempfile::tempdir().expect("Worker identity fixture");
+        let worker_dir = directory.path().join("worker");
+        std::fs::create_dir(&worker_dir).expect("create Worker directory");
+        let worker_id = "12345678-1234-4234-8234-123456789abc";
+        let marker = format!("{worker_id}\nENROLLED\n").into_bytes();
+        let protected_key = b"protected-key-fixture";
+        std::fs::write(worker_dir.join("worker_id"), &marker).expect("write marker");
+        std::fs::write(
+            worker_dir.join(format!("{worker_id}.device-key.dpapi")),
+            protected_key,
+        )
+        .expect("write protected key");
+        let binding = WorkerHostBinding {
+            executable: PathBuf::new(),
+            host_config: PathBuf::new(),
+            data_root: directory.path().to_path_buf(),
+            worker_id: worker_id.to_string(),
+            identity_marker_sha256: format!("{:x}", Sha256::digest(&marker)),
+            protected_key_sha256: format!("{:x}", Sha256::digest(protected_key)),
+        };
+        let guard = worker_host::guard_identity_files(&binding).expect("guard identity files");
+        (directory, guard)
+    }
+
+    #[cfg(windows)]
     fn runtime_with_provisioned_controller() -> (tempfile::TempDir, ControllerRuntime, u16) {
         runtime_with_provisioned_controller_at(std::net::Ipv4Addr::new(192, 0, 2, 10))
     }
@@ -1577,11 +1749,132 @@ mod tests {
     }
 
     #[test]
-    fn worker_mock_quit_keeps_fixed_orderly_control_path() {
-        let mut lifecycle = Lifecycle::StartingScheduler;
-        assert_eq!(lifecycle.label(), "starting_scheduler");
-        lifecycle = Lifecycle::Stopping;
-        assert_eq!(lifecycle.label(), "stopping");
+    fn worker_job_assignment_failure_has_a_fixed_diagnostic() {
+        assert_eq!(
+            worker_job_assignment(Err(())),
+            Err("worker_process_job_assign_failed")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_job_owns_the_process_until_parent_job_handle_closes() {
+        let mut child = spawn_test_worker_process();
+        let job = ProcessJob::new_worker().expect("create Worker Job Object");
+        assign_and_resume_worker(&job, &mut child).expect("assign and resume Worker");
+        assert!(child.try_wait().expect("check Worker process").is_none());
+
+        drop(job);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while Instant::now() < deadline {
+            if let Some(exited) = child.try_wait().expect("poll Worker exit") {
+                status = Some(exited);
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            status.is_some(),
+            "closing Desktop Job Object must stop Worker"
+        );
+        let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normal_worker_stop_does_not_use_the_job_object_kill_path() {
+        let mut child = spawn_test_worker_process();
+        let job = ProcessJob::new_worker().expect("create Worker Job Object");
+        assign_and_resume_worker(&job, &mut child).expect("assign and resume Worker");
+        let (_identity_directory, identity_guard) = worker_test_identity_guard();
+        let mut supervisor = Supervisor {
+            worker_ownership: Some(WorkerOwnership::Desktop),
+            worker_runtime: Some(WorkerRuntime {
+                child,
+                _job: job,
+                _identity_guard: identity_guard,
+            }),
+            ..Supervisor::default()
+        };
+
+        assert_eq!(
+            supervisor.stop(),
+            Err("worker_drain_unavailable".to_string())
+        );
+        assert!(supervisor
+            .worker_runtime
+            .as_mut()
+            .expect("Worker remains owned")
+            .child
+            .try_wait()
+            .expect("Worker remains live")
+            .is_none());
+        assert_eq!(
+            supervisor.snapshot().diagnostic_code,
+            Some("worker_drain_unavailable")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_process_lock_probe_does_not_create_lock_file() {
+        let directory = tempfile::tempdir().expect("Worker root");
+        std::fs::create_dir(directory.path().join("worker")).expect("create Worker directory");
+        let lock_path = directory.path().join("worker/agent.lock");
+
+        assert_eq!(
+            worker_host::process_lock_is_available(directory.path()),
+            Ok(())
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_held_worker_process_lock_blocks_desktop_spawn_without_modification() {
+        use std::{fs, io::Write};
+
+        let directory = tempfile::tempdir().expect("Worker root");
+        let worker = directory.path().join("worker");
+        fs::create_dir(&worker).expect("create Worker directory");
+        let path = worker.join("agent.lock");
+        fs::write(&path, b"0").expect("create existing process lock file");
+        let before = fs::read(&path).expect("snapshot process lock file");
+        let mut owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open process lock owner");
+        let handle = {
+            use std::os::windows::io::AsRawHandle;
+            owner.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+        };
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+            unsafe { std::mem::zeroed() };
+        let locked = unsafe {
+            windows_sys::Win32::Storage::FileSystem::LockFileEx(
+                handle,
+                windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        assert_ne!(locked, 0, "fixture acquires Worker process lock");
+        assert_eq!(
+            worker_host::process_lock_is_available(directory.path()),
+            Err("worker_process_lock_held")
+        );
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
+        }
+        assert_eq!(
+            fs::read(&path).expect("process lock remains identical"),
+            before
+        );
+        let _ = owner.flush();
     }
 
     #[test]

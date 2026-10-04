@@ -35,7 +35,23 @@ export interface DesktopSnapshot {
     endpoint: string | null;
     databasePort: number | null;
     diagnosticCode: string | null;
+    workerOwnership: "LEGACY" | "TAKEOVER_REQUIRED" | "DESKTOP" | "BLOCKED" | null;
+    legacyTaskState: "RUNNING" | "READY" | "DISABLED" | "INVALID" | "NOT_REGISTERED" | null;
+    workerId: string | null;
   };
+}
+
+export type WorkerDrainReason =
+  | "DESKTOP_QUIT"
+  | "DESKTOP_RESTART"
+  | "DESKTOP_LEGACY_CUTOVER"
+  | "DESKTOP_ROLLBACK";
+
+export interface WorkerDrainStatus {
+  status: string;
+  activeBrowserSessions: number;
+  runningWorkerJobs: number;
+  quiescent: boolean;
 }
 
 export type OperatorRole = "OWNER" | "ADMIN" | "OPERATOR" | "VIEWER";
@@ -101,6 +117,8 @@ export const DESKTOP_COMMANDS = [
   "operator_create_user",
   "operator_update_user",
   "operator_change_password",
+  "request_local_worker_drain",
+  "local_worker_drain_status",
   "controller_https_configure",
   "controller_https_reconfigure",
   "controller_https_summary",
@@ -181,6 +199,14 @@ export function operatorUpdateUser(
 
 export function operatorChangePassword(newPassword: string): Promise<OperatorIdentity> {
   return invoke<OperatorIdentity>("operator_change_password", { newPassword });
+}
+
+export function requestLocalWorkerDrain(reasonCode: WorkerDrainReason): Promise<WorkerDrainStatus> {
+  return invoke<WorkerDrainStatus>("request_local_worker_drain", { reasonCode });
+}
+
+export function localWorkerDrainStatus(): Promise<WorkerDrainStatus> {
+  return invoke<WorkerDrainStatus>("local_worker_drain_status");
 }
 
 export function controllerHttpsConfigure(

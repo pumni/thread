@@ -29,6 +29,9 @@ function snapshot(role: DesktopSnapshot["role"] = null): DesktopSnapshot {
       endpoint: role === "CONTROLLER" ? "https://127.0.0.1:8443" : null,
       databasePort: role === "CONTROLLER" ? 4247 : null,
       diagnosticCode: null,
+      workerOwnership: role === "WORKER" ? "BLOCKED" : null,
+      legacyTaskState: null,
+      workerId: null,
     },
   };
 }
@@ -90,6 +93,8 @@ describe("desktop provisioning", () => {
       "operator_create_user",
       "operator_update_user",
       "operator_change_password",
+      "request_local_worker_drain",
+      "local_worker_drain_status",
       "controller_https_configure",
       "controller_https_reconfigure",
       "controller_https_summary",
