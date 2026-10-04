@@ -331,6 +331,50 @@ function Find-Element(
     }
 }
 
+function Find-ElementByName(
+    [System.Windows.Automation.AutomationElement]$Root,
+    [string]$Name
+) {
+    if (-not $Root) { return $null }
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name
+    )
+    try {
+        return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
+    }
+}
+
+function Find-ElementByType(
+    [System.Windows.Automation.AutomationElement]$Root,
+    [System.Windows.Automation.ControlType]$ControlType
+) {
+    if (-not $Root) { return $null }
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ControlType
+    )
+    try {
+        return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    } catch {
+        if (Test-ElementUnavailable $_.Exception) { return $null }
+        throw
+    }
+}
+
+function Find-ElementByAllowedControlTypes(
+    [System.Windows.Automation.AutomationElement]$Root,
+    [string]$Name,
+    [System.Windows.Automation.ControlType[]]$ControlTypes
+) {
+    foreach ($controlType in $ControlTypes) {
+        $candidate = Find-Element $Root $Name $controlType
+        if ($candidate) { return $candidate }
+    }
+    return $null
+}
+
 function Get-ElementName([System.Windows.Automation.AutomationElement]$Element) {
     if (-not $Element) { return $null }
     try {
@@ -383,18 +427,58 @@ function Invoke-Button([int]$ProcessId, [string]$Name, [scriptblock]$BeforeInvok
     } 20 "desktop_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
-function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
+function Set-LoginInput {
+    param(
+        [int]$ProcessId,
+        [string]$Name,
+        [string]$Value,
+        [System.Windows.Automation.ControlType[]]$AllowedControlTypes = @(
+            [System.Windows.Automation.ControlType]::Edit
+        )
+    )
+
     $fieldId = [regex]::Replace($Name.Trim().ToLowerInvariant(), "[^a-z0-9]+", "_").Trim("_")
     if ([string]::IsNullOrWhiteSpace($fieldId)) { $fieldId = "unknown" }
     $inputUnavailableCode = "desktop_input_unavailable_$fieldId"
+    $isNumericPort = $fieldId -eq "https_port"
+    $expectedPort = 0
+    if ($isNumericPort -and -not [int]::TryParse(
+        $Value,
+        [System.Globalization.NumberStyles]::Integer,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref]$expectedPort
+    )) {
+        throw "desktop_input_expected_value_invalid_$fieldId"
+    }
+
     $resolvedInput = [pscustomobject]@{ Control = $null }
-    Wait-Until {
-        $candidate = Find-Element (Get-Window $ProcessId) $Name `
-            ([System.Windows.Automation.ControlType]::Edit)
-        if (-not $candidate) { return $false }
-        $resolvedInput.Control = $candidate
-        return $true
-    } 20 $inputUnavailableCode
+    try {
+        Wait-Until {
+            $candidate = Find-ElementByAllowedControlTypes `
+                (Get-Window $ProcessId) $Name $AllowedControlTypes
+            if (-not $candidate) { return $false }
+            $resolvedInput.Control = $candidate
+            return $true
+        } 20 $inputUnavailableCode
+    } catch {
+        if ($_.Exception.Message -eq $inputUnavailableCode) {
+            $namedControl = Find-ElementByName (Get-Window $ProcessId) $Name
+            if ($namedControl) {
+                $normalizedType = "unknown"
+                try {
+                    $controlTypeName = [string]$namedControl.Current.ControlType.ProgrammaticName
+                    $normalizedType = [regex]::Replace(
+                        $controlTypeName, "^ControlType\.", ""
+                    ).ToLowerInvariant()
+                    if ([string]::IsNullOrWhiteSpace($normalizedType)) {
+                        $normalizedType = "unknown"
+                    }
+                } catch { $normalizedType = "unknown" }
+                throw "desktop_input_unexpected_control_type_${fieldId}_${normalizedType}"
+            }
+        }
+        throw
+    }
 
     $inputControl = $resolvedInput.Control
     $inputControl.SetFocus()
@@ -402,13 +486,51 @@ function Set-LoginInput([int]$ProcessId, [string]$Name, [string]$Value) {
     [System.Windows.Forms.SendKeys]::SendWait($Value)
     if ($fieldId -ne "password") {
         Wait-Until {
-            $current = Find-Element (Get-Window $ProcessId) $Name `
-                ([System.Windows.Automation.ControlType]::Edit)
+            $current = Find-ElementByAllowedControlTypes `
+                (Get-Window $ProcessId) $Name $AllowedControlTypes
             if (-not $current) { return $false }
+
+            $controlTypeName = [string]$current.Current.ControlType.ProgrammaticName
+            if ($controlTypeName -eq "ControlType.Spinner") {
+                try {
+                    $rangePattern = $current.GetCurrentPattern(
+                        [System.Windows.Automation.RangeValuePattern]::Pattern
+                    )
+                    return [double]$rangePattern.Current.Value -eq [double]$expectedPort
+                } catch {
+                    $childEdit = Find-ElementByType $current `
+                        ([System.Windows.Automation.ControlType]::Edit)
+                    if (-not $childEdit) { return $false }
+                    try {
+                        $valuePattern = $childEdit.GetCurrentPattern(
+                            [System.Windows.Automation.ValuePattern]::Pattern
+                        )
+                        $actualPort = 0
+                        $parsedPort = [int]::TryParse(
+                            [string]$valuePattern.Current.Value,
+                            [System.Globalization.NumberStyles]::Integer,
+                            [System.Globalization.CultureInfo]::InvariantCulture,
+                            [ref]$actualPort
+                        )
+                        return $parsedPort -and $actualPort -eq $expectedPort
+                    } catch { return $false }
+                }
+            }
+
             try {
                 $valuePattern = $current.GetCurrentPattern(
                     [System.Windows.Automation.ValuePattern]::Pattern
                 )
+                if ($isNumericPort) {
+                    $actualPort = 0
+                    $parsedPort = [int]::TryParse(
+                        [string]$valuePattern.Current.Value,
+                        [System.Globalization.NumberStyles]::Integer,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [ref]$actualPort
+                    )
+                    return $parsedPort -and $actualPort -eq $expectedPort
+                }
                 return $valuePattern.Current.Value -ceq $Value
             } catch { return $false }
         } 5 "desktop_input_value_not_populated_$fieldId"
@@ -788,7 +910,14 @@ function Open-ControllerEndpointReconfiguration([int]$ProcessId) {
 
 function Set-ControllerEndpointFields([int]$ProcessId, [string]$Address, [int]$Port) {
     Set-LoginInput $ProcessId "Stable LAN IPv4 address" $Address
-    Set-LoginInput $ProcessId "HTTPS port" ([string]$Port)
+    Set-LoginInput `
+        -ProcessId $ProcessId `
+        -Name "HTTPS port" `
+        -Value ([string]$Port) `
+        -AllowedControlTypes @(
+            [System.Windows.Automation.ControlType]::Spinner,
+            [System.Windows.Automation.ControlType]::Edit
+        )
 }
 
 function Get-FileSha256([string]$Path) {

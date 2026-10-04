@@ -117,7 +117,7 @@ if ($normalWaitCommands.Count -ne 1 -or
     assert "process-authoritative Controller Quit assertion PASS" in completed.stdout
 
 
-def test_controller_login_input_waits_for_named_uia_edit() -> None:
+def test_controller_input_uia_types_are_bounded_and_password_is_not_read_back() -> None:
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell AST parser is only available on Windows test hosts")
@@ -132,13 +132,69 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
 )
 if ($parseErrors.Count -gt 0) {{ throw "Controller smoke script did not parse" }}
 
-$loginFunctions = @($ast.FindAll({{
+$functionNodes = @($ast.FindAll({{
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -eq 'Set-LoginInput'
+        $node.Name -in @('Set-LoginInput', 'Set-ControllerEndpointFields',
+            'Find-ElementByAllowedControlTypes', 'Find-ElementByName',
+            'Find-ElementByType')
 }}, $true))
-if ($loginFunctions.Count -ne 1) {{ throw "Expected one Set-LoginInput function" }}
-$loginBody = $loginFunctions[0].Body
+if ($functionNodes.Count -ne 5) {{ throw "Expected the focused Controller input helpers" }}
+$functions = @{{}}
+foreach ($functionNode in $functionNodes) {{ $functions[$functionNode.Name] = $functionNode }}
+$login = $functions['Set-LoginInput']
+$loginBody = $login.Body
+
+function Get-Commands($body, [string]$name) {{
+    @($body.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq $name
+    }}, $true))
+}}
+function Get-PatternCalls($body) {{
+    @($body.FindAll({{
+        param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $node.Member.Extent.Text -eq 'GetCurrentPattern'
+    }}, $true))
+}}
+
+$allowedParameter = @($loginBody.ParamBlock.Parameters | Where-Object {{
+    $_.Name.VariablePath.UserPath -eq 'AllowedControlTypes'
+}})
+if ($allowedParameter.Count -ne 1 -or
+    ($allowedParameter[0].DefaultValue.Extent.Text -replace '\s+', '') -ne
+        '@([System.Windows.Automation.ControlType]::Edit)') {{
+    throw "Default and text input control type must remain Edit-only"
+}}
+
+$allInputCalls = Get-Commands $ast 'Set-LoginInput'
+$customInputCalls = @($allInputCalls | Where-Object {{
+    $_.Extent.Text -match '-AllowedControlTypes'
+}})
+if ($customInputCalls.Count -ne 1 -or
+    $customInputCalls[0].Extent.Text -notmatch 'HTTPS port') {{
+    throw "Only the HTTPS port call may override allowed UIA control types"
+}}
+$portTypeNames = @([regex]::Matches(
+    $customInputCalls[0].Extent.Text, 'ControlType\]::(Spinner|Edit)'
+) | ForEach-Object {{ $_.Groups[1].Value }})
+if (($portTypeNames -join ',') -ne 'Spinner,Edit') {{
+    throw "HTTPS port must explicitly allow Spinner and Edit"
+}}
+
+$endpointBody = $functions['Set-ControllerEndpointFields'].Body
+$endpointCalls = Get-Commands $endpointBody 'Set-LoginInput'
+$addressCall = @(
+    $endpointCalls | Where-Object {{ $_.Extent.Text -match 'Stable LAN IPv4 address' }}
+)
+$portCall = @($endpointCalls | Where-Object {{ $_.Extent.Text -match 'HTTPS port' }})
+if ($addressCall.Count -ne 1 -or $addressCall[0].Extent.Text -match '-AllowedControlTypes' -or
+    $portCall.Count -ne 1 -or $portCall[0].Extent.Text -notmatch '-AllowedControlTypes') {{
+    throw "Endpoint inputs must keep IPv4 on Edit and set explicit port types"
+}}
+
 $commands = @($loginBody.FindAll({{
     param($node) $node -is [System.Management.Automation.Language.CommandAst]
 }}, $true))
@@ -149,27 +205,74 @@ $sendCalls = @($loginBody.FindAll({{
     $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
         $node.Member.Extent.Text -eq 'SendWait'
 }}, $true))
-if ($waitCalls.Count -lt 2 -or $sendCalls.Count -ne 2 -or
+if ($waitCalls.Count -ne 2 -or $sendCalls.Count -ne 2 -or
     $waitCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset) {{
-    throw "Login input must wait for its Edit control before sending keys"
+    throw "Input must use bounded UIA lookup before keyboard mutation"
 }}
-$editCondition = $waitCalls[0].CommandElements[1].ScriptBlock
-$editLookups = @($editCondition.FindAll({{
-    param($node)
-    $node -is [System.Management.Automation.Language.CommandAst] -and
-        $node.GetCommandName() -eq 'Find-Element'
-}}, $true))
-if ($editLookups.Count -ne 1 -or
+$allowedLookups = Get-Commands $loginBody 'Find-ElementByAllowedControlTypes'
+if ($allowedLookups.Count -ne 2 -or
     $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode') {{
-    throw "Named Edit lookup must use the bounded field-specific wait"
+    throw "Allowed exact-name UIA types must use the bounded field-specific lookup"
 }}
-$bodyText = $loginBody.Extent.Text
-if ($bodyText -notmatch '\$fieldId\s*=\s*\[regex\]::Replace' -or
-    $bodyText -notmatch 'desktop_input_unavailable_\$fieldId' -or
-    $bodyText -notmatch '\$fieldId\s*-ne\s*"password"') {{
-    throw "Input diagnostics must be normalized and password values must not be verified"
+$inputHelper = $functions['Find-ElementByAllowedControlTypes'].Body.Extent.Text
+if ($inputHelper -notmatch 'foreach\s*\(\s*\$controlType\s+in\s+\$ControlTypes\s*\)' -or
+    $inputHelper -notmatch 'Find-Element\s+\$Root\s+\$Name\s+\$controlType') {{
+    throw "Allowed lookup must pair the exact name with each caller-approved type"
 }}
-"Bounded Controller login input assertion PASS"
+
+$passwordGate = @($loginBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -match '\$fieldId\s*-ne\s*"password"'
+}}, $true))
+$verificationText = if ($passwordGate.Count -eq 1) {{ $passwordGate[0].Extent.Text }} else {{ '' }}
+if ($passwordGate.Count -ne 1 -or
+    $verificationText -notmatch '\[System\.Windows\.Automation\.RangeValuePattern\]::Pattern' -or
+    $verificationText -notmatch '\[System\.Windows\.Automation\.ValuePattern\]::Pattern' -or
+    $verificationText -notmatch '\[int\]::TryParse' -or
+    $verificationText -notmatch 'RangeValuePattern' -or
+    $verificationText -notmatch 'desktop_input_value_not_populated_\$fieldId') {{
+    throw "Non-secret read-back must be type-specific, numeric-safe, and password-gated"
+}}
+$spinnerBranch = @($passwordGate[0].FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -match '\$controlTypeName\s*-eq\s*"ControlType\.Spinner"'
+}}, $true))
+if ($spinnerBranch.Count -ne 1 -or
+    $spinnerBranch[0].Extent.Text -notmatch '\[double\]\$rangePattern\.Current\.Value' -or
+    $spinnerBranch[0].Extent.Text -notmatch 'Find-ElementByType\s+\$current' -or
+    $spinnerBranch[0].Extent.Text -notmatch '\[System\.Windows\.Automation\.ControlType\]::Edit') {{
+    throw "Spinner must verify RangeValue and keep any Edit fallback inside the named spinner"
+}}
+
+$namedTypeLookups = Get-Commands $loginBody 'Find-ElementByName'
+$diagnosticCatches = @($loginBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.CatchClauseAst] -and
+    (Get-Commands $node.Body 'Find-ElementByName').Count -eq 1
+}}, $true))
+$expectedFieldType = '$' + '{{fieldId}}_$' + '{{normalizedType}}'
+$expectedTypeCode = 'desktop_input_unexpected_control_type_' + $expectedFieldType
+if ($namedTypeLookups.Count -ne 1 -or $diagnosticCatches.Count -ne 1 -or
+    -not $diagnosticCatches[0].Extent.Text.Contains($expectedTypeCode) -or
+    $functions['Find-ElementByName'].Body.Extent.Text -notmatch '(?s)NameProperty.*\$Name') {{
+    throw "Untyped exact-name lookup must be diagnostic-only with a sanitized type error"
+}}
+$childTypeLookups = Get-Commands $loginBody 'Find-ElementByType'
+if ($childTypeLookups.Count -ne 1 -or
+    $childTypeLookups[0].Extent.StartOffset -lt $spinnerBranch[0].Extent.StartOffset -or
+    $childTypeLookups[0].Extent.EndOffset -gt $spinnerBranch[0].Extent.EndOffset) {{
+    throw "Edit fallback must remain scoped to the exact named Spinner"
+}}
+
+$allPatternReads = Get-PatternCalls $loginBody
+$gatedPatternReads = Get-PatternCalls $passwordGate[0].Clauses[0].Item2
+if ($allPatternReads.Count -ne $gatedPatternReads.Count -or
+    $allPatternReads.Count -lt 3) {{
+    throw "Password must remain exempt from all UIA value-pattern read-back"
+}}
+"Typed bounded Controller input assertion PASS"
 """
     completed = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
@@ -180,7 +283,7 @@ if ($bodyText -notmatch '\$fieldId\s*=\s*\[regex\]::Replace' -or
     )
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
-    assert "Bounded Controller login input assertion PASS" in completed.stdout
+    assert "Typed bounded Controller input assertion PASS" in completed.stdout
 
 
 def _load_verifier() -> ModuleType:
