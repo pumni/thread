@@ -494,8 +494,8 @@ public static class ThreadsDesktopSmokeCertificateVerifier
 function Test-PlaintextHttpRejected([int]$Port) {
     $client = [System.Net.Sockets.TcpClient]::new()
     try {
-        $client.ReceiveTimeout = 1_000
-        $client.SendTimeout = 1_000
+        $client.ReceiveTimeout = 1000
+        $client.SendTimeout = 1000
         $client.Connect([System.Net.IPAddress]::Loopback, $Port)
         $stream = $client.GetStream()
         $request = [System.Text.Encoding]::ASCII.GetBytes(

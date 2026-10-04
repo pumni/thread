@@ -785,8 +785,8 @@ function Test-ControllerHttps([object]$Config) {
 function Test-PlaintextHttpRejected([object]$Config) {
     $client = [System.Net.Sockets.TcpClient]::new()
     try {
-        $client.ReceiveTimeout = 1_000
-        $client.SendTimeout = 1_000
+        $client.ReceiveTimeout = 1000
+        $client.SendTimeout = 1000
         $client.Connect([Net.IPAddress]::Loopback, [int]$Config.endpointPort)
         $stream = $client.GetStream()
         $request = [Text.Encoding]::ASCII.GetBytes(
