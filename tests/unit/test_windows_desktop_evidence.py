@@ -844,6 +844,140 @@ def test_controller_session_timeline_is_separate_and_covers_lifecycle_transition
     assert "operator_session_timeline = @($operatorSessionTimeline)" in source
 
 
+def test_controller_runtime_identity_baselines_are_phase_scoped() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell runtime identity test is only available on Windows test hosts")
+
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    helpers = source[
+        source.index("function Add-ControllerRuntimeIdentitySnapshot") : source.index(
+            "function Wait-ForDesktopParentExit"
+        )
+    ]
+    assertion = f"""
+$script:controllerRuntimeIdentityTimeline = [System.Collections.Generic.List[object]]::new()
+{helpers}
+function New-OwnedProcesses([int]$Postgres, [int]$Http, [int]$Scheduler) {{
+    return [pscustomobject]@{{
+        postgres = @([pscustomobject]@{{ ProcessId = $Postgres }})
+        http = @([pscustomobject]@{{ ProcessId = $Http }})
+        scheduler = @([pscustomobject]@{{ ProcessId = $Scheduler }})
+    }}
+}}
+function New-ControllerConfig([int]$Port) {{
+    return [pscustomobject]@{{
+        controllerId = 'controller-identity'
+        lanAddress = '192.0.2.10'
+        endpointPort = $Port
+    }}
+}}
+$initial = Add-ControllerRuntimeIdentitySnapshot 'after_owner_bootstrap' `
+    (New-OwnedProcesses 100 200 300) (New-ControllerConfig 52030)
+$cutover = Add-ControllerRuntimeIdentitySnapshot 'after_endpoint_cutover' `
+    (New-OwnedProcesses 100 201 301) (New-ControllerConfig 52105)
+Assert-ControllerRuntimeIdentityCutover $initial $cutover
+$hidden = Add-ControllerRuntimeIdentitySnapshot 'after_window_hide' `
+    (New-OwnedProcesses 100 201 301) (New-ControllerConfig 52105)
+Assert-ControllerRuntimeIdentityContinuity $cutover $hidden 'hide_identity_changed'
+$reopen = Add-ControllerRuntimeIdentitySnapshot 'after_tray_reopen' `
+    (New-OwnedProcesses 100 201 301) (New-ControllerConfig 52105)
+Assert-ControllerRuntimeIdentityContinuity $cutover $reopen 'reopen_identity_changed'
+$staleInitialRejected = $false
+try {{
+    Assert-ControllerRuntimeIdentityContinuity $initial $reopen 'stale_initial_baseline_accepted'
+}} catch {{
+    if ($_.Exception.Message -ceq 'stale_initial_baseline_accepted') {{
+        $staleInitialRejected = $true
+    }} else {{
+        throw
+    }}
+}}
+if (-not $staleInitialRejected -or $initial.http_pid -ne 200 -or $initial.scheduler_pid -ne 300) {{
+    throw 'phase_specific_process_baseline_invalid'
+}}
+[Console]::WriteLine((ConvertTo-Json `
+    -InputObject @($script:controllerRuntimeIdentityTimeline.ToArray()) -Depth 6 -Compress))
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    timeline = json.loads(completed.stdout.strip())
+    assert [entry["stage"] for entry in timeline] == [
+        "after_owner_bootstrap",
+        "after_endpoint_cutover",
+        "after_window_hide",
+        "after_tray_reopen",
+    ]
+    assert [entry["postgres_pid"] for entry in timeline] == [100, 100, 100, 100]
+    assert [entry["http_pid"] for entry in timeline] == [200, 201, 201, 201]
+    assert [entry["scheduler_pid"] for entry in timeline] == [300, 301, 301, 301]
+    assert [entry["endpoint_port"] for entry in timeline] == [52030, 52105, 52105, 52105]
+
+
+def test_controller_runtime_identity_calls_use_phase_baselines() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    normalized = re.sub(r"`[ \t]*\r?\n[ \t]*", " ", source)
+
+    stages = (
+        "after_owner_bootstrap",
+        "after_endpoint_cutover",
+        "after_window_hide",
+        "after_tray_reopen",
+    )
+    stage_positions: list[int] = []
+    for stage in stages:
+        match = re.search(
+            rf'Add-ControllerRuntimeIdentitySnapshot[ \t]*`[ \t]*\r?\n[ \t]*"{stage}"',
+            source,
+        )
+        assert match is not None, stage
+        stage_positions.append(match.start())
+    assert stage_positions == sorted(stage_positions)
+    assert (
+        "Assert-ControllerRuntimeIdentityCutover $initialRuntimeIdentity "
+        "$postCutoverRuntimeIdentity" in normalized
+    )
+    assert re.search(
+        r"Assert-ControllerRuntimeIdentityContinuity \$postCutoverRuntimeIdentity "
+        r"[ \t]*`[ \t]*\r?\n[ \t]*\$windowHideRuntimeIdentity "
+        r'"controller_window_hide_changed_runtime_identity"',
+        source,
+    )
+    assert re.search(
+        r"Assert-ControllerRuntimeIdentityContinuity \$postCutoverRuntimeIdentity "
+        r"[ \t]*`[ \t]*\r?\n[ \t]*\$trayReopenRuntimeIdentity "
+        r'"controller_reopen_changed_runtime_identity"',
+        source,
+    )
+
+    shutdown = source[
+        source.index("$shutdownProcesses = @{") : source.index(
+            "if ($shutdownProcesses.Values -contains $null)",
+            source.index("$shutdownProcesses = @{"),
+        )
+    ]
+    assert "$trayReopenRuntimeIdentity.scheduler_pid" in shutdown
+    assert "$trayReopenRuntimeIdentity.http_pid" in shutdown
+    assert "$trayReopenRuntimeIdentity.postgres_pid" in shutdown
+    assert "$initial" not in shutdown
+    assert "$httpPid" not in shutdown and "$schedulerPid" not in shutdown
+
+    for field, variable in (
+        ("initial_postgres_pid", "$initialPostgresPid"),
+        ("initial_http_pid", "$initialHttpPid"),
+        ("initial_scheduler_pid", "$initialSchedulerPid"),
+    ):
+        assert f"{field} = {variable}" in source
+    assert "controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)" in source
+
+
 def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_right_boundary() -> (
     None
 ):

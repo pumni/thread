@@ -155,6 +155,7 @@ $script:smokeOwnerUsername = "dx05owner" + [Guid]::NewGuid().ToString("N").Subst
 $script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
 $processEvidence = [ordered]@{}
 $operatorSessionTimeline = [System.Collections.Generic.List[object]]::new()
+$controllerRuntimeIdentityTimeline = [System.Collections.Generic.List[object]]::new()
 $rootWasMoved = $false
 $parentCrashPids = @()
 $parentCrashProcesses = @()
@@ -976,6 +977,50 @@ function Assert-ControllerProcesses {
     return $owned
 }
 
+function Add-ControllerRuntimeIdentitySnapshot(
+    [string]$Stage,
+    [object]$Owned,
+    [object]$Config
+) {
+    $snapshot = [pscustomobject][ordered]@{
+        stage = $Stage
+        postgres_pid = [int]$Owned.postgres[0].ProcessId
+        http_pid = [int]$Owned.http[0].ProcessId
+        scheduler_pid = [int]$Owned.scheduler[0].ProcessId
+        controller_id = [string]$Config.controllerId
+        lan_address = [string]$Config.lanAddress
+        endpoint_port = [int]$Config.endpointPort
+    }
+    $script:controllerRuntimeIdentityTimeline.Add($snapshot)
+    return $snapshot
+}
+
+function Assert-ControllerRuntimeIdentityCutover([object]$Initial, [object]$Cutover) {
+    if ([int]$Cutover.postgres_pid -ne [int]$Initial.postgres_pid -or
+        [int]$Cutover.http_pid -eq [int]$Initial.http_pid -or
+        [int]$Cutover.scheduler_pid -eq [int]$Initial.scheduler_pid -or
+        [string]$Cutover.controller_id -cne [string]$Initial.controller_id -or
+        ([string]$Cutover.lan_address -ceq [string]$Initial.lan_address -and
+            [int]$Cutover.endpoint_port -eq [int]$Initial.endpoint_port)) {
+        throw "controller_running_endpoint_transition_invalid"
+    }
+}
+
+function Assert-ControllerRuntimeIdentityContinuity(
+    [object]$Expected,
+    [object]$Observed,
+    [string]$FailureCode
+) {
+    if ([int]$Observed.postgres_pid -ne [int]$Expected.postgres_pid -or
+        [int]$Observed.http_pid -ne [int]$Expected.http_pid -or
+        [int]$Observed.scheduler_pid -ne [int]$Expected.scheduler_pid -or
+        [string]$Observed.controller_id -cne [string]$Expected.controller_id -or
+        [string]$Observed.lan_address -cne [string]$Expected.lan_address -or
+        [int]$Observed.endpoint_port -ne [int]$Expected.endpoint_port) {
+        throw $FailureCode
+    }
+}
+
 function Wait-ForDesktopParentExit([int]$ProcessId) {
     Wait-Until {
         $desktopProcess = Get-ProcessIfPresent $ProcessId
@@ -1717,10 +1762,14 @@ try {
     }
     $checks.plaintext_health_rejected = $true
     $owned = Assert-ControllerProcesses
-    $httpPid = [int]$owned.http[0].ProcessId
-    $schedulerPid = [int]$owned.scheduler[0].ProcessId
-    $postgresPid = [int]$owned.postgres[0].ProcessId
-    if ($httpPid -eq $schedulerPid) { throw "controller_http_scheduler_process_collapsed" }
+    $initialRuntimeIdentity = Add-ControllerRuntimeIdentitySnapshot `
+        "after_owner_bootstrap" $owned $config
+    $initialHttpPid = [int]$initialRuntimeIdentity.http_pid
+    $initialSchedulerPid = [int]$initialRuntimeIdentity.scheduler_pid
+    $initialPostgresPid = [int]$initialRuntimeIdentity.postgres_pid
+    if ($initialHttpPid -eq $initialSchedulerPid) {
+        throw "controller_http_scheduler_process_collapsed"
+    }
     $checks.separate_http_and_scheduler_processes = $true
     $dbListeners = @(Get-ListenerAddresses ([int]$config.databasePort))
     $httpListeners = @(Get-ListenerAddresses ([int]$config.endpointPort))
@@ -1837,15 +1886,15 @@ try {
         $leafAfterEndpointChange = Get-FileSha256 $leafCertificatePath
         if ($rootAfterEndpointChange -cne $rootBeforeEndpointChange -or
             $leafAfterEndpointChange -ceq $leafBeforeEndpointChange -or
-            [int]$newProcesses.postgres[0].ProcessId -ne $oldPostgresPid -or
-            [int]$newProcesses.http[0].ProcessId -eq $oldHttpPid -or
-            [int]$newProcesses.scheduler[0].ProcessId -eq $oldSchedulerPid -or
             $schedulerExited -ge $httpExited -or $newSchedulerStart -lt $newHttpStart -or
             @(Get-ListenerAddresses $oldHttpsPort).Count -ne 0 -or
             (Get-ListenerAddresses $newHttpsPort).Count -ne 1 -or
             -not (Test-PlaintextHttpRejected $config)) {
             throw "controller_running_endpoint_transition_invalid"
         }
+        $postCutoverRuntimeIdentity = Add-ControllerRuntimeIdentitySnapshot `
+            "after_endpoint_cutover" $newProcesses $config
+        Assert-ControllerRuntimeIdentityCutover $initialRuntimeIdentity $postCutoverRuntimeIdentity
         $checks.endpoint_running_transition_preserves_postgres = $true
         $checks.plaintext_health_rejected = $true
         Ensure-ControllerOwner $desktop.Id "cutover_relogin" `
@@ -1870,6 +1919,11 @@ try {
             $current.scheduler.Count -eq 1
     } 15 "controller_runtime_stopped_when_window_hidden"
     $null = Wait-ForControllerHttps $config 5
+    $hiddenProcesses = Assert-ControllerProcesses
+    $windowHideRuntimeIdentity = Add-ControllerRuntimeIdentitySnapshot `
+        "after_window_hide" $hiddenProcesses $config
+    Assert-ControllerRuntimeIdentityContinuity $postCutoverRuntimeIdentity `
+        $windowHideRuntimeIdentity "controller_window_hide_changed_runtime_identity"
     $null = Wait-ForOperatorSessionCount `
         $config "window_hide_lock" 0 15 "controller_owner_session_not_revoked_on_lock"
     Assert-DatabaseValue $config $sentinel
@@ -1891,18 +1945,17 @@ try {
     Ensure-ControllerOwner $desktop.Id "reopen_after_login" -ForceReauthentication
     $checks.owner_reauthenticated_after_reopen = $true
     $owned = Assert-ControllerProcesses
-    if ([int]$owned.postgres[0].ProcessId -ne $postgresPid -or
-        [int]$owned.http[0].ProcessId -ne $httpPid -or
-        [int]$owned.scheduler[0].ProcessId -ne $schedulerPid -or
-        (Get-ControllerConfig).controllerId -cne $controllerIdentity) {
-        throw "controller_reopen_changed_runtime_identity"
-    }
+    $trayReopenRuntimeIdentity = Add-ControllerRuntimeIdentitySnapshot `
+        "after_tray_reopen" $owned (Get-ControllerConfig)
+    Assert-ControllerRuntimeIdentityContinuity $postCutoverRuntimeIdentity `
+        $trayReopenRuntimeIdentity "controller_reopen_changed_runtime_identity"
     $checks.reopen_keeps_one_runtime_and_database_identity = $true
 
     $shutdownProcesses = @{
-        scheduler = Get-TrackedProcess $schedulerPid $runtimeExecutable
-        http = Get-TrackedProcess $httpPid $runtimeExecutable
-        postgres = Get-TrackedProcess $postgresPid (Join-Path $postgresBin "postgres.exe")
+        scheduler = Get-TrackedProcess ([int]$trayReopenRuntimeIdentity.scheduler_pid) $runtimeExecutable
+        http = Get-TrackedProcess ([int]$trayReopenRuntimeIdentity.http_pid) $runtimeExecutable
+        postgres = Get-TrackedProcess ([int]$trayReopenRuntimeIdentity.postgres_pid) `
+            (Join-Path $postgresBin "postgres.exe")
     }
     if ($shutdownProcesses.Values -contains $null) {
         foreach ($process in $shutdownProcesses.Values) { if ($process) { $process.Dispose() } }
@@ -2181,9 +2234,15 @@ try {
 
     $postOwnerRuntimeProbe = $processEvidence["post_owner_runtime_probe"]
     $processEvidence = [ordered]@{
-        initial_postgres_pid = $postgresPid
-        initial_http_pid = $httpPid
-        initial_scheduler_pid = $schedulerPid
+        initial_postgres_pid = $initialPostgresPid
+        initial_http_pid = $initialHttpPid
+        initial_scheduler_pid = $initialSchedulerPid
+        post_cutover_postgres_pid = $postCutoverRuntimeIdentity.postgres_pid
+        post_cutover_http_pid = $postCutoverRuntimeIdentity.http_pid
+        post_cutover_scheduler_pid = $postCutoverRuntimeIdentity.scheduler_pid
+        tray_reopen_postgres_pid = $trayReopenRuntimeIdentity.postgres_pid
+        tray_reopen_http_pid = $trayReopenRuntimeIdentity.http_pid
+        tray_reopen_scheduler_pid = $trayReopenRuntimeIdentity.scheduler_pid
         parent_crash_runtime_pids = $parentCrashPids
         controller_id = $controllerIdentity
         database_system_identifier = $databaseSystemIdentifier
@@ -2283,6 +2342,7 @@ try {
         checks = $checks
         process_evidence = $processEvidence
         operator_session_timeline = @($operatorSessionTimeline)
+        controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)
         result = $result
         failure_code = $failureCode
         failure_codes = @($failureCodes)
