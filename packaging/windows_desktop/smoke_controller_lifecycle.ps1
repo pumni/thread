@@ -688,12 +688,25 @@ function Test-ResolvedInputValue(
     [string]$ExpectedValue,
     [int]$ExpectedPort
 ) {
-    $current = & $ResolveControl
+    $current = $null
+    try { $current = & $ResolveControl } catch { }
     if (-not $current) {
-        return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+        return [pscustomobject]@{
+            Matched = $false
+            ValueObserved = $false
+            ObservedLength = $null
+        }
     }
 
-    $controlTypeName = [string]$current.Current.ControlType.ProgrammaticName
+    $controlTypeName = $null
+    try { $controlTypeName = [string]$current.Current.ControlType.ProgrammaticName } catch { }
+    if (-not $controlTypeName) {
+        return [pscustomobject]@{
+            Matched = $false
+            ValueObserved = $false
+            ObservedLength = $null
+        }
+    }
     if ($controlTypeName -eq "ControlType.Spinner") {
         try {
             $rangePattern = $current.GetCurrentPattern(
@@ -701,13 +714,18 @@ function Test-ResolvedInputValue(
             )
             return [pscustomobject]@{
                 Matched = [double]$rangePattern.Current.Value -eq [double]$ExpectedPort
+                ValueObserved = $true
                 ObservedLength = $null
             }
         } catch {
             $childEdit = Find-ElementByType $current `
                 ([System.Windows.Automation.ControlType]::Edit)
             if (-not $childEdit) {
-                return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+                return [pscustomobject]@{
+                    Matched = $false
+                    ValueObserved = $false
+                    ObservedLength = $null
+                }
             }
             try {
                 $valuePattern = $childEdit.GetCurrentPattern(
@@ -722,10 +740,15 @@ function Test-ResolvedInputValue(
                 )
                 return [pscustomobject]@{
                     Matched = $parsedPort -and $actualPort -eq $ExpectedPort
+                    ValueObserved = $true
                     ObservedLength = $null
                 }
             } catch {
-                return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+                return [pscustomobject]@{
+                    Matched = $false
+                    ValueObserved = $false
+                    ObservedLength = $null
+                }
             }
         }
     }
@@ -745,6 +768,7 @@ function Test-ResolvedInputValue(
             )
             return [pscustomobject]@{
                 Matched = $parsedPort -and $actualPort -eq $ExpectedPort
+                ValueObserved = $true
                 ObservedLength = $null
             }
         }
@@ -754,10 +778,15 @@ function Test-ResolvedInputValue(
                 $ExpectedValue,
                 [System.StringComparison]::Ordinal
             )
+            ValueObserved = $true
             ObservedLength = if ($FieldId -eq "username") { $actualValue.Length } else { $null }
         }
     } catch {
-        return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+        return [pscustomobject]@{
+            Matched = $false
+            ValueObserved = $false
+            ObservedLength = $null
+        }
     }
 }
 
@@ -779,7 +808,11 @@ function Invoke-ResolvedInputMutation {
         programmatic_set_attempted = $false
         programmatic_set_succeeded = $null
         programmatic_failure_code = $null
+        programmatic_verification_observed = $false
         programmatic_verification_succeeded = $null
+        programmatic_verification_timed_out = $false
+        fallback_control_reacquired = $false
+        fallback_control_type = $null
         focus_requested = $false
         focus_confirmed = $false
         verification_performed = $false
@@ -825,25 +858,40 @@ function Invoke-ResolvedInputMutation {
                     "desktop_input_value_pattern_set_failed_$FieldId"
             }
             if ($setSucceeded) {
-                $programmaticVerification = $null
-                try {
-                    $programmaticVerification = Test-ResolvedInputValue `
-                        $ResolveControl $FieldId $Value $ExpectedPort
-                } catch { }
-                $record.verification_performed = $true
-                $record.programmatic_verification_succeeded = [bool](
-                    $programmaticVerification -and $programmaticVerification.Matched
-                )
-                $record.verification_succeeded = $record.programmatic_verification_succeeded
-                if ($programmaticVerification) {
-                    $record.observed_value_length = $programmaticVerification.ObservedLength
+                $programmaticVerification = [pscustomobject]@{
+                    Value = $null
+                    ValueObserved = $false
                 }
-                if ($record.programmatic_verification_succeeded) {
+                try {
+                    Wait-Until {
+                        $programmaticVerification.Value = Test-ResolvedInputValue `
+                            $ResolveControl $FieldId $Value $ExpectedPort
+                        if ($programmaticVerification.Value.ValueObserved) {
+                            $programmaticVerification.ValueObserved = $true
+                        }
+                        return [bool]$programmaticVerification.Value.Matched
+                    } 3 "desktop_input_value_not_populated_$FieldId"
+                    $record.programmatic_verification_observed = $true
+                    $record.programmatic_verification_succeeded = $true
+                    $record.verification_performed = $true
+                    $record.verification_succeeded = $true
+                    $record.observed_value_length = $programmaticVerification.Value.ObservedLength
                     Add-InputMutationEvidence $record
                     return
+                } catch {
+                    $record.programmatic_verification_observed = `
+                        [bool]$programmaticVerification.ValueObserved
+                    $record.programmatic_verification_succeeded = $false
+                    $record.programmatic_verification_timed_out = $true
+                    $record.verification_performed = $true
+                    $record.verification_succeeded = $false
+                    $record.programmatic_failure_code = `
+                        "desktop_input_value_not_populated_$FieldId"
+                    if ($programmaticVerification.Value) {
+                        $record.observed_value_length = `
+                            $programmaticVerification.Value.ObservedLength
+                    }
                 }
-                $record.programmatic_failure_code = `
-                    "desktop_input_value_not_populated_$FieldId"
             } else {
                 $record.programmatic_verification_succeeded = $false
             }
@@ -851,14 +899,26 @@ function Invoke-ResolvedInputMutation {
     }
 
     $record.mutation_method = "KEYBOARD"
+    $fallbackControl = $null
+    try { $fallbackControl = & $ResolveControl } catch { }
+    if (-not $fallbackControl) {
+        $record.failure_code = "desktop_input_keyboard_fallback_control_unavailable_$FieldId"
+        Add-InputMutationEvidence $record
+        throw $record.failure_code
+    }
+    $record.fallback_control_reacquired = $true
+    try {
+        $record.fallback_control_type = [string]$fallbackControl.Current.ControlType.ProgrammaticName
+    } catch { }
     $record.focus_requested = $true
-    try { $control.SetFocus() } catch { }
+    try { $fallbackControl.SetFocus() } catch { }
     $focusAcquired = $false
     try {
         Wait-Until {
-            $focusedControl = & $ResolveControl
+            $focusedControl = $null
+            try { $focusedControl = & $ResolveControl } catch { }
             if (-not $focusedControl) { return $false }
-            return [bool]$focusedControl.Current.HasKeyboardFocus
+            try { return [bool]$focusedControl.Current.HasKeyboardFocus } catch { return $false }
         } 5 "desktop_input_focus_not_acquired_$FieldId"
         $focusAcquired = $true
     } catch { }

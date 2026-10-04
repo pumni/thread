@@ -336,14 +336,26 @@ $keyboardCalls = @($mutationCommands | Where-Object {{
 }})
 $mutationFocusCalls = Get-Invocations $mutationBody 'SetFocus'
 $setValueCalls = Get-Invocations $mutationBody 'SetValue'
-if ($mutationWaits.Count -ne 2 -or $keyboardCalls.Count -ne 1 -or
+$programmaticWaitFailurePattern = '\}}\s+3\s+"desktop_input_value_not_populated_\$FieldId"'
+$fallbackReacquireOffset = $mutationBody.Extent.Text.IndexOf(
+    '$fallbackControl = & $ResolveControl'
+)
+$fallbackFocusOffset = $mutationBody.Extent.Text.IndexOf('$fallbackControl.SetFocus()')
+if ($mutationWaits.Count -ne 3 -or $keyboardCalls.Count -ne 1 -or
     $mutationFocusCalls.Count -ne 1 -or $setValueCalls.Count -ne 1 -or
-    $mutationFocusCalls[0].Extent.StartOffset -ge $mutationWaits[0].Extent.StartOffset -or
-    $mutationWaits[0].Extent.StartOffset -ge $keyboardCalls[0].Extent.StartOffset -or
-    $keyboardCalls[0].Extent.StartOffset -ge $mutationWaits[1].Extent.StartOffset -or
+    $setValueCalls[0].Extent.StartOffset -ge $mutationWaits[0].Extent.StartOffset -or
+    $mutationWaits[0].Extent.Text -notmatch $programmaticWaitFailurePattern -or
+    $mutationWaits[0].Extent.Text -match '\.SetValue\(' -or
+    $fallbackReacquireOffset -lt 0 -or $fallbackFocusOffset -lt 0 -or
+    $fallbackReacquireOffset -ge $fallbackFocusOffset -or
+    $mutationBody.Extent.Text -match '\$control\.SetFocus\(' -or
+    $mutationFocusCalls[0].Expression.Extent.Text -ne '$fallbackControl' -or
+    $mutationFocusCalls[0].Extent.StartOffset -ge $mutationWaits[1].Extent.StartOffset -or
+    $mutationWaits[1].Extent.StartOffset -ge $keyboardCalls[0].Extent.StartOffset -or
+    $keyboardCalls[0].Extent.StartOffset -ge $mutationWaits[2].Extent.StartOffset -or
     $mutationBody.Extent.Text -notmatch 'desktop_input_focus_not_acquired_\$FieldId' -or
     $mutationBody.Extent.Text -notmatch 'HasKeyboardFocus') {{
-    throw "Keyboard fallback must prove focus before typing and verify afterward"
+    throw "Input mutation or fallback ordering is invalid"
 }}
 $programmaticGate = @($mutationBody.FindAll({{
     param($node)
@@ -495,19 +507,21 @@ if ($helperNodes.Count -ne $helperNames.Count) {{ throw "Input mutation helpers 
 foreach ($helperNode in $helperNodes) {{ Invoke-Expression $helperNode.Extent.Text }}
 
 function Wait-Until([scriptblock]$Condition, [int]$TimeoutSeconds, [string]$Failure) {{
-    if (& $Condition) {{ return }}
+    for ($attempt = 0; $attempt -lt ($TimeoutSeconds * 4); $attempt++) {{
+        if (& $Condition) {{ return }}
+    }}
     throw $Failure
 }}
 function Find-ElementByType($Root, $ControlType) {{ return $null }}
 function Send-InputKeyboardValue([string]$Value) {{
-    if (-not $script:activeControl.Current.HasKeyboardFocus) {{
+    if (-not $script:focusedControl -or -not $script:focusedControl.Current.HasKeyboardFocus) {{
         throw 'synthetic focus invariant failed'
     }}
     $script:sendCount++
     if ($script:keyboardCorrupt) {{
-        $script:activeControl.ValuePattern.Current.Value = 'different'
+        $script:focusedControl.ValuePattern.Current.Value = 'different'
     }} else {{
-        $script:activeControl.ValuePattern.Current.Value = $Value
+        $script:focusedControl.ValuePattern.Current.Value = $Value
     }}
 }}
 function New-FakeControl(
@@ -524,6 +538,15 @@ function New-FakeControl(
         param([string]$NewValue)
         $this.SetCount++
         if ($this.Mode -eq 'throw_set') {{ throw 'synthetic pattern failure' }}
+        if ($this.Mode -eq 'delayed') {{
+            $this.PendingValue = $NewValue
+            $this.ReadCount = 0
+            return
+        }}
+        if ($this.Mode -eq 'replace') {{
+            $script:activeControl = $script:replacementControl
+            return
+        }}
         if ($this.Mode -eq 'mismatch') {{
             $this.Current.Value = $NewValue.ToUpperInvariant()
         }} else {{
@@ -541,6 +564,8 @@ function New-FakeControl(
             HasKeyboardFocus = $false
         }}
     }}
+    $pattern | Add-Member -NotePropertyName PendingValue -NotePropertyValue $null
+    $pattern | Add-Member -NotePropertyName ReadCount -NotePropertyValue 0
     Add-Member -InputObject $control -MemberType ScriptMethod -Name GetCurrentPattern -Value {{
         param($RequestedPattern)
         $this.PatternCalls++
@@ -548,11 +573,21 @@ function New-FakeControl(
         if ($this.PatternMode -eq 'initial_unavailable' -and $this.PatternCalls -eq 1) {{
             throw 'synthetic transient pattern unavailability'
         }}
+        if ($this.PatternMode -eq 'delayed' -and $this.ValuePattern.PendingValue) {{
+            $this.ValuePattern.ReadCount++
+            if ($this.ValuePattern.ReadCount -ge 3) {{
+                $this.ValuePattern.Current.Value = $this.ValuePattern.PendingValue
+                $this.ValuePattern.PendingValue = $null
+            }}
+        }}
         return $this.ValuePattern
     }}
     Add-Member -InputObject $control -MemberType ScriptMethod -Name SetFocus -Value {{
         $this.FocusCalls++
-        if ($this.FocusWorks) {{ $this.Current.HasKeyboardFocus = $true }}
+        if ($this.FocusWorks) {{
+            $this.Current.HasKeyboardFocus = $true
+            $script:focusedControl = $this
+        }}
     }}
     return $control
 }}
@@ -561,14 +596,27 @@ function Invoke-TestMutation(
     [string]$Value,
     [string]$PatternMode = 'available',
     [bool]$FocusWorks = $true,
-    [bool]$KeyboardCorrupt = $false
+    [bool]$KeyboardCorrupt = $false,
+    [bool]$ReplaceOnFallback = $false
 ) {{
-    $script:activeControl = New-FakeControl $PatternMode $FocusWorks
+    $initialMode = if ($PatternMode -eq 'replace') {{ 'replace' }} else {{ $PatternMode }}
+    $script:initialControl = New-FakeControl $initialMode $FocusWorks
+    $script:replacementControl = New-FakeControl 'available' $FocusWorks
+    $script:activeControl = $script:initialControl
+    $script:focusedControl = $null
+    $script:resolveReplacementAfterFirst = $ReplaceOnFallback
+    $script:resolveCalls = 0
     $script:inputMutationEvidence = [System.Collections.Generic.List[object]]::new()
     $script:sendCount = 0
     $script:keyboardCorrupt = $KeyboardCorrupt
     $script:failure = $null
-    $resolve = {{ return $script:activeControl }}
+    $resolve = {{
+        $script:resolveCalls++
+        if ($script:resolveReplacementAfterFirst -and $script:resolveCalls -ge 2) {{
+            return $script:replacementControl
+        }}
+        return $script:activeControl
+    }}
     $expectedPort = if ($FieldId -eq 'https_port') {{ [int]$Value }} else {{ 0 }}
     try {{
         Invoke-ResolvedInputMutation `
@@ -580,9 +628,13 @@ function Invoke-TestMutation(
     return [ordered]@{{
         failure = $script:failure
         sends = $script:sendCount
-        set_count = $script:activeControl.ValuePattern.SetCount
+        set_count = $script:initialControl.ValuePattern.SetCount
+        active_set_count = $script:activeControl.ValuePattern.SetCount
         pattern_calls = $script:activeControl.PatternCalls
-        focus_calls = $script:activeControl.FocusCalls
+        initial_focus_calls = $script:initialControl.FocusCalls
+        active_focus_calls = $script:activeControl.FocusCalls
+        replacement_focus_calls = $script:replacementControl.FocusCalls
+        resolve_calls = $script:resolveCalls
         evidence_count = $script:inputMutationEvidence.Count
         evidence = $evidence
         evidence_json = ConvertTo-Json -InputObject $evidence -Compress -Depth 5
@@ -590,6 +642,8 @@ function Invoke-TestMutation(
 }}
 
 $valuePatternSuccess = Invoke-TestMutation 'username' 'synthetic-user'
+$delayedValuePatternSuccess = Invoke-TestMutation 'username' 'synthetic-user' 'delayed'
+$replacementFallback = Invoke-TestMutation 'username' 'synthetic-user' 'replace'
 $unsupportedPatternFallback = Invoke-TestMutation 'username' 'synthetic-user' 'initial_unavailable'
 $unverifiedPatternFallback = Invoke-TestMutation 'username' 'synthetic-user' 'mismatch'
 $setFailureFallback = Invoke-TestMutation 'username' 'synthetic-user' 'throw_set'
@@ -597,15 +651,21 @@ $focusFailure = Invoke-TestMutation 'username' 'synthetic-user' 'unavailable' $f
 $verificationFailure = Invoke-TestMutation 'username' 'synthetic-user' 'unavailable' $true $true
 $secret = 'synthetic-password-never-in-evidence'
 $passwordFallback = Invoke-TestMutation 'password' $secret
+$passwordReplacementFallback = Invoke-TestMutation 'password' $secret 'available' $true $false $true
+$passwordReplacementSecretLeaked = $passwordReplacementFallback.evidence_json.Contains($secret)
 $result = [ordered]@{{
     value_pattern_success = $valuePatternSuccess
+    delayed_value_pattern_success = $delayedValuePatternSuccess
+    replacement_fallback = $replacementFallback
     unsupported_pattern_fallback = $unsupportedPatternFallback
     unverified_pattern_fallback = $unverifiedPatternFallback
     set_failure_fallback = $setFailureFallback
     focus_failure = $focusFailure
     verification_failure = $verificationFailure
     password_fallback = $passwordFallback
+    password_replacement_fallback = $passwordReplacementFallback
     password_secret_leaked = $passwordFallback.evidence_json.Contains($secret)
+    password_replacement_secret_leaked = $passwordReplacementSecretLeaked
 }}
 [Console]::WriteLine(($result | ConvertTo-Json -Compress -Depth 8))
 "dynamic input mutation proof PASS"
@@ -629,6 +689,29 @@ $result = [ordered]@{{
     assert value_pattern["evidence"]["mutation_method"] == "VALUE_PATTERN"
     assert value_pattern["evidence"]["verification_succeeded"] is True
     assert value_pattern["evidence"]["observed_value_length"] == len("synthetic-user")
+
+    delayed = result["delayed_value_pattern_success"]
+    assert delayed["failure"] is None
+    assert delayed["set_count"] == 1
+    assert delayed["sends"] == 0
+    assert delayed["pattern_calls"] >= 4
+    assert delayed["evidence"]["mutation_method"] == "VALUE_PATTERN"
+    assert delayed["evidence"]["programmatic_verification_observed"] is True
+    assert delayed["evidence"]["programmatic_verification_succeeded"] is True
+    assert delayed["evidence"]["programmatic_verification_timed_out"] is False
+
+    replacement = result["replacement_fallback"]
+    assert replacement["failure"] is None
+    assert replacement["set_count"] == 1
+    assert replacement["active_set_count"] == 0
+    assert replacement["sends"] == 1
+    assert replacement["initial_focus_calls"] == 0
+    assert replacement["active_focus_calls"] == 1
+    assert replacement["evidence"]["programmatic_verification_timed_out"] is True
+    assert replacement["evidence"]["fallback_control_reacquired"] is True
+    assert replacement["evidence"]["fallback_control_type"] == "ControlType.Edit"
+    assert replacement["evidence"]["focus_confirmed"] is True
+    assert replacement["evidence"]["verification_succeeded"] is True
 
     for key in (
         "unsupported_pattern_fallback",
@@ -673,6 +756,7 @@ $result = [ordered]@{{
     password = result["password_fallback"]
     password_record = password["evidence"]
     assert result["password_secret_leaked"] is False
+    assert result["password_replacement_secret_leaked"] is False
     assert password["failure"] is None
     assert password["sends"] == 1
     assert password["set_count"] == 0
@@ -680,9 +764,28 @@ $result = [ordered]@{{
     assert password_record["verification_performed"] is False
     assert password_record["verification_succeeded"] is None
     assert "observed_value_length" not in password_record
+    password_replacement = result["password_replacement_fallback"]
+    assert password_replacement["failure"] is None
+    assert password_replacement["sends"] == 1
+    assert password_replacement["initial_focus_calls"] == 0
+    assert password_replacement["replacement_focus_calls"] == 1
+    assert password_replacement["evidence"]["fallback_control_reacquired"] is True
+    assert password_replacement["evidence"]["verification_performed"] is False
+    assert password_replacement["evidence"]["verification_succeeded"] is None
+    assert "observed_value_length" not in password_replacement["evidence"]
     secret_hash = hashlib.sha256(b"synthetic-password-never-in-evidence").hexdigest()
-    for forbidden in (secret_hash, "bearer", "token", "authorization"):
-        assert forbidden not in password["evidence_json"].lower()
+    for evidence_json in (
+        password["evidence_json"],
+        password_replacement["evidence_json"],
+    ):
+        for forbidden in (
+            secret_hash,
+            "synthetic-password-never-in-evidence",
+            "bearer",
+            "token",
+            "authorization",
+        ):
+            assert forbidden not in evidence_json.lower()
     forbidden_fields = {
         "password",
         "password_value",
