@@ -644,6 +644,143 @@ def test_post_owner_probe_snapshot_and_failure_taxonomy_are_preserved() -> None:
     ):
         assert failure_code in source
     assert "post_owner_runtime_probe = $postOwnerRuntimeProbe" in source
+    assert "operator_session_timeline = @($operatorSessionTimeline)" in source
+
+
+def test_post_owner_transport_classifier_ignores_owner_session_count() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell runtime classifier test is only available on Windows test hosts")
+
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    classifier = source[
+        source.index("function Get-PostOwnerRuntimeFailureCode") : source.index(
+            "function Get-ControllerHttpsProbeFailureCode"
+        )
+    ]
+    assertion = f"""
+{classifier}
+$runtime = @{{
+    process_query_outcome = 'PASS'
+    postgres_count = 1
+    http_count = 1
+    scheduler_count = 1
+    listener_query_outcome = 'PASS'
+    endpoint_listener_count = 1
+    owner_session_query_outcome = 'PASS'
+    active_owner_session_count = 1
+}}
+$withOneOwner = [pscustomobject]($runtime.Clone())
+$withNoOwner = [pscustomobject]($runtime.Clone())
+$withNoOwner.active_owner_session_count = 0
+$oneFailure = Get-PostOwnerRuntimeFailureCode $withOneOwner
+$zeroFailure = Get-PostOwnerRuntimeFailureCode $withNoOwner
+if ($null -ne $oneFailure -or $null -ne $zeroFailure) {{
+    throw "owner_session_count_changed_transport_classification"
+}}
+"runtime classifier accepts owner session counts 0 and 1"
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "runtime classifier accepts owner session counts 0 and 1" in completed.stdout
+
+
+def test_operator_session_waiter_records_named_transitions() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell session timeline test is only available on Windows test hosts")
+
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    helper_functions = source[
+        source.index("function Add-OperatorSessionTransition") : source.index(
+            "function Assert-OneActiveOwnerSession"
+        )
+    ]
+    assertion = f"""
+$script:operatorSessionTimeline = [System.Collections.Generic.List[object]]::new()
+$script:mockOwnerSessionCount = 0
+function Get-ActiveOwnerSessionCount([object]$Config) {{
+    return [int]$script:mockOwnerSessionCount
+}}
+function Get-SafeExceptionTypeName([object]$Exception) {{
+    return $Exception.GetType().Name
+}}
+{helper_functions}
+$null = Wait-ForOperatorSessionCount 'local-config' 'window_hide_lock' 0 1 'lock_failed'
+$script:mockOwnerSessionCount = 1
+$null = Wait-ForOperatorSessionCount 'local-config' 'reopen_after_login' 1 1 'login_failed'
+[Console]::WriteLine((ConvertTo-Json `
+    -InputObject @($script:operatorSessionTimeline.ToArray()) -Depth 6 -Compress))
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    timeline = json.loads(completed.stdout.strip())
+    assert [entry["stage"] for entry in timeline] == ["window_hide_lock", "reopen_after_login"]
+    assert [entry["expected_active_owner_session_count"] for entry in timeline] == [0, 1]
+    assert [entry["observed_active_owner_session_count"] for entry in timeline] == [0, 1]
+    assert [entry["outcome"] for entry in timeline] == ["PASS", "PASS"]
+
+
+def test_controller_session_timeline_is_separate_and_covers_lifecycle_transitions() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    normalized_source = re.sub(r"`\s*\r?\n\s*", " ", source)
+    classifier = source[
+        source.index("function Get-PostOwnerRuntimeFailureCode") : source.index(
+            "function Get-ControllerHttpsProbeFailureCode"
+        )
+    ]
+    assert "active_owner_session_count" not in classifier
+    assert "owner_session_query_outcome" not in classifier
+
+    waiter = source[
+        source.index("function Wait-ForControllerHttps") : source.index(
+            "function Test-PlaintextHttpRejected"
+        )
+    ]
+    assert "Wait-ForOperatorSessionCount" not in waiter
+    assert "Get-ActiveOwnerSessionCount" not in waiter
+
+    transitions = {
+        '"bootstrap" 1': "controller_first_owner_session_missing",
+        '"failed_ip_reconfigure" 1': (
+            "controller_endpoint_reconfigure_session_lost_on_unavailable_ip"
+        ),
+        '"failed_port_reconfigure" 1': "controller_endpoint_reconfigure_session_lost_on_collision",
+        '"window_hide_lock" 0': "controller_owner_session_not_revoked_on_lock",
+        '"reopen_before_login" 0': "controller_reopen_owner_session_not_locked",
+        '"before_privileged_quit" 1': "controller_active_owner_session_count_not_one",
+        '"after_quit_relaunch" 0': "controller_owner_session_exists_after_quit_relaunch",
+    }
+    for stage_call, failure_code in transitions.items():
+        assert stage_call in normalized_source
+        assert failure_code in source
+    assert '"cutover_revoke"' in source and '"reopen_before_login"' in source
+    assert "$config $revocationStage 0 15 $revocationFailure" in normalized_source
+    assert '"cutover_relogin"' in source and '"reopen_after_login"' in source
+    assert "$config $loginStage 1 30 $loginFailure" in normalized_source
+    restart_start = source.index(
+        "$desktop = Start-ExistingController", source.index("Set-ExpiringControllerLeaf $config")
+    )
+    restart_probe = source.index("Wait-ForControllerHttps $config 60", restart_start)
+    relaunch_session_check = source.index('"after_quit_relaunch"', restart_probe)
+    assert restart_start < restart_probe < relaunch_session_check
+    assert "function Wait-ForOperatorSessionCount" in source
+    assert "Add-OperatorSessionTransition" in source
+    assert "operator_session_timeline = @($operatorSessionTimeline)" in source
 
 
 def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_right_boundary() -> (
@@ -657,7 +794,7 @@ def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_righ
         unavailable_start : source.index("$endpointReservation =", unavailable_start)
     ]
     assert unavailable_attempt.index('"Apply endpoint change"') < unavailable_attempt.index(
-        "Get-ActiveOwnerSessionCount $config"
+        '"failed_ip_reconfigure"'
     )
     assert "controller_endpoint_reconfigure_session_lost_on_unavailable_ip" in unavailable_attempt
     assert "$checks.endpoint_running_unavailable_ip_preserves_owner_session = $true" in (
@@ -673,7 +810,7 @@ def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_righ
         collision_start : source.index("$endpointReservation.Stop()", collision_start)
     ]
     assert collision_attempt.index('"Apply endpoint change"') < collision_attempt.index(
-        "Get-ActiveOwnerSessionCount $config"
+        '"failed_port_reconfigure"'
     )
     assert "controller_endpoint_reconfigure_session_lost_on_collision" in collision_attempt
     assert "$checks.endpoint_running_collision_preserves_owner_session = $true" in collision_attempt

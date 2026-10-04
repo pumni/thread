@@ -154,6 +154,7 @@ $sentinel = [Guid]::NewGuid().ToString("N")
 $script:smokeOwnerUsername = "dx05owner" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
 $script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
 $processEvidence = [ordered]@{}
+$operatorSessionTimeline = [System.Collections.Generic.List[object]]::new()
 $rootWasMoved = $false
 $parentCrashPids = @()
 $parentCrashProcesses = @()
@@ -699,13 +700,68 @@ function Get-ActiveOwnerSessionCount([object]$Config) {
     return [int]$count
 }
 
+function Add-OperatorSessionTransition(
+    [string]$Stage,
+    [int]$ExpectedCount,
+    [Nullable[int]]$ObservedCount,
+    [string]$QueryOutcome,
+    [string]$ExceptionType,
+    [string]$Outcome,
+    [string]$FailureCode
+) {
+    $script:operatorSessionTimeline.Add([ordered]@{
+        stage = $Stage
+        recorded_utc = [DateTimeOffset]::UtcNow.ToString("O")
+        expected_active_owner_session_count = $ExpectedCount
+        observed_active_owner_session_count = $ObservedCount
+        query_outcome = $QueryOutcome
+        query_exception_type = $ExceptionType
+        outcome = $Outcome
+        failure_code = $FailureCode
+    }) | Out-Null
+}
+
+function Wait-ForOperatorSessionCount(
+    [object]$Config,
+    [string]$Stage,
+    [int]$ExpectedCount,
+    [int]$TimeoutSeconds,
+    [string]$FailureCode
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $observedCount = $null
+    $queryOutcome = "NOT_RUN"
+    $exceptionType = $null
+    do {
+        try {
+            $observedCount = Get-ActiveOwnerSessionCount $Config
+            $queryOutcome = "PASS"
+            $exceptionType = $null
+        } catch {
+            $observedCount = $null
+            $queryOutcome = "FAIL"
+            $exceptionType = Get-SafeExceptionTypeName $_.Exception
+        }
+
+        if ($queryOutcome -eq "PASS" -and $observedCount -eq $ExpectedCount) {
+            Add-OperatorSessionTransition `
+                $Stage $ExpectedCount $observedCount $queryOutcome $exceptionType "PASS" $null
+            return [int]$observedCount
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds 200
+    } while ($true)
+
+    Add-OperatorSessionTransition `
+        $Stage $ExpectedCount $observedCount $queryOutcome $exceptionType "FAIL" $FailureCode
+    throw $FailureCode
+}
+
 function Assert-OneActiveOwnerSession([object]$Config) {
-    $activeSessions = Get-ActiveOwnerSessionCount $Config
+    $activeSessions = Wait-ForOperatorSessionCount `
+        $Config "before_privileged_quit" 1 3 "controller_active_owner_session_count_not_one"
     $processEvidence.operator_session_preflight = [ordered]@{
         active_sessions = [string]$activeSessions
-    }
-    if ($activeSessions -ne 1) {
-        throw "controller_active_owner_session_count_not_one_$activeSessions"
     }
     $checks.active_session_verified_before_privileged_quit = $true
 }
@@ -740,13 +796,18 @@ function Ensure-ControllerOwner(
 ) {
     $config = Get-ControllerConfig
     if ($ForceReauthentication) {
+        $revocationStage = if ($AfterEndpointReconfiguration) {
+            "cutover_revoke"
+        } else {
+            "reopen_before_login"
+        }
         $revocationFailure = if ($AfterEndpointReconfiguration) {
             "controller_endpoint_reconfigure_session_not_revoked"
         } else {
             "controller_owner_session_not_revoked_on_lock"
         }
-        Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 0 } 15 `
-            $revocationFailure
+        $null = Wait-ForOperatorSessionCount `
+            $config $revocationStage 0 15 $revocationFailure
         if ($AfterEndpointReconfiguration) {
             $checks.endpoint_running_transition_revokes_owner_session = $true
         }
@@ -776,7 +837,8 @@ function Ensure-ControllerOwner(
     } else {
         "controller_owner_login_failed"
     }
-    Wait-Until { (Get-ActiveOwnerSessionCount $config) -eq 1 } 30 $loginFailure
+    $loginStage = if ($AfterEndpointReconfiguration) { "cutover_relogin" } else { "reopen_after_login" }
+    $null = Wait-ForOperatorSessionCount $config $loginStage 1 30 $loginFailure
     if ($AfterEndpointReconfiguration) {
         $checks.endpoint_running_transition_reauthenticates_one_owner_session = $true
     }
@@ -1221,15 +1283,6 @@ function Get-PostOwnerRuntimeFailureCode([object]$Snapshot) {
     if ($Snapshot.endpoint_listener_count -eq 0) {
         return "controller_post_owner_endpoint_listener_absent"
     }
-    if ($Snapshot.owner_session_query_outcome -ne "PASS") {
-        return "controller_post_owner_owner_session_snapshot_failed"
-    }
-    if ($Snapshot.active_owner_session_count -eq 0) {
-        return "controller_post_owner_active_owner_session_missing"
-    }
-    if ($Snapshot.active_owner_session_count -ne 1) {
-        return "controller_post_owner_active_owner_session_count_invalid"
-    }
     return $null
 }
 
@@ -1652,6 +1705,8 @@ try {
         $config.endpointPort -gt 0 -and $config.databasePort -gt 0
     if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
     Bootstrap-ControllerOwner $desktop.Id
+    $null = Wait-ForOperatorSessionCount `
+        $config "bootstrap" 1 5 "controller_first_owner_session_missing"
     $null = Wait-ForControllerHttps $config 60 -AfterOwnerBootstrap
     $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
     $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
@@ -1700,9 +1755,8 @@ try {
         (Get-FileSha256 $leafCertificatePath) -cne $leafBeforeEndpointChange) {
         throw "controller_running_unavailable_ip_changed_state"
     }
-    if ((Get-ActiveOwnerSessionCount $config) -ne 1) {
-        throw "controller_endpoint_reconfigure_session_lost_on_unavailable_ip"
-    }
+    $null = Wait-ForOperatorSessionCount `
+        $config "failed_ip_reconfigure" 1 3 "controller_endpoint_reconfigure_session_lost_on_unavailable_ip"
     $checks.endpoint_running_unavailable_ip_rolls_back = $true
     $checks.endpoint_running_unavailable_ip_preserves_owner_session = $true
 
@@ -1725,9 +1779,8 @@ try {
             [int]$afterCollisionProcesses.scheduler[0].ProcessId -ne $oldSchedulerPid) {
             throw "controller_running_endpoint_collision_changed_runtime_or_identity"
         }
-        if ((Get-ActiveOwnerSessionCount $config) -ne 1) {
-            throw "controller_endpoint_reconfigure_session_lost_on_collision"
-        }
+        $null = Wait-ForOperatorSessionCount `
+            $config "failed_port_reconfigure" 1 3 "controller_endpoint_reconfigure_session_lost_on_collision"
         $checks.endpoint_running_collision_rolls_back = $true
         $checks.endpoint_running_collision_preserves_owner_session = $true
     } finally {
@@ -1816,6 +1869,8 @@ try {
             $current.scheduler.Count -eq 1
     } 15 "controller_runtime_stopped_when_window_hidden"
     $null = Wait-ForControllerHttps $config 5
+    $null = Wait-ForOperatorSessionCount `
+        $config "window_hide_lock" 0 15 "controller_owner_session_not_revoked_on_lock"
     Assert-DatabaseValue $config $sentinel
     $checks.x_hides_and_runtime_continues = $true
 
@@ -1829,6 +1884,8 @@ try {
         return $null -ne (Find-TextContaining $window "Session locked") -and
             $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
     } 15 "controller_reopen_did_not_require_operator_sign_in"
+    $null = Wait-ForOperatorSessionCount `
+        (Get-ControllerConfig) "reopen_before_login" 0 5 "controller_reopen_owner_session_not_locked"
     $checks.reopen_requires_operator_sign_in = $true
     Ensure-ControllerOwner $desktop.Id -ForceReauthentication
     $checks.owner_reauthenticated_after_reopen = $true
@@ -1910,6 +1967,8 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
+    $null = Wait-ForOperatorSessionCount `
+        $config "after_quit_relaunch" 0 15 "controller_owner_session_exists_after_quit_relaunch"
     $rootFingerprintAfterRestart =
         (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $renewedLeaf = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
@@ -2216,6 +2275,7 @@ try {
         runtime_layout = "shared"
         checks = $checks
         process_evidence = $processEvidence
+        operator_session_timeline = @($operatorSessionTimeline)
         result = $result
         failure_code = $failureCode
         failure_codes = @($failureCodes)
