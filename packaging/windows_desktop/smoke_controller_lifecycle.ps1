@@ -237,6 +237,7 @@ $processEvidence = [ordered]@{}
 $scenarioEvidence = [ordered]@{}
 $operatorSessionTimeline = [System.Collections.Generic.List[object]]::new()
 $operatorLoginAttemptTimeline = [System.Collections.Generic.List[object]]::new()
+$inputMutationEvidence = [System.Collections.Generic.List[object]]::new()
 $controllerRuntimeIdentityTimeline = [System.Collections.Generic.List[object]]::new()
 $endpointCollisionEvidence = $null
 $rootWasMoved = $false
@@ -671,6 +672,237 @@ function Invoke-Button([int]$ProcessId, [string]$Name, [scriptblock]$BeforeInvok
     } 20 "desktop_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
+function Add-InputMutationEvidence([object]$Evidence) {
+    $script:inputMutationEvidence.Add($Evidence) | Out-Null
+}
+
+function Send-InputKeyboardValue([string]$Value) {
+    [System.Windows.Forms.SendKeys]::SendWait("^a")
+    [System.Windows.Forms.SendKeys]::SendWait("{BACKSPACE}")
+    [System.Windows.Forms.SendKeys]::SendWait($Value)
+}
+
+function Test-ResolvedInputValue(
+    [scriptblock]$ResolveControl,
+    [string]$FieldId,
+    [string]$ExpectedValue,
+    [int]$ExpectedPort
+) {
+    $current = & $ResolveControl
+    if (-not $current) {
+        return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+    }
+
+    $controlTypeName = [string]$current.Current.ControlType.ProgrammaticName
+    if ($controlTypeName -eq "ControlType.Spinner") {
+        try {
+            $rangePattern = $current.GetCurrentPattern(
+                [System.Windows.Automation.RangeValuePattern]::Pattern
+            )
+            return [pscustomobject]@{
+                Matched = [double]$rangePattern.Current.Value -eq [double]$ExpectedPort
+                ObservedLength = $null
+            }
+        } catch {
+            $childEdit = Find-ElementByType $current `
+                ([System.Windows.Automation.ControlType]::Edit)
+            if (-not $childEdit) {
+                return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+            }
+            try {
+                $valuePattern = $childEdit.GetCurrentPattern(
+                    [System.Windows.Automation.ValuePattern]::Pattern
+                )
+                $actualPort = 0
+                $parsedPort = [int]::TryParse(
+                    [string]$valuePattern.Current.Value,
+                    [System.Globalization.NumberStyles]::Integer,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$actualPort
+                )
+                return [pscustomobject]@{
+                    Matched = $parsedPort -and $actualPort -eq $ExpectedPort
+                    ObservedLength = $null
+                }
+            } catch {
+                return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+            }
+        }
+    }
+
+    try {
+        $valuePattern = $current.GetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern
+        )
+        $actualValue = [string]$valuePattern.Current.Value
+        if ($FieldId -eq "https_port") {
+            $actualPort = 0
+            $parsedPort = [int]::TryParse(
+                $actualValue,
+                [System.Globalization.NumberStyles]::Integer,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$actualPort
+            )
+            return [pscustomobject]@{
+                Matched = $parsedPort -and $actualPort -eq $ExpectedPort
+                ObservedLength = $null
+            }
+        }
+        return [pscustomobject]@{
+            Matched = [string]::Equals(
+                $actualValue,
+                $ExpectedValue,
+                [System.StringComparison]::Ordinal
+            )
+            ObservedLength = if ($FieldId -eq "username") { $actualValue.Length } else { $null }
+        }
+    } catch {
+        return [pscustomobject]@{ Matched = $false; ObservedLength = $null }
+    }
+}
+
+function Invoke-ResolvedInputMutation {
+    param(
+        [string]$FieldId,
+        [string]$Value,
+        [scriptblock]$ResolveControl,
+        [int]$ExpectedPort
+    )
+
+    $isPassword = $FieldId -eq "password"
+    $record = [ordered]@{
+        field_id = $FieldId
+        control_type = $null
+        value_pattern_supported = $null
+        value_pattern_read_only = $null
+        mutation_method = $null
+        programmatic_set_attempted = $false
+        programmatic_set_succeeded = $null
+        programmatic_failure_code = $null
+        programmatic_verification_succeeded = $null
+        focus_requested = $false
+        focus_confirmed = $false
+        verification_performed = $false
+        verification_succeeded = $null
+        observed_value_length = $null
+        failure_code = $null
+    }
+    if ($isPassword) { $record.Remove("observed_value_length") }
+
+    $control = $null
+    try { $control = & $ResolveControl } catch { }
+    if (-not $control) {
+        $record.failure_code = "desktop_input_unavailable_$FieldId"
+        Add-InputMutationEvidence $record
+        throw $record.failure_code
+    }
+
+    try { $record.control_type = [string]$control.Current.ControlType.ProgrammaticName } catch { }
+    $isEdit = $record.control_type -eq "ControlType.Edit"
+    if (-not $isPassword -and $isEdit) {
+        $valuePattern = $null
+        try {
+            $valuePattern = $control.GetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern
+            )
+            $record.value_pattern_supported = $true
+            $record.value_pattern_read_only = [bool]$valuePattern.Current.IsReadOnly
+        } catch {
+            $record.value_pattern_supported = $false
+        }
+
+        if ($record.value_pattern_supported -and -not $record.value_pattern_read_only) {
+            $record.mutation_method = "VALUE_PATTERN"
+            $record.programmatic_set_attempted = $true
+            $setSucceeded = $false
+            try {
+                $valuePattern.SetValue($Value)
+                $record.programmatic_set_succeeded = $true
+                $setSucceeded = $true
+            } catch {
+                $record.programmatic_set_succeeded = $false
+                $record.programmatic_failure_code = `
+                    "desktop_input_value_pattern_set_failed_$FieldId"
+            }
+            if ($setSucceeded) {
+                $programmaticVerification = $null
+                try {
+                    $programmaticVerification = Test-ResolvedInputValue `
+                        $ResolveControl $FieldId $Value $ExpectedPort
+                } catch { }
+                $record.verification_performed = $true
+                $record.programmatic_verification_succeeded = [bool](
+                    $programmaticVerification -and $programmaticVerification.Matched
+                )
+                $record.verification_succeeded = $record.programmatic_verification_succeeded
+                if ($programmaticVerification) {
+                    $record.observed_value_length = $programmaticVerification.ObservedLength
+                }
+                if ($record.programmatic_verification_succeeded) {
+                    Add-InputMutationEvidence $record
+                    return
+                }
+                $record.programmatic_failure_code = `
+                    "desktop_input_value_not_populated_$FieldId"
+            } else {
+                $record.programmatic_verification_succeeded = $false
+            }
+        }
+    }
+
+    $record.mutation_method = "KEYBOARD"
+    $record.focus_requested = $true
+    try { $control.SetFocus() } catch { }
+    $focusAcquired = $false
+    try {
+        Wait-Until {
+            $focusedControl = & $ResolveControl
+            if (-not $focusedControl) { return $false }
+            return [bool]$focusedControl.Current.HasKeyboardFocus
+        } 5 "desktop_input_focus_not_acquired_$FieldId"
+        $focusAcquired = $true
+    } catch { }
+    $record.focus_confirmed = $focusAcquired
+    if (-not $focusAcquired) {
+        $record.failure_code = "desktop_input_focus_not_acquired_$FieldId"
+        Add-InputMutationEvidence $record
+        throw $record.failure_code
+    }
+
+    try {
+        Send-InputKeyboardValue -Value $Value
+    } catch {
+        $record.failure_code = "desktop_input_keyboard_mutation_failed_$FieldId"
+        Add-InputMutationEvidence $record
+        throw $record.failure_code
+    }
+
+    if (-not $isPassword) {
+        $verification = [pscustomobject]@{ Value = $null }
+        try {
+            Wait-Until {
+                $verification.Value = Test-ResolvedInputValue `
+                    $ResolveControl $FieldId $Value $ExpectedPort
+                return [bool]$verification.Value.Matched
+            } 5 "desktop_input_value_not_populated_$FieldId"
+        } catch {
+            $record.verification_performed = $true
+            $record.verification_succeeded = $false
+            $record.failure_code = "desktop_input_value_not_populated_$FieldId"
+            if ($verification.Value) {
+                $record.observed_value_length = $verification.Value.ObservedLength
+            }
+            Add-InputMutationEvidence $record
+            throw $record.failure_code
+        }
+        $record.verification_performed = $true
+        $record.verification_succeeded = $true
+        $record.observed_value_length = $verification.Value.ObservedLength
+    }
+
+    Add-InputMutationEvidence $record
+}
+
 function Set-LoginInput {
     param(
         [int]$ProcessId,
@@ -718,62 +950,16 @@ function Set-LoginInput {
         throw
     }
 
-    $inputControl = $resolvedInput.Control
-    $inputControl.SetFocus()
-    [System.Windows.Forms.SendKeys]::SendWait("^a")
-    [System.Windows.Forms.SendKeys]::SendWait($Value)
-    if ($fieldId -ne "password") {
-        Wait-Until {
-            $resolution = Resolve-InputControl `
-                $ProcessId $Name $AutomationId $AllowedControlTypes $fieldId
-            $current = $resolution.Control
-            if (-not $current) { return $false }
-
-            $controlTypeName = [string]$current.Current.ControlType.ProgrammaticName
-            if ($controlTypeName -eq "ControlType.Spinner") {
-                try {
-                    $rangePattern = $current.GetCurrentPattern(
-                        [System.Windows.Automation.RangeValuePattern]::Pattern
-                    )
-                    return [double]$rangePattern.Current.Value -eq [double]$expectedPort
-                } catch {
-                    $childEdit = Find-ElementByType $current `
-                        ([System.Windows.Automation.ControlType]::Edit)
-                    if (-not $childEdit) { return $false }
-                    try {
-                        $valuePattern = $childEdit.GetCurrentPattern(
-                            [System.Windows.Automation.ValuePattern]::Pattern
-                        )
-                        $actualPort = 0
-                        $parsedPort = [int]::TryParse(
-                            [string]$valuePattern.Current.Value,
-                            [System.Globalization.NumberStyles]::Integer,
-                            [System.Globalization.CultureInfo]::InvariantCulture,
-                            [ref]$actualPort
-                        )
-                        return $parsedPort -and $actualPort -eq $expectedPort
-                    } catch { return $false }
-                }
-            }
-
-            try {
-                $valuePattern = $current.GetCurrentPattern(
-                    [System.Windows.Automation.ValuePattern]::Pattern
-                )
-                if ($isNumericPort) {
-                    $actualPort = 0
-                    $parsedPort = [int]::TryParse(
-                        [string]$valuePattern.Current.Value,
-                        [System.Globalization.NumberStyles]::Integer,
-                        [System.Globalization.CultureInfo]::InvariantCulture,
-                        [ref]$actualPort
-                    )
-                    return $parsedPort -and $actualPort -eq $expectedPort
-                }
-                return $valuePattern.Current.Value -ceq $Value
-            } catch { return $false }
-        } 5 "desktop_input_value_not_populated_$fieldId"
+    $resolveCurrentInput = {
+        $resolution = Resolve-InputControl `
+            $ProcessId $Name $AutomationId $AllowedControlTypes $fieldId
+        return $resolution.Control
     }
+    Invoke-ResolvedInputMutation `
+        -FieldId $fieldId `
+        -Value $Value `
+        -ResolveControl $resolveCurrentInput `
+        -ExpectedPort $expectedPort
 }
 
 function Get-ActiveOwnerSessionCount([object]$Config) {
@@ -3053,6 +3239,7 @@ try {
         scenario_evidence = $scenarioEvidence
         operator_session_timeline = @($operatorSessionTimeline)
         operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)
+        input_mutation_evidence = @($inputMutationEvidence)
         controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)
         endpoint_collision_evidence = $endpointCollisionEvidence
         result = $result

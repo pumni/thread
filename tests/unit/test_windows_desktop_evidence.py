@@ -241,9 +241,11 @@ $functionNodes = @($ast.FindAll({{
             'Find-ElementsByName', 'Find-ElementsByAutomationIdAndType',
             'Find-ElementByType', 'Test-ElementSupportsPattern',
             'Test-InteractiveInputElement', 'Resolve-InputControl',
-            'Get-InputLookupDiagnostics')
+            'Get-InputLookupDiagnostics', 'Add-InputMutationEvidence',
+            'Send-InputKeyboardValue', 'Test-ResolvedInputValue',
+            'Invoke-ResolvedInputMutation')
 }}, $true))
-if ($functionNodes.Count -ne 9) {{ throw "Expected the focused Controller input helpers" }}
+if ($functionNodes.Count -ne 13) {{ throw "Expected the focused Controller input helpers" }}
 $functions = @{{}}
 foreach ($functionNode in $functionNodes) {{ $functions[$functionNode.Name] = $functionNode }}
 $login = $functions['Set-LoginInput']
@@ -313,23 +315,59 @@ $commands = @($loginBody.FindAll({{
 }}, $true))
 $waitCalls = @($commands | Where-Object {{ $_.GetCommandName() -eq 'Wait-Until' }} |
     Sort-Object {{ $_.Extent.StartOffset }})
-$sendCalls = @($loginBody.FindAll({{
+$mutationCalls = @($commands | Where-Object {{
+    $_.GetCommandName() -eq 'Invoke-ResolvedInputMutation'
+}})
+if ($waitCalls.Count -ne 1 -or $mutationCalls.Count -ne 1 -or
+    $waitCalls[0].Extent.StartOffset -ge $mutationCalls[0].Extent.StartOffset -or
+    $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode' -or
+    $loginBody.Extent.Text -match 'SendWait|\.SetFocus\(') {{
+    throw "Bounded exact-control lookup must complete before delegated input mutation"
+}}
+
+$mutationBody = $functions['Invoke-ResolvedInputMutation'].Body
+$mutationCommands = @($mutationBody.FindAll({{
+    param($node) $node -is [System.Management.Automation.Language.CommandAst]
+}}, $true))
+$mutationWaits = @($mutationCommands | Where-Object {{ $_.GetCommandName() -eq 'Wait-Until' }} |
+    Sort-Object {{ $_.Extent.StartOffset }})
+$keyboardCalls = @($mutationCommands | Where-Object {{
+    $_.GetCommandName() -eq 'Send-InputKeyboardValue'
+}})
+$mutationFocusCalls = Get-Invocations $mutationBody 'SetFocus'
+$setValueCalls = Get-Invocations $mutationBody 'SetValue'
+if ($mutationWaits.Count -ne 2 -or $keyboardCalls.Count -ne 1 -or
+    $mutationFocusCalls.Count -ne 1 -or $setValueCalls.Count -ne 1 -or
+    $mutationFocusCalls[0].Extent.StartOffset -ge $mutationWaits[0].Extent.StartOffset -or
+    $mutationWaits[0].Extent.StartOffset -ge $keyboardCalls[0].Extent.StartOffset -or
+    $keyboardCalls[0].Extent.StartOffset -ge $mutationWaits[1].Extent.StartOffset -or
+    $mutationBody.Extent.Text -notmatch 'desktop_input_focus_not_acquired_\$FieldId' -or
+    $mutationBody.Extent.Text -notmatch 'HasKeyboardFocus') {{
+    throw "Keyboard fallback must prove focus before typing and verify afterward"
+}}
+$programmaticGate = @($mutationBody.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses[0].Item1.Extent.Text -match '-not\s+\$isPassword\s+-and\s+\$isEdit'
+}}, $true))
+if ($programmaticGate.Count -ne 1 -or
+    $programmaticGate[0].Extent.Text -notmatch 'ValuePattern' -or
+    $programmaticGate[0].Extent.Text -notmatch 'IsReadOnly' -or
+    $programmaticGate[0].Extent.Text -notmatch '\.SetValue\(\$Value\)' -or
+    $programmaticGate[0].Extent.Text -notmatch 'Test-ResolvedInputValue') {{
+    throw "Writable non-password Edit must try and verify ValuePattern before keyboard fallback"
+}}
+$keyboardBody = $functions['Send-InputKeyboardValue'].Body.Extent.Text
+$sendCalls = @($functions['Send-InputKeyboardValue'].Body.FindAll({{
     param($node)
     $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
         $node.Member.Extent.Text -eq 'SendWait'
 }}, $true))
-if ($waitCalls.Count -ne 2 -or $sendCalls.Count -ne 2 -or
-    $waitCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset) {{
-    throw "Input must use bounded UIA lookup before keyboard mutation"
-}}
-$resolverCalls = Get-Commands $loginBody 'Resolve-InputControl'
-$focusCalls = Get-Invocations $loginBody 'SetFocus'
-if ($resolverCalls.Count -lt 2 -or $focusCalls.Count -ne 1 -or
-    $resolverCalls[0].Extent.StartOffset -ge $focusCalls[0].Extent.StartOffset -or
-    $focusCalls[0].Extent.StartOffset -ge $sendCalls[0].Extent.StartOffset -or
-    $sendCalls[0].Extent.StartOffset -ge $sendCalls[1].Extent.StartOffset -or
-    $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode') {{
-    throw "Resolved interactive input must be focused and keyboard-mutated after bounded lookup"
+if ($sendCalls.Count -ne 3 -or
+    $keyboardBody -notmatch 'SendWait\("\^a"\)' -or
+    $keyboardBody -notmatch 'SendWait\("\{{BACKSPACE\}}"\)' -or
+    $keyboardBody -notmatch 'SendWait\(\$Value\)') {{
+    throw "Keyboard fallback must select all, delete, and enter the value"
 }}
 $resolutionBody = $functions['Resolve-InputControl'].Body.Extent.Text
 $resolverBody = $functions['Resolve-InputControl'].Body
@@ -366,30 +404,15 @@ if ($interactiveChildLookup.Count -ne 1 -or
     throw "Spinner compatibility must find only an Edit child of that exact Spinner"
 }}
 
-$passwordGate = @($loginBody.FindAll({{
-    param($node)
-    $node -is [System.Management.Automation.Language.IfStatementAst] -and
-        $node.Clauses[0].Item1.Extent.Text -match '\$fieldId\s*-ne\s*"password"'
-}}, $true))
-$verificationText = if ($passwordGate.Count -eq 1) {{ $passwordGate[0].Extent.Text }} else {{ '' }}
-if ($passwordGate.Count -ne 1 -or
-    $verificationText -notmatch '\[System\.Windows\.Automation\.RangeValuePattern\]::Pattern' -or
-    $verificationText -notmatch '\[System\.Windows\.Automation\.ValuePattern\]::Pattern' -or
-    $verificationText -notmatch '\[int\]::TryParse' -or
-    $verificationText -notmatch 'RangeValuePattern' -or
-    $verificationText -notmatch 'desktop_input_value_not_populated_\$fieldId') {{
-    throw "Non-secret read-back must be type-specific, numeric-safe, and password-gated"
-}}
-$spinnerBranch = @($passwordGate[0].FindAll({{
-    param($node)
-    $node -is [System.Management.Automation.Language.IfStatementAst] -and
-        $node.Clauses[0].Item1.Extent.Text -match '\$controlTypeName\s*-eq\s*"ControlType\.Spinner"'
-}}, $true))
-if ($spinnerBranch.Count -ne 1 -or
-    $spinnerBranch[0].Extent.Text -notmatch '\[double\]\$rangePattern\.Current\.Value' -or
-    $spinnerBranch[0].Extent.Text -notmatch 'Find-ElementByType\s+\$current' -or
-    $spinnerBranch[0].Extent.Text -notmatch '\[System\.Windows\.Automation\.ControlType\]::Edit') {{
-    throw "Spinner must verify RangeValue and keep any Edit fallback inside the named spinner"
+$verificationBody = $functions['Test-ResolvedInputValue'].Body.Extent.Text
+if ($verificationBody -notmatch '\[System\.Windows\.Automation\.RangeValuePattern\]::Pattern' -or
+    $verificationBody -notmatch '\[System\.Windows\.Automation\.ValuePattern\]::Pattern' -or
+    $verificationBody -notmatch '\[double\]\$rangePattern\.Current\.Value' -or
+    $verificationBody -notmatch '\[int\]::TryParse' -or
+    $verificationBody -notmatch '\[System\.StringComparison\]::Ordinal' -or
+    $verificationBody -notmatch 'Find-ElementByType\s+\$current' -or
+    $verificationBody -notmatch '\[System\.Windows\.Automation\.ControlType\]::Edit') {{
+    throw "Verification must preserve exact text, numeric-safe Spinner, and scoped Edit fallback"
 }}
 
 $diagnosticBody = $functions['Get-InputLookupDiagnostics'].Body.Extent.Text
@@ -419,18 +442,18 @@ if ($namedTypeLookups.Count -ne 1 -or $diagnosticCatches.Count -ne 1 -or
     $diagPatternReads.Count -lt 4) {{
     throw "Lookup failure must record safe pattern-presence diagnostics only"
 }}
-$childTypeLookups = Get-Commands $loginBody 'Find-ElementByType'
-if ($childTypeLookups.Count -ne 1 -or
-    $childTypeLookups[0].Extent.StartOffset -lt $spinnerBranch[0].Extent.StartOffset -or
-    $childTypeLookups[0].Extent.EndOffset -gt $spinnerBranch[0].Extent.EndOffset) {{
-    throw "Edit fallback must remain scoped to the exact named Spinner"
+$evidenceBody = $functions['Invoke-ResolvedInputMutation'].Body.Extent.Text
+foreach ($safeField in @('field_id', 'control_type', 'value_pattern_supported',
+        'value_pattern_read_only', 'mutation_method', 'focus_requested',
+        'focus_confirmed', 'verification_performed', 'verification_succeeded',
+        'failure_code')) {{
+    if ($evidenceBody -notmatch "(?m)$safeField\s*=") {{
+        throw "Input mutation evidence omits safe field $safeField"
+    }}
 }}
-
-$allPatternReads = Get-PatternCalls $loginBody
-$gatedPatternReads = Get-PatternCalls $passwordGate[0].Clauses[0].Item2
-if ($allPatternReads.Count -ne $gatedPatternReads.Count -or
-    $allPatternReads.Count -lt 3) {{
-    throw "Password must remain exempt from all UIA value-pattern read-back"
+if ($evidenceBody -notmatch 'if\s*\(\$isPassword\).*Remove\("observed_value_length"\)' -or
+    $evidenceBody -match 'password.*Current\.Value|Current\.Value.*password') {{
+    throw "Password evidence must omit length and never read the secret back"
 }}
 "Typed bounded Controller input assertion PASS"
 """
@@ -444,6 +467,236 @@ if ($allPatternReads.Count -ne $gatedPatternReads.Count -or
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
     assert "Typed bounded Controller input assertion PASS" in completed.stdout
+
+
+def test_controller_input_mutation_is_pattern_first_focus_gated_and_secret_safe() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell mutation-path test is only available on Windows test hosts")
+
+    smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
+    assertion = rf"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    '{smoke_path}', [ref]$tokens, [ref]$parseErrors
+)
+if ($parseErrors.Count -gt 0) {{ throw "Controller smoke script did not parse" }}
+$helperNames = @('Add-InputMutationEvidence', 'Test-ResolvedInputValue',
+    'Invoke-ResolvedInputMutation')
+$helperNodes = @($ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -in $helperNames
+}}, $true))
+if ($helperNodes.Count -ne $helperNames.Count) {{ throw "Input mutation helpers missing" }}
+foreach ($helperNode in $helperNodes) {{ Invoke-Expression $helperNode.Extent.Text }}
+
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutSeconds, [string]$Failure) {{
+    if (& $Condition) {{ return }}
+    throw $Failure
+}}
+function Find-ElementByType($Root, $ControlType) {{ return $null }}
+function Send-InputKeyboardValue([string]$Value) {{
+    if (-not $script:activeControl.Current.HasKeyboardFocus) {{
+        throw 'synthetic focus invariant failed'
+    }}
+    $script:sendCount++
+    if ($script:keyboardCorrupt) {{
+        $script:activeControl.ValuePattern.Current.Value = 'different'
+    }} else {{
+        $script:activeControl.ValuePattern.Current.Value = $Value
+    }}
+}}
+function New-FakeControl(
+    [string]$PatternMode = 'available',
+    [bool]$FocusWorks = $true,
+    [bool]$ReadOnly = $false
+) {{
+    $pattern = [pscustomobject]@{{
+        Mode = $PatternMode
+        SetCount = 0
+        Current = [pscustomobject]@{{ IsReadOnly = $ReadOnly; Value = 'old' }}
+    }}
+    Add-Member -InputObject $pattern -MemberType ScriptMethod -Name SetValue -Value {{
+        param([string]$NewValue)
+        $this.SetCount++
+        if ($this.Mode -eq 'throw_set') {{ throw 'synthetic pattern failure' }}
+        if ($this.Mode -eq 'mismatch') {{
+            $this.Current.Value = $NewValue.ToUpperInvariant()
+        }} else {{
+            $this.Current.Value = $NewValue
+        }}
+    }}
+    $control = [pscustomobject]@{{
+        PatternMode = $PatternMode
+        PatternCalls = 0
+        FocusWorks = $FocusWorks
+        FocusCalls = 0
+        ValuePattern = $pattern
+        Current = [pscustomobject]@{{
+            ControlType = [pscustomobject]@{{ ProgrammaticName = 'ControlType.Edit' }}
+            HasKeyboardFocus = $false
+        }}
+    }}
+    Add-Member -InputObject $control -MemberType ScriptMethod -Name GetCurrentPattern -Value {{
+        param($RequestedPattern)
+        $this.PatternCalls++
+        if ($this.PatternMode -eq 'unavailable') {{ throw 'synthetic unsupported pattern' }}
+        if ($this.PatternMode -eq 'initial_unavailable' -and $this.PatternCalls -eq 1) {{
+            throw 'synthetic transient pattern unavailability'
+        }}
+        return $this.ValuePattern
+    }}
+    Add-Member -InputObject $control -MemberType ScriptMethod -Name SetFocus -Value {{
+        $this.FocusCalls++
+        if ($this.FocusWorks) {{ $this.Current.HasKeyboardFocus = $true }}
+    }}
+    return $control
+}}
+function Invoke-TestMutation(
+    [string]$FieldId,
+    [string]$Value,
+    [string]$PatternMode = 'available',
+    [bool]$FocusWorks = $true,
+    [bool]$KeyboardCorrupt = $false
+) {{
+    $script:activeControl = New-FakeControl $PatternMode $FocusWorks
+    $script:inputMutationEvidence = [System.Collections.Generic.List[object]]::new()
+    $script:sendCount = 0
+    $script:keyboardCorrupt = $KeyboardCorrupt
+    $script:failure = $null
+    $resolve = {{ return $script:activeControl }}
+    $expectedPort = if ($FieldId -eq 'https_port') {{ [int]$Value }} else {{ 0 }}
+    try {{
+        Invoke-ResolvedInputMutation `
+            -FieldId $FieldId -Value $Value -ResolveControl $resolve -ExpectedPort $expectedPort
+    }} catch {{ $script:failure = $_.Exception.Message }}
+    $evidence = if ($script:inputMutationEvidence.Count -eq 1) {{
+        $script:inputMutationEvidence[0]
+    }} else {{ $null }}
+    return [ordered]@{{
+        failure = $script:failure
+        sends = $script:sendCount
+        set_count = $script:activeControl.ValuePattern.SetCount
+        pattern_calls = $script:activeControl.PatternCalls
+        focus_calls = $script:activeControl.FocusCalls
+        evidence_count = $script:inputMutationEvidence.Count
+        evidence = $evidence
+        evidence_json = ConvertTo-Json -InputObject $evidence -Compress -Depth 5
+    }}
+}}
+
+$valuePatternSuccess = Invoke-TestMutation 'username' 'synthetic-user'
+$unsupportedPatternFallback = Invoke-TestMutation 'username' 'synthetic-user' 'initial_unavailable'
+$unverifiedPatternFallback = Invoke-TestMutation 'username' 'synthetic-user' 'mismatch'
+$setFailureFallback = Invoke-TestMutation 'username' 'synthetic-user' 'throw_set'
+$focusFailure = Invoke-TestMutation 'username' 'synthetic-user' 'unavailable' $false
+$verificationFailure = Invoke-TestMutation 'username' 'synthetic-user' 'unavailable' $true $true
+$secret = 'synthetic-password-never-in-evidence'
+$passwordFallback = Invoke-TestMutation 'password' $secret
+$result = [ordered]@{{
+    value_pattern_success = $valuePatternSuccess
+    unsupported_pattern_fallback = $unsupportedPatternFallback
+    unverified_pattern_fallback = $unverifiedPatternFallback
+    set_failure_fallback = $setFailureFallback
+    focus_failure = $focusFailure
+    verification_failure = $verificationFailure
+    password_fallback = $passwordFallback
+    password_secret_leaked = $passwordFallback.evidence_json.Contains($secret)
+}}
+[Console]::WriteLine(($result | ConvertTo-Json -Compress -Depth 8))
+"dynamic input mutation proof PASS"
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    result = json.loads(completed.stdout.splitlines()[0])
+
+    value_pattern = result["value_pattern_success"]
+    assert value_pattern["failure"] is None
+    assert value_pattern["sends"] == 0
+    assert value_pattern["set_count"] == 1
+    assert value_pattern["evidence_json"].find("synthetic-user") == -1
+    assert value_pattern["evidence"]["mutation_method"] == "VALUE_PATTERN"
+    assert value_pattern["evidence"]["verification_succeeded"] is True
+    assert value_pattern["evidence"]["observed_value_length"] == len("synthetic-user")
+
+    for key in (
+        "unsupported_pattern_fallback",
+        "unverified_pattern_fallback",
+        "set_failure_fallback",
+    ):
+        fallback = result[key]
+        assert fallback["failure"] is None
+        assert fallback["sends"] == 1
+        assert fallback["evidence"]["mutation_method"] == "KEYBOARD"
+        assert fallback["evidence"]["focus_requested"] is True
+        assert fallback["evidence"]["focus_confirmed"] is True
+        assert fallback["evidence"]["verification_succeeded"] is True
+    assert result["unverified_pattern_fallback"]["set_count"] == 1
+    assert (
+        result["unverified_pattern_fallback"]["evidence"]["programmatic_verification_succeeded"]
+        is False
+    )
+    assert (
+        result["unverified_pattern_fallback"]["evidence"]["programmatic_failure_code"]
+        == "desktop_input_value_not_populated_username"
+    )
+    assert (
+        result["set_failure_fallback"]["evidence"]["programmatic_failure_code"]
+        == "desktop_input_value_pattern_set_failed_username"
+    )
+
+    focus_failure = result["focus_failure"]
+    assert focus_failure["failure"] == "desktop_input_focus_not_acquired_username"
+    assert focus_failure["sends"] == 0
+    assert focus_failure["evidence_count"] == 1
+    assert focus_failure["evidence"]["failure_code"] == focus_failure["failure"]
+    assert focus_failure["evidence"]["focus_confirmed"] is False
+
+    verification_failure = result["verification_failure"]
+    assert verification_failure["failure"] == "desktop_input_value_not_populated_username"
+    assert verification_failure["sends"] == 1
+    assert verification_failure["evidence_count"] == 1
+    assert verification_failure["evidence"]["verification_performed"] is True
+    assert verification_failure["evidence"]["verification_succeeded"] is False
+
+    password = result["password_fallback"]
+    password_record = password["evidence"]
+    assert result["password_secret_leaked"] is False
+    assert password["failure"] is None
+    assert password["sends"] == 1
+    assert password["set_count"] == 0
+    assert password["pattern_calls"] == 0
+    assert password_record["verification_performed"] is False
+    assert password_record["verification_succeeded"] is None
+    assert "observed_value_length" not in password_record
+    secret_hash = hashlib.sha256(b"synthetic-password-never-in-evidence").hexdigest()
+    for forbidden in (secret_hash, "bearer", "token", "authorization"):
+        assert forbidden not in password["evidence_json"].lower()
+    forbidden_fields = {
+        "password",
+        "password_value",
+        "password_hash",
+        "password_length",
+        "value",
+        "raw_value",
+        "bearer",
+        "token",
+        "authorization",
+    }
+    assert not (forbidden_fields & password_record.keys())
+
+    assert "dynamic input mutation proof PASS" in completed.stdout
 
 
 def _write_probe_identity(directory: Path, prefix: str, *, leaf_ip: str) -> tuple[Path, Path, Path]:
@@ -916,6 +1169,7 @@ def test_controller_session_timeline_is_separate_and_scenario_scoped() -> None:
     assert "Add-OperatorSessionTransition" in source
     assert "operator_session_timeline = @($operatorSessionTimeline)" in source
     assert "operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)" in source
+    assert "input_mutation_evidence = @($inputMutationEvidence)" in source
 
 
 def test_bootstrap_requires_serving_key_cleanup_after_graceful_runtime_exit() -> None:
@@ -1916,12 +2170,25 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
     polling = observed[observed.index("while ($outcome") :]
     assert ".Invoke()" not in polling
     assert "Set-LoginInput" not in polling
+    assert "SetValue" not in polling
+    assert "Send-InputKeyboardValue" not in polling
+    assert "SendWait" not in polling
     assert 'Invoke-Button $ProcessId "Sign in"' not in source
 
     ensure_start = source.index("function Ensure-ControllerOwner")
     ensure_end = source.index("function Start-Desktop", ensure_start)
     ensure_owner = source[ensure_start:ensure_end]
     assert ensure_owner.count("Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage") == 1
+
+    bootstrap_start = source.index("function Bootstrap-ControllerOwner")
+    bootstrap_end = source.index("function Ensure-ControllerOwner", bootstrap_start)
+    bootstrap = source[bootstrap_start:bootstrap_end]
+    assert bootstrap.count('Invoke-Button $ProcessId "Create first Owner"') == 1
+    assert bootstrap.count('Set-LoginInput $ProcessId "Username"') == 1
+    assert bootstrap.count('Set-LoginInput $ProcessId "Password"') == 1
+    assert bootstrap.index('Invoke-Button $ProcessId "Create first Owner"') < bootstrap.index(
+        "Wait-Until {"
+    )
 
     timeline_start = observed.index("$script:operatorLoginAttemptTimeline.Add(")
     timeline_end = observed.index(") | Out-Null", timeline_start)
