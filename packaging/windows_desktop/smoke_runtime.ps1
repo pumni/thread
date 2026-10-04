@@ -412,7 +412,7 @@ function New-SyntheticTlsIdentity([string]$AdminDirectory, [string]$ServingDirec
     [System.IO.File]::WriteAllText($leafKeyPath, $leafKey.ExportPkcs8PrivateKeyPem(), $utf8)
     [System.IO.File]::WriteAllText(
         $fullchainPath,
-        $leafCertificate.ExportCertificatePem() + $rootCertificate.ExportCertificatePem(),
+        $leafCertificate.ExportCertificatePem() + "`r`n" + $rootCertificate.ExportCertificatePem(),
         $utf8
     )
     $fingerprint = "SHA256:" + (Get-Sha256Hex $rootCertificateDerPath)
