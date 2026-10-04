@@ -23,7 +23,7 @@ REQUIRED_SCENARIOS = (
 def _read_evidence(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):  # fmt: skip
         return None
     return value if isinstance(value, dict) else None
 

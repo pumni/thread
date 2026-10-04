@@ -862,6 +862,101 @@ function Get-OperatorLoginDatabaseState([object]$Config) {
     }
 }
 
+function Get-PostCrashOperatorAuthState([object]$Config) {
+    $username = $script:smokeOwnerUsername
+    $activeSessions = Get-ActiveOwnerSessionCount $Config
+    $loginSuccessAuditCount = Invoke-Psql $Config `
+        "SELECT COUNT(*) FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type = 'operator.login_succeeded';"
+    $loginAuditEventCount = Invoke-Psql $Config `
+        "SELECT COUNT(*) FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type LIKE 'operator.login_%';"
+    if ($loginSuccessAuditCount -notmatch '^\d+$' -or $loginAuditEventCount -notmatch '^\d+$') {
+        throw "controller_post_crash_login_audit_count_invalid"
+    }
+    return [pscustomobject]@{
+        server_active_session_count = [int]$activeSessions
+        login_success_audit_count = [int]$loginSuccessAuditCount
+        login_audit_event_count = [int]$loginAuditEventCount
+        operator_login_attempt_timeline_count = [int]$script:operatorLoginAttemptTimeline.Count
+    }
+}
+
+function Assert-PostCrashOperatorReauthenticationRequired(
+    [int]$ProcessId,
+    [object]$Config,
+    [string]$Stage,
+    [object]$BeforeCrash
+) {
+    $uiStateHolder = [pscustomobject]@{ Value = $null }
+    try {
+        Wait-Until {
+            $uiStateHolder.Value = Get-OperatorLoginUiState $ProcessId
+            return [bool]$uiStateHolder.Value.Ready
+        } 15 "controller_post_crash_login_ui_not_actionable"
+    } catch { }
+
+    $uiState = $uiStateHolder.Value
+    if (-not $uiState) {
+        $uiState = [pscustomobject]@{
+            Ready = $false
+            UsernamePresent = $false
+            UsernameEnabled = $false
+            UsernameFocusable = $false
+            PasswordPresent = $false
+            PasswordEnabled = $false
+            PasswordFocusable = $false
+            SignInPresent = $false
+            SignInEnabled = $false
+            SignInInvokePatternAvailable = $false
+        }
+    }
+    $afterRelaunch = Get-PostCrashOperatorAuthState $Config
+    $automaticLoginAuditDelta =
+        [int]$afterRelaunch.login_audit_event_count - [int]$BeforeCrash.login_audit_event_count
+    $loginSuccessAuditDelta =
+        [int]$afterRelaunch.login_success_audit_count - [int]$BeforeCrash.login_success_audit_count
+    $serverSessionCountDelta =
+        [int]$afterRelaunch.server_active_session_count - [int]$BeforeCrash.server_active_session_count
+    $loginAttemptTimelineDelta = [int]$afterRelaunch.operator_login_attempt_timeline_count -
+        [int]$BeforeCrash.operator_login_attempt_timeline_count
+    $failureCode = if (-not [bool]$uiState.Ready) {
+        "controller_post_crash_login_ui_not_actionable"
+    } elseif ($automaticLoginAuditDelta -ne 0 -or $loginSuccessAuditDelta -ne 0 -or
+        $loginAttemptTimelineDelta -ne 0) {
+        "controller_post_crash_automatic_login_detected"
+    } elseif ($serverSessionCountDelta -ne 0) {
+        "controller_post_crash_server_session_count_changed"
+    } else { $null }
+    $evidence = [ordered]@{
+        stage = $Stage
+        recorded_utc = [DateTimeOffset]::UtcNow.ToString("O")
+        client_reauthentication_required = [bool]$uiState.Ready
+        login_ui_ready = [bool]$uiState.Ready
+        username_control_present = [bool]$uiState.UsernamePresent
+        username_control_enabled = [bool]$uiState.UsernameEnabled
+        username_control_keyboard_focusable = [bool]$uiState.UsernameFocusable
+        password_control_present = [bool]$uiState.PasswordPresent
+        password_control_enabled = [bool]$uiState.PasswordEnabled
+        password_control_keyboard_focusable = [bool]$uiState.PasswordFocusable
+        sign_in_present = [bool]$uiState.SignInPresent
+        sign_in_enabled = [bool]$uiState.SignInEnabled
+        sign_in_invoke_pattern_available = [bool]$uiState.SignInInvokePatternAvailable
+        server_active_session_count_before_crash = [int]$BeforeCrash.server_active_session_count
+        server_active_session_count_after_relaunch = [int]$afterRelaunch.server_active_session_count
+        login_success_audit_count_before_crash = [int]$BeforeCrash.login_success_audit_count
+        login_success_audit_count_after_relaunch = [int]$afterRelaunch.login_success_audit_count
+        automatic_login_audit_delta = $automaticLoginAuditDelta
+        login_success_audit_delta = $loginSuccessAuditDelta
+        server_session_count_delta = $serverSessionCountDelta
+        operator_login_attempt_timeline_delta = $loginAttemptTimelineDelta
+        server_session_rows_are_local_bearer_evidence = $false
+        outcome = if ($failureCode) { "BLOCKER" } else { "PASS" }
+        failure_code = $failureCode
+    }
+    $script:scenarioEvidence[$Stage] = $evidence
+    if ($failureCode) { throw $failureCode }
+    return $evidence
+}
+
 function Get-OperatorLoginUiErrorCategory([int]$ProcessId) {
     try {
         $window = Get-Window $ProcessId
@@ -2432,6 +2527,10 @@ try {
         foreach ($process in $shutdownProcesses.Values) { $process.Dispose() }
     }
     Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
+    $checks.serving_leaf_key_cleaned_on_shutdown = -not (Test-Path -LiteralPath $servingKeyPath)
+    if (-not $checks.serving_leaf_key_cleaned_on_shutdown) {
+        throw "controller_serving_leaf_key_not_cleaned_on_shutdown"
+    }
     $checks.graceful_quit_stops_scheduler_http_then_postgres = $true
     }
 
@@ -2497,6 +2596,7 @@ try {
     $owned = Assert-ControllerProcesses
     $null = Set-OperatorSessionMode $desktop.Id $config "signed_in" `
         "database_crash_before_crash" "controller_scenario_fixture_owner_session_missing"
+    $databaseCrashAuthBefore = Get-PostCrashOperatorAuthState $config
     $scenarioEvidence.database_crash_before = Add-ControllerRuntimeIdentitySnapshot `
         "before_database_crash" $owned $config
     $databaseCrashPid = [int]$owned.postgres[0].ProcessId
@@ -2512,8 +2612,8 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
-    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
-        "after_database_crash_recovery" "controller_owner_session_exists_after_database_crash_recovery"
+    $null = Assert-PostCrashOperatorReauthenticationRequired `
+        $desktop.Id $config "database_crash_reauthentication_boundary" $databaseCrashAuthBefore
     Assert-DatabaseValue $config $sentinel
     if ([string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
         throw "controller_database_identity_changed_after_crash"
@@ -2528,6 +2628,7 @@ try {
     $beforeParentCrash = Assert-ControllerProcesses
     $null = Set-OperatorSessionMode $desktop.Id $config "signed_in" `
         "parent_crash_before_crash" "controller_scenario_fixture_owner_session_missing"
+    $parentCrashAuthBefore = Get-PostCrashOperatorAuthState $config
     $scenarioEvidence.parent_crash_before = Add-ControllerRuntimeIdentitySnapshot `
         "before_parent_crash" $beforeParentCrash $config
     $runtimeRootPids = @(
@@ -2563,8 +2664,8 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
-    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
-        "after_parent_crash_recovery" "controller_owner_session_exists_after_parent_crash_recovery"
+    $null = Assert-PostCrashOperatorReauthenticationRequired `
+        $desktop.Id $config "parent_crash_reauthentication_boundary" $parentCrashAuthBefore
     Assert-DatabaseValue $config $sentinel
     $owned = Assert-ControllerProcesses
     $rootFingerprintAfterParentCrash =

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import ipaddress
@@ -844,14 +845,6 @@ def test_controller_session_timeline_is_separate_and_scenario_scoped() -> None:
         ("reopen_before_login", "controller_reopen_owner_session_not_locked"),
         ("after_quit_relaunch", "controller_owner_session_exists_after_quit_relaunch"),
         (
-            "after_database_crash_recovery",
-            "controller_owner_session_exists_after_database_crash_recovery",
-        ),
-        (
-            "after_parent_crash_recovery",
-            "controller_owner_session_exists_after_parent_crash_recovery",
-        ),
-        (
             "after_failed_migration_recovery",
             "controller_owner_session_exists_after_failed_migration_recovery",
         ),
@@ -923,6 +916,222 @@ def test_controller_session_timeline_is_separate_and_scenario_scoped() -> None:
     assert "Add-OperatorSessionTransition" in source
     assert "operator_session_timeline = @($operatorSessionTimeline)" in source
     assert "operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)" in source
+
+
+def test_bootstrap_requires_serving_key_cleanup_after_graceful_runtime_exit() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    scenario_start = source.index("$fixture = Initialize-HealthyControllerFixture")
+    bootstrap_start = source.index(
+        'if ($Scenario -eq "bootstrap_https_cutover_tray")', scenario_start
+    )
+    shutdown_start = source.index("$shutdownProcesses = @{", bootstrap_start)
+    bootstrap_end = source.index('if ($Scenario -eq "restart_renewal")', shutdown_start)
+    shutdown = source[shutdown_start:bootstrap_end]
+
+    runtime_exit = shutdown.index(
+        "Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "
+        '"controller_quit_left_runtime_processes"'
+    )
+    cleanup_assertion = shutdown.index(
+        "$checks.serving_leaf_key_cleaned_on_shutdown = -not "
+        "(Test-Path -LiteralPath $servingKeyPath)"
+    )
+    check_complete = shutdown.index(
+        "$checks.graceful_quit_stops_scheduler_http_then_postgres = $true"
+    )
+    assert runtime_exit < cleanup_assertion < check_complete
+    assert 'throw "controller_serving_leaf_key_not_cleaned_on_shutdown"' in shutdown
+    bootstrap_checks = source.split("bootstrap_https_cutover_tray = @(", maxsplit=1)[1].split(
+        ")", maxsplit=1
+    )[0]
+    assert '"serving_leaf_key_cleaned_on_shutdown"' in bootstrap_checks
+
+
+def test_post_crash_reauthentication_boundary_is_attempt_free_and_authoritative() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    helper_start = source.index("function Assert-PostCrashOperatorReauthenticationRequired")
+    helper_end = source.index("function Get-OperatorLoginUiErrorCategory", helper_start)
+    helper = source[helper_start:helper_end]
+
+    assert "Invoke-ObservedOperatorLogin" not in helper
+    assert "Invoke-Button" not in helper
+    assert "Set-LoginInput" not in helper
+    assert ".Invoke()" not in helper
+    for field in (
+        "client_reauthentication_required",
+        "login_ui_ready",
+        "server_active_session_count_before_crash",
+        "server_active_session_count_after_relaunch",
+        "login_success_audit_count_before_crash",
+        "login_success_audit_count_after_relaunch",
+        "automatic_login_audit_delta",
+        "server_session_count_delta",
+        "server_session_rows_are_local_bearer_evidence",
+    ):
+        assert field in helper
+
+    database_start = source.index('if ($Scenario -eq "database_crash_recovery")')
+    parent_start = source.index('if ($Scenario -eq "parent_crash_recovery")', database_start)
+    migration_start = source.index('if ($Scenario -eq "migration_recovery_auth")', parent_start)
+    database_block = source[database_start:parent_start]
+    parent_block = source[parent_start:migration_start]
+    for block, stage, recovery_marker in (
+        (
+            database_block,
+            "database_crash_reauthentication_boundary",
+            "database_crash_fails_closed_and_recovers_wal",
+        ),
+        (
+            parent_block,
+            "parent_crash_reauthentication_boundary",
+            "desktop_parent_crash_owns_process_tree_and_recovers_wal",
+        ),
+    ):
+        assert "Assert-PostCrashOperatorReauthenticationRequired" in block
+        assert f'"{stage}"' in block
+        assert recovery_marker in block
+        assert 'Set-OperatorSessionMode $desktop.Id $config "signed_out"' not in block
+    assert "function Get-PostCrashOperatorAuthState" in source
+    auth_state = source[source.index("function Get-PostCrashOperatorAuthState") : helper_start]
+    assert "event_type LIKE 'operator.login_%'" in auth_state
+    assert "operator_login_attempt_timeline_count" in auth_state
+
+
+def test_post_crash_reauthentication_helper_dynamically_preserves_historical_server_rows() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell crash-auth boundary test is only available on Windows test hosts")
+
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    helper_start = source.index("function Assert-PostCrashOperatorReauthenticationRequired")
+    helper_end = source.index("function Get-OperatorLoginUiErrorCategory", helper_start)
+    helper = source[helper_start:helper_end]
+    assertion = f"""
+$script:scenarioEvidence = [ordered]@{{}}
+$script:operatorLoginAttemptTimeline = [System.Collections.Generic.List[object]]::new()
+foreach ($attempt in 1..4) {{ $script:operatorLoginAttemptTimeline.Add($attempt) | Out-Null }}
+$script:submissionCount = 0
+$script:mockUi = [pscustomobject]@{{
+    Ready = $true
+    UsernamePresent = $true
+    UsernameEnabled = $true
+    UsernameFocusable = $true
+    PasswordPresent = $true
+    PasswordEnabled = $true
+    PasswordFocusable = $true
+    SignInPresent = $true
+    SignInEnabled = $true
+    SignInInvokePatternAvailable = $true
+}}
+$script:mockAfter = [pscustomobject]@{{
+    server_active_session_count = 1
+    login_success_audit_count = 9
+    login_audit_event_count = 12
+    operator_login_attempt_timeline_count = 4
+}}
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutSeconds, [string]$Failure) {{
+    if (-not (& $Condition)) {{ throw $Failure }}
+}}
+function Get-OperatorLoginUiState([int]$ProcessId) {{ return $script:mockUi }}
+function Get-PostCrashOperatorAuthState([object]$Config) {{ return $script:mockAfter }}
+function Invoke-ObservedOperatorLogin {{ $script:submissionCount++ }}
+function Invoke-Button {{ $script:submissionCount++ }}
+{helper}
+$before = [pscustomobject]@{{
+    server_active_session_count = 1
+    login_success_audit_count = 9
+    login_audit_event_count = 12
+    operator_login_attempt_timeline_count = 4
+}}
+$persisted = Assert-PostCrashOperatorReauthenticationRequired 42 'synthetic-config' `
+    'database_crash_reauthentication_boundary' $before
+$script:mockUi.Ready = $false
+$uiFailure = $null
+try {{
+    $null = Assert-PostCrashOperatorReauthenticationRequired 42 'synthetic-config' `
+        'ui_failure' $before
+}} catch {{ $uiFailure = $_.Exception.Message }}
+$script:mockUi.Ready = $true
+$script:mockAfter.login_success_audit_count = 10
+$script:mockAfter.login_audit_event_count = 13
+$auditFailure = $null
+try {{
+    $null = Assert-PostCrashOperatorReauthenticationRequired 42 'synthetic-config' `
+        'audit_failure' $before
+}} catch {{ $auditFailure = $_.Exception.Message }}
+$script:mockAfter.login_success_audit_count = 9
+$script:mockAfter.login_audit_event_count = 12
+$script:mockAfter.server_active_session_count = 2
+$sessionFailure = $null
+try {{
+    $null = Assert-PostCrashOperatorReauthenticationRequired 42 'synthetic-config' `
+        'session_failure' $before
+}} catch {{ $sessionFailure = $_.Exception.Message }}
+[Console]::WriteLine((ConvertTo-Json -InputObject @{{
+    persisted = $persisted
+    ui_failure = $uiFailure
+    audit_failure = $auditFailure
+    session_failure = $sessionFailure
+    submission_count = $script:submissionCount
+    persisted_evidence = $script:scenarioEvidence.database_crash_reauthentication_boundary
+}} -Depth 8 -Compress))
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    evidence = result["persisted_evidence"]
+    assert result["ui_failure"] == "controller_post_crash_login_ui_not_actionable"
+    assert result["audit_failure"] == "controller_post_crash_automatic_login_detected"
+    assert result["session_failure"] == "controller_post_crash_server_session_count_changed"
+    assert result["submission_count"] == 0
+    assert result["persisted"]["client_reauthentication_required"] is True
+    assert result["persisted"]["login_ui_ready"] is True
+    assert evidence["server_active_session_count_before_crash"] == 1
+    assert evidence["server_active_session_count_after_relaunch"] == 1
+    assert evidence["login_success_audit_count_before_crash"] == 9
+    assert evidence["login_success_audit_count_after_relaunch"] == 9
+    assert evidence["automatic_login_audit_delta"] == 0
+    assert evidence["login_success_audit_delta"] == 0
+    assert evidence["server_session_count_delta"] == 0
+    assert evidence["operator_login_attempt_timeline_delta"] == 0
+    assert evidence["server_session_rows_are_local_bearer_evidence"] is False
+
+
+def test_controller_scenario_auth_timeline_does_not_equate_crash_rows_with_local_login() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    normalized = re.sub(r"`\s*\r?\n\s*", " ", source)
+    for scenario, stage in (
+        ("database_crash_recovery", "database_crash_reauthentication_boundary"),
+        ("parent_crash_recovery", "parent_crash_reauthentication_boundary"),
+    ):
+        start = source.index(f'if ($Scenario -eq "{scenario}")')
+        next_scenario = (
+            source.index('if ($Scenario -eq "migration_recovery_auth")', start)
+            if scenario == "parent_crash_recovery"
+            else source.index('if ($Scenario -eq "parent_crash_recovery")', start)
+        )
+        block = source[start:next_scenario]
+        assert f'"{stage}"' in block
+        recovery_start = block.index("$desktop = Start-ExistingController")
+        recovery = block[recovery_start:]
+        assert 'Set-OperatorSessionMode $desktop.Id $config "signed_out"' not in recovery
+        assert "Wait-ForOperatorSessionCount" not in recovery
+    assert '"window_hide_lock" "controller_owner_session_not_revoked_on_lock"' in normalized
+    assert '"reopen_before_login" "controller_reopen_owner_session_not_locked"' in normalized
+    assert (
+        '"after_quit_relaunch" "controller_owner_session_exists_after_quit_relaunch"' in normalized
+    )
+    assert (
+        '"after_failed_migration_recovery" '
+        '"controller_owner_session_exists_after_failed_migration_recovery"' in normalized
+    )
 
 
 def test_controller_runtime_identity_baselines_are_phase_scoped() -> None:
@@ -1220,6 +1429,11 @@ def _load_scenario_aggregator() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_controller_scenario_aggregator_parses_with_python_312_grammar() -> None:
+    source = SCENARIO_AGGREGATOR.read_text(encoding="utf-8")
+    ast.parse(source, feature_version=(3, 12))
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -1927,3 +2141,101 @@ def test_controller_scenario_aggregate_requires_all_exact_sha_clean_profile_evid
         row for row in blocked["scenarios"] if row["scenario"] == CONTROLLER_SCENARIOS[-1]
     )
     assert missing_row["result"] == "MISSING"
+
+
+@pytest.mark.parametrize(
+    "failure", ("missing", "duplicate", "wrong_sha", "wrong_runner", "blocker")
+)
+def test_controller_scenario_aggregate_writes_blocker_manifest_for_invalid_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    aggregator = _load_scenario_aggregator()
+    revision = "c" * 40
+    artifact_root = tmp_path / "artifacts"
+    scenario_dirs: dict[str, Path] = {}
+    for scenario in CONTROLLER_SCENARIOS:
+        evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}"
+        scenario_dirs[scenario] = evidence_dir
+        evidence: dict[str, Any] = {
+            "schema_version": 2,
+            "source_revision": revision,
+            "scenario": scenario,
+            "runner": {
+                "github_hosted": True,
+                "windows_x64": True,
+                "non_administrator": True,
+                "clean_profile": True,
+            },
+            "checks": {"fixture": True},
+            "failure_codes": [],
+            "failure_code": None,
+            "result": "PASS",
+        }
+        if failure == "wrong_sha" and scenario == CONTROLLER_SCENARIOS[0]:
+            evidence["source_revision"] = "f" * 40
+        elif failure == "wrong_runner" and scenario == CONTROLLER_SCENARIOS[0]:
+            evidence["runner"]["clean_profile"] = False
+        elif failure == "blocker" and scenario == CONTROLLER_SCENARIOS[0]:
+            evidence["result"] = "BLOCKER"
+            evidence["failure_code"] = "synthetic_scenario_blocker"
+        _write_json(evidence_dir / "controller-lifecycle.json", evidence)
+
+    expected_scenario = CONTROLLER_SCENARIOS[0]
+    if failure == "missing":
+        shutil.rmtree(scenario_dirs[CONTROLLER_SCENARIOS[-1]])
+        expected_scenario = CONTROLLER_SCENARIOS[-1]
+    elif failure == "duplicate":
+        original_iterdir = Path.iterdir
+        duplicate_path = scenario_dirs[expected_scenario]
+
+        def duplicate_scenario_artifact(path: Path) -> Any:
+            yield from original_iterdir(path)
+            if path == artifact_root:
+                yield duplicate_path
+
+        monkeypatch.setattr(Path, "iterdir", duplicate_scenario_artifact)
+
+    output_root = tmp_path / f"combined-{failure}"
+    if failure == "blocker":
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "aggregate_controller_scenarios.py",
+                "--artifact-root",
+                str(artifact_root),
+                "--source-sha",
+                revision,
+                "--output-root",
+                str(output_root),
+            ],
+        )
+        assert aggregator.main() == 1
+    else:
+        manifest = aggregator.aggregate_scenarios(artifact_root, revision, output_root)
+        assert manifest["result"] == "BLOCKER"
+
+    manifest_path = output_root / "controller-acceptance-manifest.json"
+    assert manifest_path.is_file()
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert written["result"] == "BLOCKER"
+    row = next(item for item in written["scenarios"] if item["scenario"] == expected_scenario)
+    expected_result = {
+        "missing": "MISSING",
+        "duplicate": "DUPLICATE",
+        "wrong_sha": "BLOCKER",
+        "wrong_runner": "BLOCKER",
+        "blocker": "BLOCKER",
+    }[failure]
+    assert row["result"] == expected_result
+    if failure == "wrong_sha":
+        assert row["primary_failure_code"] == "controller_scenario_source_revision_mismatch"
+    elif failure == "wrong_runner":
+        assert row["primary_failure_code"] == "controller_scenario_runner_preflight_invalid"
+    elif failure == "blocker":
+        assert row["primary_failure_code"] == "synthetic_scenario_blocker"
+    combined_scenarios = output_root / "controller-scenarios"
+    assert combined_scenarios.is_dir()
+    assert (combined_scenarios / CONTROLLER_SCENARIOS[1] / "controller-lifecycle.json").is_file()
+    if failure == "blocker":
+        assert (combined_scenarios / expected_scenario / "controller-lifecycle.json").is_file()
