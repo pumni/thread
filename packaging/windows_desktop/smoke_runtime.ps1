@@ -431,25 +431,53 @@ function New-SyntheticTlsIdentity([string]$AdminDirectory, [string]$ServingDirec
 }
 
 function Get-VerifiedHttpsStatus([int]$Port, [string]$Route, [string]$RootCertificatePath) {
+    if ($null -eq ("ThreadsDesktopSmokeCertificateVerifier" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+
+public static class ThreadsDesktopSmokeCertificateVerifier
+{
+    public static X509Certificate2 RootCertificate { get; set; }
+
+    public static bool Validate(
+        HttpRequestMessage request,
+        X509Certificate2 certificate,
+        X509Chain chain,
+        SslPolicyErrors errors)
+    {
+        var disallowed = SslPolicyErrors.RemoteCertificateNameMismatch |
+                         SslPolicyErrors.RemoteCertificateNotAvailable;
+        if (RootCertificate is null || certificate is null || chain is null ||
+            (errors & disallowed) != 0)
+        {
+            return false;
+        }
+
+        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        chain.ChainPolicy.VerificationFlags = X509VerificationFlags.NoFlag;
+        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        chain.ChainPolicy.CustomTrustStore.Add(RootCertificate);
+        return chain.Build(certificate);
+    }
+}
+'@
+    }
     $rootCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
         [System.IO.File]::ReadAllBytes($RootCertificatePath)
     )
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.UseProxy = $false
-    $handler.ServerCertificateCustomValidationCallback = {
-        param($request, $certificate, $chain, $errors)
-        $nameOrMissing = [System.Net.Security.SslPolicyErrors]::RemoteCertificateNameMismatch -bor
-            [System.Net.Security.SslPolicyErrors]::RemoteCertificateNotAvailable
-        if (($errors -band $nameOrMissing) -ne 0) { return $false }
-        $chain.ChainPolicy.TrustMode =
-            [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
-        $chain.ChainPolicy.VerificationFlags =
-            [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
-        $chain.ChainPolicy.RevocationMode =
-            [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-        $null = $chain.ChainPolicy.CustomTrustStore.Add($rootCertificate)
-        return $chain.Build($certificate)
-    }.GetNewClosure()
+    [ThreadsDesktopSmokeCertificateVerifier]::RootCertificate = $rootCertificate
+    $callbackType = [System.Net.Http.HttpClientHandler].GetProperty(
+        "ServerCertificateCustomValidationCallback"
+    ).PropertyType
+    $handler.ServerCertificateCustomValidationCallback =
+        [System.Delegate]::CreateDelegate(
+            $callbackType,
+            [ThreadsDesktopSmokeCertificateVerifier].GetMethod("Validate")
+        )
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(3)
     try {
