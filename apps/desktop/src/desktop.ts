@@ -47,8 +47,17 @@ export type WorkerDrainReason =
   | "DESKTOP_LEGACY_CUTOVER"
   | "DESKTOP_ROLLBACK";
 
+export type WorkerStatus =
+  | "REGISTERING"
+  | "ONLINE"
+  | "DEGRADED"
+  | "DRAINING"
+  | "OFFLINE"
+  | "DISABLED"
+  | "UPGRADE_REQUIRED";
+
 export interface WorkerDrainStatus {
-  status: string;
+  status: WorkerStatus;
   activeBrowserSessions: number;
   runningWorkerJobs: number;
   quiescent: boolean;

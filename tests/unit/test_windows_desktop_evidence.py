@@ -12,6 +12,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +33,9 @@ CONTROLLER_HTTPS_PROBE = REPO_ROOT / "packaging" / "windows_desktop" / "controll
 HOSTED_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "run_hosted_smoke.ps1"
 SCENARIO_AGGREGATOR = (
     REPO_ROOT / "packaging" / "windows_desktop" / "aggregate_controller_scenarios.py"
+)
+WORKER_DESKTOP_ARTIFACT_STAGE = (
+    REPO_ROOT / "packaging" / "windows_desktop" / "Stage-WorkerDesktopTestArtifact.ps1"
 )
 CONTROLLER_SCENARIOS = (
     "bootstrap_https_cutover_tray",
@@ -2548,6 +2552,71 @@ def test_controller_scenario_aggregate_requires_all_exact_sha_clean_profile_evid
         row for row in blocked["scenarios"] if row["scenario"] == CONTROLLER_SCENARIOS[-1]
     )
     assert missing_row["result"] == "MISSING"
+
+
+def test_worker_desktop_test_artifact_stages_the_tauri_resource_layout() -> None:
+    if os.name != "nt":
+        pytest.skip("Worker Desktop artifact staging is a Windows PowerShell contract")
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is required to validate Worker Desktop artifact staging")
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        source = temporary_root / "source"
+        source.mkdir()
+        executable = source / "threads-desktop.exe"
+        executable.write_bytes(b"synthetic Desktop executable")
+        destination = temporary_root / "worker-desktop-artifact"
+
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(WORKER_DESKTOP_ARTIFACT_STAGE),
+                "-DesktopExecutable",
+                str(executable),
+                "-Destination",
+                str(destination),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert {path.name for path in destination.iterdir()} == {
+            "threads-desktop.exe",
+            "Manage-ThreadsWorkerTask.ps1",
+        }
+        assert (destination / "threads-desktop.exe").read_bytes() == executable.read_bytes()
+        task_helper_source = (
+            REPO_ROOT / "packaging" / "windows_worker" / "Manage-ThreadsWorkerTask.ps1"
+        )
+        assert (destination / "Manage-ThreadsWorkerTask.ps1").read_bytes() == (
+            task_helper_source.read_bytes()
+        )
+
+        artifact = json.loads(result.stdout.strip())
+        assert artifact == {
+            "schema": "threads-worker-desktop-test-artifact-v1",
+            "executable": "threads-desktop.exe",
+            "resource_directory": ".",
+            "task_helper": "Manage-ThreadsWorkerTask.ps1",
+        }
+        tauri_config = json.loads(
+            (REPO_ROOT / "apps" / "desktop" / "src-tauri" / "tauri.conf.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        task_helper_resource = "../../../packaging/windows_worker/Manage-ThreadsWorkerTask.ps1"
+        assert tauri_config["bundle"]["resources"] == {
+            task_helper_resource: "Manage-ThreadsWorkerTask.ps1"
+        }
 
 
 @pytest.mark.parametrize(

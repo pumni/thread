@@ -79,10 +79,22 @@ struct WorkerDrainRequest<'a> {
     reason_code: &'a str,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum WorkerStatus {
+    Registering,
+    Online,
+    Degraded,
+    Draining,
+    Offline,
+    Disabled,
+    UpgradeRequired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct WorkerDrainStatus {
-    pub status: String,
+    pub status: WorkerStatus,
     pub active_browser_sessions: u32,
     pub running_worker_jobs: u32,
     pub quiescent: bool,
@@ -360,6 +372,13 @@ impl OperatorAuthState {
             .send()
             .await
             .map_err(|_| "worker_drain_unavailable".to_string())?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.clear_if_matches(&snapshot);
+            return Err("operator_session_revoked".to_string());
+        }
+        if response.status() == StatusCode::FORBIDDEN {
+            return Err("operator_forbidden".to_string());
+        }
         if !response.status().is_success() {
             return Err("worker_drain_request_failed".to_string());
         }
@@ -387,6 +406,13 @@ impl OperatorAuthState {
             .send()
             .await
             .map_err(|_| "worker_drain_unavailable".to_string())?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.clear_if_matches(&snapshot);
+            return Err("operator_session_revoked".to_string());
+        }
+        if response.status() == StatusCode::FORBIDDEN {
+            return Err("operator_forbidden".to_string());
+        }
         if !response.status().is_success() {
             return Err("worker_drain_unavailable".to_string());
         }
@@ -728,6 +754,13 @@ mod tests {
         body: String,
     }
 
+    #[derive(Clone, Copy)]
+    enum WorkerEndpointFailure {
+        Status(u16),
+        Disconnect,
+        UnknownStatus,
+    }
+
     fn logout_server() -> (
         String,
         Client,
@@ -863,6 +896,7 @@ mod tests {
 
     fn worker_drain_api_server(
         role: &'static str,
+        endpoint_failure: Option<WorkerEndpointFailure>,
     ) -> (
         String,
         Vec<u8>,
@@ -917,7 +951,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut drain_status_reads = 0;
-            for _ in 0..6 {
+            let request_limit = if endpoint_failure.is_some() { 2 } else { 6 };
+            for _ in 0..request_limit {
                 let accept_deadline = Instant::now() + Duration::from_secs(10);
                 let (socket, _) = loop {
                     match listener.accept() {
@@ -986,24 +1021,57 @@ mod tests {
                     })
                     .expect("Worker API request receiver");
 
-                let response_body = if request_line.starts_with("GET /v1/operator/me ") {
-                    format!(
-                        "{{\"id\":\"synthetic-operator\",\"username\":\"operator\",\"role\":\"{role}\",\"must_change_password\":false,\"expires_at\":\"2026-10-05T00:00:00Z\"}}"
+                let (status, response_body) = if request_line.starts_with("GET /v1/operator/me ") {
+                    (
+                        "200 OK",
+                        format!(
+                            "{{\"id\":\"synthetic-operator\",\"username\":\"operator\",\"role\":\"{role}\",\"must_change_password\":false,\"expires_at\":\"2026-10-05T00:00:00Z\"}}"
+                        ),
+                    )
+                } else if let Some(WorkerEndpointFailure::Disconnect) = endpoint_failure {
+                    break;
+                } else if let Some(WorkerEndpointFailure::Status(status)) = endpoint_failure {
+                    let reason = match status {
+                        401 => "Unauthorized",
+                        403 => "Forbidden",
+                        _ => panic!("unsupported synthetic Worker endpoint status"),
+                    };
+                    (
+                        if status == 401 {
+                            "401 Unauthorized"
+                        } else {
+                            "403 Forbidden"
+                        },
+                        reason.to_string(),
+                    )
+                } else if matches!(endpoint_failure, Some(WorkerEndpointFailure::UnknownStatus)) {
+                    (
+                        "200 OK",
+                        r#"{"status":"UNKNOWN","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string(),
                     )
                 } else if request_line.starts_with("POST /v1/workers/") {
-                    r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string()
+                    (
+                        "200 OK",
+                        r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string(),
+                    )
                 } else if request_line.starts_with("GET /v1/workers/") {
                     drain_status_reads += 1;
                     if drain_status_reads == 1 {
-                        r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string()
+                        (
+                            "200 OK",
+                            r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string(),
+                        )
                     } else {
-                        r#"{"status":"OFFLINE","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string()
+                        (
+                            "200 OK",
+                            r#"{"status":"OFFLINE","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string(),
+                        )
                     }
                 } else {
                     panic!("unexpected test Worker API request: {request_line}");
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 );
@@ -1145,7 +1213,8 @@ mod tests {
 
     #[test]
     fn worker_drain_client_requests_once_then_polls_status_with_private_root_session() {
-        let (base_url, root_der, request_receiver, server) = worker_drain_api_server("OPERATOR");
+        let (base_url, root_der, request_receiver, server) =
+            worker_drain_api_server("OPERATOR", None);
         let client = private_root_client(&root_der).expect("private-root Worker client");
         let state = OperatorAuthState::default();
         install_session_with_client(&state, &base_url, "synthetic-operator-bearer", client);
@@ -1155,16 +1224,16 @@ mod tests {
             state.request_local_worker_drain(worker_id, "DESKTOP_LEGACY_CUTOVER"),
         )
         .expect("Operator-authorized drain request");
-        assert_eq!(requested.status, "DRAINING");
+        assert_eq!(requested.status, WorkerStatus::Draining);
         assert_eq!(requested.running_worker_jobs, 2);
         assert!(!requested.quiescent);
 
         let draining = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
             .expect("first drain status poll");
-        assert_eq!(draining.status, "DRAINING");
+        assert_eq!(draining.status, WorkerStatus::Draining);
         let offline = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
             .expect("second drain status poll");
-        assert_eq!(offline.status, "OFFLINE");
+        assert_eq!(offline.status, WorkerStatus::Offline);
         assert_eq!(offline.active_browser_sessions, 0);
         assert_eq!(offline.running_worker_jobs, 0);
         assert!(offline.quiescent);
@@ -1202,6 +1271,115 @@ mod tests {
         assert_eq!(post_body["reason_code"], "DESKTOP_LEGACY_CUTOVER");
         let serialized = serde_json::to_string(&offline).expect("safe drain status DTO");
         assert!(!serialized.contains("synthetic-operator-bearer"));
+    }
+
+    fn assert_worker_endpoint_failure(
+        method: &str,
+        endpoint_failure: WorkerEndpointFailure,
+        expected_code: &str,
+        clear_session: bool,
+    ) {
+        let (base_url, root_der, request_receiver, server) =
+            worker_drain_api_server("OPERATOR", Some(endpoint_failure));
+        let client = private_root_client(&root_der).expect("private-root Worker client");
+        let state = OperatorAuthState::default();
+        install_session_with_client(&state, &base_url, "synthetic-operator-bearer", client);
+        let worker_id = "12345678-1234-4234-8234-123456789abc";
+        let result = match method {
+            "POST" => tauri::async_runtime::block_on(
+                state.request_local_worker_drain(worker_id, "DESKTOP_QUIT"),
+            )
+            .map(|_| ()),
+            "GET" => tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
+                .map(|_| ()),
+            _ => panic!("unsupported Worker endpoint method"),
+        };
+        assert_eq!(result.unwrap_err(), expected_code);
+        assert_eq!(
+            state
+                .session
+                .lock()
+                .expect("Operator session mutex")
+                .is_none(),
+            clear_session
+        );
+
+        let evidence = (0..2)
+            .map(|_| {
+                request_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("captured Operator and Worker endpoint requests")
+            })
+            .collect::<Vec<_>>();
+        server.join().expect("Worker API test server finished");
+        assert!(evidence[0].target.starts_with("GET /v1/operator/me "));
+        assert!(evidence[1]
+            .target
+            .starts_with(&format!("{method} /v1/workers/{worker_id}/drain ")));
+        assert!(evidence.iter().all(|request| {
+            request.authorization == "authorization: Bearer synthetic-operator-bearer"
+        }));
+    }
+
+    #[test]
+    fn worker_drain_endpoint_rechecks_auth_and_maps_revocation_forbidden_and_transport_errors() {
+        for method in ["POST", "GET"] {
+            assert_worker_endpoint_failure(
+                method,
+                WorkerEndpointFailure::Status(401),
+                "operator_session_revoked",
+                true,
+            );
+            assert_worker_endpoint_failure(
+                method,
+                WorkerEndpointFailure::Status(403),
+                "operator_forbidden",
+                false,
+            );
+            assert_worker_endpoint_failure(
+                method,
+                WorkerEndpointFailure::Disconnect,
+                "worker_drain_unavailable",
+                false,
+            );
+            assert_worker_endpoint_failure(
+                method,
+                WorkerEndpointFailure::UnknownStatus,
+                "worker_drain_response_invalid",
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn worker_drain_status_uses_the_exact_server_status_enum() {
+        for (wire, expected) in [
+            ("REGISTERING", WorkerStatus::Registering),
+            ("ONLINE", WorkerStatus::Online),
+            ("DEGRADED", WorkerStatus::Degraded),
+            ("DRAINING", WorkerStatus::Draining),
+            ("OFFLINE", WorkerStatus::Offline),
+            ("DISABLED", WorkerStatus::Disabled),
+            ("UPGRADE_REQUIRED", WorkerStatus::UpgradeRequired),
+        ] {
+            let value: WorkerDrainStatus = serde_json::from_value(serde_json::json!({
+                "status": wire,
+                "active_browser_sessions": 0,
+                "running_worker_jobs": 0,
+                "quiescent": true
+            }))
+            .expect("known Worker status parses");
+            assert_eq!(value.status, expected);
+            assert_eq!(serde_json::to_value(value).unwrap()["status"], wire);
+        }
+
+        let unknown = serde_json::from_value::<WorkerDrainStatus>(serde_json::json!({
+            "status": "UNKNOWN",
+            "active_browser_sessions": 0,
+            "running_worker_jobs": 0,
+            "quiescent": true
+        }));
+        assert!(unknown.is_err());
     }
 
     #[test]

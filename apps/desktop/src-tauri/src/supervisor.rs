@@ -14,13 +14,17 @@ use std::{
 use crate::{
     controller_store::ControllerStore,
     controller_tls::{self, ControllerTlsSummary},
-    worker_host::{self, LegacyTaskState, WorkerHostBinding, WorkerOwnership},
+    worker_host::{
+        self, LegacyTaskState, ProcessLockObservation, WorkerHostBinding, WorkerOwnership,
+    },
     ProvisionedRole,
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 const MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
+const WORKER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKER_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const POSTGRES_STDERR_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -361,7 +365,12 @@ impl Supervisor {
         };
         self.legacy_task_state = Some(inspection.state);
         let decision = worker_host::classify_task(inspection.state);
-        self.worker_ownership = Some(decision.ownership);
+        self.worker_ownership = Some(match inspection.state {
+            LegacyTaskState::Running | LegacyTaskState::Ready => decision.ownership,
+            LegacyTaskState::Invalid
+            | LegacyTaskState::NotRegistered
+            | LegacyTaskState::Disabled => WorkerOwnership::Blocked,
+        });
         if matches!(
             inspection.state,
             LegacyTaskState::Invalid | LegacyTaskState::NotRegistered
@@ -429,21 +438,44 @@ impl Supervisor {
             if let Err(code) = assign_and_resume_worker(&job, &mut child) {
                 return Err(self.fail_worker(code));
             }
-            if !worker_host::binding_identity_unchanged(&binding) {
-                drop(job);
-                let _ = child.wait();
-                return Err(self.fail_worker("worker_identity_corrupt"));
-            }
             self.worker_runtime = Some(WorkerRuntime {
                 child,
                 _job: job,
                 _identity_guard: identity_guard,
             });
-            self.worker_ownership = Some(WorkerOwnership::Desktop);
-            self.lifecycle = Lifecycle::Running;
-            self.diagnostic_code = None;
+            let deadline = Instant::now() + WORKER_LOCK_TIMEOUT;
+            let observation = {
+                let runtime = self
+                    .worker_runtime
+                    .as_mut()
+                    .expect("Worker runtime was just installed");
+                wait_for_worker_lock_with(
+                    || {
+                        runtime
+                            .child
+                            .try_wait()
+                            .is_ok_and(|status| status.is_none())
+                    },
+                    || worker_host::observe_process_lock(&binding.data_root),
+                    || Instant::now() >= deadline,
+                    thread::sleep,
+                )
+            };
+            if let Err(code) = observation {
+                return Err(self.fail_worker(code));
+            }
+            if !worker_host::binding_identity_unchanged(&binding) {
+                return Err(self.fail_worker("worker_identity_corrupt"));
+            }
+            self.mark_worker_owned_unverified();
             Ok(())
         }
+    }
+
+    fn mark_worker_owned_unverified(&mut self) {
+        self.worker_ownership = Some(WorkerOwnership::Desktop);
+        self.lifecycle = Lifecycle::Starting;
+        self.diagnostic_code = None;
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
@@ -482,6 +514,30 @@ impl Supervisor {
     fn fail_worker(&mut self, code: &'static str) -> String {
         self.worker_ownership = Some(WorkerOwnership::Blocked);
         self.fail(code)
+    }
+}
+
+fn wait_for_worker_lock_with(
+    mut child_is_running: impl FnMut() -> bool,
+    mut observe_lock: impl FnMut() -> ProcessLockObservation,
+    mut deadline_reached: impl FnMut() -> bool,
+    mut wait: impl FnMut(Duration),
+) -> Result<(), &'static str> {
+    loop {
+        if !child_is_running() {
+            return Err("worker_process_exited");
+        }
+        match observe_lock() {
+            ProcessLockObservation::Held => return Ok(()),
+            ProcessLockObservation::NotHeld => {}
+            ProcessLockObservation::Unavailable => {
+                return Err("worker_process_lock_unavailable");
+            }
+        }
+        if deadline_reached() {
+            return Err("worker_process_lock_not_acquired");
+        }
+        wait(WORKER_LOCK_POLL_INTERVAL);
     }
 }
 
@@ -1609,6 +1665,81 @@ fn stop_child(child: &mut Option<Child>) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_startup_wait_succeeds_only_after_lock_is_observed_held() {
+        let observations = [
+            ProcessLockObservation::NotHeld,
+            ProcessLockObservation::Held,
+        ];
+        let mut index = 0;
+        let result = wait_for_worker_lock_with(
+            || true,
+            || {
+                let observation = observations[index];
+                index += 1;
+                observation
+            },
+            || false,
+            |_| {},
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn worker_startup_wait_fails_when_child_exits_before_lock_proof() {
+        let observations = std::cell::Cell::new(0);
+        let result = wait_for_worker_lock_with(
+            || false,
+            || {
+                observations.set(observations.get() + 1);
+                ProcessLockObservation::NotHeld
+            },
+            || false,
+            |_| {},
+        );
+        assert_eq!(result, Err("worker_process_exited"));
+        assert_eq!(observations.get(), 0);
+    }
+
+    #[test]
+    fn worker_startup_wait_times_out_without_retrying_the_process() {
+        let checks = std::cell::Cell::new(0);
+        let waits = std::cell::Cell::new(0);
+        let result = wait_for_worker_lock_with(
+            || true,
+            || {
+                checks.set(checks.get() + 1);
+                ProcessLockObservation::NotHeld
+            },
+            || checks.get() == 3,
+            |_| waits.set(waits.get() + 1),
+        );
+        assert_eq!(result, Err("worker_process_lock_not_acquired"));
+        assert_eq!(checks.get(), 3);
+        assert_eq!(waits.get(), 2);
+
+        let source = include_str!("supervisor.rs");
+        let start = source
+            .find("fn start_worker(&mut self)")
+            .expect("Worker start");
+        let end = source[start..]
+            .find("pub fn stop(&mut self)")
+            .map(|offset| start + offset)
+            .expect("Worker stop follows start");
+        assert_eq!(source[start..end].matches("command.spawn()").count(), 1);
+    }
+
+    #[test]
+    fn local_worker_ownership_remains_server_unverified() {
+        let mut supervisor = Supervisor::default();
+        supervisor.mark_worker_owned_unverified();
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.state, "starting");
+        assert_eq!(snapshot.worker_ownership, Some("DESKTOP"));
+        assert_ne!(snapshot.state, "running");
+    }
 
     #[cfg(windows)]
     fn spawn_test_worker_process() -> Child {

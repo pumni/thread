@@ -13,7 +13,7 @@ use std::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const TASK_HELPER_NAME: &str = "Manage-ThreadsWorkerTask.ps1";
+pub(super) const TASK_HELPER_NAME: &str = "Manage-ThreadsWorkerTask.ps1";
 const KEY_FILE_MAGIC: &[u8] = b"TPW-DPAPI-ED25519-1\0";
 const KEY_CONTEXT: &[u8] = b"threads-platform-worker-key-v1\0";
 const MAX_HOST_CONFIG_BYTES: u64 = 16_384;
@@ -72,6 +72,13 @@ pub(super) enum WorkerOwnership {
     TakeoverRequired,
     Desktop,
     Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProcessLockObservation {
+    Held,
+    NotHeld,
+    Unavailable,
 }
 
 impl WorkerOwnership {
@@ -665,30 +672,114 @@ fn read_file(file: &mut fs::File) -> Result<Vec<u8>, &'static str> {
     Ok(bytes)
 }
 
+#[cfg(windows)]
+fn has_reparse_point_attribute(attributes: u32) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    fs::symlink_metadata(path)
+        .map(|metadata| has_reparse_point_attribute(metadata.file_attributes()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
 fn is_reparse_point(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
 }
 
+fn classify_process_lock_read(result: std::io::Result<usize>) -> ProcessLockObservation {
+    match result {
+        Ok(_) => ProcessLockObservation::NotHeld,
+        Err(error) if error.raw_os_error() == Some(33) => ProcessLockObservation::Held,
+        Err(_) => ProcessLockObservation::Unavailable,
+    }
+}
+
+pub(super) fn observe_process_lock(data_root: &Path) -> ProcessLockObservation {
+    let path = data_root.join("worker").join("agent.lock");
+    #[cfg(windows)]
+    {
+        use std::io::{Seek, SeekFrom};
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let mut file = match fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ProcessLockObservation::NotHeld;
+            }
+            Err(_) => return ProcessLockObservation::Unavailable,
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return ProcessLockObservation::Unavailable,
+        };
+        if has_reparse_point_attribute(metadata.file_attributes()) {
+            return ProcessLockObservation::Unavailable;
+        }
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return ProcessLockObservation::Unavailable;
+        }
+        let mut first_byte = [0_u8; 1];
+        classify_process_lock_read(file.read(&mut first_byte))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        ProcessLockObservation::Unavailable
+    }
+}
+
 pub(super) fn process_lock_is_available(data_root: &Path) -> Result<(), &'static str> {
     let path = data_root.join("worker").join("agent.lock");
     #[cfg(windows)]
     {
-        use std::{fs::OpenOptions, os::windows::io::AsRawHandle};
+        use std::{
+            fs::OpenOptions,
+            os::windows::{fs::MetadataExt, fs::OpenOptionsExt, io::AsRawHandle},
+        };
         use windows_sys::Win32::{
-            Foundation::HANDLE,
+            Foundation::{GetLastError, ERROR_LOCK_VIOLATION, HANDLE},
             Storage::FileSystem::{
-                LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+                LockFileEx, UnlockFileEx, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+                LOCKFILE_FAIL_IMMEDIATELY,
             },
             System::IO::OVERLAPPED,
         };
 
-        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err("worker_process_lock_unavailable"),
         };
+        let metadata = file
+            .metadata()
+            .map_err(|_| "worker_process_lock_unavailable")?;
+        if has_reparse_point_attribute(metadata.file_attributes()) {
+            return Err("worker_process_lock_unavailable");
+        }
         let handle = file.as_raw_handle() as HANDLE;
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         let locked = unsafe {
@@ -702,7 +793,11 @@ pub(super) fn process_lock_is_available(data_root: &Path) -> Result<(), &'static
             )
         };
         if locked == 0 {
-            return Err("worker_process_lock_held");
+            return Err(if unsafe { GetLastError() } == ERROR_LOCK_VIOLATION {
+                "worker_process_lock_held"
+            } else {
+                "worker_process_lock_unavailable"
+            });
         }
         let unlocked = unsafe { UnlockFileEx(handle, 0, 1, 0, &mut overlapped) };
         if unlocked == 0 {
@@ -740,6 +835,14 @@ fn sanitize_worker_environment(command: &mut Command) {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(windows)]
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
     fn write_manifest(package: &Path, sha: &str) {
         let manifest = serde_json::json!({
@@ -1072,5 +1175,260 @@ mod tests {
                 Some(None)
             );
         }
+    }
+
+    #[test]
+    fn lock_read_classifier_only_treats_error_33_as_held() {
+        assert_eq!(
+            classify_process_lock_read(Ok(0)),
+            ProcessLockObservation::NotHeld
+        );
+        assert_eq!(
+            classify_process_lock_read(Ok(1)),
+            ProcessLockObservation::NotHeld
+        );
+        assert_eq!(
+            classify_process_lock_read(Err(std::io::Error::from_raw_os_error(33))),
+            ProcessLockObservation::Held
+        );
+        assert_eq!(
+            classify_process_lock_read(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            ProcessLockObservation::Unavailable
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_point_detection_uses_the_windows_file_attribute() {
+        assert!(!has_reparse_point_attribute(0));
+        assert!(has_reparse_point_attribute(0x0400));
+        assert!(has_reparse_point_attribute(0x0400 | 0x0020));
+    }
+
+    #[test]
+    fn post_resume_observer_has_no_lock_or_mutating_file_operations() {
+        let source = include_str!("worker_host.rs");
+        let start = source
+            .find("pub(super) fn observe_process_lock")
+            .expect("post-resume observer exists");
+        let end = source[start..]
+            .find("pub(super) fn process_lock_is_available")
+            .map(|offset| start + offset)
+            .expect("pre-spawn availability probe follows observer");
+        let observer = &source[start..end];
+        for forbidden in [
+            "LockFileEx",
+            "UnlockFileEx",
+            ".write(",
+            ".create(",
+            ".append(",
+            ".truncate(",
+        ] {
+            assert!(
+                !observer.contains(forbidden),
+                "post-resume observer must not contain {forbidden}"
+            );
+        }
+        assert!(observer.contains(".read(true)"));
+        assert!(observer.contains("FILE_FLAG_OPEN_REPARSE_POINT"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_and_unlocked_process_lock_observations_do_not_mutate_the_file() {
+        let directory = tempfile::tempdir().expect("Worker root");
+        let worker = directory.path().join("worker");
+        fs::create_dir(&worker).expect("create Worker directory");
+        let lock_path = worker.join("agent.lock");
+
+        assert_eq!(
+            observe_process_lock(directory.path()),
+            ProcessLockObservation::NotHeld
+        );
+        assert!(!lock_path.exists(), "observer must not create agent.lock");
+
+        fs::write(&lock_path, b"worker lock sentinel").expect("create existing lock file");
+        let before = fs::read(&lock_path).expect("snapshot unlocked process lock");
+        assert_eq!(
+            observe_process_lock(directory.path()),
+            ProcessLockObservation::NotHeld
+        );
+        assert_eq!(
+            fs::read(&lock_path).expect("read unchanged process lock"),
+            before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_observer_detects_byte_range_lock_held_by_another_handle() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK},
+            System::IO::OVERLAPPED,
+        };
+
+        let directory = tempfile::tempdir().expect("Worker root");
+        let worker = directory.path().join("worker");
+        fs::create_dir(&worker).expect("create Worker directory");
+        let path = worker.join("agent.lock");
+        fs::write(&path, b"0").expect("create existing process lock file");
+        let before = fs::read(&path).expect("snapshot process lock");
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open lock owner");
+        let handle = owner.as_raw_handle() as HANDLE;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let locked =
+            unsafe { LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut overlapped) };
+        assert_ne!(locked, 0, "fixture acquires byte zero");
+        assert_eq!(
+            observe_process_lock(directory.path()),
+            ProcessLockObservation::Held
+        );
+        unsafe {
+            UnlockFileEx(handle, 0, 1, 0, &mut overlapped);
+        }
+        assert_eq!(
+            observe_process_lock(directory.path()),
+            ProcessLockObservation::NotHeld
+        );
+        assert_eq!(fs::read(&path).expect("lock remains unchanged"), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_lock_junction_fails_closed_without_following_target() {
+        let directory = tempfile::tempdir().expect("Worker root");
+        let worker = directory.path().join("worker");
+        fs::create_dir(&worker).expect("create Worker directory");
+        let target = worker.join("target-lock-directory");
+        let link = worker.join("agent.lock");
+        fs::create_dir(&target).expect("create junction target");
+        let sentinel = target.join("sentinel");
+        fs::write(&sentinel, b"target bytes").expect("create target sentinel");
+        let junction = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .expect("create directory junction");
+        assert!(
+            junction.status.success(),
+            "Windows creates directory junction"
+        );
+
+        assert!(is_reparse_point(&link));
+        assert_eq!(
+            observe_process_lock(directory.path()),
+            ProcessLockObservation::Unavailable
+        );
+        assert_eq!(
+            fs::read(&sentinel).expect("target remains untouched"),
+            b"target bytes"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_worker_process_lock_interoperates_with_read_only_observer() {
+        let directory = tempfile::tempdir().expect("Worker root");
+        let worker = directory.path().join("worker");
+        fs::create_dir(&worker).expect("create Worker directory");
+        let lock_path = worker.join("agent.lock");
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("resolve repository root");
+        let python_source = repository_root.join("src").to_string_lossy().into_owned();
+        let script = concat!(
+            "import sys\n",
+            "from pathlib import Path\n",
+            "sys.path.insert(0, sys.argv[2])\n",
+            "from threads_platform.infrastructure.worker_agent.process_lock import WorkerProcessLock\n",
+            "lock = WorkerProcessLock(Path(sys.argv[1]))\n",
+            "lock.acquire()\n",
+            "print('WORKER_LOCK_HELD', flush=True)\n",
+            "sys.stdin.readline()\n",
+            "lock.release()\n",
+        );
+
+        let (program, prefix_args) = python_launcher();
+        let mut child = Command::new(program)
+            .args(prefix_args)
+            .arg("-c")
+            .arg(script)
+            .arg(&lock_path)
+            .arg(python_source)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start Python Worker lock fixture");
+        let stdout = child.stdout.take().expect("capture Worker lock signal");
+        let (signal_sender, signal_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = signal_sender.send(result);
+        });
+        let signal = match signal_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(signal)) => signal,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Worker lock fixture did not signal within the deadline");
+            }
+        };
+        if signal.trim() != "WORKER_LOCK_HELD" {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Worker lock fixture did not acquire the expected byte range");
+        }
+
+        let held = observe_process_lock(directory.path());
+        let mut stdin = child.stdin.take().expect("Worker lock release channel");
+        stdin
+            .write_all(b"release\n")
+            .expect("release actual Worker lock");
+        drop(stdin);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll Worker lock fixture") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Worker lock fixture did not exit before deadline");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let released = observe_process_lock(directory.path());
+
+        assert!(status.success(), "Worker lock fixture exits cleanly");
+        assert_eq!(held, ProcessLockObservation::Held);
+        assert_eq!(released, ProcessLockObservation::NotHeld);
+        assert_eq!(fs::read(&lock_path).expect("read lock bytes"), b"0");
+    }
+
+    #[cfg(windows)]
+    fn python_launcher() -> (&'static str, Vec<&'static str>) {
+        for (program, prefix_args) in [("py", vec!["-3"]), ("python", vec![])] {
+            let available = Command::new(program)
+                .args(prefix_args.iter().copied())
+                .args(["-c", "pass"])
+                .status()
+                .is_ok_and(|status| status.success());
+            if available {
+                return (program, prefix_args);
+            }
+        }
+        panic!("Windows test host must provide Python for Worker lock interoperability");
     }
 }

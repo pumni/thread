@@ -882,12 +882,19 @@ fn runtime_root(app: &tauri::App) -> tauri::Result<PathBuf> {
 }
 
 fn worker_task_helper_path(app: &tauri::App) -> Option<PathBuf> {
-    app.path()
-        .resolve(
-            "Manage-ThreadsWorkerTask.ps1",
-            tauri::path::BaseDirectory::Resource,
-        )
-        .ok()
+    worker_task_helper_from_resolution(
+        app.path()
+            .resolve(
+                worker_host::TASK_HELPER_NAME,
+                tauri::path::BaseDirectory::Resource,
+            )
+            .ok(),
+    )
+}
+
+fn worker_task_helper_from_resolution(resolved: Option<PathBuf>) -> Option<PathBuf> {
+    let helper = resolved?;
+    helper.is_file().then_some(helper)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -980,6 +987,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_task_helper_is_resolved_from_the_bundled_resource_directory() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("Tauri config");
+        assert_eq!(
+            config["bundle"]["resources"]
+                ["../../../packaging/windows_worker/Manage-ThreadsWorkerTask.ps1"],
+            worker_host::TASK_HELPER_NAME
+        );
+
+        let resource_dir = tempfile::tempdir().expect("installed resource directory");
+        assert_eq!(worker_task_helper_from_resolution(None), None);
+        let helper = resource_dir.path().join(worker_host::TASK_HELPER_NAME);
+        fs::write(&helper, b"bundled task helper").expect("stage task helper resource");
+        assert_eq!(
+            worker_task_helper_from_resolution(Some(helper.clone())),
+            Some(helper),
+        );
+    }
 
     #[test]
     fn config_round_trips_and_rejects_incompatible_schema() {
