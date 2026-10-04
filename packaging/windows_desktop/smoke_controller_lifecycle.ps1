@@ -8,6 +8,20 @@ param(
     [string]$ExpectedSourceRevision,
     [Parameter(Mandatory = $true)]
     [string]$EvidencePath,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet(
+        "bootstrap_https_cutover_tray",
+        "restart_renewal",
+        "database_crash_recovery",
+        "parent_crash_recovery",
+        "migration_recovery_auth",
+        "database_port_collision",
+        "endpoint_port_collision",
+        "unowned_root",
+        "unwritable_root",
+        "corrupt_cluster"
+    )]
+    [string]$Scenario,
     [Parameter()]
     [string]$VerifiedSourceRevision,
     [Parameter()]
@@ -21,6 +35,11 @@ if (-not (Test-Path -LiteralPath $privateRootProbePath -PathType Leaf)) {
     throw "controller_https_probe_script_missing"
 }
 . $privateRootProbePath
+$loginEvidencePath = Join-Path $PSScriptRoot "operator_login_evidence.ps1"
+if (-not (Test-Path -LiteralPath $loginEvidencePath -PathType Leaf)) {
+    throw "controller_login_evidence_script_missing"
+}
+. $loginEvidencePath
 $DesktopExecutable = (Resolve-Path -LiteralPath $DesktopExecutable).Path
 $RuntimeRoot = (Resolve-Path -LiteralPath $RuntimeRoot).Path
 $EvidencePath = [System.IO.Path]::GetFullPath($EvidencePath)
@@ -83,6 +102,7 @@ $runtimeExecutable = Join-Path $RuntimeRoot "threads-runtime\threads-runtime.exe
 $postgresBin = Join-Path $RuntimeRoot "postgresql\bin"
 $pgCtl = Join-Path $postgresBin "pg_ctl.exe"
 $psql = Join-Path $postgresBin "psql.exe"
+$pgControlData = Join-Path $postgresBin "pg_controldata.exe"
 $identifier = "com.pumni.threads-desktop"
 $configDirectory = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)) $identifier
 $configPath = Join-Path $configDirectory "device-config.json"
@@ -142,6 +162,66 @@ $checks = [ordered]@{
     unwritable_root_is_rejected = $false
     corrupt_cluster_is_preserved_and_rejected = $false
 }
+$commonScenarioChecks = @(
+    "clean_profile",
+    "runtime_bundle_shared",
+    "controller_root_current_user_acl",
+    "dpapi_current_user_round_trip",
+    "atomic_non_secret_config",
+    "controller_https_configuration_persisted",
+    "endpoint_reconfigure_before_owner",
+    "endpoint_unavailable_ip_rolls_back",
+    "endpoint_collision_rolls_back",
+    "no_lan_listener_before_local_owner_bootstrap",
+    "controller_https_root_fingerprint_matches_ui",
+    "no_owner_or_lan_bootstrap",
+    "local_first_owner_bootstrap",
+    "separate_http_and_scheduler_processes",
+    "loopback_postgres_wildcard_https_listener",
+    "local_readiness_uses_private_root",
+    "plaintext_health_rejected"
+)
+$scenarioSpecificChecks = @{
+    bootstrap_https_cutover_tray = @(
+        "endpoint_running_unavailable_ip_rolls_back",
+        "endpoint_running_unavailable_ip_preserves_owner_session",
+        "endpoint_running_collision_rolls_back",
+        "endpoint_running_collision_preserves_owner_session",
+        "endpoint_running_transition_preserves_postgres",
+        "endpoint_running_transition_revokes_owner_session",
+        "endpoint_running_transition_reauthenticates_one_owner_session",
+        "x_hides_and_runtime_continues",
+        "reopen_keeps_one_runtime_and_database_identity",
+        "reopen_requires_operator_sign_in",
+        "owner_reauthenticated_after_reopen",
+        "active_session_verified_before_privileged_quit",
+        "graceful_quit_stops_scheduler_http_then_postgres",
+        "serving_leaf_key_cleaned_on_shutdown"
+    )
+    restart_renewal = @(
+        "root_identity_persists_across_restart",
+        "leaf_renewal_preserves_root_identity",
+        "stale_serving_leaf_key_replaced_on_startup",
+        "serving_leaf_key_cleaned_on_shutdown",
+        "relaunch_preserves_database_and_endpoint"
+    )
+    database_crash_recovery = @("database_crash_fails_closed_and_recovers_wal")
+    parent_crash_recovery = @(
+        "desktop_parent_crash_owns_process_tree_and_recovers_wal",
+        "controller_root_identity_survives_crash_restart"
+    )
+    migration_recovery_auth = @(
+        "failed_migration_preserves_existing_cluster",
+        "active_session_verified_before_privileged_quit",
+        "graceful_quit_stops_scheduler_http_then_postgres"
+    )
+    database_port_collision = @("database_port_collision_does_not_rotate")
+    endpoint_port_collision = @("endpoint_port_collision_does_not_rotate")
+    unowned_root = @("unowned_root_is_preserved_and_rejected")
+    unwritable_root = @("unwritable_root_is_rejected")
+    corrupt_cluster = @("corrupt_cluster_is_preserved_and_rejected")
+}
+$scenarioCheckNames = @($commonScenarioChecks + $scenarioSpecificChecks[$Scenario] | Select-Object -Unique)
 $result = "BLOCKER"
 $failureCode = $null
 $failureScriptLine = $null
@@ -154,7 +234,9 @@ $sentinel = [Guid]::NewGuid().ToString("N")
 $script:smokeOwnerUsername = "dx05owner" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
 $script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
 $processEvidence = [ordered]@{}
+$scenarioEvidence = [ordered]@{}
 $operatorSessionTimeline = [System.Collections.Generic.List[object]]::new()
+$operatorLoginAttemptTimeline = [System.Collections.Generic.List[object]]::new()
 $controllerRuntimeIdentityTimeline = [System.Collections.Generic.List[object]]::new()
 $endpointCollisionEvidence = $null
 $rootWasMoved = $false
@@ -702,6 +784,240 @@ function Get-ActiveOwnerSessionCount([object]$Config) {
     return [int]$count
 }
 
+function Get-OperatorLoginUiState([int]$ProcessId) {
+    $window = Get-Window $ProcessId
+    $username = if ($window) {
+        Find-Element $window "Username" ([System.Windows.Automation.ControlType]::Edit)
+    } else { $null }
+    $password = if ($window) {
+        Find-Element $window "Password" ([System.Windows.Automation.ControlType]::Edit)
+    } else { $null }
+    $signIn = if ($window) {
+        Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button)
+    } else { $null }
+    $usernameCurrent = if ($username) { $username.Current } else { $null }
+    $passwordCurrent = if ($password) { $password.Current } else { $null }
+    $signInCurrent = if ($signIn) { $signIn.Current } else { $null }
+    $invokePattern = $null
+    $invokeAvailable = $false
+    if ($signIn) {
+        try {
+            $invokeAvailable = $signIn.TryGetCurrentPattern(
+                [System.Windows.Automation.InvokePattern]::Pattern,
+                [ref]$invokePattern
+            )
+        } catch { $invokeAvailable = $false }
+    }
+    return [pscustomobject]@{
+        Username = $username
+        Password = $password
+        SignIn = $signIn
+        UsernamePresent = $null -ne $username
+        UsernameEnabled = $null -ne $usernameCurrent -and $usernameCurrent.IsEnabled
+        UsernameFocusable = $null -ne $usernameCurrent -and $usernameCurrent.IsKeyboardFocusable
+        PasswordPresent = $null -ne $password
+        PasswordEnabled = $null -ne $passwordCurrent -and $passwordCurrent.IsEnabled
+        PasswordFocusable = $null -ne $passwordCurrent -and $passwordCurrent.IsKeyboardFocusable
+        SignInPresent = $null -ne $signIn
+        SignInEnabled = $null -ne $signInCurrent -and $signInCurrent.IsEnabled
+        SignInInvokePatternAvailable = [bool]$invokeAvailable
+        Ready = $null -ne $username -and $null -ne $password -and $null -ne $signIn -and
+            $null -ne $usernameCurrent -and $usernameCurrent.IsEnabled -and
+            $usernameCurrent.IsKeyboardFocusable -and
+            $null -ne $passwordCurrent -and $passwordCurrent.IsEnabled -and
+            $passwordCurrent.IsKeyboardFocusable -and
+            $null -ne $signInCurrent -and $signInCurrent.IsEnabled -and $invokeAvailable
+    }
+}
+
+function Get-OperatorLoginDatabaseState([object]$Config) {
+    $username = $script:smokeOwnerUsername
+    $ownerRow = Invoke-Psql $Config `
+        "SELECT enabled::text || '|' || role || '|' || must_change_password::text FROM public.operator_users WHERE username = '$username';"
+    $ownerFields = if ([string]::IsNullOrWhiteSpace($ownerRow)) { @() } else { $ownerRow.Split('|') }
+    $throttleRow = Invoke-Psql $Config `
+        "SELECT (t.operator_user_id IS NOT NULL)::text || '|' || COALESCE(t.failed_attempts, 0)::text || '|' || COALESCE((t.locked_until > now())::text, 'false') FROM public.operator_users u LEFT JOIN public.operator_login_throttles t ON t.operator_user_id = u.id WHERE u.username = '$username';"
+    $throttleFields = $throttleRow.Split('|')
+    $activeSessions = Get-ActiveOwnerSessionCount $Config
+    $eventRows = Invoke-Psql $Config `
+        "SELECT COALESCE(string_agg(event_type, ',' ORDER BY created_at DESC), '') FROM (SELECT event_type, created_at FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type LIKE 'operator.login_%' ORDER BY created_at DESC LIMIT 8) recent;"
+    return [ordered]@{
+        active_owner_session_count = $activeSessions
+        owner_exists = $ownerFields.Count -eq 3
+        owner_enabled = $ownerFields.Count -eq 3 -and $ownerFields[0] -eq "true"
+        owner_role = if ($ownerFields.Count -eq 3) { $ownerFields[1] } else { $null }
+        owner_must_change_password = $ownerFields.Count -eq 3 -and $ownerFields[2] -eq "true"
+        login_throttle_present = $throttleFields.Count -eq 3 -and $throttleFields[0] -eq "true"
+        login_failed_attempts = if ($throttleFields.Count -eq 3) { [int]$throttleFields[1] } else { 0 }
+        login_lock_active = $throttleFields.Count -eq 3 -and $throttleFields[2] -eq "true"
+        recent_owner_audit_event_types = if ([string]::IsNullOrWhiteSpace($eventRows)) {
+            @()
+        } else { @($eventRows.Split(',') | Where-Object { $_ -match '^operator\.login_[a-z_]+$' }) }
+    }
+}
+
+function Get-OperatorLoginUiErrorCategory([int]$ProcessId) {
+    try {
+        $window = Get-Window $ProcessId
+        if (-not $window) { return "NONE" }
+        if (Find-TextContaining $window "The Controller could not verify Operator access.") {
+            return "OPERATOR_API_UNAVAILABLE"
+        }
+        if (Find-TextContaining $window "Sign-in failed.") { return "SIGN_IN_FAILED" }
+        if (Find-TextContaining $window "First Owner setup failed.") { return "FIRST_OWNER_SETUP_FAILED" }
+    } catch { return "NONE" }
+    return "NONE"
+}
+
+function Get-OperatorLoginSnapshot(
+    [int]$ProcessId,
+    [object]$Config,
+    [object]$UiState
+) {
+    $runtime = Get-ControllerProcesses
+    $supervisorState = "UNKNOWN"
+    try {
+        $window = Get-Window $ProcessId
+        if ($window -and (Find-TextContaining $window "Controller runtime is running")) {
+            $supervisorState = "RUNNING"
+        } elseif ($window -and (Find-TextContaining $window "Controller runtime failed")) {
+            $supervisorState = "FAILED"
+        }
+    } catch { }
+    $healthOutcome = "UNAVAILABLE"
+    $readyOutcome = "UNAVAILABLE"
+    try { $healthOutcome = [string](Invoke-ControllerHttpsProbe $Config "/health").outcome } catch { }
+    try { $readyOutcome = [string](Invoke-ControllerHttpsProbe $Config "/ready").outcome } catch { }
+    $database = Get-OperatorLoginDatabaseState $Config
+    return [ordered]@{
+        recorded_utc = [DateTimeOffset]::UtcNow.ToString("O")
+        supervisor_state = $supervisorState
+        supervisor_diagnostic_code = Get-ControllerDiagnosticCode $ProcessId
+        endpoint_port = [int]$Config.endpointPort
+        health_probe_outcome = $healthOutcome
+        ready_probe_outcome = $readyOutcome
+        username_control_present = [bool]$UiState.UsernamePresent
+        username_control_enabled = [bool]$UiState.UsernameEnabled
+        username_control_keyboard_focusable = [bool]$UiState.UsernameFocusable
+        password_control_present = [bool]$UiState.PasswordPresent
+        password_control_enabled = [bool]$UiState.PasswordEnabled
+        password_control_keyboard_focusable = [bool]$UiState.PasswordFocusable
+        sign_in_present = [bool]$UiState.SignInPresent
+        sign_in_enabled = [bool]$UiState.SignInEnabled
+        sign_in_invoke_pattern_available = [bool]$UiState.SignInInvokePatternAvailable
+        active_owner_session_count = [int]$database.active_owner_session_count
+        owner_exists = [bool]$database.owner_exists
+        owner_enabled = [bool]$database.owner_enabled
+        owner_role = $database.owner_role
+        owner_must_change_password = [bool]$database.owner_must_change_password
+        login_throttle_present = [bool]$database.login_throttle_present
+        login_failed_attempts = [int]$database.login_failed_attempts
+        login_lock_active = [bool]$database.login_lock_active
+        recent_owner_audit_event_types = @($database.recent_owner_audit_event_types)
+        postgres_count = @($runtime.postgres).Count
+        http_count = @($runtime.http).Count
+        scheduler_count = @($runtime.scheduler).Count
+    }
+}
+
+function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]$Stage) {
+    $uiStateHolder = [pscustomobject]@{ Value = $null }
+    try {
+        Wait-Until {
+            $uiStateHolder.Value = Get-OperatorLoginUiState $ProcessId
+            return [bool]$uiStateHolder.Value.Ready
+        } 15 "controller_operator_login_ui_not_ready"
+    } catch { }
+    $uiState = if ($uiStateHolder.Value) { $uiStateHolder.Value } else {
+        Get-OperatorLoginUiState $ProcessId
+    }
+
+    $inputMutationSucceeded = $false
+    if ($uiState.Ready) {
+        try {
+            Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
+            Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
+            $inputMutationSucceeded = $true
+        } catch { $inputMutationSucceeded = $false }
+    }
+    $uiState = Get-OperatorLoginUiState $ProcessId
+    $beforeState = Get-OperatorLoginSnapshot $ProcessId $Config $uiState
+    $beforeState.stage = $Stage
+    $beforeState.active_owner_session_count_before = [int]$beforeState.active_owner_session_count
+    $beforeState.login_throttle_present_before = [bool]$beforeState.login_throttle_present
+    $beforeState.login_failed_attempts_before = [int]$beforeState.login_failed_attempts
+    $beforeState.login_lock_active_before = [bool]$beforeState.login_lock_active
+    $before = [ordered]@{
+        active_owner_session_count_before = [int]$beforeState.active_owner_session_count
+        login_failed_attempts = [int]$beforeState.login_failed_attempts
+        login_lock_active = [bool]$beforeState.login_lock_active
+        health_probe_outcome_before = [string]$beforeState.health_probe_outcome
+        ready_probe_outcome_before = [string]$beforeState.ready_probe_outcome
+    }
+    $uiReady = [bool]$uiState.Ready -and $inputMutationSucceeded
+    $invokeCompleted = $false
+    if ($uiReady) {
+        try {
+            $invokePattern = $uiState.SignIn.GetCurrentPattern(
+                [System.Windows.Automation.InvokePattern]::Pattern
+            )
+            $invokePattern.Invoke()
+            $invokeCompleted = $true
+        } catch { $invokeCompleted = $false }
+    }
+
+    $uiErrorCategory = "NONE"
+    $afterState = Get-OperatorLoginSnapshot $ProcessId $Config `
+        (Get-OperatorLoginUiState $ProcessId)
+    $after = [ordered]@{
+        active_owner_session_count_after = [int]$afterState.active_owner_session_count
+        login_failed_attempts = [int]$afterState.login_failed_attempts
+        login_lock_active = [bool]$afterState.login_lock_active
+        recent_owner_audit_event_types_after = @($afterState.recent_owner_audit_event_types)
+        health_probe_outcome = [string]$afterState.health_probe_outcome
+        ready_probe_outcome = [string]$afterState.ready_probe_outcome
+    }
+    $afterState.stage = $Stage
+    $afterState.active_owner_session_count_after = [int]$afterState.active_owner_session_count
+    $afterState.login_throttle_present_after = [bool]$afterState.login_throttle_present
+    $afterState.login_failed_attempts_after = [int]$afterState.login_failed_attempts
+    $afterState.login_lock_active_after = [bool]$afterState.login_lock_active
+    $outcome = Get-OperatorLoginOutcome $before $after $uiReady $invokeCompleted $uiErrorCategory
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ($outcome -eq "LOGIN_FAILURE_UNCLASSIFIED" -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $uiErrorCategory = Get-OperatorLoginUiErrorCategory $ProcessId
+        $afterState = Get-OperatorLoginSnapshot $ProcessId $Config `
+            (Get-OperatorLoginUiState $ProcessId)
+        $after = [ordered]@{
+            active_owner_session_count_after = [int]$afterState.active_owner_session_count
+            login_failed_attempts = [int]$afterState.login_failed_attempts
+            login_lock_active = [bool]$afterState.login_lock_active
+            recent_owner_audit_event_types_after = @($afterState.recent_owner_audit_event_types)
+            health_probe_outcome = [string]$afterState.health_probe_outcome
+            ready_probe_outcome = [string]$afterState.ready_probe_outcome
+        }
+        $afterState.stage = $Stage
+        $afterState.active_owner_session_count_after = [int]$afterState.active_owner_session_count
+        $afterState.login_throttle_present_after = [bool]$afterState.login_throttle_present
+        $afterState.login_failed_attempts_after = [int]$afterState.login_failed_attempts
+        $afterState.login_lock_active_after = [bool]$afterState.login_lock_active
+        $outcome = Get-OperatorLoginOutcome $before $after $uiReady $invokeCompleted $uiErrorCategory
+    }
+    $failure = if ($outcome -eq "SUCCESS") { $null } else { Get-OperatorLoginFailureCode $outcome }
+    $script:operatorLoginAttemptTimeline.Add([ordered]@{
+        stage = $Stage
+        recorded_utc = [DateTimeOffset]::UtcNow.ToString("O")
+        pre_login = $beforeState
+        sign_in_invoke_completed = $invokeCompleted
+        ui_error_category = $uiErrorCategory
+        post_login = $afterState
+        outcome = $outcome
+        failure_code = $failure
+    }) | Out-Null
+    if ($outcome -ne "SUCCESS") { throw $failure }
+}
+
 function Add-OperatorSessionTransition(
     [string]$Stage,
     [int]$ExpectedCount,
@@ -821,29 +1137,44 @@ function Ensure-ControllerOwner(
             throw "controller_active_owner_session_count_not_one"
         }
     }
-    $readinessFailure = if ($AfterEndpointReconfiguration) {
-        "controller_endpoint_reconfigure_reauthentication_failed"
-    } else {
-        "controller_operator_reauthentication_not_ready"
-    }
-    Wait-Until {
-        $window = Get-Window $ProcessId
-        return $null -ne (Find-Element $window "Username" ([System.Windows.Automation.ControlType]::Edit)) -and
-            $null -ne (Find-Element $window "Password" ([System.Windows.Automation.ControlType]::Edit)) -and
-            $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
-    } 15 $readinessFailure
-    Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
-    Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
-    Invoke-Button $ProcessId "Sign in"
-    $loginFailure = if ($AfterEndpointReconfiguration) {
-        "controller_endpoint_reconfigure_reauthentication_failed"
-    } else {
-        "controller_owner_login_failed"
-    }
-    $null = Wait-ForOperatorSessionCount $config $LoginStage 1 30 $loginFailure
+    Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage
+    $null = Wait-ForOperatorSessionCount `
+        $config $LoginStage 1 3 "controller_owner_login_session_not_observed"
     if ($AfterEndpointReconfiguration) {
         $checks.endpoint_running_transition_reauthenticates_one_owner_session = $true
     }
+}
+
+function Set-OperatorSessionMode(
+    [int]$ProcessId,
+    [object]$Config,
+    [ValidateSet("signed_in", "signed_out")]
+    [string]$Mode,
+    [string]$Stage,
+    [string]$FailureCode
+) {
+    if ($Mode -eq "signed_in") {
+        Ensure-ControllerOwner $ProcessId $Stage
+        return Wait-ForOperatorSessionCount `
+            $Config $Stage 1 3 $FailureCode
+    }
+    $observed = Get-ActiveOwnerSessionCount $Config
+    if ($observed -eq 1) {
+        $window = Get-ProcessIfPresent $ProcessId
+        if (-not $window) { throw "controller_scenario_signed_out_window_unavailable" }
+        $window.Refresh()
+        if (-not [ThreadsControllerSmoke.NativeMethods]::PostMessage(
+            $window.MainWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero
+        )) { throw "controller_scenario_signed_out_lock_failed" }
+        Wait-Until {
+            -not [ThreadsControllerSmoke.NativeMethods]::IsWindowVisible($window.MainWindowHandle)
+        } 10 "controller_scenario_signed_out_lock_timeout"
+        $window.Dispose()
+    } elseif ($observed -ne 0) {
+        throw "controller_scenario_owner_session_count_invalid"
+    }
+    return Wait-ForOperatorSessionCount `
+        $Config $Stage 0 3 $FailureCode
 }
 
 function Start-Desktop([int]$WindowTimeout = 30) {
@@ -970,6 +1301,18 @@ function Invoke-Psql([object]$Config, [string]$Sql) {
         [Array]::Clear($plain, 0, $plain.Length)
         $env:PGPASSWORD = $oldPassword
     }
+}
+
+function Get-PostgresSystemIdentifierFromControlFile {
+    $dataDirectory = Join-Path $controllerRoot "postgresql"
+    if (-not (Test-Path -LiteralPath $pgControlData -PathType Leaf)) {
+        throw "controller_postgres_control_data_tool_missing"
+    }
+    $lines = @(& $pgControlData $dataDirectory 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "controller_postgres_control_data_read_failed" }
+    $match = @($lines | Where-Object { $_ -match '^Database system identifier:\s*(\d+)$' })
+    if ($match.Count -ne 1) { throw "controller_postgres_system_identifier_unavailable" }
+    return [regex]::Match([string]$match[0], '\d+').Value
 }
 
 function Get-OperatorSessionEvidence([object]$Config) {
@@ -1565,6 +1908,62 @@ function Assert-DatabaseValue([object]$Config, [string]$Expected) {
     if ($actual -cne $Expected) { throw "controller_durable_sentinel_mismatch" }
 }
 
+function Initialize-HealthyControllerFixture([int]$ProcessId, [object]$Config) {
+    $databaseSystemIdentifier = Invoke-Psql $Config "SELECT system_identifier FROM pg_control_system();"
+    $operatorUsersTable = Invoke-Psql $Config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
+    $operatorUserCount = Invoke-Psql $Config "SELECT COUNT(*) FROM public.operator_users;"
+    $script:checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and
+        $operatorUserCount -eq "0" -and $Config.endpointPort -gt 0 -and $Config.databasePort -gt 0
+    if (-not $script:checks.no_owner_or_lan_bootstrap) {
+        throw "controller_m1_owner_boundary_invalid"
+    }
+
+    Bootstrap-ControllerOwner $ProcessId
+    $null = Wait-ForOperatorSessionCount `
+        $Config "bootstrap" 1 5 "controller_first_owner_session_missing"
+    $null = Wait-ForControllerHttps $Config 60 -AfterOwnerBootstrap
+    $enabledOwnerCount = Invoke-Psql $Config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
+    $script:checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
+    if (-not $script:checks.local_first_owner_bootstrap) {
+        throw "controller_local_first_owner_bootstrap_invalid"
+    }
+    $script:checks.local_readiness_uses_private_root = $true
+    if (-not (Test-PlaintextHttpRejected $Config)) {
+        throw "controller_plaintext_health_listener_present"
+    }
+    $script:checks.plaintext_health_rejected = $true
+    $owned = Assert-ControllerProcesses
+    $identity = Add-ControllerRuntimeIdentitySnapshot `
+        "after_owner_bootstrap" $owned $Config
+    if ([int]$identity.http_pid -eq [int]$identity.scheduler_pid) {
+        throw "controller_http_scheduler_process_collapsed"
+    }
+    $script:checks.separate_http_and_scheduler_processes = $true
+    $dbListeners = @(Get-ListenerAddresses ([int]$Config.databasePort))
+    $httpListeners = @(Get-ListenerAddresses ([int]$Config.endpointPort))
+    $privateDatabaseAndWildcardTls =
+        $dbListeners.Count -eq 1 -and $dbListeners[0] -eq "127.0.0.1" -and
+        $httpListeners.Count -eq 1 -and $httpListeners[0] -eq "0.0.0.0" -and
+        (Test-Path -LiteralPath $servingKeyPath -PathType Leaf)
+    Set-Check "loopback_postgres_wildcard_https_listener" $privateDatabaseAndWildcardTls `
+        "controller_listener_topology_invalid"
+    if (-not $privateDatabaseAndWildcardTls) { throw "controller_listener_topology_invalid" }
+    Invoke-Psql $Config "CREATE TABLE dx04_runtime_evidence (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO dx04_runtime_evidence (id, marker) VALUES (1, '$script:sentinel');" | Out-Null
+    Assert-DatabaseValue $Config $script:sentinel
+
+    return [pscustomobject]@{
+        Config = Get-ControllerConfig
+        ControllerId = [string]$Config.controllerId
+        DatabaseSystemIdentifier = [string]$databaseSystemIdentifier
+        Sentinel = [string]$script:sentinel
+        RuntimeIdentity = $identity
+        Processes = $owned
+        RootFingerprint = Get-FileSha256 $rootCertificatePath
+        EndpointPort = [int]$Config.endpointPort
+        LanAddress = [string]$Config.lanAddress
+    }
+}
+
 try {
     if ($VerifiedSourceRevision) {
         if (-not $VerifiedWorktreeClean -or $VerifiedSourceRevision -ne $ExpectedSourceRevision) {
@@ -1778,27 +2177,15 @@ try {
         $config.lanAddress -ceq $lanAddress -and $config.endpointPort -eq $selectedHttpsPort
     if (-not $checks.atomic_non_secret_config) { throw "controller_config_contains_secret_or_invalid_state" }
 
-    $databaseSystemIdentifier = Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();"
-    $operatorUsersTable = Invoke-Psql $config "SELECT to_regclass('public.operator_users') IS NOT NULL;"
-    $operatorUserCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users;"
-    $checks.no_owner_or_lan_bootstrap = $operatorUsersTable -eq "t" -and $operatorUserCount -eq "0" -and
-        $config.endpointPort -gt 0 -and $config.databasePort -gt 0
-    if (-not $checks.no_owner_or_lan_bootstrap) { throw "controller_m1_owner_boundary_invalid" }
-    Bootstrap-ControllerOwner $desktop.Id
-    $null = Wait-ForOperatorSessionCount `
-        $config "bootstrap" 1 5 "controller_first_owner_session_missing"
-    $null = Wait-ForControllerHttps $config 60 -AfterOwnerBootstrap
-    $enabledOwnerCount = Invoke-Psql $config "SELECT COUNT(*) FROM public.operator_users WHERE role = 'OWNER' AND enabled;"
-    $checks.local_first_owner_bootstrap = $enabledOwnerCount -eq "1"
-    if (-not $checks.local_first_owner_bootstrap) { throw "controller_local_first_owner_bootstrap_invalid" }
-    $checks.local_readiness_uses_private_root = $true
-    if (-not (Test-PlaintextHttpRejected $config)) {
-        throw "controller_plaintext_health_listener_present"
-    }
-    $checks.plaintext_health_rejected = $true
-    $owned = Assert-ControllerProcesses
-    $initialRuntimeIdentity = Add-ControllerRuntimeIdentitySnapshot `
-        "after_owner_bootstrap" $owned $config
+    $fixture = Initialize-HealthyControllerFixture $desktop.Id $config
+    $config = $fixture.Config
+    $controllerIdentity = $fixture.ControllerId
+    $databaseSystemIdentifier = $fixture.DatabaseSystemIdentifier
+    $initialRuntimeIdentity = $fixture.RuntimeIdentity
+    $owned = $fixture.Processes
+    $fixtureSessionStage = "${Scenario}_fixture_signed_in"
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_in" `
+        $fixtureSessionStage "controller_scenario_fixture_owner_session_missing"
     $initialHttpPid = [int]$initialRuntimeIdentity.http_pid
     $initialSchedulerPid = [int]$initialRuntimeIdentity.scheduler_pid
     $initialPostgresPid = [int]$initialRuntimeIdentity.postgres_pid
@@ -1806,18 +2193,8 @@ try {
         throw "controller_http_scheduler_process_collapsed"
     }
     $checks.separate_http_and_scheduler_processes = $true
-    $dbListeners = @(Get-ListenerAddresses ([int]$config.databasePort))
-    $httpListeners = @(Get-ListenerAddresses ([int]$config.endpointPort))
-    $privateDatabaseAndWildcardTls =
-        $dbListeners.Count -eq 1 -and $dbListeners[0] -eq "127.0.0.1" -and
-        $httpListeners.Count -eq 1 -and $httpListeners[0] -eq "0.0.0.0" -and
-        (Test-Path -LiteralPath $servingKeyPath -PathType Leaf)
-    Set-Check "loopback_postgres_wildcard_https_listener" $privateDatabaseAndWildcardTls `
-        "controller_listener_topology_invalid"
-    if (-not $privateDatabaseAndWildcardTls) { throw "controller_listener_topology_invalid" }
-    Invoke-Psql $config "CREATE TABLE dx04_runtime_evidence (id integer PRIMARY KEY, marker text NOT NULL); INSERT INTO dx04_runtime_evidence (id, marker) VALUES (1, '$sentinel');" | Out-Null
-    Assert-DatabaseValue $config $sentinel
 
+    if ($Scenario -eq "bootstrap_https_cutover_tray") {
     # Failed post-Owner attempts preserve the endpoint and both certificate identities.
     $ownedBeforeEndpointChange = Assert-ControllerProcesses
     $oldHttpsPort = [int]$config.endpointPort
@@ -1959,8 +2336,8 @@ try {
         "after_window_hide" $hiddenProcesses $config
     Assert-ControllerRuntimeIdentityContinuity $postCutoverRuntimeIdentity `
         $windowHideRuntimeIdentity "controller_window_hide_changed_runtime_identity"
-    $null = Wait-ForOperatorSessionCount `
-        $config "window_hide_lock" 0 15 "controller_owner_session_not_revoked_on_lock"
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
+        "window_hide_lock" "controller_owner_session_not_revoked_on_lock"
     Assert-DatabaseValue $config $sentinel
     $checks.x_hides_and_runtime_continues = $true
 
@@ -1974,8 +2351,8 @@ try {
         return $null -ne (Find-TextContaining $window "Session locked") -and
             $null -ne (Find-Element $window "Sign in" ([System.Windows.Automation.ControlType]::Button))
     } 15 "controller_reopen_did_not_require_operator_sign_in"
-    $null = Wait-ForOperatorSessionCount `
-        (Get-ControllerConfig) "reopen_before_login" 0 5 "controller_reopen_owner_session_not_locked"
+    $null = Set-OperatorSessionMode $desktop.Id (Get-ControllerConfig) "signed_out" `
+        "reopen_before_login" "controller_reopen_owner_session_not_locked"
     $checks.reopen_requires_operator_sign_in = $true
     Ensure-ControllerOwner $desktop.Id "reopen_after_login" -ForceReauthentication
     $checks.owner_reauthenticated_after_reopen = $true
@@ -2038,6 +2415,12 @@ try {
     }
     Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
     $checks.graceful_quit_stops_scheduler_http_then_postgres = $true
+    }
+
+    if ($Scenario -eq "restart_renewal") {
+    Quit-Desktop $desktop.Id "restart_renewal_quit_login"
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
+    $checks.graceful_quit_stops_scheduler_http_then_postgres = $true
     $rootFingerprintBeforeRestart =
         (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $leafCertificatePath = Join-Path (Join-Path $controllerRoot "tls") "leaf-cert.der"
@@ -2056,8 +2439,8 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
-    $null = Wait-ForOperatorSessionCount `
-        $config "after_quit_relaunch" 0 15 "controller_owner_session_exists_after_quit_relaunch"
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
+        "after_quit_relaunch" "controller_owner_session_exists_after_quit_relaunch"
     $rootFingerprintAfterRestart =
         (Get-FileHash -LiteralPath $rootCertificatePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $renewedLeaf = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
@@ -2086,9 +2469,18 @@ try {
         [string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
         throw "controller_relaunch_changed_database_identity"
     }
+    $restartIdentity = Add-ControllerRuntimeIdentitySnapshot `
+        "after_restart_renewal" $owned $config
+    $scenarioEvidence.restart_runtime_identity = $restartIdentity
     $checks.relaunch_preserves_database_and_endpoint = $true
+    }
 
+    if ($Scenario -eq "database_crash_recovery") {
     $owned = Assert-ControllerProcesses
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_in" `
+        "database_crash_before_crash" "controller_scenario_fixture_owner_session_missing"
+    $scenarioEvidence.database_crash_before = Add-ControllerRuntimeIdentitySnapshot `
+        "before_database_crash" $owned $config
     $databaseCrashPid = [int]$owned.postgres[0].ProcessId
     $databaseCrashProcess = Get-TrackedProcess $databaseCrashPid (Join-Path $postgresBin "postgres.exe")
     if (-not $databaseCrashProcess) { throw "controller_database_process_unavailable_before_crash" }
@@ -2102,15 +2494,24 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
-    $null = Wait-ForOperatorSessionCount `
-        $config "after_database_crash_recovery" 0 15 "controller_owner_session_exists_after_database_crash_recovery"
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
+        "after_database_crash_recovery" "controller_owner_session_exists_after_database_crash_recovery"
     Assert-DatabaseValue $config $sentinel
     if ([string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
         throw "controller_database_identity_changed_after_crash"
     }
+    $scenarioEvidence.database_crash_after = Add-ControllerRuntimeIdentitySnapshot `
+        "after_database_crash_recovery" (Assert-ControllerProcesses) $config
     $checks.database_crash_fails_closed_and_recovers_wal = $true
+    }
 
+    if ($Scenario -eq "parent_crash_recovery") {
+    $rootFingerprintBeforeRestart = Get-FileSha256 $rootCertificatePath
     $beforeParentCrash = Assert-ControllerProcesses
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_in" `
+        "parent_crash_before_crash" "controller_scenario_fixture_owner_session_missing"
+    $scenarioEvidence.parent_crash_before = Add-ControllerRuntimeIdentitySnapshot `
+        "before_parent_crash" $beforeParentCrash $config
     $runtimeRootPids = @(
         $beforeParentCrash.postgres[0].ProcessId,
         $beforeParentCrash.http[0].ProcessId,
@@ -2144,8 +2545,8 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
-    $null = Wait-ForOperatorSessionCount `
-        $config "after_parent_crash_recovery" 0 15 "controller_owner_session_exists_after_parent_crash_recovery"
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
+        "after_parent_crash_recovery" "controller_owner_session_exists_after_parent_crash_recovery"
     Assert-DatabaseValue $config $sentinel
     $owned = Assert-ControllerProcesses
     $rootFingerprintAfterParentCrash =
@@ -2155,12 +2556,20 @@ try {
         $rootFingerprintAfterParentCrash -cne $rootFingerprintBeforeRestart) {
         throw "controller_scheduler_or_database_duplicated_after_parent_crash"
     }
+    $scenarioEvidence.parent_crash_after = Add-ControllerRuntimeIdentitySnapshot `
+        "after_parent_crash_recovery" $owned $config
     $checks.controller_root_identity_survives_crash_restart = $true
     $checks.desktop_parent_crash_owns_process_tree_and_recovers_wal = $true
+    }
 
+    if ($Scenario -eq "migration_recovery_auth") {
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_in" `
+        "migration_recovery_before_mutation" "controller_scenario_fixture_owner_session_missing"
+    $scenarioEvidence.migration_recovery_before = Add-ControllerRuntimeIdentitySnapshot `
+        "before_migration_failure" (Assert-ControllerProcesses) $config
     $currentMigration = Invoke-Psql $config "SELECT version_num FROM alembic_version;"
     Invoke-Psql $config "UPDATE alembic_version SET version_num = 'dx04_missing_revision';" | Out-Null
-    Quit-Desktop $desktop.Id "parent_crash_recovery_quit_login"
+    Quit-Desktop $desktop.Id "migration_recovery_fixture_quit_login"
     $desktop = Start-Desktop 260
     Wait-ControllerState $desktop.Id "Failed" "controller_migration_failed" 150
     $config = Get-ControllerConfig
@@ -2173,31 +2582,92 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
-    $null = Wait-ForOperatorSessionCount `
-        $config "after_failed_migration_recovery" 0 15 "controller_owner_session_exists_after_failed_migration_recovery"
+    $null = Set-OperatorSessionMode $desktop.Id $config "signed_out" `
+        "after_failed_migration_recovery" "controller_owner_session_exists_after_failed_migration_recovery"
     Assert-DatabaseValue $config $sentinel
+    $scenarioEvidence.migration_recovery_after = Add-ControllerRuntimeIdentitySnapshot `
+        "after_failed_migration_recovery" (Assert-ControllerProcesses) $config
     $checks.failed_migration_preserves_existing_cluster = $true
 
     Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"
+    $checks.graceful_quit_stops_scheduler_http_then_postgres = $true
+    }
+
+    if ($Scenario -eq "database_port_collision") {
+    Quit-Desktop $desktop.Id "database_port_collision_fixture_quit_login"
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
     $config = Get-ControllerConfig
+    $expectedDatabasePort = [int]$config.databasePort
+    $databaseConfigHash = Get-FileSha256 (Join-Path $controllerRoot "controller.json")
+    $databaseRootHash = Get-FileSha256 $rootCertificatePath
+    $databaseLeafHash = Get-FileSha256 $leafCertificatePath
     $databaseReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, [int]$config.databasePort)
     $databaseReservation.Start()
     try {
         $desktop = Start-Desktop
-        Wait-ControllerState $desktop.Id "Failed" "controller_database_port_in_use" 40
-        if ((Get-ControllerConfig).databasePort -ne $config.databasePort -or
-            (Get-ControllerProcesses).all.Count -ne 0) { throw "controller_database_port_silently_rotated" }
+        $databaseDiagnosticWaitCompleted = $false
+        try {
+            Wait-ControllerState $desktop.Id "Failed" "controller_database_port_in_use" 40
+            $databaseDiagnosticWaitCompleted = $true
+        } catch { }
+        $databaseObservedConfig = Get-ControllerConfig
+        $databaseProcesses = Get-ControllerProcesses
+        $databaseCollisionEvidence = [ordered]@{
+            expected_database_port = $expectedDatabasePort
+            observed_persisted_database_port = [int]$databaseObservedConfig.databasePort
+            expected_diagnostic_code = "controller_database_port_in_use"
+            observed_diagnostic_code = Get-ControllerDiagnosticCode $desktop.Id
+            diagnostic_wait_completed = $databaseDiagnosticWaitCompleted
+            postgres_count = @($databaseProcesses.postgres_tree).Count
+            postgres_pids = @($databaseProcesses.postgres_tree | ForEach-Object { [int]$_.ProcessId })
+            http_count = @($databaseProcesses.http).Count
+            http_pids = @($databaseProcesses.http | ForEach-Object { [int]$_.ProcessId })
+            scheduler_count = @($databaseProcesses.scheduler).Count
+            scheduler_pids = @($databaseProcesses.scheduler | ForEach-Object { [int]$_.ProcessId })
+            config_sha256_unchanged = (Get-FileSha256 (Join-Path $controllerRoot "controller.json")) -ceq $databaseConfigHash
+            root_sha256_unchanged = (Get-FileSha256 $rootCertificatePath) -ceq $databaseRootHash
+            leaf_sha256_unchanged = (Get-FileSha256 $leafCertificatePath) -ceq $databaseLeafHash
+            database_system_identifier_unchanged =
+                (Get-PostgresSystemIdentifierFromControlFile) -ceq $databaseSystemIdentifier
+        }
+        $scenarioEvidence.database_port_collision = $databaseCollisionEvidence
+        if ($databaseCollisionEvidence.observed_persisted_database_port -ne $expectedDatabasePort) {
+            throw "controller_database_port_collision_changed_persisted_port"
+        }
+        if ($databaseCollisionEvidence.postgres_count -ne 0 -or
+            $databaseCollisionEvidence.http_count -ne 0 -or
+            $databaseCollisionEvidence.scheduler_count -ne 0) {
+            throw "controller_database_port_collision_left_runtime_processes"
+        }
+        if (-not $databaseDiagnosticWaitCompleted -or
+            $databaseCollisionEvidence.observed_diagnostic_code -cne "controller_database_port_in_use") {
+            throw "controller_database_port_collision_diagnostic_not_confirmed"
+        }
+        if (-not $databaseCollisionEvidence.config_sha256_unchanged -or
+            -not $databaseCollisionEvidence.root_sha256_unchanged -or
+            -not $databaseCollisionEvidence.leaf_sha256_unchanged -or
+            -not $databaseCollisionEvidence.database_system_identifier_unchanged) {
+            throw "controller_database_port_collision_changed_identity"
+        }
         $checks.database_port_collision_does_not_rotate = $true
         Quit-Desktop $desktop.Id "database_port_collision_shutdown_login"
     } finally {
         $databaseReservation.Stop()
     }
+    }
 
+    if ($Scenario -eq "endpoint_port_collision") {
+    Quit-Desktop $desktop.Id "endpoint_port_collision_fixture_quit_login"
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
+    $config = Get-ControllerConfig
     $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, [int]$config.endpointPort)
     $endpointReservation.Start()
     try {
         $expectedCollisionPort = [int]$config.endpointPort
         $expectedCollisionDiagnostic = "controller_endpoint_port_in_use"
+        $endpointConfigHash = Get-FileSha256 (Join-Path $controllerRoot "controller.json")
+        $endpointRootHash = Get-FileSha256 $rootCertificatePath
+        $endpointLeafHash = Get-FileSha256 $leafCertificatePath
         $desktop = Start-Desktop
         $collisionDiagnosticWaitCompleted = $false
         try {
@@ -2224,15 +2694,32 @@ try {
             expected_diagnostic_code = $expectedCollisionDiagnostic
             observed_diagnostic_code = (Get-ControllerDiagnosticCode $desktop.Id)
             diagnostic_wait_completed = $collisionDiagnosticWaitCompleted
+            config_sha256_unchanged =
+                (Get-FileSha256 (Join-Path $controllerRoot "controller.json")) -ceq $endpointConfigHash
+            root_sha256_unchanged = (Get-FileSha256 $rootCertificatePath) -ceq $endpointRootHash
+            leaf_sha256_unchanged = (Get-FileSha256 $leafCertificatePath) -ceq $endpointLeafHash
+            database_system_identifier_unchanged =
+                (Get-PostgresSystemIdentifierFromControlFile) -ceq $databaseSystemIdentifier
         }
+        $scenarioEvidence.endpoint_port_collision = $endpointCollisionEvidence
         $collisionFailure = Get-EndpointCollisionFailureCode $endpointCollisionEvidence
         if ($collisionFailure) { throw $collisionFailure }
+        if (-not $endpointCollisionEvidence.config_sha256_unchanged -or
+            -not $endpointCollisionEvidence.root_sha256_unchanged -or
+            -not $endpointCollisionEvidence.leaf_sha256_unchanged -or
+            -not $endpointCollisionEvidence.database_system_identifier_unchanged) {
+            throw "controller_endpoint_collision_changed_tls_or_cluster_identity"
+        }
         $checks.endpoint_port_collision_does_not_rotate = $true
         Quit-Desktop $desktop.Id "endpoint_port_collision_shutdown_login"
     } finally {
         $endpointReservation.Stop()
     }
+    }
 
+    if ($Scenario -eq "unowned_root") {
+    Quit-Desktop $desktop.Id "unowned_root_fixture_quit_login"
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
     Move-Item -LiteralPath $controllerRoot -Destination $savedRoot
     $rootWasMoved = $true
     New-Item -ItemType Directory -Path $controllerRoot | Out-Null
@@ -2248,7 +2735,11 @@ try {
     Move-Item -LiteralPath $controllerRoot -Destination $unownedRoot
     Move-Item -LiteralPath $savedRoot -Destination $controllerRoot
     $rootWasMoved = $false
+    }
 
+    if ($Scenario -eq "unwritable_root") {
+    Quit-Desktop $desktop.Id "unwritable_root_fixture_quit_login"
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
     $aclBeforeDeny = Get-Acl -LiteralPath $controllerRoot
     $aclWithDeny = Get-Acl -LiteralPath $controllerRoot
     $denyWriteRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
@@ -2280,7 +2771,11 @@ try {
     Quit-Desktop $desktop.Id "unwritable_root_shutdown_login"
     Set-Acl -LiteralPath $controllerRoot -AclObject $aclBeforeDeny
     $aclBeforeDeny = $null
+    }
 
+    if ($Scenario -eq "corrupt_cluster") {
+    Quit-Desktop $desktop.Id "corrupt_cluster_fixture_quit_login"
+    Wait-Until { (Get-ControllerProcesses).all.Count -eq 0 } 15 "controller_quit_left_runtime_processes"
     $pgVersionPath = Join-Path $controllerRoot "postgresql\PG_VERSION"
     $pgVersionBackup = Get-Content -LiteralPath $pgVersionPath -Raw
     [System.IO.File]::WriteAllText($pgVersionPath, "corrupt")
@@ -2293,27 +2788,46 @@ try {
     $checks.corrupt_cluster_is_preserved_and_rejected = $true
     Quit-Desktop $desktop.Id "corrupt_cluster_shutdown_login"
     [System.IO.File]::WriteAllText($pgVersionPath, $pgVersionBackup)
-
-    $postOwnerRuntimeProbe = $processEvidence["post_owner_runtime_probe"]
-    $processEvidence = [ordered]@{
-        initial_postgres_pid = $initialPostgresPid
-        initial_http_pid = $initialHttpPid
-        initial_scheduler_pid = $initialSchedulerPid
-        post_cutover_postgres_pid = $postCutoverRuntimeIdentity.postgres_pid
-        post_cutover_http_pid = $postCutoverRuntimeIdentity.http_pid
-        post_cutover_scheduler_pid = $postCutoverRuntimeIdentity.scheduler_pid
-        tray_reopen_postgres_pid = $trayReopenRuntimeIdentity.postgres_pid
-        tray_reopen_http_pid = $trayReopenRuntimeIdentity.http_pid
-        tray_reopen_scheduler_pid = $trayReopenRuntimeIdentity.scheduler_pid
-        parent_crash_runtime_pids = $parentCrashPids
-        controller_id = $controllerIdentity
-        database_system_identifier = $databaseSystemIdentifier
-        persisted_database_port = $config.databasePort
-        persisted_endpoint_port = $config.endpointPort
-        graceful_quit_exit_order = $shutdownExitOrder
-        post_owner_runtime_probe = $postOwnerRuntimeProbe
     }
-    $result = if (@($checks.Values | Where-Object { -not $_ }).Count -eq 0 -and $failureCodes.Count -eq 0) {
+
+    $finalProcesses = Get-ControllerProcesses
+    $processEvidence.initial_postgres_pid = [int]$initialPostgresPid
+    $processEvidence.initial_http_pid = [int]$initialHttpPid
+    $processEvidence.initial_scheduler_pid = [int]$initialSchedulerPid
+    if ($Scenario -eq "bootstrap_https_cutover_tray") {
+        $processEvidence.post_cutover_postgres_pid = [int]$postCutoverRuntimeIdentity.postgres_pid
+        $processEvidence.post_cutover_http_pid = [int]$postCutoverRuntimeIdentity.http_pid
+        $processEvidence.post_cutover_scheduler_pid = [int]$postCutoverRuntimeIdentity.scheduler_pid
+        $processEvidence.tray_reopen_postgres_pid = [int]$trayReopenRuntimeIdentity.postgres_pid
+        $processEvidence.tray_reopen_http_pid = [int]$trayReopenRuntimeIdentity.http_pid
+        $processEvidence.tray_reopen_scheduler_pid = [int]$trayReopenRuntimeIdentity.scheduler_pid
+        $processEvidence.graceful_quit_exit_order = $shutdownExitOrder
+    }
+    if ($Scenario -eq "parent_crash_recovery") {
+        $processEvidence.parent_crash_runtime_pids = @($parentCrashPids)
+    }
+    $processEvidence.controller_id = $controllerIdentity
+    $processEvidence.database_system_identifier = $databaseSystemIdentifier
+    $processEvidence.persisted_database_port = if ($config) { [int]$config.databasePort } else { $null }
+    $processEvidence.persisted_endpoint_port = if ($config) { [int]$config.endpointPort } else { $null }
+    $processEvidence.final_runtime_counts = [ordered]@{
+        postgres = @($finalProcesses.postgres).Count
+        http = @($finalProcesses.http).Count
+        scheduler = @($finalProcesses.scheduler).Count
+    }
+    $scenarioEvidence.controller_id = $controllerIdentity
+    $scenarioEvidence.database_system_identifier = $databaseSystemIdentifier
+    $scenarioEvidence.persisted_database_port = if ($config) { [int]$config.databasePort } else { $null }
+    $scenarioEvidence.persisted_endpoint_port = if ($config) { [int]$config.endpointPort } else { $null }
+    $scenarioEvidence.sentinel_readable = if ($config) {
+        try { Assert-DatabaseValue $config $sentinel; $true } catch { $false }
+    } else { $false }
+    $missingScenarioChecks = @($scenarioCheckNames | Where-Object { -not [bool]$checks[$_] })
+    if ($missingScenarioChecks.Count -gt 0) {
+        Add-Failure "controller_scenario_required_check_failed"
+        $scenarioEvidence.missing_checks = @($missingScenarioChecks)
+    }
+    $result = if ($failureCodes.Count -eq 0) {
         "PASS"
     } else { "BLOCKER" }
 } catch {
@@ -2389,9 +2903,23 @@ try {
     $env:PGPASSWORD = $previousPsqlPassword
     $evidenceDirectory = Split-Path -Parent $EvidencePath
     New-Item -ItemType Directory -Path $evidenceDirectory -Force | Out-Null
+    $scenarioCheckEvidence = [ordered]@{}
+    foreach ($checkName in $scenarioCheckNames) {
+        $scenarioCheckEvidence[[string]$checkName] = [bool]$checks[[string]$checkName]
+    }
     $evidence = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         source_revision = $ExpectedSourceRevision
+        scenario = $Scenario
+        runner = [ordered]@{
+            github_hosted = $env:GITHUB_ACTIONS -eq "true" -and $env:RUNNER_ENVIRONMENT -eq "github-hosted"
+            windows_x64 = [Environment]::Is64BitOperatingSystem -and $env:RUNNER_OS -eq "Windows" -and
+                $env:RUNNER_ARCH -eq "X64"
+            non_administrator = -not [Security.Principal.WindowsPrincipal]::new(
+                [Security.Principal.WindowsIdentity]::GetCurrent()
+            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            clean_profile = [bool]$checks.clean_profile
+        }
         checked_head = $head
         source_worktree_clean = $worktreeIsClean
         windows_version = [Environment]::OSVersion.Version.ToString()
@@ -2401,9 +2929,11 @@ try {
         ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         data_root = "CurrentUserLocalAppData"
         runtime_layout = "shared"
-        checks = $checks
+        checks = $scenarioCheckEvidence
         process_evidence = $processEvidence
+        scenario_evidence = $scenarioEvidence
         operator_session_timeline = @($operatorSessionTimeline)
+        operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)
         controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)
         endpoint_collision_evidence = $endpointCollisionEvidence
         result = $result

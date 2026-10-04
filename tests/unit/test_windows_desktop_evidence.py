@@ -29,6 +29,67 @@ SCRIPT = REPO_ROOT / "packaging" / "windows_desktop" / "verify_runtime_evidence.
 CONTROLLER_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "smoke_controller_lifecycle.ps1"
 CONTROLLER_HTTPS_PROBE = REPO_ROOT / "packaging" / "windows_desktop" / "controller_https_probe.ps1"
 HOSTED_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "run_hosted_smoke.ps1"
+SCENARIO_AGGREGATOR = (
+    REPO_ROOT / "packaging" / "windows_desktop" / "aggregate_controller_scenarios.py"
+)
+CONTROLLER_SCENARIOS = (
+    "bootstrap_https_cutover_tray",
+    "restart_renewal",
+    "database_crash_recovery",
+    "parent_crash_recovery",
+    "migration_recovery_auth",
+    "database_port_collision",
+    "endpoint_port_collision",
+    "unowned_root",
+    "unwritable_root",
+    "corrupt_cluster",
+)
+FROZEN_CONTROLLER_CHECKS = (
+    "clean_profile",
+    "runtime_bundle_shared",
+    "controller_root_current_user_acl",
+    "dpapi_current_user_round_trip",
+    "atomic_non_secret_config",
+    "controller_https_configuration_persisted",
+    "endpoint_reconfigure_before_owner",
+    "endpoint_unavailable_ip_rolls_back",
+    "endpoint_collision_rolls_back",
+    "endpoint_running_unavailable_ip_rolls_back",
+    "endpoint_running_unavailable_ip_preserves_owner_session",
+    "endpoint_running_collision_rolls_back",
+    "endpoint_running_collision_preserves_owner_session",
+    "endpoint_running_transition_preserves_postgres",
+    "endpoint_running_transition_revokes_owner_session",
+    "endpoint_running_transition_reauthenticates_one_owner_session",
+    "no_lan_listener_before_local_owner_bootstrap",
+    "loopback_postgres_wildcard_https_listener",
+    "controller_https_root_fingerprint_matches_ui",
+    "local_readiness_uses_private_root",
+    "plaintext_health_rejected",
+    "serving_leaf_key_cleaned_on_shutdown",
+    "stale_serving_leaf_key_replaced_on_startup",
+    "leaf_renewal_preserves_root_identity",
+    "root_identity_persists_across_restart",
+    "no_owner_or_lan_bootstrap",
+    "local_first_owner_bootstrap",
+    "separate_http_and_scheduler_processes",
+    "x_hides_and_runtime_continues",
+    "reopen_keeps_one_runtime_and_database_identity",
+    "reopen_requires_operator_sign_in",
+    "owner_reauthenticated_after_reopen",
+    "active_session_verified_before_privileged_quit",
+    "graceful_quit_stops_scheduler_http_then_postgres",
+    "relaunch_preserves_database_and_endpoint",
+    "database_crash_fails_closed_and_recovers_wal",
+    "desktop_parent_crash_owns_process_tree_and_recovers_wal",
+    "controller_root_identity_survives_crash_restart",
+    "failed_migration_preserves_existing_cluster",
+    "database_port_collision_does_not_rotate",
+    "endpoint_port_collision_does_not_rotate",
+    "unowned_root_is_preserved_and_rejected",
+    "unwritable_root_is_rejected",
+    "corrupt_cluster_is_preserved_and_rejected",
+)
 
 
 def test_controller_quit_wait_is_process_authoritative() -> None:
@@ -601,10 +662,18 @@ def test_post_owner_probe_snapshot_and_failure_taxonomy_are_preserved() -> None:
     assert "$stageControllerHttpsProbeScript" in hosted_source
     assert "Copy-Item -LiteralPath $controllerHttpsProbeScript" in hosted_source
 
-    owner_call = source.index("Bootstrap-ControllerOwner $desktop.Id")
-    after_owner_probe = source.index("Wait-ForControllerHttps $config 60 -AfterOwnerBootstrap")
-    enabled_owner_check = source.index("$enabledOwnerCount = Invoke-Psql", owner_call)
+    fixture_helper = source[
+        source.index("function Initialize-HealthyControllerFixture") : source.index(
+            "\ntry {", source.index("function Initialize-HealthyControllerFixture")
+        )
+    ]
+    owner_call = fixture_helper.index("Bootstrap-ControllerOwner $ProcessId")
+    after_owner_probe = fixture_helper.index(
+        "Wait-ForControllerHttps $Config 60 -AfterOwnerBootstrap"
+    )
+    enabled_owner_check = fixture_helper.index("$enabledOwnerCount = Invoke-Psql", owner_call)
     assert owner_call < after_owner_probe < enabled_owner_check
+    assert "$fixture = Initialize-HealthyControllerFixture $desktop.Id $config" in source
 
     snapshot_function = source[
         source.index("function Get-PostOwnerRuntimeSnapshot") : source.index(
@@ -643,7 +712,8 @@ def test_post_owner_probe_snapshot_and_failure_taxonomy_are_preserved() -> None:
         "controller_https_readiness_status_",
     ):
         assert failure_code in source
-    assert "post_owner_runtime_probe = $postOwnerRuntimeProbe" in source
+    assert '"post_owner_runtime_probe"' in source
+    assert "process_evidence = $processEvidence" in source
     assert "operator_session_timeline = @($operatorSessionTimeline)" in source
 
 
@@ -735,9 +805,9 @@ $null = Wait-ForOperatorSessionCount 'local-config' 'reopen_after_login' 1 1 'lo
     assert [entry["outcome"] for entry in timeline] == ["PASS", "PASS"]
 
 
-def test_controller_session_timeline_is_separate_and_covers_lifecycle_transitions() -> None:
+def test_controller_session_timeline_is_separate_and_scenario_scoped() -> None:
     source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
-    normalized_source = re.sub(r"`\s*\r?\n\s*", " ", source)
+    normalized = re.sub(r"`\s*\r?\n\s*", " ", source)
     classifier = source[
         source.index("function Get-PostOwnerRuntimeFailureCode") : source.index(
             "function Get-ControllerHttpsProbeFailureCode"
@@ -754,94 +824,105 @@ def test_controller_session_timeline_is_separate_and_covers_lifecycle_transition
     assert "Wait-ForOperatorSessionCount" not in waiter
     assert "Get-ActiveOwnerSessionCount" not in waiter
 
-    transitions = {
-        '"bootstrap" 1': "controller_first_owner_session_missing",
-        '"failed_ip_reconfigure" 1': (
-            "controller_endpoint_reconfigure_session_lost_on_unavailable_ip"
+    transitions = (
+        ('"bootstrap" 1', "controller_first_owner_session_missing"),
+        (
+            '"failed_ip_reconfigure" 1',
+            "controller_endpoint_reconfigure_session_lost_on_unavailable_ip",
         ),
-        '"failed_port_reconfigure" 1': "controller_endpoint_reconfigure_session_lost_on_collision",
-        '"window_hide_lock" 0': "controller_owner_session_not_revoked_on_lock",
-        '"reopen_before_login" 0': "controller_reopen_owner_session_not_locked",
-        '"before_privileged_quit" 1': "controller_active_owner_session_count_not_one",
-        '"after_quit_relaunch" 0': "controller_owner_session_exists_after_quit_relaunch",
-        '"after_database_crash_recovery" 0': (
-            "controller_owner_session_exists_after_database_crash_recovery"
+        (
+            '"failed_port_reconfigure" 1',
+            "controller_endpoint_reconfigure_session_lost_on_collision",
         ),
-        '"after_parent_crash_recovery" 0': (
-            "controller_owner_session_exists_after_parent_crash_recovery"
-        ),
-        '"after_failed_migration_recovery" 0': (
-            "controller_owner_session_exists_after_failed_migration_recovery"
-        ),
-    }
-    for stage_call, failure_code in transitions.items():
-        assert stage_call in normalized_source
+        ('"before_privileged_quit" 1', "controller_active_owner_session_count_not_one"),
+    )
+    for stage_call, failure_code in transitions:
+        assert stage_call in normalized
         assert failure_code in source
+    for stage, failure_code in (
+        ("window_hide_lock", "controller_owner_session_not_revoked_on_lock"),
+        ("reopen_before_login", "controller_reopen_owner_session_not_locked"),
+        ("after_quit_relaunch", "controller_owner_session_exists_after_quit_relaunch"),
+        (
+            "after_database_crash_recovery",
+            "controller_owner_session_exists_after_database_crash_recovery",
+        ),
+        (
+            "after_parent_crash_recovery",
+            "controller_owner_session_exists_after_parent_crash_recovery",
+        ),
+        (
+            "after_failed_migration_recovery",
+            "controller_owner_session_exists_after_failed_migration_recovery",
+        ),
+    ):
+        assert re.search(
+            rf'Set-OperatorSessionMode[^\n]*"signed_out"\s+"{re.escape(stage)}"\s+"{re.escape(failure_code)}"',
+            normalized,
+        )
+    session_mode = source[
+        source.index("function Set-OperatorSessionMode") : source.index("function Start-Desktop")
+    ]
+    assert (
+        "return Wait-ForOperatorSessionCount `\n        $Config $Stage 0 3 $FailureCode"
+        in session_mode
+    )
     assert '"cutover_revoke"' in source and '"reopen_before_login"' in source
+
     ensure_owner = source[
         source.index("function Ensure-ControllerOwner") : source.index("function Start-Desktop")
     ]
-    assert "[string]$LoginStage" in ensure_owner
     normalized_ensure = re.sub(r"`\s*\r?\n\s*", " ", ensure_owner)
     assert "$config $revocationStage 0 15 $revocationFailure" in normalized_ensure
-    assert "$config $LoginStage 1 30 $loginFailure" in normalized_ensure
-    assert 'Ensure-ControllerOwner $desktop.Id "cutover_relogin"' in normalized_source
-    assert 'Ensure-ControllerOwner $desktop.Id "reopen_after_login"' in normalized_source
-    assert source.count('"reopen_after_login"') == 1
+    assert "Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage" in normalized_ensure
+    assert "$config $LoginStage 1 3" in normalized_ensure
+    assert 'Ensure-ControllerOwner $desktop.Id "cutover_relogin"' in normalized
+    assert 'Ensure-ControllerOwner $desktop.Id "reopen_after_login"' in normalized
     assert "function Quit-Desktop([int]$ProcessId, [string]$LoginStage)" in source
     assert "Ensure-ControllerOwner $ProcessId $LoginStage" in source
-    quit_calls = re.findall(r"(?m)^\s*Quit-Desktop\s+\$desktop\.Id[^\r\n]*", source)
-    assert len(quit_calls) == 10
-    assert all(re.fullmatch(r'\s*Quit-Desktop \$desktop\.Id "[^"]+"', call) for call in quit_calls)
     assert 'Wait-ForOperatorSessionCount `\n        $Config "before_privileged_quit" 1' in source
-    for stage in (
-        "after_database_crash_recovery",
-        "after_parent_crash_recovery",
-        "after_failed_migration_recovery",
-    ):
-        stage_index = source.index(f'"{stage}"')
-        readiness_index = source.rfind("Wait-ForControllerHttps $config 60", 0, stage_index)
-        assert 0 <= readiness_index < stage_index
-        assert source.index("Assert-DatabaseValue $config $sentinel", stage_index) > stage_index
-    parent_recovery = source.index('"after_parent_crash_recovery"')
-    parent_quit_login = source.index('Quit-Desktop $desktop.Id "parent_crash_recovery_quit_login"')
-    migration_recovery = source.index('"after_failed_migration_recovery"')
-    migration_quit_login = source.index(
-        'Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"'
-    )
-    assert parent_recovery < parent_quit_login < migration_recovery < migration_quit_login
-    ordered_lifecycle_events = (
-        "Bootstrap-ControllerOwner $desktop.Id",
-        '"bootstrap"',
-        "Set-ControllerEndpointFields $desktop.Id $unavailableAddress $oldHttpsPort",
-        '"failed_ip_reconfigure"',
-        "Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort",
-        '"failed_port_reconfigure"',
-        'Ensure-ControllerOwner $desktop.Id "cutover_relogin"',
-        "controller_window_close_message_failed",
-        '"window_hide_lock"',
-        '"reopen_before_login"',
-        'Ensure-ControllerOwner $desktop.Id "reopen_after_login"',
-        'Quit-Desktop $desktop.Id "graceful_quit_authorization_login"',
-        '"after_quit_relaunch"',
-        '"after_database_crash_recovery"',
-        '"after_parent_crash_recovery"',
-        'Quit-Desktop $desktop.Id "parent_crash_recovery_quit_login"',
-        '"after_failed_migration_recovery"',
-        'Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"',
-    )
-    event_cursor = 0
-    for event in ordered_lifecycle_events:
-        event_cursor = source.index(event, event_cursor) + len(event)
-    restart_start = source.index(
-        "$desktop = Start-ExistingController", source.index("Set-ExpiringControllerLeaf $config")
-    )
-    restart_probe = source.index("Wait-ForControllerHttps $config 60", restart_start)
-    relaunch_session_check = source.index('"after_quit_relaunch"', restart_probe)
-    assert restart_start < restart_probe < relaunch_session_check
+
+    scenario_blocks = {
+        "bootstrap_https_cutover_tray": (
+            '"failed_ip_reconfigure"',
+            '"failed_port_reconfigure"',
+            '"window_hide_lock"',
+            '"reopen_before_login"',
+            'Ensure-ControllerOwner $desktop.Id "reopen_after_login"',
+        ),
+        "restart_renewal": ('"after_quit_relaunch"', "leaf_renewal_preserves_root_identity"),
+        "database_crash_recovery": (
+            '"after_database_crash_recovery"',
+            "Assert-DatabaseValue $config $sentinel",
+        ),
+        "parent_crash_recovery": (
+            '"after_parent_crash_recovery"',
+            "$scenarioEvidence.parent_crash_after",
+        ),
+        "migration_recovery_auth": (
+            '"after_failed_migration_recovery"',
+            'Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"',
+        ),
+    }
+    for scenario, evidence in scenario_blocks.items():
+        start = source.index(f'if ($Scenario -eq "{scenario}")')
+        next_scenario = min(
+            (
+                position
+                for other in CONTROLLER_SCENARIOS
+                if other != scenario
+                and (position := source.find(f'if ($Scenario -eq "{other}")', start + 1)) >= 0
+            ),
+            default=source.index("$finalProcesses = Get-ControllerProcesses", start),
+        )
+        block = source[start:next_scenario]
+        for item in evidence:
+            assert item in block, (scenario, item)
+
     assert "function Wait-ForOperatorSessionCount" in source
     assert "Add-OperatorSessionTransition" in source
     assert "operator_session_timeline = @($operatorSessionTimeline)" in source
+    assert "operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)" in source
 
 
 def test_controller_runtime_identity_baselines_are_phase_scoped() -> None:
@@ -970,11 +1051,11 @@ def test_controller_runtime_identity_calls_use_phase_baselines() -> None:
     assert "$httpPid" not in shutdown and "$schedulerPid" not in shutdown
 
     for field, variable in (
-        ("initial_postgres_pid", "$initialPostgresPid"),
-        ("initial_http_pid", "$initialHttpPid"),
-        ("initial_scheduler_pid", "$initialSchedulerPid"),
+        ("initial_postgres_pid", "[int]$initialPostgresPid"),
+        ("initial_http_pid", "[int]$initialHttpPid"),
+        ("initial_scheduler_pid", "[int]$initialSchedulerPid"),
     ):
-        assert f"{field} = {variable}" in source
+        assert f"$processEvidence.{field} = {variable}" in source
     assert "controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)" in source
 
 
@@ -1104,9 +1185,16 @@ def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_righ
         source.index("function Ensure-ControllerOwner") : source.index("function Start-Desktop")
     ]
     transition_revoke = owner_helper.index('"controller_endpoint_reconfigure_session_not_revoked"')
-    transition_login = owner_helper.index('Set-LoginInput $ProcessId "Username"')
+    transition_login = owner_helper.index(
+        "Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage"
+    )
     assert transition_revoke < transition_login
-    assert '"controller_endpoint_reconfigure_reauthentication_failed"' in owner_helper
+    login_evidence_source = (
+        REPO_ROOT / "packaging" / "windows_desktop" / "operator_login_evidence.ps1"
+    ).read_text(encoding="utf-8")
+    assert "Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage" in owner_helper
+    assert "Get-OperatorLoginFailureCode" in source
+    assert '"controller_owner_login_failure_unclassified"' in login_evidence_source
     assert "$checks.endpoint_running_transition_revokes_owner_session = $true" in owner_helper
     assert "$checks.endpoint_running_transition_reauthenticates_one_owner_session = $true" in (
         owner_helper
@@ -1120,6 +1208,16 @@ def _load_verifier() -> ModuleType:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_scenario_aggregator() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "aggregate_controller_scenarios", SCENARIO_AGGREGATOR
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
@@ -1494,3 +1592,270 @@ def test_verification_accepts_only_the_selected_runtime_layout(
     assert exit_code == 0
     assert result["status"] == "PASS"
     assert [candidate["layout"] for candidate in result["candidates"]] == ["shared"]
+
+
+def test_controller_login_classifier_uses_only_authoritative_or_allowlisted_evidence() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell login-classifier test is only available on Windows test hosts")
+    module_path = str(
+        REPO_ROOT / "packaging" / "windows_desktop" / "operator_login_evidence.ps1"
+    ).replace("'", "''")
+    assertion = rf"""
+. '{module_path}'
+$before = [ordered]@{{
+    active_owner_session_count_before = 0
+    login_failed_attempts = 0
+    login_lock_active = $false
+    health_probe_outcome_before = 'PASS'
+    ready_probe_outcome_before = 'PASS'
+}}
+function New-After([int]$Sessions, [int]$Failures = 0, [bool]$Locked = $false,
+    [string[]]$Events = @(), [string]$Health = 'PASS', [string]$Ready = 'PASS') {{
+    return [ordered]@{{
+        active_owner_session_count_after = $Sessions
+        login_failed_attempts = $Failures
+        login_lock_active = $Locked
+        recent_owner_audit_event_types_after = $Events
+        health_probe_outcome = $Health
+        ready_probe_outcome = $Ready
+    }}
+}}
+$auditSuccess = New-After 0 -Events @('operator.login_succeeded')
+$outcomes = @(
+    (Get-OperatorLoginOutcome $before (New-After 0) $false $false 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $false 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 1) $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0 -Failures 1) $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before $auditSuccess $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $true 'OPERATOR_API_UNAVAILABLE'),
+    (Get-OperatorLoginOutcome $before (New-After 0 -Health 'FAIL') $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $true 'NONE')
+)
+[Console]::WriteLine(($outcomes | ConvertTo-Json -Compress))
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert json.loads(completed.stdout.strip()) == [
+        "LOGIN_UI_NOT_READY",
+        "LOGIN_UI_INVOKE_FAILED",
+        "SUCCESS",
+        "LOGIN_SERVER_REJECTED",
+        "LOGIN_SESSION_NOT_PERSISTED",
+        "LOGIN_TRANSPORT_UNAVAILABLE",
+        "LOGIN_RUNTIME_BECAME_UNREADY",
+        "LOGIN_FAILURE_UNCLASSIFIED",
+    ]
+
+
+def test_controller_login_readiness_is_actionable_and_submits_once_without_secret_readback() -> (
+    None
+):
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    ui_start = source.index("function Get-OperatorLoginUiState")
+    ui_end = source.index("function Get-OperatorLoginDatabaseState", ui_start)
+    ui_state = source[ui_start:ui_end]
+    for required in (
+        "UsernamePresent",
+        "UsernameEnabled",
+        "UsernameFocusable",
+        "PasswordPresent",
+        "PasswordEnabled",
+        "PasswordFocusable",
+        "SignInPresent",
+        "SignInEnabled",
+        "SignInInvokePatternAvailable",
+        "IsKeyboardFocusable",
+        "IsEnabled",
+        "InvokePattern",
+    ):
+        assert required in ui_state
+
+    observed_start = source.index("function Invoke-ObservedOperatorLogin")
+    observed_end = source.index("function Add-OperatorSessionTransition", observed_start)
+    observed = source[observed_start:observed_end]
+    assert observed.count("$invokePattern.Invoke()") == 1
+    assert observed.count('Set-LoginInput $ProcessId "Username"') == 1
+    assert observed.count('Set-LoginInput $ProcessId "Password"') == 1
+    assert 'while ($outcome -eq "LOGIN_FAILURE_UNCLASSIFIED"' in observed
+    polling = observed[observed.index("while ($outcome") :]
+    assert ".Invoke()" not in polling
+    assert "Set-LoginInput" not in polling
+    assert 'Invoke-Button $ProcessId "Sign in"' not in source
+
+    ensure_start = source.index("function Ensure-ControllerOwner")
+    ensure_end = source.index("function Start-Desktop", ensure_start)
+    ensure_owner = source[ensure_start:ensure_end]
+    assert ensure_owner.count("Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage") == 1
+
+    timeline_start = observed.index("$script:operatorLoginAttemptTimeline.Add(")
+    timeline_end = observed.index(") | Out-Null", timeline_start)
+    timeline_record = observed[timeline_start:timeline_end]
+    assert "$script:smokeOwnerPassword" not in timeline_record
+    assert "$script:smokeOwnerUsername" not in timeline_record
+    assert "bearer" not in timeline_record.lower()
+    assert "authorization" not in timeline_record.lower()
+    assert "$_" not in timeline_record
+    assert "operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)" in source
+    assert 'Ensure-ControllerOwner $desktop.Id "reopen_after_login"' in source
+    for stage in (
+        "cutover_relogin",
+        "reopen_after_login",
+        "graceful_quit_authorization_login",
+        "restart_renewal_quit_login",
+        "database_crash_failure_shutdown_login",
+        "migration_recovery_fixture_quit_login",
+        "failed_migration_recovery_quit_login",
+        "database_port_collision_fixture_quit_login",
+        "endpoint_port_collision_fixture_quit_login",
+        "unowned_root_fixture_quit_login",
+        "unwritable_root_fixture_quit_login",
+        "corrupt_cluster_fixture_quit_login",
+    ):
+        assert f'"{stage}"' in source
+    for safe_category in (
+        "SUCCESS",
+        "LOGIN_UI_NOT_READY",
+        "LOGIN_UI_INVOKE_FAILED",
+        "LOGIN_RUNTIME_BECAME_UNREADY",
+        "LOGIN_TRANSPORT_UNAVAILABLE",
+        "LOGIN_SERVER_REJECTED",
+        "LOGIN_SESSION_NOT_PERSISTED",
+        "LOGIN_FAILURE_UNCLASSIFIED",
+    ):
+        assert safe_category in source or safe_category in (
+            REPO_ROOT / "packaging" / "windows_desktop" / "operator_login_evidence.ps1"
+        ).read_text(encoding="utf-8")
+
+
+def test_controller_acceptance_scenarios_cover_every_frozen_check() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    check_region = source.split("$checks = [ordered]@{", maxsplit=1)[1].split("\n}", maxsplit=1)[0]
+    declared_checks = set(re.findall(r"(?m)^\s*([a-z][a-z0-9_]+)\s*=\s*\$false\s*$", check_region))
+    assert declared_checks == set(FROZEN_CONTROLLER_CHECKS)
+
+    common_region = source.split("$commonScenarioChecks = @(", maxsplit=1)[1].split(
+        ")\n$scenarioSpecificChecks", maxsplit=1
+    )[0]
+    common_checks = set(re.findall(r'"([a-z][a-z0-9_]+)"', common_region))
+    specific_region = source.split("$scenarioSpecificChecks = @{", maxsplit=1)[1].split(
+        "}\n$scenarioCheckNames", maxsplit=1
+    )[0]
+    assigned: set[str] = set(common_checks)
+    scenario_names: list[str] = []
+    for scenario, body in re.findall(
+        r"(?ms)^\s{4}([a-z][a-z0-9_]+)\s*=\s*@\((.*?)\)", specific_region
+    ):
+        scenario_names.append(scenario)
+        assigned.update(re.findall(r'"([a-z][a-z0-9_]+)"', body))
+    assert tuple(scenario_names) == CONTROLLER_SCENARIOS
+    assert assigned == declared_checks
+
+    assert "function Initialize-HealthyControllerFixture" in source
+    for field in (
+        "Config = Get-ControllerConfig",
+        "ControllerId =",
+        "DatabaseSystemIdentifier =",
+        "RuntimeIdentity =",
+        "RootFingerprint =",
+        "EndpointPort =",
+        "LanAddress =",
+    ):
+        assert field in source
+    for scenario in CONTROLLER_SCENARIOS:
+        assert f'if ($Scenario -eq "{scenario}")' in source
+    assert "function Set-OperatorSessionMode" in source
+    assert '[ValidateSet("signed_in", "signed_out")]' in source
+    assert 'Set-OperatorSessionMode $desktop.Id $config "signed_in"' in source
+    assert 'Set-OperatorSessionMode $desktop.Id $config "signed_out"' in source
+    assert "[string]$Scenario" in source
+    assert "operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)" in source
+
+
+def test_desktop_workflow_runs_independent_exact_sha_controller_scenarios() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "desktop.yml").read_text(encoding="utf-8")
+    scenario_start = workflow.index("  controller-acceptance-scenario:")
+    aggregate_start = workflow.index("  controller-acceptance:", scenario_start)
+    scenario_job = workflow[scenario_start:aggregate_start]
+    aggregate_job = workflow[aggregate_start:]
+
+    assert "runs-on: windows-2025" in scenario_job
+    assert "fail-fast: false" in scenario_job
+    assert "native" in scenario_job and "windows-runtime-packaging" in scenario_job
+    for scenario in CONTROLLER_SCENARIOS:
+        assert f"          - {scenario}" in scenario_job
+    assert "-ControllerScenario ${{ matrix.scenario }}" in scenario_job
+    assert (
+        "name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-${{ matrix.scenario }}" in scenario_job
+    )
+    assert "if: always()" in scenario_job
+    assert "-RuntimeLayout shared" in scenario_job
+    assert "-ControllerOnly" in scenario_job
+
+    assert "if: ${{ always() && inputs.runtime_layout == 'shared' }}" in aggregate_job
+    assert "name: Shared Controller acceptance join (Windows x64)" in aggregate_job
+    assert "pattern: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-*" in aggregate_job
+    assert "aggregate_controller_scenarios.py" in aggregate_job
+    assert "--source-sha ${{ env.DESKTOP_SOURCE_SHA }}" in aggregate_job
+    assert "name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}" in aggregate_job
+    assert "controller-acceptance-manifest.json" in SCENARIO_AGGREGATOR.read_text(encoding="utf-8")
+    assert (REPO_ROOT / ".github" / "workflows" / "pr-acceptance.yml").read_text(
+        encoding="utf-8"
+    ).count("uses: ./.github/workflows/desktop.yml") == 1
+
+
+def test_controller_scenario_aggregate_requires_all_exact_sha_clean_profile_evidence(
+    tmp_path: Path,
+) -> None:
+    aggregator = _load_scenario_aggregator()
+    revision = "e" * 40
+    artifact_root = tmp_path / "artifacts"
+    for scenario in CONTROLLER_SCENARIOS:
+        evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}"
+        evidence_dir.mkdir(parents=True)
+        _write_json(
+            evidence_dir / "controller-lifecycle.json",
+            {
+                "schema_version": 2,
+                "source_revision": revision,
+                "scenario": scenario,
+                "runner": {
+                    "github_hosted": True,
+                    "windows_x64": True,
+                    "non_administrator": True,
+                    "clean_profile": True,
+                },
+                "checks": {"fixture": True},
+                "failure_codes": [],
+                "failure_code": None,
+                "result": "PASS",
+            },
+        )
+
+    output_root = tmp_path / "combined"
+    manifest = aggregator.aggregate_scenarios(artifact_root, revision, output_root)
+    assert manifest["result"] == "PASS"
+    assert tuple(manifest["required_scenarios"]) == CONTROLLER_SCENARIOS
+    assert set(manifest["observed_scenarios"]) == set(CONTROLLER_SCENARIOS)
+    assert all(row["result"] == "PASS" for row in manifest["scenarios"])
+    assert (output_root / "controller-acceptance-manifest.json").is_file()
+    for scenario in CONTROLLER_SCENARIOS:
+        assert (
+            output_root / "controller-scenarios" / scenario / "controller-lifecycle.json"
+        ).is_file()
+
+    missing = artifact_root / f"dx04-evidence-{revision}-{CONTROLLER_SCENARIOS[-1]}"
+    shutil.rmtree(missing)
+    blocked = aggregator.aggregate_scenarios(artifact_root, revision, tmp_path / "missing")
+    assert blocked["result"] == "BLOCKER"
+    missing_row = next(
+        row for row in blocked["scenarios"] if row["scenario"] == CONTROLLER_SCENARIOS[-1]
+    )
+    assert missing_row["result"] == "MISSING"

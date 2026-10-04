@@ -14,7 +14,21 @@ param(
     [Parameter()]
     [string]$ControllerDesktopExecutable,
     [Parameter()]
-    [string]$ControllerEvidenceOutput
+    [string]$ControllerEvidenceOutput,
+    [Parameter()]
+    [ValidateSet(
+        "bootstrap_https_cutover_tray",
+        "restart_renewal",
+        "database_crash_recovery",
+        "parent_crash_recovery",
+        "migration_recovery_auth",
+        "database_port_collision",
+        "endpoint_port_collision",
+        "unowned_root",
+        "unwritable_root",
+        "corrupt_cluster"
+    )]
+    [string]$ControllerScenario
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +39,9 @@ $sourceStatus = @(& git -C $RepositoryRoot status --porcelain)
 $sourceStatusExitCode = $LASTEXITCODE
 $controllerSmokeRequested = -not [string]::IsNullOrWhiteSpace($ControllerDesktopExecutable)
 $controllerEvidenceRequested = -not [string]::IsNullOrWhiteSpace($ControllerEvidenceOutput)
+$controllerScenarioRequested = -not [string]::IsNullOrWhiteSpace($ControllerScenario)
 $controllerArgumentsValid = $controllerSmokeRequested -eq $controllerEvidenceRequested -and
+    $controllerSmokeRequested -eq $controllerScenarioRequested -and
     (-not $controllerSmokeRequested -or $RuntimeLayout -eq "shared") -and
     (-not $ControllerOnly -or $controllerSmokeRequested)
 if (
@@ -50,6 +66,7 @@ $verifierScript = Join-Path $RepositoryRoot "packaging\windows_desktop\verify_ru
 $lockPath = Join-Path $RepositoryRoot "uv.lock"
 $controllerSmokeScript = Join-Path $RepositoryRoot "packaging\windows_desktop\smoke_controller_lifecycle.ps1"
 $controllerHttpsProbeScript = Join-Path $RepositoryRoot "packaging\windows_desktop\controller_https_probe.ps1"
+$operatorLoginEvidenceScript = Join-Path $RepositoryRoot "packaging\windows_desktop\operator_login_evidence.ps1"
 $downloadManifestPath = Join-Path $RepositoryRoot "packaging\windows_desktop\download-manifest.json"
 $postgresArchivePath = Join-Path $RepositoryRoot "build\downloads\postgresql-17.11-4-windows-x64-binaries.zip"
 $EvidenceOutput = [System.IO.Path]::GetFullPath($EvidenceOutput)
@@ -75,6 +92,7 @@ $stageEvidence = Join-Path $stageRoot "evidence"
 $stageSmokeScript = Join-Path $stageRoot "smoke_runtime.ps1"
 $stageControllerSmokeScript = Join-Path $stageRoot "smoke_controller_lifecycle.ps1"
 $stageControllerHttpsProbeScript = Join-Path $stageRoot "controller_https_probe.ps1"
+$stageOperatorLoginEvidenceScript = Join-Path $stageRoot "operator_login_evidence.ps1"
 $stageControllerDesktop = Join-Path $stageRoot "desktop\threads-desktop.exe"
 $stageControllerEvidence = Join-Path $stageEvidence "controller-lifecycle.json"
 $failures = [System.Collections.Generic.List[string]]::new()
@@ -238,7 +256,8 @@ function Invoke-ControllerSmokeProcess(
     [string]$SmokeScript,
     [string]$DesktopExecutable,
     [string]$RuntimeRoot,
-    [string]$SmokeEvidencePath
+    [string]$SmokeEvidencePath,
+    [string]$Scenario
 ) {
     $stdoutPath = Join-Path $stageRoot "controller-smoke.stdout.internal.log"
     $stderrPath = Join-Path $stageRoot "controller-smoke.stderr.internal.log"
@@ -262,6 +281,8 @@ function Invoke-ControllerSmokeProcess(
         $ExpectedSourceRevision,
         "-EvidencePath",
         $SmokeEvidencePath,
+        "-Scenario",
+        $Scenario,
         "-VerifiedSourceRevision",
         $ExpectedSourceRevision,
         "-VerifiedWorktreeClean"
@@ -287,10 +308,43 @@ function Invoke-ControllerSmokeProcess(
 
     $smokeEvidence = $null
     if (Test-Path -LiteralPath $SmokeEvidencePath -PathType Leaf) {
-        New-Item -ItemType Directory -Path (Split-Path -Parent $ControllerEvidenceOutput) -Force | Out-Null
-        Copy-Item -LiteralPath $SmokeEvidencePath -Destination $ControllerEvidenceOutput -Force
         $smokeEvidence = Get-Content -LiteralPath $SmokeEvidencePath -Raw | ConvertFrom-Json
+    } else {
+        $childIsNonAdministrator = -not $parentIsAdministrator -or $null -ne $smokeCredential
+        $smokeEvidence = [ordered]@{
+            schema_version = 2
+            source_revision = $ExpectedSourceRevision
+            scenario = $Scenario
+            runner = [ordered]@{
+                github_hosted = $env:GITHUB_ACTIONS -eq "true" -and
+                    $env:RUNNER_ENVIRONMENT -eq "github-hosted"
+                windows_x64 = $env:RUNNER_OS -eq "Windows" -and
+                    $env:RUNNER_ARCH -eq "X64" -and [Environment]::Is64BitOperatingSystem
+                non_administrator = $childIsNonAdministrator
+                clean_profile = $true
+            }
+            checked_head = $ExpectedSourceRevision
+            source_worktree_clean = $true
+            current_user_is_administrator = -not $childIsNonAdministrator
+            checks = @{}
+            operator_session_timeline = @()
+            operator_login_attempt_timeline = @()
+            controller_runtime_identity_timeline = @()
+            process_evidence = @{}
+            scenario_evidence = @{}
+            result = "BLOCKER"
+            failure_code = "controller_scenario_smoke_evidence_missing"
+            failure_codes = @("controller_scenario_smoke_evidence_missing")
+        }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $SmokeEvidencePath) -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            $SmokeEvidencePath,
+            ($smokeEvidence | ConvertTo-Json -Depth 8),
+            [System.Text.UTF8Encoding]::new($false)
+        )
     }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ControllerEvidenceOutput) -Force | Out-Null
+    Copy-Item -LiteralPath $SmokeEvidencePath -Destination $ControllerEvidenceOutput -Force
     foreach ($stream in @(
         @{ raw = $stdoutPath; safe = $stdoutEvidencePath },
         @{ raw = $stderrPath; safe = $stderrEvidencePath }
@@ -420,6 +474,10 @@ try {
     }
     $smokeUserEnvironment = @{
         DESKTOP_SOURCE_SHA = $ExpectedSourceRevision
+        GITHUB_ACTIONS = $env:GITHUB_ACTIONS
+        RUNNER_ENVIRONMENT = $env:RUNNER_ENVIRONMENT
+        RUNNER_OS = $env:RUNNER_OS
+        RUNNER_ARCH = $env:RUNNER_ARCH
         USERPROFILE = $smokeProfileRoot
         APPDATA = Join-Path $smokeProfileRoot "AppData\Roaming"
         LOCALAPPDATA = Join-Path $smokeProfileRoot "AppData\Local"
@@ -478,6 +536,9 @@ try {
         if (-not (Test-Path -LiteralPath $controllerHttpsProbeScript -PathType Leaf)) {
             throw "hosted_controller_https_probe_script_missing"
         }
+        if (-not (Test-Path -LiteralPath $operatorLoginEvidenceScript -PathType Leaf)) {
+            throw "hosted_controller_login_evidence_script_missing"
+        }
         if (-not (Test-Path -LiteralPath $ControllerDesktopExecutable -PathType Leaf)) {
             throw "hosted_controller_desktop_executable_missing"
         }
@@ -485,6 +546,7 @@ try {
         Copy-Item -LiteralPath $ControllerDesktopExecutable -Destination $stageControllerDesktop
         Copy-Item -LiteralPath $controllerSmokeScript -Destination $stageControllerSmokeScript
         Copy-Item -LiteralPath $controllerHttpsProbeScript -Destination $stageControllerHttpsProbeScript
+        Copy-Item -LiteralPath $operatorLoginEvidenceScript -Destination $stageOperatorLoginEvidenceScript
     }
 
     if (-not $ControllerOnly) {
@@ -536,7 +598,8 @@ try {
                 $stageControllerSmokeScript `
                 $stageControllerDesktop `
                 (Join-Path $stageCandidates $RuntimeLayout) `
-                $stageControllerEvidence
+                $stageControllerEvidence `
+                $ControllerScenario
             if (-not $controllerSmokePassed) { $failures.Add("shared M1 Controller lifecycle smoke failed") }
         } catch {
             $safeFailure = ConvertTo-SafeChildOutput ([string]$_.Exception.Message)
