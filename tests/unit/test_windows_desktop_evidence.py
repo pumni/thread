@@ -482,9 +482,12 @@ if ($evidenceBody -notmatch 'if\s*\(\$isPassword\).*Remove\("observed_value_leng
 
 
 def test_controller_input_mutation_is_pattern_first_focus_gated_and_secret_safe() -> None:
+    if sys.platform != "win32":
+        pytest.skip("requires Windows UI Automation runtime")
+
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
-        pytest.skip("PowerShell mutation-path test is only available on Windows test hosts")
+        pytest.skip("requires PowerShell for Windows UI Automation runtime test")
 
     smoke_path = str(CONTROLLER_SMOKE).replace("'", "''")
     assertion = rf"""
@@ -800,6 +803,40 @@ $result = [ordered]@{{
     assert not (forbidden_fields & password_record.keys())
 
     assert "dynamic input mutation proof PASS" in completed.stdout
+
+
+def test_controller_input_mutation_runtime_test_requires_windows_uia() -> None:
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    dynamic_test = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        == "test_controller_input_mutation_is_pattern_first_focus_gated_and_secret_safe"
+    )
+    platform_gate = dynamic_test.body[0]
+    assert isinstance(platform_gate, ast.If)
+    assert isinstance(platform_gate.test, ast.Compare)
+    assert isinstance(platform_gate.test.left, ast.Attribute)
+    assert isinstance(platform_gate.test.left.value, ast.Name)
+    assert platform_gate.test.left.value.id == "sys"
+    assert platform_gate.test.left.attr == "platform"
+    assert len(platform_gate.test.ops) == 1
+    assert isinstance(platform_gate.test.ops[0], ast.NotEq)
+    assert len(platform_gate.test.comparators) == 1
+    assert isinstance(platform_gate.test.comparators[0], ast.Constant)
+    assert platform_gate.test.comparators[0].value == "win32"
+
+    skip_statement = platform_gate.body[0]
+    assert isinstance(skip_statement, ast.Expr)
+    skip_call = skip_statement.value
+    assert isinstance(skip_call, ast.Call)
+    assert isinstance(skip_call.func, ast.Attribute)
+    assert isinstance(skip_call.func.value, ast.Name)
+    assert skip_call.func.value.id == "pytest"
+    assert skip_call.func.attr == "skip"
+    assert isinstance(skip_call.args[0], ast.Constant)
+    assert skip_call.args[0].value == "requires Windows UI Automation runtime"
 
 
 def _write_probe_identity(directory: Path, prefix: str, *, leaf_ip: str) -> tuple[Path, Path, Path]:
