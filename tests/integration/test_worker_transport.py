@@ -123,7 +123,6 @@ async def test_worker_enrollment_auth_and_hello_use_authenticated_tls_routes(
         Settings(
             worker_admin_token=SecretStr(admin_token),
             worker_admin_auth_profile="legacy_linux_it",
-            worker_tls_required=True,
         ),
         worker_control_service=service,
     )
@@ -280,7 +279,6 @@ async def test_durable_https_pull_recovers_job_without_wss_notification(
         Settings(
             worker_admin_token=SecretStr(admin_token),
             worker_admin_auth_profile="legacy_linux_it",
-            worker_tls_required=True,
         ),
         worker_control_service=control,
         worker_job_service=jobs,
@@ -386,7 +384,6 @@ async def test_established_wss_sessions_expire_for_presence_and_notifications(
     )
     notifications = WorkerNotificationHub()
     app = create_app(
-        Settings(worker_tls_required=True),
         worker_control_service=control,
         worker_notifications=notifications,
     )

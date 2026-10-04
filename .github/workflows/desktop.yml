@@ -219,13 +219,27 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  controller-acceptance:
+  controller-acceptance-scenario:
     if: ${{ inputs.runtime_layout == 'shared' }}
-    name: Shared Controller acceptance join (Windows x64)
+    name: Controller scenario ${{ matrix.scenario }} (Windows x64)
     runs-on: windows-2025
     needs:
       - native
       - windows-runtime-packaging
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - bootstrap_https_cutover_tray
+          - restart_renewal
+          - database_crash_recovery
+          - parent_crash_recovery
+          - migration_recovery_auth
+          - database_port_collision
+          - endpoint_port_collision
+          - unowned_root
+          - unwritable_root
+          - corrupt_cluster
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -254,7 +268,7 @@ jobs:
           if ($actual -ne $env:DESKTOP_SOURCE_SHA) { throw "checkout_sha_mismatch" }
           if (-not [Environment]::Is64BitOperatingSystem) { throw "runner_must_be_windows_x64" }
           Write-Output "DESKTOP_SOURCE_SHA=$actual"
-      - name: Run shared Controller lifecycle smoke as a non-administrator
+      - name: Run isolated Controller scenario as a non-administrator
         shell: pwsh
         run: >-
           ./packaging/windows_desktop/run_hosted_smoke.ps1
@@ -264,12 +278,89 @@ jobs:
           -ControllerOnly
           -EvidenceOutput $env:GITHUB_WORKSPACE/build/windows-desktop/evidence/hosted
           -ControllerDesktopExecutable "$env:GITHUB_WORKSPACE/build/windows-desktop/desktop/threads-desktop.exe"
-          -ControllerEvidenceOutput "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/controller-lifecycle.json"
-      - name: Upload exact-SHA Controller acceptance evidence
+          -ControllerScenario ${{ matrix.scenario }}
+          -ControllerEvidenceOutput "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/controller-scenarios/${{ matrix.scenario }}/controller-lifecycle.json"
+      - name: Ensure exact-SHA scenario evidence exists
+        if: always()
+        shell: pwsh
+        run: |
+          $evidencePath = "$env:GITHUB_WORKSPACE/build/windows-desktop/evidence/controller-scenarios/${{ matrix.scenario }}/controller-lifecycle.json"
+          if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $evidencePath) -Force | Out-Null
+            $evidence = [ordered]@{
+              schema_version = 2
+              source_revision = $env:DESKTOP_SOURCE_SHA
+              scenario = "${{ matrix.scenario }}"
+              runner = [ordered]@{
+                github_hosted = $env:GITHUB_ACTIONS -eq "true" -and $env:RUNNER_ENVIRONMENT -eq "github-hosted"
+                windows_x64 = $env:RUNNER_OS -eq "Windows" -and $env:RUNNER_ARCH -eq "X64"
+                non_administrator = $false
+                clean_profile = $false
+              }
+              checks = @{}
+              operator_session_timeline = @()
+              operator_login_attempt_timeline = @()
+              controller_runtime_identity_timeline = @()
+              process_evidence = @{}
+              scenario_evidence = @{}
+              result = "BLOCKER"
+              failure_code = "controller_scenario_harness_evidence_missing"
+              failure_codes = @("controller_scenario_harness_evidence_missing")
+            }
+            [System.IO.File]::WriteAllText(
+              $evidencePath,
+              ($evidence | ConvertTo-Json -Depth 8),
+              [System.Text.UTF8Encoding]::new($false)
+            )
+          }
+      - name: Upload exact-SHA Controller scenario evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-${{ matrix.scenario }}
+          path: build/windows-desktop/evidence/controller-scenarios/${{ matrix.scenario }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  controller-acceptance:
+    if: ${{ always() && inputs.runtime_layout == 'shared' }}
+    name: Shared Controller acceptance join (Windows x64)
+    runs-on: ubuntu-24.04
+    needs:
+      - controller-acceptance-scenario
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+      - name: Assert exact aggregate source revision
+        shell: bash
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$DESKTOP_SOURCE_SHA" ]]; then
+            echo "checkout_sha_mismatch" >&2
+            exit 1
+          fi
+      - name: Download every exact-SHA Controller scenario artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-*
+          path: build/windows-desktop/scenario-artifacts
+          merge-multiple: false
+      - name: Validate and assemble Controller acceptance evidence
+        if: always()
+        run: >-
+          python packaging/windows_desktop/aggregate_controller_scenarios.py
+          --artifact-root build/windows-desktop/scenario-artifacts
+          --source-sha ${{ env.DESKTOP_SOURCE_SHA }}
+          --output-root build/windows-desktop/aggregate
+      - name: Upload combined exact-SHA Controller acceptance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}
-          path: build/windows-desktop/evidence
+          path: build/windows-desktop/aggregate
           if-no-files-found: warn
           retention-days: 14

@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -47,6 +48,7 @@ async def test_worker_enrollment_authentication_protocol_and_presence(
         presence_ttl=timedelta(seconds=10),
     )
     issued = await service.create_enrollment()
+    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", issued.code)
     identity = WorkerDeviceIdentity.generate()
     worker_id = uuid4()
     with pytest.raises(WorkerControlError, match="INVALID_PUBLIC_KEY"):

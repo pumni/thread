@@ -23,10 +23,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HOME=/home/app \
     PATH="/app/.venv/bin:$PATH" \
     THREADS_PLATFORM_HTTP_HOST=0.0.0.0 \
-    THREADS_PLATFORM_HTTP_PORT=8000
+    THREADS_PLATFORM_HTTP_PORT=8000 \
+    THREADS_PLATFORM_TLS_CERTFILE=/var/lib/threads/controller-tls-serving/leaf-fullchain.pem \
+    THREADS_PLATFORM_TLS_KEYFILE=/var/lib/threads/controller-tls-serving/leaf-key.pem
 
 RUN groupadd --gid 10001 app \
-    && useradd --uid 10001 --gid app --home-dir /home/app --create-home --shell /usr/sbin/nologin app
+    && useradd --uid 10001 --gid app --home-dir /home/app --create-home --shell /usr/sbin/nologin app \
+    && mkdir -p /var/lib/threads/controller-tls-admin /var/lib/threads/controller-tls-serving \
+    && chown -R app:app /var/lib/threads \
+    && chmod 0700 /var/lib/threads/controller-tls-admin /var/lib/threads/controller-tls-serving
 
 WORKDIR /app
 
@@ -38,4 +43,4 @@ USER app
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "exec uvicorn threads_platform.app:app --host \"${THREADS_PLATFORM_HTTP_HOST:-0.0.0.0}\" --port \"${THREADS_PLATFORM_HTTP_PORT:-8000}\""]
+CMD ["sh", "-c", "test -r \"${THREADS_PLATFORM_TLS_CERTFILE}\" && test -r \"${THREADS_PLATFORM_TLS_KEYFILE}\" && exec uvicorn threads_platform.app:app --host \"${THREADS_PLATFORM_HTTP_HOST:-0.0.0.0}\" --port \"${THREADS_PLATFORM_HTTP_PORT:-8000}\" --ssl-certfile \"${THREADS_PLATFORM_TLS_CERTFILE}\" --ssl-keyfile \"${THREADS_PLATFORM_TLS_KEYFILE}\" --no-proxy-headers --no-access-log"]

@@ -55,7 +55,7 @@ from threads_platform.observability.tracing import (
 from threads_platform.transport.http.auth import BearerTokenAuthenticator, CommandAuthenticator
 from threads_platform.transport.http.commands import create_command_router
 from threads_platform.transport.http.operators import create_operator_router
-from threads_platform.transport.http.worker_tls import WorkerTransportTLSMiddleware
+from threads_platform.transport.http.worker_tls import TransportSecurityMiddleware
 from threads_platform.transport.http.workers import create_worker_router
 
 
@@ -236,10 +236,7 @@ def create_app(
             authenticator or BearerTokenAuthenticator(resolved_settings.crm_ingress_token),
         )
     )
-    application.add_middleware(
-        WorkerTransportTLSMiddleware,
-        required=resolved_settings.worker_tls_required,
-    )
+    application.add_middleware(TransportSecurityMiddleware)
     application.add_middleware(HTTPRequestTracingMiddleware, tracing=tracing)
     application.include_router(
         create_worker_router(

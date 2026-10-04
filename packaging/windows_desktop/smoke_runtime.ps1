@@ -121,7 +121,17 @@ $evidence = [ordered]@{
         cleared_runtime_environment_names = @()
         sanitized_path_forbidden_tools_absent = $false
     }
-    checks = [ordered]@{}
+    checks = [ordered]@{
+        direct_uvicorn_tls = $false
+        verified_https_health = $false
+        verified_https_ready = $false
+        plaintext_health_rejected = $false
+        root_key_outside_serving_directory = $false
+        root_key_absent_from_http_argv = $false
+        root_private_key_absent_from_runtime_logs = $false
+        leaf_private_key_absent_from_runtime_logs = $false
+        scheduler_has_no_tls_key_args = $false
+    }
     timings_ms = [ordered]@{}
     redacted_logs = @()
     primary_failure_code = $null
@@ -326,6 +336,186 @@ function Invoke-Psql([string]$Sql, [string]$Label) {
     return (($output | Out-String).Trim())
 }
 
+function New-SyntheticTlsIdentity([string]$AdminDirectory, [string]$ServingDirectory) {
+    New-Item -ItemType Directory -Path $AdminDirectory, $ServingDirectory -Force | Out-Null
+    $now = [DateTimeOffset]::UtcNow
+    $rootKey = [System.Security.Cryptography.ECDsa]::Create()
+    $rootKey.KeySize = 256
+    $rootRequest = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        "CN=Threads Desktop runtime smoke root",
+        $rootKey,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256
+    )
+    $rootConstraints = [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new(
+        $true, $true, 0, $true
+    )
+    $rootUsage = [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
+        ([System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::KeyCertSign -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::CrlSign),
+        $true
+    )
+    $rootRequest.CertificateExtensions.Add($rootConstraints)
+    $rootRequest.CertificateExtensions.Add($rootUsage)
+    $rootCertificate = $rootRequest.CreateSelfSigned($now.AddMinutes(-5), $now.AddDays(3650))
+
+    $leafKey = [System.Security.Cryptography.ECDsa]::Create()
+    $leafKey.KeySize = 256
+    $leafRequest = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+        "CN=Threads Desktop runtime smoke leaf",
+        $leafKey,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256
+    )
+    $leafRequest.CertificateExtensions.Add(
+        [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new(
+            $false, $false, 0, $true
+        )
+    )
+    $leafRequest.CertificateExtensions.Add(
+        [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new(
+            [System.Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature,
+            $true
+        )
+    )
+    $eku = [System.Security.Cryptography.OidCollection]::new()
+    $null = $eku.Add([System.Security.Cryptography.Oid]::new("1.3.6.1.5.5.7.3.1"))
+    $leafRequest.CertificateExtensions.Add(
+        [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new(
+            $eku, $false
+        )
+    )
+    $sans = [System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()
+    $sans.AddIpAddress([System.Net.IPAddress]::Parse("192.0.2.10"))
+    $sans.AddIpAddress([System.Net.IPAddress]::Loopback)
+    $leafRequest.CertificateExtensions.Add($sans.Build())
+    $serial = [byte[]]::new(16)
+    $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $random.GetBytes($serial) }
+    finally { $random.Dispose() }
+    $leafPublicCertificate = $leafRequest.Create(
+        $rootCertificate, $now.AddMinutes(-5), $now.AddDays(90), $serial
+    )
+    $leafCertificate = $leafPublicCertificate
+    $rootCertificatePath = Join-Path $AdminDirectory "root-cert.pem"
+    $rootCertificateDerPath = Join-Path $AdminDirectory "root-cert.der"
+    $rootKeyPath = Join-Path $AdminDirectory "root-key.pem"
+    $leafCertificatePath = Join-Path $ServingDirectory "leaf-cert.pem"
+    $leafKeyPath = Join-Path $ServingDirectory "leaf-key.pem"
+    $fullchainPath = Join-Path $ServingDirectory "leaf-fullchain.pem"
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($rootCertificatePath, $rootCertificate.ExportCertificatePem(), $utf8)
+    [System.IO.File]::WriteAllBytes(
+        $rootCertificateDerPath,
+        $rootCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+    )
+    [System.IO.File]::WriteAllText($rootKeyPath, $rootKey.ExportPkcs8PrivateKeyPem(), $utf8)
+    [System.IO.File]::WriteAllText($leafCertificatePath, $leafCertificate.ExportCertificatePem(), $utf8)
+    [System.IO.File]::WriteAllText($leafKeyPath, $leafKey.ExportPkcs8PrivateKeyPem(), $utf8)
+    [System.IO.File]::WriteAllText(
+        $fullchainPath,
+        $leafCertificate.ExportCertificatePem() + "`r`n" + $rootCertificate.ExportCertificatePem(),
+        $utf8
+    )
+    $fingerprint = "SHA256:" + (Get-Sha256Hex $rootCertificateDerPath)
+    return [ordered]@{
+        root_certificate = $rootCertificateDerPath
+        root_key = $rootKeyPath
+        leaf_certificate = $leafCertificatePath
+        leaf_key = $leafKeyPath
+        fullchain = $fullchainPath
+        fingerprint = $fingerprint
+        root_key_object = $rootKey
+        leaf_key_object = $leafKey
+        root_certificate_object = $rootCertificate
+        leaf_certificate_object = $leafCertificate
+    }
+}
+
+function Get-VerifiedHttpsStatus([int]$Port, [string]$Route, [string]$RootCertificatePath) {
+    if ($null -eq ("ThreadsDesktopSmokeCertificateVerifier" -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+
+public static class ThreadsDesktopSmokeCertificateVerifier
+{
+    public static X509Certificate2 RootCertificate { get; set; }
+
+    public static bool Validate(
+        HttpRequestMessage request,
+        X509Certificate2 certificate,
+        X509Chain chain,
+        SslPolicyErrors errors)
+    {
+        var disallowed = SslPolicyErrors.RemoteCertificateNameMismatch |
+                         SslPolicyErrors.RemoteCertificateNotAvailable;
+        if (RootCertificate is null || certificate is null || chain is null ||
+            (errors & disallowed) != 0)
+        {
+            return false;
+        }
+
+        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        chain.ChainPolicy.VerificationFlags = X509VerificationFlags.NoFlag;
+        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        chain.ChainPolicy.CustomTrustStore.Add(RootCertificate);
+        return chain.Build(certificate);
+    }
+}
+'@
+    }
+    $rootCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        [System.IO.File]::ReadAllBytes($RootCertificatePath)
+    )
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    [ThreadsDesktopSmokeCertificateVerifier]::RootCertificate = $rootCertificate
+    $callbackType = [System.Net.Http.HttpClientHandler].GetProperty(
+        "ServerCertificateCustomValidationCallback"
+    ).PropertyType
+    $handler.ServerCertificateCustomValidationCallback =
+        [System.Delegate]::CreateDelegate(
+            $callbackType,
+            [ThreadsDesktopSmokeCertificateVerifier].GetMethod("Validate")
+        )
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(3)
+    try {
+        $response = $client.GetAsync("https://127.0.0.1:$Port$Route").GetAwaiter().GetResult()
+        try { return [int]$response.StatusCode }
+        finally { $response.Dispose() }
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+        $rootCertificate.Dispose()
+    }
+}
+
+function Test-PlaintextHttpRejected([int]$Port) {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $client.ReceiveTimeout = 1000
+        $client.SendTimeout = 1000
+        $client.Connect([System.Net.IPAddress]::Loopback, $Port)
+        $stream = $client.GetStream()
+        $request = [System.Text.Encoding]::ASCII.GetBytes(
+            "GET /health HTTP/1.1`r`nHost: 127.0.0.1`r`nConnection: close`r`n`r`n"
+        )
+        $stream.Write($request, 0, $request.Length)
+        $buffer = [byte[]]::new(16)
+        try {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            return $read -eq 0 -or [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read) -notmatch '^HTTP/'
+        } catch [System.IO.IOException] {
+            return $true
+        }
+    } catch [System.Net.Sockets.SocketException] {
+        return $true
+    } finally {
+        $client.Dispose()
+    }
+}
+
 function Start-BackgroundRuntime([string]$Executable, [string[]]$Arguments, [string]$Label) {
     $stdout = Join-Path $localRoot "$Label.stdout.raw.log"
     $stderr = Join-Path $localRoot "$Label.stderr.raw.log"
@@ -491,6 +681,18 @@ try {
     New-Item -ItemType Directory -Path $localRoot -Force | Out-Null
     Restrict-TreeToCurrentUser $localRoot
     $evidence.checks.private_data_acl_current_user_only = $true
+    $tlsAdminDirectory = Join-Path $localRoot "controller-tls-admin"
+    $tlsServingDirectory = Join-Path $localRoot "controller-tls-serving"
+    $tlsIdentity = New-SyntheticTlsIdentity $tlsAdminDirectory $tlsServingDirectory
+    $rootKeyFilesInServingDirectory = @(
+        Get-ChildItem -LiteralPath $tlsServingDirectory -Recurse -File |
+            Where-Object { $_.Name -match '(?i)root.*key|root-key' }
+    )
+    $evidence.checks.root_key_outside_serving_directory =
+        (Test-Path -LiteralPath $tlsIdentity.root_key) -and $rootKeyFilesInServingDirectory.Count -eq 0
+    if (-not $evidence.checks.root_key_outside_serving_directory) {
+        throw "root_signing_key_in_serving_directory"
+    }
     $dataDirectory = Join-Path $localRoot "postgres-data"
     $postgresLog = Join-Path $localRoot "postgres.redacted.log"
     $protectedCredential = Join-Path $localRoot "database-credential.dpapi"
@@ -547,20 +749,35 @@ try {
     $httpPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
     $listener.Stop()
     $httpStartedAt = [DateTime]::UtcNow
-    $apiProcess = Start-BackgroundRuntime $httpExe ($httpPrefix + @("--host", "127.0.0.1", "--port", "$httpPort")) "http"
+    $apiProcess = Start-BackgroundRuntime $httpExe ($httpPrefix + @(
+        "--host", "127.0.0.1",
+        "--port", "$httpPort",
+        "--ssl-certfile", $tlsIdentity.fullchain,
+        "--ssl-keyfile", $tlsIdentity.leaf_key
+    )) "http"
+    $evidence.checks.direct_uvicorn_tls = $true
     $schedulerProcess = Start-BackgroundRuntime $schedulerExe $schedulerPrefix "scheduler"
+    $httpProcessInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$($apiProcess.Id)"
+    $schedulerProcessInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$($schedulerProcess.Id)"
+    $evidence.checks.root_key_absent_from_http_argv =
+        [string]$httpProcessInfo.CommandLine -notmatch '(?i)root-key|controller-tls-admin'
+    $evidence.checks.scheduler_has_no_tls_key_args =
+        [string]$schedulerProcessInfo.CommandLine -notmatch '(?i)ssl-keyfile|leaf-key|root-key|controller-tls'
+    if (-not $evidence.checks.root_key_absent_from_http_argv) {
+        throw "root_signing_key_in_http_argv"
+    }
+    if (-not $evidence.checks.scheduler_has_no_tls_key_args) {
+        throw "scheduler_received_tls_key_argument"
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(40)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($apiProcess.HasExited) { throw "packaged_http_exited_before_ready" }
         if ($schedulerProcess.HasExited) { throw "packaged_scheduler_exited_during_startup" }
         try {
-            $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$httpPort/health")
-            $request.Proxy = $null
-            $request.Timeout = 2000
-            $response = $request.GetResponse()
-            $httpStatus = [int]$response.StatusCode
-            $response.Close()
-            if ($httpStatus -eq 200) {
+            $healthStatus = Get-VerifiedHttpsStatus $httpPort "/health" $tlsIdentity.root_certificate
+            $readyStatus = Get-VerifiedHttpsStatus $httpPort "/ready" $tlsIdentity.root_certificate
+            $httpStatus = $healthStatus
+            if ($healthStatus -eq 200 -and $readyStatus -eq 200) {
                 break
             }
         } catch {
@@ -568,6 +785,14 @@ try {
         }
     }
     if (-not $httpStatus) { throw "packaged_http_health_timeout" }
+    if ($httpStatus -ne 200 -or $readyStatus -ne 200) { throw "packaged_https_readiness_failed" }
+    $evidence.checks.verified_https_health = $true
+    $evidence.checks.verified_https_ready = $true
+    $evidence.checks.controller_root_fingerprint = $tlsIdentity.fingerprint
+    if (-not (Test-PlaintextHttpRejected $httpPort)) {
+        throw "packaged_plaintext_health_listener_present"
+    }
+    $evidence.checks.plaintext_health_rejected = $true
     $evidence.timings_ms.http_health_ready = [int]([DateTime]::UtcNow - $httpStartedAt).TotalMilliseconds
     Start-Sleep -Seconds 3
     if ($schedulerProcess.HasExited) { throw "packaged_scheduler_did_not_remain_running" }
@@ -689,8 +914,24 @@ try {
         $redactionVerified = $runtimeLogsCreated -and
             $remainingRawLogs.Count -eq 0 -and
             $existingSafeLogs.Count -gt 0
+        $rootPrivateKeyText = if ($tlsIdentity -and (Test-Path -LiteralPath $tlsIdentity.root_key)) {
+            [System.IO.File]::ReadAllText($tlsIdentity.root_key).Trim()
+        } else { "" }
+        $leafPrivateKeyText = if ($tlsIdentity -and (Test-Path -LiteralPath $tlsIdentity.leaf_key)) {
+            [System.IO.File]::ReadAllText($tlsIdentity.leaf_key).Trim()
+        } else { "" }
+        $rootKeyAbsentFromLogs = $rootPrivateKeyText.Length -gt 0
+        $leafKeyAbsentFromLogs = $leafPrivateKeyText.Length -gt 0
         foreach ($safeLog in $existingSafeLogs) {
             $content = [System.IO.File]::ReadAllText($safeLog)
+            if (($rootPrivateKeyText -and $content.Contains($rootPrivateKeyText)) -or
+                [regex]::IsMatch($content, "-----BEGIN (?:EC )?PRIVATE KEY-----")) {
+                $rootKeyAbsentFromLogs = $false
+            }
+            if (($leafPrivateKeyText -and $content.Contains($leafPrivateKeyText)) -or
+                [regex]::IsMatch($content, "-----BEGIN (?:EC )?PRIVATE KEY-----")) {
+                $leafKeyAbsentFromLogs = $false
+            }
             if (($databaseUrl -and $content.Contains($databaseUrl)) -or
                 ($databasePassword -and $content.Contains($databasePassword)) -or
                 [regex]::IsMatch($content, "(?i)(password|database_url)\s*[:=]\s*(?!<REDACTED>)[^\s]+") -or
@@ -699,6 +940,11 @@ try {
                 [regex]::IsMatch($content, "(?i)postgres(?:ql)?(?:\+\w+)?://[^\s:@/]+:[^@\s/]+@")) {
                 $redactionVerified = $false
             }
+        }
+        $evidence.checks.root_private_key_absent_from_runtime_logs = $rootKeyAbsentFromLogs
+        $evidence.checks.leaf_private_key_absent_from_runtime_logs = $leafKeyAbsentFromLogs
+        if (-not $rootKeyAbsentFromLogs -or -not $leafKeyAbsentFromLogs) {
+            $redactionVerified = $false
         }
     } catch {
         $runtimeLogsCreated = $runtimeLogsCreated -or

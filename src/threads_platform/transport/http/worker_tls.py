@@ -3,15 +3,20 @@ import json
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 
-class WorkerTransportTLSMiddleware:
-    def __init__(self, app: ASGIApp, *, required: bool = True) -> None:
+class TransportSecurityMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
         self._app = app
-        self._required = required
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") not in {"http", "websocket"}:
+            await self._app(scope, receive, send)
+            return
         path = scope.get("path", "")
-        is_worker_path = path == "/v1/workers" or path.startswith("/v1/workers/")
-        if not self._required or not is_worker_path:
+        protected_path = any(
+            path == prefix or path.startswith(f"{prefix}/")
+            for prefix in ("/v1/operator", "/v1/workers")
+        )
+        if not protected_path:
             await self._app(scope, receive, send)
             return
         secure_scheme = "https" if scope["type"] == "http" else "wss"

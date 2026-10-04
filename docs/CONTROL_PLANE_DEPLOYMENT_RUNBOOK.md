@@ -25,13 +25,75 @@ smoke.
 
 ## Build and run
 
+The Control Plane listener uses direct Uvicorn TLS. There is no reverse proxy:
+HTTPS and WSS, Operator and Worker routes, `/health`, `/ready`, and `/metrics`
+share one listener. Configure an explicit stable IPv4 address and port; the
+leaf certificate SAN contains exactly that address and `127.0.0.1`. A local
+administrator provisions the private root and leaf before starting HTTP:
+
+```powershell
+uv run python -m threads_platform.controller_tls_admin provision `
+  --admin-dir <controller-tls-admin> `
+  --serving-dir <controller-tls-serving> `
+  --lan-address <stable-ipv4>
+uv run python -m threads_platform.controller_tls_admin fingerprint `
+  --admin-dir <controller-tls-admin>
+```
+
+Use `ensure` at normal startup. It validates the provisioned root and serving
+leaf, keeps a leaf with more than 30 days remaining, renews a still-valid leaf
+at 30 days or less under the existing root, and fails closed for expired,
+not-yet-valid, corrupt, or partial identity state. Use `reissue` only for an
+explicit endpoint change; it validates the old SAN and issues a new exact SAN
+under the same root. Use `renew` for an explicit administrator-requested leaf
+replacement. Keep `root-key.pem` in the administrator-only directory; mount only
+`leaf-fullchain.pem` and `leaf-key.pem` read-only into the ordinary HTTP
+service. The scheduler receives no TLS key. Linux private-key files must be
+owned by the service administrator and mode `0600`; the admin command fails
+closed on broader modes. Compare the printed SHA-256 root DER fingerprint
+out-of-band with remote clients before they confirm private application trust.
+No product root is installed in an operating-system or browser CA store.
+
+The local commands for the normal-start check and explicit endpoint change are:
+
+```powershell
+uv run python -m threads_platform.controller_tls_admin ensure `
+  --admin-dir <controller-tls-admin> `
+  --serving-dir <controller-tls-serving> `
+  --lan-address <stable-ipv4>
+uv run python -m threads_platform.controller_tls_admin reissue `
+  --admin-dir <controller-tls-admin> `
+  --serving-dir <controller-tls-serving> `
+  --current-lan-address <old-ipv4> `
+  --lan-address <new-ipv4>
+```
+
 From the repository root:
 
 ```powershell
+$env:THREADS_PLATFORM_TLS_LAN_ADDRESS = "<stable-ipv4>"
 docker compose build
+docker compose --profile tls-admin run --rm --no-deps tls-admin
 docker compose up -d --wait postgres
 docker compose up --force-recreate --no-deps migrate
 docker compose up -d http scheduler
+```
+
+The `tls-admin` profile performs explicit first root provisioning; normal
+startup never creates a root. Its `identity-provisioned` fingerprint marker is
+retained with root state, so missing or partial state fails closed. Every
+ordinary HTTP creation is gated by the one-shot `tls-prepare` service, which
+mounts root-admin state read-only and serving state writable, runs `ensure`, and
+exits before HTTP starts. HTTP mounts only serving material; the scheduler has
+no TLS key volume. For an endpoint/SAN change, stop the application services
+and run the local `reissue` operation with both the currently configured and
+new IPv4 addresses, then recreate HTTP through Compose so `tls-prepare` runs
+again. To recreate HTTP, remove the completed prepare container first so the
+dependency executes again:
+
+```powershell
+docker compose rm --stop --force tls-prepare
+docker compose up -d --force-recreate http
 ```
 
 The migration service runs `alembic upgrade head` once and exits. The HTTP and
@@ -40,13 +102,16 @@ migrations during startup. Run the migration job again explicitly for each
 deployment with `--force-recreate` before starting/recreating application
 processes.
 
-The HTTP service runs the existing FastAPI application through Uvicorn. Its
-container bind address defaults to `0.0.0.0` and port to `8000`; configure
+The HTTP service runs the existing FastAPI application through Uvicorn with
+`--ssl-certfile`, `--ssl-keyfile`, and `--no-proxy-headers`. Missing TLS paths
+fail startup; there is no plaintext production listener. Its container bind
+address defaults to `0.0.0.0` and port to `8000`; configure
 `THREADS_PLATFORM_HTTP_HOST` and `THREADS_PLATFORM_CONTAINER_PORT` to change
-them. Compose publishes the HTTP port on host loopback only, using
+them. Compose publishes the selected stable IPv4 using
+`THREADS_PLATFORM_TLS_LAN_ADDRESS` and host port
 `THREADS_PLATFORM_SMOKE_HTTP_PORT` (default `8000`). `/health` is liveness;
 `/ready` checks PostgreSQL and persisted Worker status. The Compose healthcheck
-uses `/health`; it does not replace `/ready`.
+verifies HTTPS using the Controller root; it does not replace `/ready`.
 
 The scheduler runs independently as:
 
@@ -56,7 +121,7 @@ python -m threads_platform.scheduler
 
 ## Metrics scrape boundaries (#89)
 
-The HTTP process serves Prometheus text at `/metrics` on the configured HTTP
+The HTTP process serves Prometheus text at `/metrics` on the configured HTTPS
 port. It reads Worker and WorkerJob counts from PostgreSQL for each scrape; when
 PostgreSQL is unavailable it reports `threads_platform_database_up 0` and omits
 the persisted count samples. `/ready` keeps its separate #72 status and HTTP
@@ -100,11 +165,16 @@ correlation, and failure semantics.
 Scrape the two process owners separately:
 
 ```powershell
-curl.exe http://127.0.0.1:8000/metrics
+curl.exe --cacert <controller-tls-admin>\root-cert.pem https://<stable-ipv4>:8000/metrics
 docker compose exec -T http python -c "from urllib.request import urlopen; print(urlopen('http://scheduler:9101/metrics').read().decode())"
 ```
 
-The extended Compose smoke checks both surfaces, verifies that scheduler port
+The extended Compose smoke provisions isolated synthetic private TLS state,
+compares the CLI fingerprint with the served root, checks verified HTTPS for
+health/readiness/Operator and Worker routes, and checks verified WSS with a
+synthetic authenticated Worker. It also proves the HTTP container cannot read
+root signing state and the scheduler receives no TLS private key. The smoke
+checks both metrics surfaces, verifies that scheduler port
 9101 is not published, and checks PostgreSQL-derived gauges after HTTP
 recreation. It also confirms that the scheduler's process-local tick counters
 start over after scheduler recreation. HTTP gauges rediscover durable rows from
@@ -135,18 +205,20 @@ uv sync --locked
 uv run --locked python scripts/control_plane_compose_smoke.py
 ```
 
-The smoke builds and inspects the image, starts PostgreSQL, runs the one-shot
-migration, starts HTTP and scheduler separately, and checks `/health` and
-`/ready`. It writes two synthetic Worker rows using the existing Worker
+The smoke builds and inspects the image, creates isolated synthetic TLS state,
+starts PostgreSQL, runs the one-shot migration, starts HTTP and scheduler
+separately, and checks verified HTTPS `/health` and `/ready`. It writes two
+synthetic Worker rows using the existing Worker
 repository: one proves PostgreSQL state survives while HTTP/scheduler are
 recreated; the other is inserted while both processes are stopped and has
 expired presence. After restart, the scheduler must discover and expire that
 persisted row exactly once. The smoke also stops PostgreSQL and checks that
 `/health` remains live while `/ready` returns `NOT_READY` / `DOWN` / HTTP 503,
-then verifies readiness and persisted rows after PostgreSQL returns. It uses no
-Meta API, CRM, or external Worker. It removes its temporary Compose project and
-PostgreSQL volume in a `finally` path; CI also has an unconditional cleanup
-step.
+then verifies readiness and persisted rows after PostgreSQL returns. The
+smoke exercises verified HTTPS Operator and Worker routes and authenticated
+WSS, with a wrong-root failure check. It uses no Meta API, CRM, or external
+Worker. It removes its temporary Compose project, TLS material, and PostgreSQL
+volume in a `finally` path; CI also has an unconditional cleanup step.
 
 For a manual non-smoke Compose deployment, the named PostgreSQL volume survives
 HTTP and scheduler restarts and ordinary `docker compose down`. Do not add
@@ -164,7 +236,8 @@ Keep PostgreSQL available and recreate only the HTTP container:
 docker compose up -d --force-recreate --no-deps http
 ```
 
-Check `/health` for process liveness and `/ready` for database availability.
+Check `/health` and `/ready` with the configured Controller root as trust
+anchor, for process liveness and database availability respectively.
 In-flight HTTP requests can be interrupted by a process replacement; use the
 existing idempotency and durable Command recovery contracts. FastAPI does not
 own scheduler loops or durable business state.

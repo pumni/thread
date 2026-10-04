@@ -156,6 +156,34 @@ def test_heavy_components_are_reusable_and_exact_sha_bound() -> None:
     assert "${{ inputs.source_sha }}" in _text(".github/workflows/windows-worker-package.yml")
 
 
+def test_docker_smoke_uses_locked_project_environment() -> None:
+    workflow = _workflow(".github/workflows/docker-control-plane-smoke.yml")
+    steps = cast(
+        list[dict[str, Any]],
+        _jobs(workflow)["compose-restart-smoke"]["steps"],
+    )
+    sync_step = next(
+        step for step in steps if step.get("name") == "Install locked smoke environment"
+    )
+    smoke_step = next(
+        step
+        for step in steps
+        if step.get("name") == "Build image and run Compose restart/recovery smoke"
+    )
+    cleanup_step = next(
+        step
+        for step in steps
+        if step.get("name") == "Remove smoke containers and PostgreSQL volume"
+    )
+
+    assert sync_step["run"] == "uv sync --locked"
+    assert smoke_step["run"] == "uv run --locked python scripts/control_plane_compose_smoke.py"
+    assert "--no-project" not in smoke_step["run"]
+    assert cleanup_step["run"] == (
+        "docker compose --profile tls-admin down --volumes --remove-orphans"
+    )
+
+
 def test_secret_scan_and_head_guard_are_cheap_draft_gates() -> None:
     secret = _workflow(".github/workflows/secret-scan.yml")
     assert set(secret["on"]) == {"pull_request", "schedule", "workflow_dispatch"}

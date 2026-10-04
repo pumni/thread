@@ -5,11 +5,14 @@ import asyncio
 import getpass
 import sys
 
+from sqlalchemy import select
+
 from threads_platform.config.settings import get_settings
 from threads_platform.infrastructure.persistence.database import (
     create_database_engine,
     create_session_factory,
 )
+from threads_platform.infrastructure.persistence.models import OperatorUserRecord
 from threads_platform.infrastructure.security.operator_auth import (
     OperatorAuthError,
     OperatorAuthService,
@@ -40,6 +43,21 @@ async def _bootstrap(username: str, password: str) -> None:
         await engine.dispose()
 
 
+async def _owner_exists() -> bool:
+    database_url = get_settings().database_url
+    if database_url is None:
+        raise OperatorAuthError("DATABASE_URL_REQUIRED")
+    engine = create_database_engine(database_url)
+    try:
+        async with create_session_factory(engine)() as session:
+            result = await session.scalar(
+                select(OperatorUserRecord.id).where(OperatorUserRecord.role == "OWNER").limit(1)
+            )
+            return result is not None
+    finally:
+        await engine.dispose()
+
+
 def bootstrap_owner_from_stdin(username: str) -> int:
     try:
         password = _read_password()
@@ -49,6 +67,15 @@ def bootstrap_owner_from_stdin(username: str) -> int:
         return 2
     except Exception:
         print("OPERATOR_BOOTSTRAP_FAILED", file=sys.stderr)
+        return 2
+    return 0
+
+
+def controller_owner_status() -> int:
+    try:
+        print("OWNER_PRESENT" if asyncio.run(_owner_exists()) else "OWNER_ABSENT")
+    except Exception:
+        print("OPERATOR_STATUS_CHECK_FAILED", file=sys.stderr)
         return 2
     return 0
 

@@ -2,7 +2,7 @@
 
 **Epic:** [#94](https://github.com/pumni/thread/issues/94) · **Planning draft:** [#93](https://github.com/pumni/thread/pull/93) · **Date:** 2026-10-01
 
-This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PLAN.md). Begin a new conversation at [SESSION_HANDOFF.md](SESSION_HANDOFF.md), and read the [pre-implementation audit](PREIMPLEMENTATION_AUDIT.md). Child issues are planning scope unless separately authorized. DX-05 / #99 is authorized; its latest coordinator comment freezes the role-action policy and related security constraints. Do not reopen those policy decisions during DX-05 implementation.
+This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PLAN.md). Begin a new conversation at [SESSION_HANDOFF.md](SESSION_HANDOFF.md), and read the [pre-implementation audit](PREIMPLEMENTATION_AUDIT.md). Child issues are planning scope unless separately authorized. Issue #100 / DX-06 is authorized by coordinator comment `5973437416`; its exact-base Draft checkpoint is the only active implementation scope. Do not start DX-07/08/09 from this authorization.
 
 | ID | GitHub issue | Phase / checkpoint | Required dependencies |
 |---|---|---|---|
@@ -27,25 +27,22 @@ This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PL
 - [#102 DX-08] Do **not** replace existing 256-bit Worker enrollment credential with six-digit UI code. Optional short-code UX is a security-reviewed redemption after verified TLS; otherwise use securely conveyed high-entropy code.
 - [#103 DX-09] Existing browser session requires Account/assignment. Build isolated pending local profile + reviewed login-state detector, atomic Controller registration and version-negotiated additive protocol.
 - [#98 DX-04] M1 is loopback-only disposable prototype without final installer or real Owner/remote HTTPS. First usable LAN requires #99 + #100; final customer installer is #106.
-- [#100 DX-06] Real TLS/WSS terminator, trusted ASGI scheme, new Operator HTTPS enforcement, correct leaf/root key custody.
+- [#100 DX-06] Direct Uvicorn TLS is the sole terminator (`proxy_headers=False`); one HTTPS/WSS listener serves Operator, Worker, health, readiness, and metrics. Persist an explicit stable IPv4/port, exact two-IP SAN, DPAPI CurrentUser root/leaf keys, temporary leaf serving file, strict TLS-only first contact, endpoint-bound app-private trust, and Linux/Docker private TLS parity.
+- [#100 DX-06 correction] Windows endpoint changes are explicit, keep the existing root identity, issue a new leaf, and require local setup before first Owner or authenticated OWNER/ADMIN afterward. Linux/Docker uses explicit `provision`, startup `ensure`, explicit `reissue`, and local `fingerprint`; HTTP starts only after successful TLS preparation.
 - [#97 DX-03/#98 DX-04] Windows installer admin context vs single non-elevated runtime user and DPAPI must be proven. No data-root/identity surprises.
 
 - [#99 DX-05 / #101 DX-07] Deliberate Worker Quit/Restart requires OWNER/ADMIN/OPERATOR login; Controller stop/restart requires OWNER/ADMIN. No device self-drain endpoint or hidden admin bearer.
-- [#100 DX-06 / #107 DX-13] Linux/Docker Controller needs non-DPAPI protected TLS trust identity + local CLI fingerprint and must serve the same secure Operator/Worker API to Windows clients. Test interoperability before claiming deployment parity.
+- [#100 DX-06 / #107 DX-13] Linux/Docker Controller uses the local Python TLS admin CLI, strict private-key modes, direct Uvicorn TLS, leaf-only HTTP volume, and no scheduler key. Verify the same secure Operator/Worker API without Windows DPAPI, Tauri, or CA-store installation.
 
-## Practical next authorized actions after planning review
+## Current authorization checkpoint
 
-1. Coordinator reviews and accepts #93 / DX-01 (#95); approved ADR/review exact SHA is recorded.
-2. Authorize **DX-02 #96** scaffold and **DX-03 #97** packaging spike independently. They may run in parallel if resourced.
-3. Treat DX-03 clean-Windows feasibility failure as a hard stop. Do **not** enlarge React scope to compensate for an unproven bundled Python/PostgreSQL distribution.
-4. Only after #96 + #97 acceptance authorize **DX-04 #98**. Its verified one-installer/Controller-X-to-tray/quit/restart demonstration is M1.
-5. Authorize downstream auth/trust/Worker/UX issues according to the dependency graph, not all at once.
+Issue #100 was authorized by coordinator comment `5973437416` against base `14942ddebb6322db049d61db83cd335b055a93b6`, on branch `codex/dx06-controller-https-trust`. DX-06 is the only authorized implementation scope in that checkpoint. Push a Draft PR, wait only for Secret scan and PR Head Guard, report the exact head, and stop for coordinator review. Do not transition the PR to Ready, run heavy hosted workflows, merge, or start DX-07/08/09 from this authorization.
 
 ## Product/security decisions
 
 - DX-05 / #99: role matrix, human session lock behavior and concurrency-safe last-Owner guard are frozen by the latest coordinator authorization comment.
 - DX-03: exact Python shared runtime, Windows PostgreSQL bundle, pinned versions and redistributable license support.
-- DX-06/DX-08: reviewed first-contact root fingerprint display/verification and secure enrollment protocol; no password or pairing code before trust.
+- DX-06: the remote trust probe sends no HTTP application bytes or credentials; the user compares the candidate root DER fingerprint with the trusted local Controller display before explicit opaque-probe confirmation. No Worker pairing UX is part of DX-06. DX-08 retains the existing 256-bit enrollment token.
 - DX-09: migration shape for nullable canonical remote identity; reviewed evidence level for browser session and API/browser identity binding.
 
 ## External issues deliberately **not** dependencies for the synthetic/Desktop controlled prototype
@@ -58,7 +55,7 @@ This is a linkable execution index for the canonical [Delivery Plan](DELIVERY_PL
 
 These gates remain essential to **production/release activation** wherever relevant, and must never be inferred as complete from the Desktop demo.
 
-## Planning PR review checklist
+## Historical planning PR review checklist
 
 - [ ] ADR-0007 product/architecture decisions confirmed.
 - [ ] DX-01…DX-14 issue scope/dependencies reviewed.
