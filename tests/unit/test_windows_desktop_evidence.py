@@ -764,14 +764,75 @@ def test_controller_session_timeline_is_separate_and_covers_lifecycle_transition
         '"reopen_before_login" 0': "controller_reopen_owner_session_not_locked",
         '"before_privileged_quit" 1': "controller_active_owner_session_count_not_one",
         '"after_quit_relaunch" 0': "controller_owner_session_exists_after_quit_relaunch",
+        '"after_database_crash_recovery" 0': (
+            "controller_owner_session_exists_after_database_crash_recovery"
+        ),
+        '"after_parent_crash_recovery" 0': (
+            "controller_owner_session_exists_after_parent_crash_recovery"
+        ),
+        '"after_failed_migration_recovery" 0': (
+            "controller_owner_session_exists_after_failed_migration_recovery"
+        ),
     }
     for stage_call, failure_code in transitions.items():
         assert stage_call in normalized_source
         assert failure_code in source
     assert '"cutover_revoke"' in source and '"reopen_before_login"' in source
-    assert "$config $revocationStage 0 15 $revocationFailure" in normalized_source
-    assert '"cutover_relogin"' in source and '"reopen_after_login"' in source
-    assert "$config $loginStage 1 30 $loginFailure" in normalized_source
+    ensure_owner = source[
+        source.index("function Ensure-ControllerOwner") : source.index("function Start-Desktop")
+    ]
+    assert "[string]$LoginStage" in ensure_owner
+    normalized_ensure = re.sub(r"`\s*\r?\n\s*", " ", ensure_owner)
+    assert "$config $revocationStage 0 15 $revocationFailure" in normalized_ensure
+    assert "$config $LoginStage 1 30 $loginFailure" in normalized_ensure
+    assert 'Ensure-ControllerOwner $desktop.Id "cutover_relogin"' in normalized_source
+    assert 'Ensure-ControllerOwner $desktop.Id "reopen_after_login"' in normalized_source
+    assert source.count('"reopen_after_login"') == 1
+    assert "function Quit-Desktop([int]$ProcessId, [string]$LoginStage)" in source
+    assert "Ensure-ControllerOwner $ProcessId $LoginStage" in source
+    quit_calls = re.findall(r"(?m)^\s*Quit-Desktop\s+\$desktop\.Id[^\r\n]*", source)
+    assert len(quit_calls) == 10
+    assert all(re.fullmatch(r'\s*Quit-Desktop \$desktop\.Id "[^"]+"', call) for call in quit_calls)
+    assert 'Wait-ForOperatorSessionCount `\n        $Config "before_privileged_quit" 1' in source
+    for stage in (
+        "after_database_crash_recovery",
+        "after_parent_crash_recovery",
+        "after_failed_migration_recovery",
+    ):
+        stage_index = source.index(f'"{stage}"')
+        readiness_index = source.rfind("Wait-ForControllerHttps $config 60", 0, stage_index)
+        assert 0 <= readiness_index < stage_index
+        assert source.index("Assert-DatabaseValue $config $sentinel", stage_index) > stage_index
+    parent_recovery = source.index('"after_parent_crash_recovery"')
+    parent_quit_login = source.index('Quit-Desktop $desktop.Id "parent_crash_recovery_quit_login"')
+    migration_recovery = source.index('"after_failed_migration_recovery"')
+    migration_quit_login = source.index(
+        'Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"'
+    )
+    assert parent_recovery < parent_quit_login < migration_recovery < migration_quit_login
+    ordered_lifecycle_events = (
+        "Bootstrap-ControllerOwner $desktop.Id",
+        '"bootstrap"',
+        "Set-ControllerEndpointFields $desktop.Id $unavailableAddress $oldHttpsPort",
+        '"failed_ip_reconfigure"',
+        "Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort",
+        '"failed_port_reconfigure"',
+        'Ensure-ControllerOwner $desktop.Id "cutover_relogin"',
+        "controller_window_close_message_failed",
+        '"window_hide_lock"',
+        '"reopen_before_login"',
+        'Ensure-ControllerOwner $desktop.Id "reopen_after_login"',
+        'Quit-Desktop $desktop.Id "graceful_quit_authorization_login"',
+        '"after_quit_relaunch"',
+        '"after_database_crash_recovery"',
+        '"after_parent_crash_recovery"',
+        'Quit-Desktop $desktop.Id "parent_crash_recovery_quit_login"',
+        '"after_failed_migration_recovery"',
+        'Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"',
+    )
+    event_cursor = 0
+    for event in ordered_lifecycle_events:
+        event_cursor = source.index(event, event_cursor) + len(event)
     restart_start = source.index(
         "$desktop = Start-ExistingController", source.index("Set-ExpiringControllerLeaf $config")
     )
@@ -826,10 +887,8 @@ def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_righ
     assert "$checks.endpoint_running_transition_reauthenticates_one_owner_session = $true" in (
         owner_helper
     )
-    assert (
-        "Ensure-ControllerOwner $desktop.Id -ForceReauthentication -AfterEndpointReconfiguration"
-        in (source)
-    )
+    assert 'Ensure-ControllerOwner $desktop.Id "cutover_relogin"' in source
+    assert "-ForceReauthentication -AfterEndpointReconfiguration" in source
 
 
 def _load_verifier() -> ModuleType:

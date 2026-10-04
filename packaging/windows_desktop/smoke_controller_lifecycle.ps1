@@ -791,6 +791,7 @@ function Bootstrap-ControllerOwner([int]$ProcessId) {
 
 function Ensure-ControllerOwner(
     [int]$ProcessId,
+    [string]$LoginStage,
     [switch]$ForceReauthentication,
     [switch]$AfterEndpointReconfiguration
 ) {
@@ -837,8 +838,7 @@ function Ensure-ControllerOwner(
     } else {
         "controller_owner_login_failed"
     }
-    $loginStage = if ($AfterEndpointReconfiguration) { "cutover_relogin" } else { "reopen_after_login" }
-    $null = Wait-ForOperatorSessionCount $config $loginStage 1 30 $loginFailure
+    $null = Wait-ForOperatorSessionCount $config $LoginStage 1 30 $loginFailure
     if ($AfterEndpointReconfiguration) {
         $checks.endpoint_running_transition_reauthenticates_one_owner_session = $true
     }
@@ -985,10 +985,10 @@ function Wait-ForDesktopParentExit([int]$ProcessId) {
     } 55 "desktop_graceful_quit_timeout"
 }
 
-function Quit-Desktop([int]$ProcessId) {
+function Quit-Desktop([int]$ProcessId, [string]$LoginStage) {
     $owned = Get-ControllerProcesses
     if ($owned.postgres.Count -eq 1 -and $owned.http.Count -eq 1 -and $owned.scheduler.Count -eq 1) {
-        Ensure-ControllerOwner $ProcessId
+        Ensure-ControllerOwner $ProcessId $LoginStage
         Invoke-Button $ProcessId "Quit…"
         Invoke-Button $ProcessId "Stop node and quit" -BeforeInvoke {
             Assert-OneActiveOwnerSession (Get-ControllerConfig)
@@ -1848,7 +1848,8 @@ try {
         }
         $checks.endpoint_running_transition_preserves_postgres = $true
         $checks.plaintext_health_rejected = $true
-        Ensure-ControllerOwner $desktop.Id -ForceReauthentication -AfterEndpointReconfiguration
+        Ensure-ControllerOwner $desktop.Id "cutover_relogin" `
+            -ForceReauthentication -AfterEndpointReconfiguration
     } finally {
         $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($schedulerExitHandle)
         $null = [ThreadsControllerSmoke.NativeMethods]::CloseHandle($httpExitHandle)
@@ -1887,7 +1888,7 @@ try {
     $null = Wait-ForOperatorSessionCount `
         (Get-ControllerConfig) "reopen_before_login" 0 5 "controller_reopen_owner_session_not_locked"
     $checks.reopen_requires_operator_sign_in = $true
-    Ensure-ControllerOwner $desktop.Id -ForceReauthentication
+    Ensure-ControllerOwner $desktop.Id "reopen_after_login" -ForceReauthentication
     $checks.owner_reauthenticated_after_reopen = $true
     $owned = Assert-ControllerProcesses
     if ([int]$owned.postgres[0].ProcessId -ne $postgresPid -or
@@ -1919,7 +1920,7 @@ try {
             }
             $shutdownProcessHandles[$name] = $nativeHandle
         }
-        Quit-Desktop $desktop.Id
+        Quit-Desktop $desktop.Id "graceful_quit_authorization_login"
         $schedulerExit = Get-ProcessExitTime `
             $shutdownProcesses.scheduler $shutdownProcessHandles["scheduler"] `
             "controller_scheduler_did_not_stop_first"
@@ -2009,10 +2010,12 @@ try {
     Wait-ControllerState $desktop.Id "Failed" "controller_database_process_exited" 25
     Wait-Until { (Get-ControllerProcesses).http.Count -eq 0 -and (Get-ControllerProcesses).scheduler.Count -eq 0 } `
         15 "controller_dependents_survived_database_crash"
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "database_crash_failure_shutdown_login"
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
+    $null = Wait-ForOperatorSessionCount `
+        $config "after_database_crash_recovery" 0 15 "controller_owner_session_exists_after_database_crash_recovery"
     Assert-DatabaseValue $config $sentinel
     if ([string](Invoke-Psql $config "SELECT system_identifier FROM pg_control_system();") -cne $databaseSystemIdentifier) {
         throw "controller_database_identity_changed_after_crash"
@@ -2053,6 +2056,8 @@ try {
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
+    $null = Wait-ForOperatorSessionCount `
+        $config "after_parent_crash_recovery" 0 15 "controller_owner_session_exists_after_parent_crash_recovery"
     Assert-DatabaseValue $config $sentinel
     $owned = Assert-ControllerProcesses
     $rootFingerprintAfterParentCrash =
@@ -2067,7 +2072,7 @@ try {
 
     $currentMigration = Invoke-Psql $config "SELECT version_num FROM alembic_version;"
     Invoke-Psql $config "UPDATE alembic_version SET version_num = 'dx04_missing_revision';" | Out-Null
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "parent_crash_recovery_quit_login"
     $desktop = Start-Desktop 260
     Wait-ControllerState $desktop.Id "Failed" "controller_migration_failed" 150
     $config = Get-ControllerConfig
@@ -2076,14 +2081,16 @@ try {
         throw "controller_migration_failure_reinitialized_database"
     }
     Invoke-Psql $config "UPDATE alembic_version SET version_num = '$currentMigration';" | Out-Null
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "failed_migration_failure_shutdown_login"
     $desktop = Start-ExistingController
     $config = Get-ControllerConfig
     $null = Wait-ForControllerHttps $config 60
+    $null = Wait-ForOperatorSessionCount `
+        $config "after_failed_migration_recovery" 0 15 "controller_owner_session_exists_after_failed_migration_recovery"
     Assert-DatabaseValue $config $sentinel
     $checks.failed_migration_preserves_existing_cluster = $true
 
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "failed_migration_recovery_quit_login"
     $config = Get-ControllerConfig
     $databaseReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, [int]$config.databasePort)
     $databaseReservation.Start()
@@ -2093,7 +2100,7 @@ try {
         if ((Get-ControllerConfig).databasePort -ne $config.databasePort -or
             (Get-ControllerProcesses).all.Count -ne 0) { throw "controller_database_port_silently_rotated" }
         $checks.database_port_collision_does_not_rotate = $true
-        Quit-Desktop $desktop.Id
+        Quit-Desktop $desktop.Id "database_port_collision_shutdown_login"
     } finally {
         $databaseReservation.Stop()
     }
@@ -2106,7 +2113,7 @@ try {
         if ((Get-ControllerConfig).endpointPort -ne $config.endpointPort -or
             (Get-ControllerProcesses).all.Count -ne 0) { throw "controller_endpoint_silently_rotated" }
         $checks.endpoint_port_collision_does_not_rotate = $true
-        Quit-Desktop $desktop.Id
+        Quit-Desktop $desktop.Id "endpoint_port_collision_shutdown_login"
     } finally {
         $endpointReservation.Stop()
     }
@@ -2122,7 +2129,7 @@ try {
         throw "controller_unowned_root_was_modified"
     }
     $checks.unowned_root_is_preserved_and_rejected = $true
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "unowned_root_shutdown_login"
     Move-Item -LiteralPath $controllerRoot -Destination $unownedRoot
     Move-Item -LiteralPath $savedRoot -Destination $controllerRoot
     $rootWasMoved = $false
@@ -2155,7 +2162,7 @@ try {
     $desktop = Start-Desktop
     Wait-ControllerState $desktop.Id "Failed" "controller_data_root_access_denied" 40
     $checks.unwritable_root_is_rejected = $true
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "unwritable_root_shutdown_login"
     Set-Acl -LiteralPath $controllerRoot -AclObject $aclBeforeDeny
     $aclBeforeDeny = $null
 
@@ -2169,7 +2176,7 @@ try {
         throw "controller_corrupt_cluster_was_modified_or_started"
     }
     $checks.corrupt_cluster_is_preserved_and_rejected = $true
-    Quit-Desktop $desktop.Id
+    Quit-Desktop $desktop.Id "corrupt_cluster_shutdown_login"
     [System.IO.File]::WriteAllText($pgVersionPath, $pgVersionBackup)
 
     $postOwnerRuntimeProbe = $processEvidence["post_owner_runtime_probe"]
