@@ -2,10 +2,12 @@ function Get-OperatorLoginOutcome(
     [object]$Before,
     [object]$After,
     [bool]$UiReady,
+    [bool]$InputMutationCompleted,
     [bool]$InvokeCompleted,
     [string]$UiErrorCategory
 ) {
     if (-not $UiReady) { return "LOGIN_UI_NOT_READY" }
+    if (-not $InputMutationCompleted) { return "LOGIN_UI_INPUT_FAILED" }
     if (-not $InvokeCompleted) { return "LOGIN_UI_INVOKE_FAILED" }
 
     if ($Before.active_owner_session_count_before -eq 0 -and
@@ -18,7 +20,9 @@ function Get-OperatorLoginOutcome(
         return "LOGIN_SERVER_REJECTED"
     }
 
-    if (@($After.recent_owner_audit_event_types_after) -contains "operator.login_succeeded") {
+    if ([int]$After.login_success_audit_count_after -gt
+        [int]$Before.login_success_audit_count_before -and
+        $After.active_owner_session_count_after -ne 1) {
         return "LOGIN_SESSION_NOT_PERSISTED"
     }
 
@@ -39,6 +43,7 @@ function Get-OperatorLoginOutcome(
 function Get-OperatorLoginFailureCode([string]$Outcome) {
     switch ($Outcome) {
         "LOGIN_UI_NOT_READY" { return "controller_owner_login_ui_not_ready" }
+        "LOGIN_UI_INPUT_FAILED" { return "controller_owner_login_input_failed" }
         "LOGIN_UI_INVOKE_FAILED" { return "controller_owner_login_invoke_failed" }
         "LOGIN_RUNTIME_BECAME_UNREADY" { return "controller_owner_login_runtime_became_unready" }
         "LOGIN_TRANSPORT_UNAVAILABLE" { return "controller_owner_login_transport_unavailable" }

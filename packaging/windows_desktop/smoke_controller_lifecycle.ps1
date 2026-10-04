@@ -169,9 +169,6 @@ $commonScenarioChecks = @(
     "dpapi_current_user_round_trip",
     "atomic_non_secret_config",
     "controller_https_configuration_persisted",
-    "endpoint_reconfigure_before_owner",
-    "endpoint_unavailable_ip_rolls_back",
-    "endpoint_collision_rolls_back",
     "no_lan_listener_before_local_owner_bootstrap",
     "controller_https_root_fingerprint_matches_ui",
     "no_owner_or_lan_bootstrap",
@@ -183,6 +180,9 @@ $commonScenarioChecks = @(
 )
 $scenarioSpecificChecks = @{
     bootstrap_https_cutover_tray = @(
+        "endpoint_reconfigure_before_owner",
+        "endpoint_unavailable_ip_rolls_back",
+        "endpoint_collision_rolls_back",
         "endpoint_running_unavailable_ip_rolls_back",
         "endpoint_running_unavailable_ip_preserves_owner_session",
         "endpoint_running_collision_rolls_back",
@@ -841,6 +841,11 @@ function Get-OperatorLoginDatabaseState([object]$Config) {
     $activeSessions = Get-ActiveOwnerSessionCount $Config
     $eventRows = Invoke-Psql $Config `
         "SELECT COALESCE(string_agg(event_type, ',' ORDER BY created_at DESC), '') FROM (SELECT event_type, created_at FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type LIKE 'operator.login_%' ORDER BY created_at DESC LIMIT 8) recent;"
+    $loginSuccessAuditCount = Invoke-Psql $Config `
+        "SELECT COUNT(*) FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type = 'operator.login_succeeded';"
+    if ($loginSuccessAuditCount -notmatch '^\d+$') {
+        throw "controller_operator_login_audit_count_invalid"
+    }
     return [ordered]@{
         active_owner_session_count = $activeSessions
         owner_exists = $ownerFields.Count -eq 3
@@ -850,6 +855,7 @@ function Get-OperatorLoginDatabaseState([object]$Config) {
         login_throttle_present = $throttleFields.Count -eq 3 -and $throttleFields[0] -eq "true"
         login_failed_attempts = if ($throttleFields.Count -eq 3) { [int]$throttleFields[1] } else { 0 }
         login_lock_active = $throttleFields.Count -eq 3 -and $throttleFields[2] -eq "true"
+        login_success_audit_count = [int]$loginSuccessAuditCount
         recent_owner_audit_event_types = if ([string]::IsNullOrWhiteSpace($eventRows)) {
             @()
         } else { @($eventRows.Split(',') | Where-Object { $_ -match '^operator\.login_[a-z_]+$' }) }
@@ -913,6 +919,7 @@ function Get-OperatorLoginSnapshot(
         login_throttle_present = [bool]$database.login_throttle_present
         login_failed_attempts = [int]$database.login_failed_attempts
         login_lock_active = [bool]$database.login_lock_active
+        login_success_audit_count = [int]$database.login_success_audit_count
         recent_owner_audit_event_types = @($database.recent_owner_audit_event_types)
         postgres_count = @($runtime.postgres).Count
         http_count = @($runtime.http).Count
@@ -932,8 +939,9 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
         Get-OperatorLoginUiState $ProcessId
     }
 
+    $uiReady = [bool]$uiState.Ready
     $inputMutationSucceeded = $false
-    if ($uiState.Ready) {
+    if ($uiReady) {
         try {
             Set-LoginInput $ProcessId "Username" $script:smokeOwnerUsername
             Set-LoginInput $ProcessId "Password" $script:smokeOwnerPassword
@@ -947,16 +955,17 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
     $beforeState.login_throttle_present_before = [bool]$beforeState.login_throttle_present
     $beforeState.login_failed_attempts_before = [int]$beforeState.login_failed_attempts
     $beforeState.login_lock_active_before = [bool]$beforeState.login_lock_active
+    $beforeState.login_success_audit_count_before = [int]$beforeState.login_success_audit_count
     $before = [ordered]@{
         active_owner_session_count_before = [int]$beforeState.active_owner_session_count
         login_failed_attempts = [int]$beforeState.login_failed_attempts
         login_lock_active = [bool]$beforeState.login_lock_active
+        login_success_audit_count_before = [int]$beforeState.login_success_audit_count
         health_probe_outcome_before = [string]$beforeState.health_probe_outcome
         ready_probe_outcome_before = [string]$beforeState.ready_probe_outcome
     }
-    $uiReady = [bool]$uiState.Ready -and $inputMutationSucceeded
     $invokeCompleted = $false
-    if ($uiReady) {
+    if ($uiReady -and $inputMutationSucceeded) {
         try {
             $invokePattern = $uiState.SignIn.GetCurrentPattern(
                 [System.Windows.Automation.InvokePattern]::Pattern
@@ -973,6 +982,7 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
         active_owner_session_count_after = [int]$afterState.active_owner_session_count
         login_failed_attempts = [int]$afterState.login_failed_attempts
         login_lock_active = [bool]$afterState.login_lock_active
+        login_success_audit_count_after = [int]$afterState.login_success_audit_count
         recent_owner_audit_event_types_after = @($afterState.recent_owner_audit_event_types)
         health_probe_outcome = [string]$afterState.health_probe_outcome
         ready_probe_outcome = [string]$afterState.ready_probe_outcome
@@ -982,7 +992,8 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
     $afterState.login_throttle_present_after = [bool]$afterState.login_throttle_present
     $afterState.login_failed_attempts_after = [int]$afterState.login_failed_attempts
     $afterState.login_lock_active_after = [bool]$afterState.login_lock_active
-    $outcome = Get-OperatorLoginOutcome $before $after $uiReady $invokeCompleted $uiErrorCategory
+    $outcome = Get-OperatorLoginOutcome `
+        $before $after $uiReady $inputMutationSucceeded $invokeCompleted $uiErrorCategory
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ($outcome -eq "LOGIN_FAILURE_UNCLASSIFIED" -and [DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 500
@@ -993,6 +1004,7 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
             active_owner_session_count_after = [int]$afterState.active_owner_session_count
             login_failed_attempts = [int]$afterState.login_failed_attempts
             login_lock_active = [bool]$afterState.login_lock_active
+            login_success_audit_count_after = [int]$afterState.login_success_audit_count
             recent_owner_audit_event_types_after = @($afterState.recent_owner_audit_event_types)
             health_probe_outcome = [string]$afterState.health_probe_outcome
             ready_probe_outcome = [string]$afterState.ready_probe_outcome
@@ -1002,13 +1014,16 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
         $afterState.login_throttle_present_after = [bool]$afterState.login_throttle_present
         $afterState.login_failed_attempts_after = [int]$afterState.login_failed_attempts
         $afterState.login_lock_active_after = [bool]$afterState.login_lock_active
-        $outcome = Get-OperatorLoginOutcome $before $after $uiReady $invokeCompleted $uiErrorCategory
+        $outcome = Get-OperatorLoginOutcome `
+            $before $after $uiReady $inputMutationSucceeded $invokeCompleted $uiErrorCategory
     }
     $failure = if ($outcome -eq "SUCCESS") { $null } else { Get-OperatorLoginFailureCode $outcome }
     $script:operatorLoginAttemptTimeline.Add([ordered]@{
         stage = $Stage
         recorded_utc = [DateTimeOffset]::UtcNow.ToString("O")
         pre_login = $beforeState
+        login_ui_ready = $uiReady
+        input_mutation_completed = $inputMutationSucceeded
         sign_in_invoke_completed = $invokeCompleted
         ui_error_category = $uiErrorCategory
         post_login = $afterState
@@ -2046,92 +2061,95 @@ try {
         throw "controller_https_identity_summary_invalid"
     }
     $leafCertificatePath = Join-Path (Join-Path $controllerRoot "tls") "leaf-cert.der"
-    $initialRootFingerprint = Get-FileSha256 $rootCertificatePath
-    $initialLeafFingerprint = Get-FileSha256 $leafCertificatePath
-    $initialPort = [int]$config.endpointPort
+    if ($Scenario -eq "bootstrap_https_cutover_tray") {
+        $initialRootFingerprint = Get-FileSha256 $rootCertificatePath
+        $initialLeafFingerprint = Get-FileSha256 $leafCertificatePath
+        $initialPort = [int]$config.endpointPort
 
-    # Local setup can correct an explicitly selected endpoint before the first Owner exists.
-    Open-ControllerEndpointReconfiguration $desktop.Id
-    $unavailableAddress = Get-UnassignedControllerIpv4
-    Set-ControllerEndpointFields $desktop.Id $unavailableAddress $initialPort
-    Invoke-Button $desktop.Id "Apply endpoint change"
-    Wait-Until {
-        $null -ne (Find-TextContaining (Get-Window $desktop.Id) "not assigned to this PC")
-    } 15 "controller_unavailable_ip_error_not_visible"
-    $unchanged = Get-ControllerConfig
-    if ($unchanged.lanAddress -cne $lanAddress -or $unchanged.endpointPort -ne $initialPort -or
-        (Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
-        (Get-FileSha256 $leafCertificatePath) -cne $initialLeafFingerprint) {
-        throw "controller_unavailable_ip_changed_persisted_state"
-    }
-    $checks.endpoint_unavailable_ip_rolls_back = $true
-
-    $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
-    $endpointReservation.Start()
-    $collisionPort = ([System.Net.IPEndPoint]$endpointReservation.LocalEndpoint).Port
-    try {
-        Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort
+        # Local setup can correct an explicitly selected endpoint before the first Owner exists.
+        Open-ControllerEndpointReconfiguration $desktop.Id
+        $unavailableAddress = Get-UnassignedControllerIpv4
+        Set-ControllerEndpointFields $desktop.Id $unavailableAddress $initialPort
         Invoke-Button $desktop.Id "Apply endpoint change"
         Wait-Until {
-            $null -ne (Find-TextContaining (Get-Window $desktop.Id) "already in use")
-        } 15 "controller_endpoint_collision_error_not_visible"
+            $null -ne (Find-TextContaining (Get-Window $desktop.Id) "not assigned to this PC")
+        } 15 "controller_unavailable_ip_error_not_visible"
         $unchanged = Get-ControllerConfig
         if ($unchanged.lanAddress -cne $lanAddress -or $unchanged.endpointPort -ne $initialPort -or
             (Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
             (Get-FileSha256 $leafCertificatePath) -cne $initialLeafFingerprint) {
-            throw "controller_endpoint_collision_changed_persisted_state"
+            throw "controller_unavailable_ip_changed_persisted_state"
         }
-        $checks.endpoint_collision_rolls_back = $true
-    } finally {
-        $endpointReservation.Stop()
-    }
+        $checks.endpoint_unavailable_ip_rolls_back = $true
 
-    $selectedHttpsPort = Get-FreeHttpsPort
-    Set-ControllerEndpointFields $desktop.Id $lanAddress $selectedHttpsPort
-    Invoke-Button $desktop.Id "Apply endpoint change"
-    Wait-Until {
-        $configured = Get-ControllerConfig
-        return $configured.lanAddress -ceq $lanAddress -and
-            $configured.endpointPort -eq $selectedHttpsPort
-    } 30 "controller_pre_owner_endpoint_reconfiguration_not_persisted"
-    $config = Get-ControllerConfig
-    $afterPreOwnerLeafFingerprint = Get-FileSha256 $leafCertificatePath
-    if ((Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
-        $afterPreOwnerLeafFingerprint -ceq $initialLeafFingerprint) {
-        throw "controller_pre_owner_reconfiguration_identity_invalid"
-    }
-    $alternateAddress = Get-AlternateControllerIpv4 $lanAddress
-    if ($alternateAddress) {
-        Open-ControllerEndpointReconfiguration $desktop.Id
-        Set-ControllerEndpointFields $desktop.Id $alternateAddress $selectedHttpsPort
+        $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, 0)
+        $endpointReservation.Start()
+        $collisionPort = ([System.Net.IPEndPoint]$endpointReservation.LocalEndpoint).Port
+        try {
+            Set-ControllerEndpointFields $desktop.Id $lanAddress $collisionPort
+            Invoke-Button $desktop.Id "Apply endpoint change"
+            Wait-Until {
+                $null -ne (Find-TextContaining (Get-Window $desktop.Id) "already in use")
+            } 15 "controller_endpoint_collision_error_not_visible"
+            $unchanged = Get-ControllerConfig
+            if ($unchanged.lanAddress -cne $lanAddress -or $unchanged.endpointPort -ne $initialPort -or
+                (Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
+                (Get-FileSha256 $leafCertificatePath) -cne $initialLeafFingerprint) {
+                throw "controller_endpoint_collision_changed_persisted_state"
+            }
+            $checks.endpoint_collision_rolls_back = $true
+        } finally {
+            $endpointReservation.Stop()
+        }
+
+        $selectedHttpsPort = Get-FreeHttpsPort
+        Set-ControllerEndpointFields $desktop.Id $lanAddress $selectedHttpsPort
         Invoke-Button $desktop.Id "Apply endpoint change"
         Wait-Until {
-            $updated = Get-ControllerConfig
-            return $updated.lanAddress -ceq $alternateAddress -and
-                $updated.endpointPort -eq $selectedHttpsPort
-        } 30 "controller_pre_owner_ip_reconfiguration_not_persisted"
+            $configured = Get-ControllerConfig
+            return $configured.lanAddress -ceq $lanAddress -and
+                $configured.endpointPort -eq $selectedHttpsPort
+        } 30 "controller_pre_owner_endpoint_reconfiguration_not_persisted"
         $config = Get-ControllerConfig
-        $ipChangedLeafFingerprint = Get-FileSha256 $leafCertificatePath
+        $afterPreOwnerLeafFingerprint = Get-FileSha256 $leafCertificatePath
         if ((Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
-            $ipChangedLeafFingerprint -ceq $afterPreOwnerLeafFingerprint -or
-            (Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint) -eq $null) {
-            throw "controller_pre_owner_ip_reconfiguration_identity_invalid"
+            $afterPreOwnerLeafFingerprint -ceq $initialLeafFingerprint) {
+            throw "controller_pre_owner_reconfiguration_identity_invalid"
         }
-        $lanAddress = $alternateAddress
-        $afterPreOwnerLeafFingerprint = $ipChangedLeafFingerprint
-        $processEvidence.endpoint_ip_reconfiguration = "PASS"
-    } else {
-        $processEvidence.endpoint_ip_reconfiguration = "UNAVAILABLE: no second assigned IPv4"
+        $alternateAddress = Get-AlternateControllerIpv4 $lanAddress
+        if ($alternateAddress) {
+            Open-ControllerEndpointReconfiguration $desktop.Id
+            Set-ControllerEndpointFields $desktop.Id $alternateAddress $selectedHttpsPort
+            Invoke-Button $desktop.Id "Apply endpoint change"
+            Wait-Until {
+                $updated = Get-ControllerConfig
+                return $updated.lanAddress -ceq $alternateAddress -and
+                    $updated.endpointPort -eq $selectedHttpsPort
+            } 30 "controller_pre_owner_ip_reconfiguration_not_persisted"
+            $config = Get-ControllerConfig
+            $ipChangedLeafFingerprint = Get-FileSha256 $leafCertificatePath
+            if ((Get-FileSha256 $rootCertificatePath) -cne $initialRootFingerprint -or
+                $ipChangedLeafFingerprint -ceq $afterPreOwnerLeafFingerprint -or
+                (Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint) -eq $null) {
+                throw "controller_pre_owner_ip_reconfiguration_identity_invalid"
+            }
+            $lanAddress = $alternateAddress
+            $afterPreOwnerLeafFingerprint = $ipChangedLeafFingerprint
+            $processEvidence.endpoint_ip_reconfiguration = "PASS"
+        } else {
+            $processEvidence.endpoint_ip_reconfiguration = "UNAVAILABLE: no second assigned IPv4"
+        }
+        $beforeOwnerProcesses = Get-ControllerProcesses
+        if ($beforeOwnerProcesses.postgres.Count -ne 1 -or $beforeOwnerProcesses.http.Count -ne 0 -or
+            $beforeOwnerProcesses.scheduler.Count -ne 0 -or
+            @(Get-ListenerAddresses $initialPort).Count -ne 0 -or
+            @(Get-ListenerAddresses $selectedHttpsPort).Count -ne 0 -or
+            (Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint) -eq $null) {
+            throw "controller_pre_owner_reconfiguration_started_listener_or_changed_root"
+        }
+        $checks.endpoint_reconfigure_before_owner = $true
     }
-    $beforeOwnerProcesses = Get-ControllerProcesses
-    if ($beforeOwnerProcesses.postgres.Count -ne 1 -or $beforeOwnerProcesses.http.Count -ne 0 -or
-        $beforeOwnerProcesses.scheduler.Count -ne 0 -or
-        @(Get-ListenerAddresses $initialPort).Count -ne 0 -or
-        @(Get-ListenerAddresses $selectedHttpsPort).Count -ne 0 -or
-        (Find-TextContaining (Get-Window $desktop.Id) $rootFingerprint) -eq $null) {
-        throw "controller_pre_owner_reconfiguration_started_listener_or_changed_root"
-    }
-    $checks.endpoint_reconfigure_before_owner = $true
+    $config = Get-ControllerConfig
     $checks.controller_https_configuration_persisted =
         $config.schemaVersion -eq 2 -and $config.lanAddress -ceq $lanAddress -and
         $config.endpointPort -eq $selectedHttpsPort

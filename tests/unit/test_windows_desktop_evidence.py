@@ -1607,30 +1607,36 @@ $before = [ordered]@{{
     active_owner_session_count_before = 0
     login_failed_attempts = 0
     login_lock_active = $false
+    login_success_audit_count_before = 7
     health_probe_outcome_before = 'PASS'
     ready_probe_outcome_before = 'PASS'
 }}
 function New-After([int]$Sessions, [int]$Failures = 0, [bool]$Locked = $false,
-    [string[]]$Events = @(), [string]$Health = 'PASS', [string]$Ready = 'PASS') {{
+    [string[]]$Events = @(), [string]$Health = 'PASS', [string]$Ready = 'PASS',
+    [int]$SuccessAuditCount = 7) {{
     return [ordered]@{{
         active_owner_session_count_after = $Sessions
         login_failed_attempts = $Failures
         login_lock_active = $Locked
+        login_success_audit_count_after = $SuccessAuditCount
         recent_owner_audit_event_types_after = $Events
         health_probe_outcome = $Health
         ready_probe_outcome = $Ready
     }}
 }}
-$auditSuccess = New-After 0 -Events @('operator.login_succeeded')
+$historicalAuditSuccess = New-After 0 -Events @('operator.login_succeeded') -SuccessAuditCount 7
+$newAuditSuccess = New-After 0 -Events @('operator.login_succeeded') -SuccessAuditCount 8
 $outcomes = @(
-    (Get-OperatorLoginOutcome $before (New-After 0) $false $false 'NONE'),
-    (Get-OperatorLoginOutcome $before (New-After 0) $true $false 'NONE'),
-    (Get-OperatorLoginOutcome $before (New-After 1) $true $true 'NONE'),
-    (Get-OperatorLoginOutcome $before (New-After 0 -Failures 1) $true $true 'NONE'),
-    (Get-OperatorLoginOutcome $before $auditSuccess $true $true 'NONE'),
-    (Get-OperatorLoginOutcome $before (New-After 0) $true $true 'OPERATOR_API_UNAVAILABLE'),
-    (Get-OperatorLoginOutcome $before (New-After 0 -Health 'FAIL') $true $true 'NONE'),
-    (Get-OperatorLoginOutcome $before (New-After 0) $true $true 'NONE')
+    (Get-OperatorLoginOutcome $before (New-After 0) $false $false $false 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $false $false 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $true $false 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 1 -SuccessAuditCount 8) $true $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0 -Failures 1) $true $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before $historicalAuditSuccess $true $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before $newAuditSuccess $true $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $true $true 'OPERATOR_API_UNAVAILABLE'),
+    (Get-OperatorLoginOutcome $before (New-After 0 -Health 'FAIL') $true $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before (New-After 0) $true $true $true 'NONE')
 )
 [Console]::WriteLine(($outcomes | ConvertTo-Json -Compress))
 """
@@ -1645,9 +1651,11 @@ $outcomes = @(
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
     assert json.loads(completed.stdout.strip()) == [
         "LOGIN_UI_NOT_READY",
+        "LOGIN_UI_INPUT_FAILED",
         "LOGIN_UI_INVOKE_FAILED",
         "SUCCESS",
         "LOGIN_SERVER_REJECTED",
+        "LOGIN_FAILURE_UNCLASSIFIED",
         "LOGIN_SESSION_NOT_PERSISTED",
         "LOGIN_TRANSPORT_UNAVAILABLE",
         "LOGIN_RUNTIME_BECAME_UNREADY",
@@ -1681,6 +1689,12 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
     observed_start = source.index("function Invoke-ObservedOperatorLogin")
     observed_end = source.index("function Add-OperatorSessionTransition", observed_start)
     observed = source[observed_start:observed_end]
+    assert "$uiReady = [bool]$uiState.Ready" in observed
+    assert "$inputMutationSucceeded = $false" in observed
+    assert "login_ui_ready = $uiReady" in observed
+    assert "input_mutation_completed = $inputMutationSucceeded" in observed
+    assert "if ($uiReady -and $inputMutationSucceeded)" in observed
+    assert "$uiReady = [bool]$uiState.Ready -and $inputMutationSucceeded" not in observed
     assert observed.count("$invokePattern.Invoke()") == 1
     assert observed.count('Set-LoginInput $ProcessId "Username"') == 1
     assert observed.count('Set-LoginInput $ProcessId "Password"') == 1
@@ -1723,6 +1737,7 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
     for safe_category in (
         "SUCCESS",
         "LOGIN_UI_NOT_READY",
+        "LOGIN_UI_INPUT_FAILED",
         "LOGIN_UI_INVOKE_FAILED",
         "LOGIN_RUNTIME_BECAME_UNREADY",
         "LOGIN_TRANSPORT_UNAVAILABLE",
@@ -1733,6 +1748,16 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
         assert safe_category in source or safe_category in (
             REPO_ROOT / "packaging" / "windows_desktop" / "operator_login_evidence.ps1"
         ).read_text(encoding="utf-8")
+
+    classifier = (
+        REPO_ROOT / "packaging" / "windows_desktop" / "operator_login_evidence.ps1"
+    ).read_text(encoding="utf-8")
+    assert "login_success_audit_count_after" in classifier
+    assert "login_success_audit_count_before" in classifier
+    assert (
+        'recent_owner_audit_event_types_after) -contains "operator.login_succeeded"'
+        not in classifier
+    )
 
 
 def test_controller_acceptance_scenarios_cover_every_frozen_check() -> None:
@@ -1750,13 +1775,56 @@ def test_controller_acceptance_scenarios_cover_every_frozen_check() -> None:
     )[0]
     assigned: set[str] = set(common_checks)
     scenario_names: list[str] = []
+    scenario_checks: dict[str, set[str]] = {}
     for scenario, body in re.findall(
         r"(?ms)^\s{4}([a-z][a-z0-9_]+)\s*=\s*@\((.*?)\)", specific_region
     ):
         scenario_names.append(scenario)
-        assigned.update(re.findall(r'"([a-z][a-z0-9_]+)"', body))
+        scenario_checks[scenario] = set(re.findall(r'"([a-z][a-z0-9_]+)"', body))
+        assigned.update(scenario_checks[scenario])
     assert tuple(scenario_names) == CONTROLLER_SCENARIOS
     assert assigned == declared_checks
+
+    pre_owner_checks = {
+        "endpoint_reconfigure_before_owner",
+        "endpoint_unavailable_ip_rolls_back",
+        "endpoint_collision_rolls_back",
+    }
+    assert not (common_checks & pre_owner_checks)
+    assert scenario_checks["bootstrap_https_cutover_tray"] & pre_owner_checks == pre_owner_checks
+    assert all(
+        not (scenario_checks[name] & pre_owner_checks)
+        for name in CONTROLLER_SCENARIOS
+        if name != "bootstrap_https_cutover_tray"
+    )
+
+    initial_setup_end = source.index(
+        "$config = Get-ControllerConfig",
+        source.index('Invoke-Button $desktop.Id "Configure HTTPS"'),
+    )
+    pre_owner_block_start = source.index(
+        'if ($Scenario -eq "bootstrap_https_cutover_tray")', initial_setup_end
+    )
+    pre_owner_marker = source.index(
+        "# Local setup can correct an explicitly selected endpoint before the first Owner exists.",
+        pre_owner_block_start,
+    )
+    shared_pre_owner_start = source.index(
+        "    $config = Get-ControllerConfig\n    $checks.controller_https_configuration_persisted",
+        pre_owner_marker,
+    )
+    pre_owner_block = source[pre_owner_block_start:shared_pre_owner_start]
+    for scenario_action in (
+        "Get-UnassignedControllerIpv4",
+        "endpointReservation.Start()",
+        '"Apply endpoint change"',
+        "$checks.endpoint_unavailable_ip_rolls_back = $true",
+        "$checks.endpoint_collision_rolls_back = $true",
+        "$checks.endpoint_reconfigure_before_owner = $true",
+    ):
+        assert scenario_action in pre_owner_block
+    assert 'if ($Scenario -eq "bootstrap_https_cutover_tray")' in pre_owner_block
+    assert 'Invoke-Button $desktop.Id "Configure HTTPS"' not in pre_owner_block
 
     assert "function Initialize-HealthyControllerFixture" in source
     for field in (
