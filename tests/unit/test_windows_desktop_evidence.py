@@ -978,6 +978,96 @@ def test_controller_runtime_identity_calls_use_phase_baselines() -> None:
     assert "controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)" in source
 
 
+def test_endpoint_collision_classifier_separates_persisted_port_and_live_processes() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell collision classifier test is only available on Windows test hosts")
+
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    classifier = source[
+        source.index("function Get-EndpointCollisionFailureCode") : source.index(
+            "function Get-ControllerConfig"
+        )
+    ]
+    assertion = f"""
+{classifier}
+$clean = [pscustomobject]@{{
+    expected_endpoint_port = 52105
+    observed_persisted_endpoint_port = 52105
+    postgres_count = 0
+    http_count = 0
+    scheduler_count = 0
+    expected_diagnostic_code = 'controller_endpoint_port_in_use'
+    observed_diagnostic_code = 'controller_endpoint_port_in_use'
+    diagnostic_wait_completed = $true
+}}
+$changedPort = [pscustomobject]($clean.PSObject.Copy())
+$changedPort.observed_persisted_endpoint_port = 52106
+$leftProcesses = [pscustomobject]($clean.PSObject.Copy())
+$leftProcesses.postgres_count = 1
+$unconfirmedDiagnostic = [pscustomobject]($clean.PSObject.Copy())
+$unconfirmedDiagnostic.diagnostic_wait_completed = $false
+$results = @(
+    (Get-EndpointCollisionFailureCode $clean),
+    (Get-EndpointCollisionFailureCode $changedPort),
+    (Get-EndpointCollisionFailureCode $leftProcesses),
+    (Get-EndpointCollisionFailureCode $unconfirmedDiagnostic)
+)
+if ($null -ne $results[0] -or
+    $results[1] -cne 'controller_endpoint_collision_changed_persisted_endpoint' -or
+    $results[2] -cne 'controller_endpoint_collision_left_runtime_processes' -or
+    $results[3] -cne 'controller_endpoint_collision_diagnostic_not_confirmed') {{
+    throw 'endpoint_collision_classification_invalid'
+}}
+[Console]::WriteLine(($results -join '|'))
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert completed.stdout.strip().endswith(
+        "controller_endpoint_collision_changed_persisted_endpoint|"
+        "controller_endpoint_collision_left_runtime_processes|"
+        "controller_endpoint_collision_diagnostic_not_confirmed"
+    )
+
+
+def test_endpoint_collision_artifact_records_endpoint_diagnostic_and_process_state() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    collision_start = source.index(
+        "$endpointReservation = [System.Net.Sockets.TcpListener]::new(",
+        source.index('"failed_migration_recovery_quit_login"'),
+    )
+    collision_end = source.index("$endpointReservation.Stop()", collision_start)
+    collision = source[collision_start:collision_end]
+
+    for field in (
+        "expected_endpoint_port",
+        "observed_persisted_endpoint_port",
+        "postgres_count",
+        "postgres_pids",
+        "http_count",
+        "http_pids",
+        "scheduler_count",
+        "scheduler_pids",
+        "expected_diagnostic_code",
+        "observed_diagnostic_code",
+        "diagnostic_wait_completed",
+    ):
+        assert field in collision
+    assert "Get-EndpointCollisionFailureCode $endpointCollisionEvidence" in collision
+    assert '"controller_endpoint_port_in_use"' in collision
+    assert '"controller_endpoint_collision_changed_persisted_endpoint"' in source
+    assert '"controller_endpoint_collision_left_runtime_processes"' in source
+    assert '"controller_endpoint_silently_rotated"' not in source
+    assert "endpoint_collision_evidence = $endpointCollisionEvidence" in source
+
+
 def test_endpoint_reconfiguration_preserves_or_revokes_owner_session_at_the_right_boundary() -> (
     None
 ):

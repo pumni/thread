@@ -156,6 +156,7 @@ $script:smokeOwnerPassword = "Dx05Owner" + [Guid]::NewGuid().ToString("N")
 $processEvidence = [ordered]@{}
 $operatorSessionTimeline = [System.Collections.Generic.List[object]]::new()
 $controllerRuntimeIdentityTimeline = [System.Collections.Generic.List[object]]::new()
+$endpointCollisionEvidence = $null
 $rootWasMoved = $false
 $parentCrashPids = @()
 $parentCrashProcesses = @()
@@ -900,6 +901,40 @@ function Wait-ControllerState([int]$ProcessId, [string]$State, [string]$Diagnost
         }
         return $null -ne (Find-TextContaining $window $State)
     } $Timeout "controller_state_unavailable_$(if ($Diagnostic) { $Diagnostic } else { $State })"
+}
+
+function Get-ControllerDiagnosticCode([int]$ProcessId) {
+    try {
+        $window = Get-Window $ProcessId
+        if (-not $window) { return $null }
+        $diagnosticElement = Find-TextContaining $window "Diagnostic code:"
+        if (-not $diagnosticElement) { return $null }
+        $diagnosticCode = ([string]$diagnosticElement.Current.Name) -replace `
+            '^.*Diagnostic code:\s*', ''
+        if ([string]::IsNullOrWhiteSpace($diagnosticCode)) { return $null }
+        return [regex]::Replace($diagnosticCode, "[^A-Za-z0-9_.-]", "_")
+    } catch {
+        return $null
+    }
+}
+
+function Get-EndpointCollisionFailureCode([object]$Evidence) {
+    if ([int]$Evidence.observed_persisted_endpoint_port -ne
+        [int]$Evidence.expected_endpoint_port) {
+        return "controller_endpoint_collision_changed_persisted_endpoint"
+    }
+    if ([int]$Evidence.postgres_count -ne 0 -or
+        [int]$Evidence.http_count -ne 0 -or
+        [int]$Evidence.scheduler_count -ne 0) {
+        return "controller_endpoint_collision_left_runtime_processes"
+    }
+    if (-not [bool]$Evidence.diagnostic_wait_completed -or
+        ($Evidence.observed_diagnostic_code -and
+            [string]$Evidence.observed_diagnostic_code -cne
+                [string]$Evidence.expected_diagnostic_code)) {
+        return "controller_endpoint_collision_diagnostic_not_confirmed"
+    }
+    return $null
 }
 
 function Get-ControllerConfig {
@@ -2161,10 +2196,37 @@ try {
     $endpointReservation = [System.Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, [int]$config.endpointPort)
     $endpointReservation.Start()
     try {
+        $expectedCollisionPort = [int]$config.endpointPort
+        $expectedCollisionDiagnostic = "controller_endpoint_port_in_use"
         $desktop = Start-Desktop
-        Wait-ControllerState $desktop.Id "Failed" "controller_endpoint_port_in_use" 40
-        if ((Get-ControllerConfig).endpointPort -ne $config.endpointPort -or
-            (Get-ControllerProcesses).all.Count -ne 0) { throw "controller_endpoint_silently_rotated" }
+        $collisionDiagnosticWaitCompleted = $false
+        try {
+            Wait-ControllerState $desktop.Id "Failed" $expectedCollisionDiagnostic 40
+            $collisionDiagnosticWaitCompleted = $true
+        } catch {
+            # Preserve the observed endpoint/process state so the artifact identifies the failed invariant.
+        }
+        $collisionObservedConfig = Get-ControllerConfig
+        $collisionProcesses = Get-ControllerProcesses
+        $endpointCollisionEvidence = [ordered]@{
+            expected_endpoint_port = $expectedCollisionPort
+            observed_persisted_endpoint_port = [int]$collisionObservedConfig.endpointPort
+            postgres_count = @($collisionProcesses.postgres_tree).Count
+            postgres_pids = @($collisionProcesses.postgres_tree | ForEach-Object {
+                [int]$_.ProcessId
+            })
+            http_count = @($collisionProcesses.http).Count
+            http_pids = @($collisionProcesses.http | ForEach-Object { [int]$_.ProcessId })
+            scheduler_count = @($collisionProcesses.scheduler).Count
+            scheduler_pids = @($collisionProcesses.scheduler | ForEach-Object {
+                [int]$_.ProcessId
+            })
+            expected_diagnostic_code = $expectedCollisionDiagnostic
+            observed_diagnostic_code = (Get-ControllerDiagnosticCode $desktop.Id)
+            diagnostic_wait_completed = $collisionDiagnosticWaitCompleted
+        }
+        $collisionFailure = Get-EndpointCollisionFailureCode $endpointCollisionEvidence
+        if ($collisionFailure) { throw $collisionFailure }
         $checks.endpoint_port_collision_does_not_rotate = $true
         Quit-Desktop $desktop.Id "endpoint_port_collision_shutdown_login"
     } finally {
@@ -2343,6 +2405,7 @@ try {
         process_evidence = $processEvidence
         operator_session_timeline = @($operatorSessionTimeline)
         controller_runtime_identity_timeline = @($controllerRuntimeIdentityTimeline)
+        endpoint_collision_evidence = $endpointCollisionEvidence
         result = $result
         failure_code = $failureCode
         failure_codes = @($failureCodes)

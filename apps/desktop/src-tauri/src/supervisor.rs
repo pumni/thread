@@ -577,6 +577,10 @@ impl ControllerRuntime {
             self.store.config().database_port,
             "controller_database_port_in_use",
         )?;
+        // Configured endpoint collisions must fail before initialization or child startup.
+        if let Some(lan_address) = self.store.config().lan_address {
+            self.validate_configured_endpoint(lan_address)?;
+        }
 
         if self.store.needs_initialization() {
             self.initialize_cluster()?;
@@ -1478,6 +1482,13 @@ mod tests {
 
     #[cfg(windows)]
     fn runtime_with_provisioned_controller() -> (tempfile::TempDir, ControllerRuntime, u16) {
+        runtime_with_provisioned_controller_at(std::net::Ipv4Addr::new(192, 0, 2, 10))
+    }
+
+    #[cfg(windows)]
+    fn runtime_with_provisioned_controller_at(
+        old_address: std::net::Ipv4Addr,
+    ) -> (tempfile::TempDir, ControllerRuntime, u16) {
         use std::fs;
 
         let directory = tempfile::tempdir().expect("temporary Controller data root");
@@ -1524,7 +1535,6 @@ mod tests {
                 break port;
             }
         };
-        let old_address = std::net::Ipv4Addr::new(192, 0, 2, 10);
         store
             .configure_https(&old_address.to_string(), old_port)
             .expect("persist initial endpoint");
@@ -1625,6 +1635,56 @@ mod tests {
             Err("controller_endpoint_port_in_use")
         );
         assert!(validate_requested_endpoint(address, port, 1, Some(port)).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_endpoint_collision_fails_before_initialization_or_child_processes() {
+        let route = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .expect("bind route probe");
+        route
+            .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 443))
+            .expect("select local interface");
+        let lan_address = match route.local_addr().expect("read route address").ip() {
+            std::net::IpAddr::V4(address) => address,
+            _ => panic!("route probe must select IPv4"),
+        };
+        assert!(!lan_address.is_loopback() && !lan_address.is_unspecified());
+
+        let (_directory, mut runtime, endpoint_port) =
+            runtime_with_provisioned_controller_at(lan_address);
+        let endpoint_reservation =
+            TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, endpoint_port))
+                .expect("reserve configured endpoint on IPv4 wildcard");
+        assert_eq!(
+            endpoint_reservation
+                .local_addr()
+                .expect("read reserved endpoint")
+                .ip(),
+            std::net::Ipv4Addr::UNSPECIFIED
+        );
+
+        let persisted_before = reconfiguration_state(&runtime);
+        let expected_database_port = runtime.store.config().database_port;
+        assert_ne!(endpoint_port, expected_database_port);
+        assert!(runtime.store.needs_initialization());
+        assert!(!runtime.store.postgres_data_dir().exists());
+
+        let mut lifecycle = Lifecycle::StartingDatabase;
+        assert_eq!(
+            runtime.start(&mut lifecycle),
+            Err("controller_endpoint_port_in_use")
+        );
+
+        assert!(runtime.postgres.is_none());
+        assert!(runtime.http.is_none());
+        assert!(runtime.scheduler.is_none());
+        assert!(runtime.store.needs_initialization());
+        assert!(!runtime.store.postgres_data_dir().exists());
+        assert_eq!(runtime.store.config().lan_address, Some(lan_address));
+        assert_eq!(runtime.store.config().endpoint_port, endpoint_port);
+        assert_eq!(runtime.store.config().database_port, expected_database_port);
+        assert_eq!(reconfiguration_state(&runtime), persisted_before);
     }
 
     #[cfg(windows)]
