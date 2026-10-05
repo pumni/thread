@@ -25,6 +25,8 @@ const MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(40);
 const WORKER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const WORKER_STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_STARTUP_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const POSTGRES_STDERR_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -112,6 +114,7 @@ struct WorkerRuntime {
 pub(super) struct Supervisor {
     lifecycle: Lifecycle,
     worker_runtime: Option<WorkerRuntime>,
+    worker_startup_cleanup: Option<WorkerRuntime>,
     worker_task_helper: Option<PathBuf>,
     worker_ownership: Option<WorkerOwnership>,
     legacy_task_state: Option<LegacyTaskState>,
@@ -127,6 +130,7 @@ impl Default for Supervisor {
         Self {
             lifecycle: Lifecycle::Stopped,
             worker_runtime: None,
+            worker_startup_cleanup: None,
             worker_task_helper: None,
             worker_ownership: None,
             legacy_task_state: None,
@@ -154,6 +158,18 @@ impl Supervisor {
     }
 
     pub fn refresh_health(&mut self) {
+        let startup_cleanup_finished =
+            self.worker_startup_cleanup.as_mut().is_some_and(|runtime| {
+                runtime._job.close().is_ok()
+                    && runtime
+                        .child
+                        .try_wait()
+                        .is_ok_and(|status| status.is_some())
+            });
+        if startup_cleanup_finished {
+            self.worker_startup_cleanup = None;
+        }
+
         if let Some(runtime) = &mut self.worker_runtime {
             match runtime.child.try_wait() {
                 Ok(Some(_)) | Err(_) => {
@@ -182,6 +198,7 @@ impl Supervisor {
             process_id: self
                 .worker_runtime
                 .as_ref()
+                .or(self.worker_startup_cleanup.as_ref())
                 .map(|runtime| runtime.child.id()),
             postgres_process_id: controller.and_then(ControllerRuntime::postgres_process_id),
             http_process_id: controller.and_then(ControllerRuntime::http_process_id),
@@ -200,6 +217,9 @@ impl Supervisor {
     }
 
     pub fn start(&mut self, role: ProvisionedRole) -> Result<(), String> {
+        if self.worker_startup_cleanup.is_some() {
+            return Err(self.fail_worker("worker_startup_cleanup_failed"));
+        }
         if self.worker_runtime.is_some() || self.controller.is_some() {
             return Ok(());
         }
@@ -438,37 +458,33 @@ impl Supervisor {
             if let Err(code) = assign_and_resume_worker(&job, &mut child) {
                 return Err(self.fail_worker(code));
             }
-            self.worker_runtime = Some(WorkerRuntime {
+            let provisional = WorkerRuntime {
                 child,
                 _job: job,
                 _identity_guard: identity_guard,
-            });
-            let deadline = Instant::now() + WORKER_LOCK_TIMEOUT;
-            let observation = {
-                let runtime = self
-                    .worker_runtime
-                    .as_mut()
-                    .expect("Worker runtime was just installed");
-                wait_for_worker_lock_with(
-                    || {
-                        runtime
-                            .child
-                            .try_wait()
-                            .is_ok_and(|status| status.is_none())
-                    },
-                    || worker_host::observe_process_lock(&binding.data_root),
-                    || Instant::now() >= deadline,
-                    thread::sleep,
-                )
             };
-            if let Err(code) = observation {
-                return Err(self.fail_worker(code));
-            }
-            if !worker_host::binding_identity_unchanged(&binding) {
-                return Err(self.fail_worker("worker_identity_corrupt"));
-            }
-            self.mark_worker_owned_unverified();
-            Ok(())
+            self.finish_worker_startup_with(
+                provisional,
+                |runtime| {
+                    let deadline = Instant::now() + WORKER_LOCK_TIMEOUT;
+                    wait_for_worker_lock_with(
+                        || {
+                            runtime
+                                .child
+                                .try_wait()
+                                .is_ok_and(|status| status.is_none())
+                        },
+                        || worker_host::observe_process_lock(&binding.data_root),
+                        || Instant::now() >= deadline,
+                        thread::sleep,
+                    )?;
+                    if !worker_host::binding_identity_unchanged(&binding) {
+                        return Err("worker_identity_corrupt");
+                    }
+                    Ok(())
+                },
+                abort_provisional_worker,
+            )
         }
     }
 
@@ -478,7 +494,37 @@ impl Supervisor {
         self.diagnostic_code = None;
     }
 
+    fn finish_worker_startup_with(
+        &mut self,
+        provisional: WorkerRuntime,
+        verify: impl FnOnce(&mut WorkerRuntime) -> Result<(), &'static str>,
+        abort: impl FnOnce(WorkerRuntime) -> Result<(), WorkerRuntime>,
+    ) -> Result<(), String> {
+        match worker_startup_transaction(
+            provisional,
+            verify,
+            |runtime| {
+                self.worker_runtime = Some(runtime);
+                self.mark_worker_owned_unverified();
+            },
+            abort,
+        ) {
+            Ok(()) => Ok(()),
+            Err(WorkerStartupTransactionError::Rejected(code)) => Err(self.fail_worker(code)),
+            Err(WorkerStartupTransactionError::CleanupUncertain(runtime)) => {
+                self.worker_startup_cleanup = Some(runtime);
+                Err(self.fail_worker("worker_startup_cleanup_failed"))
+            }
+        }
+    }
+
     pub fn stop(&mut self) -> Result<(), String> {
+        if self.worker_startup_cleanup.is_some() {
+            self.lifecycle = Lifecycle::Failed;
+            self.worker_ownership = Some(WorkerOwnership::Blocked);
+            self.diagnostic_code = Some("worker_startup_cleanup_failed");
+            return Err("worker_startup_cleanup_failed".to_string());
+        }
         if self.worker_runtime.is_some() {
             self.lifecycle = Lifecycle::Degraded;
             self.diagnostic_code = Some("worker_drain_unavailable");
@@ -515,6 +561,68 @@ impl Supervisor {
         self.worker_ownership = Some(WorkerOwnership::Blocked);
         self.fail(code)
     }
+}
+
+enum WorkerStartupTransactionError<R> {
+    Rejected(&'static str),
+    CleanupUncertain(R),
+}
+
+fn worker_startup_transaction<R>(
+    mut provisional: R,
+    verify: impl FnOnce(&mut R) -> Result<(), &'static str>,
+    publish: impl FnOnce(R),
+    abort: impl FnOnce(R) -> Result<(), R>,
+) -> Result<(), WorkerStartupTransactionError<R>> {
+    if let Err(code) = verify(&mut provisional) {
+        return match abort(provisional) {
+            Ok(()) => Err(WorkerStartupTransactionError::Rejected(code)),
+            Err(provisional) => Err(WorkerStartupTransactionError::CleanupUncertain(provisional)),
+        };
+    }
+
+    publish(provisional);
+    Ok(())
+}
+
+fn wait_for_worker_exit_with(
+    mut child_is_running: impl FnMut() -> Result<bool, ()>,
+    mut deadline_reached: impl FnMut() -> bool,
+    mut wait: impl FnMut(Duration),
+) -> Result<(), ()> {
+    loop {
+        if !child_is_running()? {
+            return Ok(());
+        }
+        if deadline_reached() {
+            return Err(());
+        }
+        wait(WORKER_STARTUP_CLEANUP_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_worker_exit(child: &mut Child, timeout: Duration) -> Result<(), ()> {
+    let deadline = Instant::now() + timeout;
+    wait_for_worker_exit_with(
+        || {
+            child
+                .try_wait()
+                .map(|status| status.is_none())
+                .map_err(|_| ())
+        },
+        || Instant::now() >= deadline,
+        thread::sleep,
+    )
+}
+
+fn abort_provisional_worker(mut runtime: WorkerRuntime) -> Result<(), WorkerRuntime> {
+    if runtime._job.close().is_err()
+        || wait_for_worker_exit(&mut runtime.child, WORKER_STARTUP_CLEANUP_TIMEOUT).is_err()
+    {
+        return Err(runtime);
+    }
+    drop(runtime);
+    Ok(())
 }
 
 fn wait_for_worker_lock_with(
@@ -1466,15 +1574,25 @@ impl ProcessJob {
             Ok(())
         }
     }
+
+    fn close(&mut self) -> Result<(), ()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        if self.0.is_null() {
+            return Ok(());
+        }
+        if unsafe { CloseHandle(self.0) } == 0 {
+            return Err(());
+        }
+        self.0 = std::ptr::null_mut();
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
 impl Drop for ProcessJob {
     fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        unsafe {
-            CloseHandle(self.0);
-        }
+        let _ = self.close();
     }
 }
 
@@ -1561,6 +1679,10 @@ impl ProcessJob {
 
     fn assign(&self, _child: &Child) -> Result<(), ()> {
         Err(())
+    }
+
+    fn close(&mut self) -> Result<(), ()> {
+        Ok(())
     }
 }
 
@@ -1667,6 +1789,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_startup_transaction_publishes_only_after_verification() {
+        let published = std::rc::Rc::new(std::cell::Cell::new(false));
+        let published_during_verify = published.clone();
+        let published_on_commit = published.clone();
+
+        let result = worker_startup_transaction(
+            "provisional worker",
+            move |_| {
+                assert!(!published_during_verify.get());
+                Ok(())
+            },
+            move |runtime| {
+                assert_eq!(runtime, "provisional worker");
+                published_on_commit.set(true);
+            },
+            |_| panic!("successful verification must not abort"),
+        );
+
+        assert!(matches!(result, Ok(())));
+        assert!(published.get());
+    }
+
+    #[test]
+    fn worker_startup_transaction_aborts_rejected_runtime_and_preserves_primary_error() {
+        let published = std::cell::Cell::new(false);
+        let aborted = std::cell::Cell::new(false);
+        let result = worker_startup_transaction(
+            "provisional worker",
+            |_| Err("worker_process_lock_not_acquired"),
+            |_| published.set(true),
+            |runtime| {
+                assert_eq!(runtime, "provisional worker");
+                aborted.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorkerStartupTransactionError::Rejected(
+                "worker_process_lock_not_acquired"
+            ))
+        ));
+        assert!(aborted.get());
+        assert!(!published.get());
+    }
+
+    #[test]
+    fn worker_startup_transaction_retains_runtime_when_cleanup_is_uncertain() {
+        let result = worker_startup_transaction(
+            "still-owned provisional worker",
+            |_| Err("worker_process_lock_unavailable"),
+            |_| panic!("rejected runtime must not publish"),
+            Err,
+        );
+
+        match result {
+            Err(WorkerStartupTransactionError::CleanupUncertain(runtime)) => {
+                assert_eq!(runtime, "still-owned provisional worker");
+            }
+            _ => panic!("uncertain cleanup must retain the provisional runtime"),
+        }
+    }
+
+    #[test]
     fn worker_startup_wait_succeeds_only_after_lock_is_observed_held() {
         let observations = [
             ProcessLockObservation::NotHeld,
@@ -1741,6 +1928,35 @@ mod tests {
         assert_ne!(snapshot.state, "running");
     }
 
+    #[test]
+    fn worker_exit_wait_is_bounded_and_requires_observed_exit() {
+        let observations = std::cell::Cell::new(0);
+        let waits = std::cell::Cell::new(0);
+        assert!(wait_for_worker_exit_with(
+            || {
+                observations.set(observations.get() + 1);
+                Ok(observations.get() < 3)
+            },
+            || false,
+            |_| waits.set(waits.get() + 1),
+        )
+        .is_ok());
+        assert_eq!(observations.get(), 3);
+        assert_eq!(waits.get(), 2);
+
+        let polls = std::cell::Cell::new(0);
+        assert!(wait_for_worker_exit_with(
+            || {
+                polls.set(polls.get() + 1);
+                Ok(true)
+            },
+            || polls.get() == 3,
+            |_| {},
+        )
+        .is_err());
+        assert_eq!(polls.get(), 3);
+    }
+
     #[cfg(windows)]
     fn spawn_test_worker_process() -> Child {
         use std::os::windows::process::CommandExt;
@@ -1756,7 +1972,11 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn worker_test_identity_guard() -> (tempfile::TempDir, worker_host::IdentityFileGuard) {
+    fn worker_test_identity_guard() -> (
+        tempfile::TempDir,
+        WorkerHostBinding,
+        worker_host::IdentityFileGuard,
+    ) {
         use sha2::{Digest, Sha256};
 
         let directory = tempfile::tempdir().expect("Worker identity fixture");
@@ -1780,7 +2000,287 @@ mod tests {
             protected_key_sha256: format!("{:x}", Sha256::digest(protected_key)),
         };
         let guard = worker_host::guard_identity_files(&binding).expect("guard identity files");
-        (directory, guard)
+        (directory, binding, guard)
+    }
+
+    #[cfg(windows)]
+    struct WorkerProcessExitObserver(windows_sys::Win32::Foundation::HANDLE);
+
+    #[cfg(windows)]
+    impl WorkerProcessExitObserver {
+        fn open(process_id: u32) -> Self {
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+            assert!(!handle.is_null(), "open Worker process exit observer");
+            Self(handle)
+        }
+
+        fn has_exited(&self) -> bool {
+            use windows_sys::Win32::{
+                Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+                System::Threading::WaitForSingleObject,
+            };
+
+            match unsafe { WaitForSingleObject(self.0, 0) } {
+                WAIT_OBJECT_0 => true,
+                WAIT_TIMEOUT => false,
+                result => panic!("unexpected process wait result {result}"),
+            }
+        }
+
+        fn wait_for_exit(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if self.has_exited() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(self.has_exited(), "Worker process exits after Job close");
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WorkerProcessExitObserver {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn provisional_worker_fixture() -> (
+        WorkerRuntime,
+        tempfile::TempDir,
+        WorkerHostBinding,
+        WorkerProcessExitObserver,
+    ) {
+        let mut child = spawn_test_worker_process();
+        let job = ProcessJob::new_worker().expect("create provisional Worker Job Object");
+        assign_and_resume_worker(&job, &mut child).expect("assign and resume provisional Worker");
+        let process_observer = WorkerProcessExitObserver::open(child.id());
+        let (identity_directory, binding, identity_guard) = worker_test_identity_guard();
+        (
+            WorkerRuntime {
+                child,
+                _job: job,
+                _identity_guard: identity_guard,
+            },
+            identity_directory,
+            binding,
+            process_observer,
+        )
+    }
+
+    #[cfg(windows)]
+    fn assert_startup_failure_aborts_worker_tree(
+        expected: &'static str,
+        verify: impl FnOnce(&mut WorkerRuntime, &WorkerHostBinding) -> Result<(), &'static str>,
+    ) {
+        let (runtime, _identity_directory, binding, process_observer) =
+            provisional_worker_fixture();
+        let mut supervisor = Supervisor::default();
+
+        assert_eq!(
+            supervisor.finish_worker_startup_with(
+                runtime,
+                |runtime| verify(runtime, &binding),
+                abort_provisional_worker,
+            ),
+            Err(expected.to_string())
+        );
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.process_id, None);
+        assert_eq!(snapshot.state, "failed");
+        assert_eq!(snapshot.worker_ownership, Some("BLOCKED"));
+        assert_eq!(snapshot.diagnostic_code, Some(expected));
+        assert!(supervisor.worker_runtime.is_none());
+        assert!(supervisor.worker_startup_cleanup.is_none());
+        process_observer.wait_for_exit();
+
+        assert_ne!(
+            supervisor.start(ProvisionedRole::Worker),
+            Ok(()),
+            "a later explicit attempt must not become a false success"
+        );
+        assert_eq!(supervisor.snapshot().process_id, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_lock_timeout_aborts_provisional_job_before_reporting_failure() {
+        assert_startup_failure_aborts_worker_tree(
+            "worker_process_lock_not_acquired",
+            |runtime, _binding| {
+                wait_for_worker_lock_with(
+                    || {
+                        runtime
+                            .child
+                            .try_wait()
+                            .is_ok_and(|status| status.is_none())
+                    },
+                    || ProcessLockObservation::NotHeld,
+                    || true,
+                    |_| {},
+                )
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unavailable_worker_lock_observation_aborts_provisional_job() {
+        assert_startup_failure_aborts_worker_tree(
+            "worker_process_lock_unavailable",
+            |runtime, _binding| {
+                wait_for_worker_lock_with(
+                    || {
+                        runtime
+                            .child
+                            .try_wait()
+                            .is_ok_and(|status| status.is_none())
+                    },
+                    || ProcessLockObservation::Unavailable,
+                    || false,
+                    |_| {},
+                )
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn changed_worker_identity_aborts_provisional_job() {
+        assert_startup_failure_aborts_worker_tree("worker_identity_corrupt", |runtime, binding| {
+            wait_for_worker_lock_with(
+                || {
+                    runtime
+                        .child
+                        .try_wait()
+                        .is_ok_and(|status| status.is_none())
+                },
+                || ProcessLockObservation::Held,
+                || false,
+                |_| {},
+            )?;
+            let mut changed = binding.clone();
+            changed.identity_marker_sha256 = "0".repeat(64);
+            if worker_host::binding_identity_unchanged(&changed) {
+                Ok(())
+            } else {
+                Err("worker_identity_corrupt")
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepted_worker_runtime_is_published_once_and_remains_server_unverified() {
+        let (runtime, _identity_directory, binding, process_observer) =
+            provisional_worker_fixture();
+        let expected_pid = runtime.child.id();
+        let mut supervisor = Supervisor {
+            worker_binding: Some(binding.clone()),
+            ..Supervisor::default()
+        };
+
+        assert!(supervisor
+            .finish_worker_startup_with(
+                runtime,
+                |runtime| {
+                    wait_for_worker_lock_with(
+                        || {
+                            runtime
+                                .child
+                                .try_wait()
+                                .is_ok_and(|status| status.is_none())
+                        },
+                        || ProcessLockObservation::Held,
+                        || false,
+                        |_| {},
+                    )?;
+                    if worker_host::binding_identity_unchanged(&binding) {
+                        Ok(())
+                    } else {
+                        Err("worker_identity_corrupt")
+                    }
+                },
+                abort_provisional_worker,
+            )
+            .is_ok());
+
+        let accepted = supervisor
+            .worker_runtime
+            .as_ref()
+            .expect("runtime published");
+        assert_eq!(accepted.child.id(), expected_pid);
+        assert!(supervisor.worker_startup_cleanup.is_none());
+        assert_eq!(supervisor.snapshot().process_id, Some(expected_pid));
+        assert_eq!(supervisor.snapshot().state, "starting");
+        assert_eq!(supervisor.snapshot().worker_ownership, Some("DESKTOP"));
+
+        assert!(supervisor.start(ProvisionedRole::Worker).is_ok());
+        assert_eq!(supervisor.snapshot().process_id, Some(expected_pid));
+
+        let mut accepted = supervisor.worker_runtime.take().expect("accepted runtime");
+        accepted._job.close().expect("close Worker Job Object");
+        wait_for_worker_exit(&mut accepted.child, Duration::from_secs(5))
+            .expect("accepted fixture exits after Job close");
+        drop(accepted);
+        process_observer.wait_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uncertain_startup_cleanup_keeps_pid_and_blocks_start_until_reaped() {
+        let (runtime, _identity_directory, _binding, process_observer) =
+            provisional_worker_fixture();
+        let expected_pid = runtime.child.id();
+        let mut supervisor = Supervisor::default();
+
+        assert_eq!(
+            supervisor.finish_worker_startup_with(
+                runtime,
+                |_| Err("worker_process_lock_not_acquired"),
+                Err,
+            ),
+            Err("worker_startup_cleanup_failed".to_string())
+        );
+        assert!(supervisor.worker_runtime.is_none());
+        assert_eq!(
+            supervisor
+                .worker_startup_cleanup
+                .as_ref()
+                .map(|runtime| runtime.child.id()),
+            Some(expected_pid)
+        );
+        assert_eq!(supervisor.snapshot().process_id, Some(expected_pid));
+        assert_eq!(
+            supervisor.snapshot().diagnostic_code,
+            Some("worker_startup_cleanup_failed")
+        );
+        assert_eq!(
+            supervisor.start(ProvisionedRole::Worker),
+            Err("worker_startup_cleanup_failed".to_string())
+        );
+        assert!(!process_observer.has_exited());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor.worker_startup_cleanup.is_some() && Instant::now() < deadline {
+            supervisor.refresh_health();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(supervisor.worker_startup_cleanup.is_none());
+        assert_eq!(supervisor.snapshot().process_id, None);
+        process_observer.wait_for_exit();
+        assert_ne!(
+            supervisor.start(ProvisionedRole::Worker),
+            Ok(()),
+            "an explicit retry still follows normal preflight"
+        );
     }
 
     #[cfg(windows)]
@@ -1918,7 +2418,7 @@ mod tests {
         let mut child = spawn_test_worker_process();
         let job = ProcessJob::new_worker().expect("create Worker Job Object");
         assign_and_resume_worker(&job, &mut child).expect("assign and resume Worker");
-        let (_identity_directory, identity_guard) = worker_test_identity_guard();
+        let (_identity_directory, _binding, identity_guard) = worker_test_identity_guard();
         let mut supervisor = Supervisor {
             worker_ownership: Some(WorkerOwnership::Desktop),
             worker_runtime: Some(WorkerRuntime {
