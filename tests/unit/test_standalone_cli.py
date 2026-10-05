@@ -6,8 +6,10 @@ from uuid import UUID
 
 import pytest
 
+import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.accounts as account_module
 from threads_platform.standalone.__main__ import main
+from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
 
 def _set_data_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
@@ -97,3 +99,75 @@ def test_cli_rejects_unknown_commands_with_argparse_code_two(
 
     assert error.value.code == 2
     assert "usage:" in capsys.readouterr().err
+
+
+def test_cli_login_success_prints_exact_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    calls: list[str] = []
+
+    async def fake_login(runtime: LocalRuntime, alias: str) -> None:
+        calls.append(alias)
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "login", fake_login)
+
+    result = main(["account", "login", "alice"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == ["alice"]
+    assert captured.out == "login browser closed alice\n"
+    assert captured.err == ""
+
+
+def test_cli_login_missing_account_has_exact_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+
+    result = main(["account", "login", "alice"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR ACCOUNT_NOT_FOUND\n"
+    assert "Traceback" not in captured.err
+
+
+def test_cli_login_busy_has_exact_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+
+    async def busy_login(runtime: LocalRuntime, alias: str) -> None:
+        raise StandaloneRuntimeError("ACCOUNT_BUSY")
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "login", busy_login)
+
+    result = main(["account", "login", "alice"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR ACCOUNT_BUSY\n"
+    assert "Traceback" not in captured.err
+
+
+def test_cli_login_keyboard_interrupt_returns_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+
+    async def interrupt_login(runtime: LocalRuntime, alias: str) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "login", interrupt_login)
+
+    result = main(["account", "login", "alice"])
+
+    captured = capsys.readouterr()
+    assert result == 130
+    assert captured.out == ""
+    assert captured.err == "ERROR INTERRUPTED\n"
+    assert "Traceback" not in captured.err
