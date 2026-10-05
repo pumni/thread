@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
+threads-local = "threads_platform.standalone.__main__:main"
 threads-credential-admin = "threads_platform.tools.credential_admin:main"
 threads-worker = "threads_platform.workers.__main__:main"
 
