@@ -12,9 +12,9 @@ assignees: ""
 
 ## Context / source of truth
 
-- Root `AGENTS.md`
-- `docs/PROJECT_STATE_HANDOFF.md`
-- Relevant task row in `docs/CONTEXT_MAP.md`
+- Root `AGENTS.md` (and nearest nested `AGENTS.md` if applicable)
+- Relevant task route in `docs/CONTEXT_MAP.md`
+- Matching specialized skill in `.agents/skills/` (if triggered)
 - Applicable ADR/protocol/design source:
 
 ## In scope

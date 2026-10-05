@@ -6,11 +6,10 @@ Codex should use the repository context layer rather than preload every document
 
 Before coding:
 
-1. follow root `AGENTS.md`;
-2. read `docs/PROJECT_STATE_HANDOFF.md`;
-3. read the authorized GitHub issue/batch and coordinator comments;
-4. use `docs/CONTEXT_MAP.md` to select only the architecture/ADR/protocol docs relevant to that task;
-5. inspect the current code and tests before proposing new abstractions.
+1. follow root `AGENTS.md` (and nearest nested `AGENTS.md` if working within a subtree);
+2. read the authorized GitHub issue/batch and coordinator comments as task authority;
+3. use `docs/CONTEXT_MAP.md` to select matching skills and relevant ADR/protocol/runbook docs;
+4. inspect current code and tests before proposing new abstractions.
 
 Read broader project documentation only when the task genuinely crosses those boundaries.
 
