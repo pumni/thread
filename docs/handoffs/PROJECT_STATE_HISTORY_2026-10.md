@@ -7,6 +7,7 @@
 > Current code and tests on the active branch define implementation truth.
 > Canonical durable design is defined in accepted ADRs (`docs/adr/`) and protocol specs (`docs/protocols/`).
 > For current task context, see root `AGENTS.md` and `docs/CONTEXT_MAP.md`.
+> All occurrences of "current milestone", "first state document ... should read", and "next action for a new coordinator" below represent preserved historical wording from past handoffs, not present instructions or live task authorization.
 
 
 > **Accepted Desktop planning baseline, 2026-10-01:** PR #93 merged into `main` at `ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`; epic #94 tracks 14 scoped implementation issues #95–#108. Start a new Desktop session with [SESSION_HANDOFF.md](../desktop/SESSION_HANDOFF.md), [PREIMPLEMENTATION_AUDIT.md](../desktop/PREIMPLEMENTATION_AUDIT.md) and the currently authorized issue **from latest main**. DX-01 planning/ADR was accepted; packaging, TLS, onboarding and other technical blockers remain gated in their own implementation issues. No Desktop runtime or production readiness has been certified.

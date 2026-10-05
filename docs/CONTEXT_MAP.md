@@ -24,7 +24,7 @@ Do not treat this as a mandatory reading list. Start with the authorized GitHub 
 - **Trigger:** WorkerJob lifecycle, claim transactions, lease renewals, fencing tokens, stale recovery, execution modes.
 - **Skill:** [`.agents/skills/worker-protocol/SKILL.md`](../.agents/skills/worker-protocol/SKILL.md).
 - **Canonical Docs:** [`docs/adr/0003-distributed-hybrid-execution.md`](adr/0003-distributed-hybrid-execution.md), [`docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`](adr/0004-persistent-worker-affinity-and-worker-jobs.md), `docs/ARCHITECTURE.md` (WorkerJob section).
-- **Implementation Truth:** `src/threads_platform/application/worker_jobs.py`, `src/threads_platform/domain/worker_job.py`, `tests/unit/test_worker_jobs.py`.
+- **Implementation Truth:** `src/threads_platform/application/worker_jobs.py`, `src/threads_platform/domain/worker_jobs.py`, `tests/unit/test_worker_jobs.py`.
 - **Key Invariants:** `Command` is business intent; `WorkerJob` is remote execution; independent lease/fencing/checkpoint semantics; stale lease claim fails closed; persistent account -> worker/profile affinity.
 
 ### 4. Worker Protocol, Auth, Enrollment, Drain & Pairing
@@ -59,7 +59,7 @@ Do not treat this as a mandatory reading list. Start with the authorized GitHub 
 - **Trigger:** Health/readiness checks (`/health`, `/ready`), Prometheus metrics (`/metrics`), OpenTelemetry tracing, Docker Compose deployment.
 - **Skill:** None.
 - **Canonical Docs:** `docs/OBSERVABILITY_RUNBOOK.md`, `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.
-- **Implementation Truth:** `src/threads_platform/infrastructure/observability/`, `deploy/`.
+- **Implementation Truth:** `src/threads_platform/observability/`, `Dockerfile`, `compose.yaml`, `scripts/control_plane_compose_smoke.py`.
 - **Key Invariants:** `/health` is process liveness; `/ready` reports persisted state fail-closed; structured log redaction; bounded metrics/tracing without leaking payloads or credentials.
 
 ### 9. Desktop React / UI
