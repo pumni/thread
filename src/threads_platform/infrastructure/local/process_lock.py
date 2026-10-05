@@ -2,12 +2,13 @@ import os
 from pathlib import Path
 from typing import BinaryIO
 
+from threads_platform.application.ports.process_lock import (
+    ProcessAlreadyRunning,
+    ProcessLock,
+)
 
-class WorkerProcessAlreadyRunning(RuntimeError):
-    pass
 
-
-class WorkerProcessLock:
+class FilesystemProcessLock(ProcessLock):
     def __init__(self, path: Path) -> None:
         self._path = path
         self._stream: BinaryIO | None = None
@@ -35,7 +36,7 @@ class WorkerProcessLock:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             stream.close()
-            raise WorkerProcessAlreadyRunning(
+            raise ProcessAlreadyRunning(
                 "another Worker Agent process holds the local lock"
             ) from error
         self._stream = stream

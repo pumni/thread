@@ -6,7 +6,7 @@ from typing import Never
 import pytest
 
 from threads_platform.domain.workers import NetworkProtocol
-from threads_platform.infrastructure.worker_agent.process_lock import WorkerProcessLock
+from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 from threads_platform.workers.browser import (
@@ -54,7 +54,7 @@ def _lock_path(root: Path, account: LocalAccount) -> Path:
 
 
 def _assert_lock_can_be_acquired(root: Path, account: LocalAccount) -> None:
-    lock = WorkerProcessLock(_lock_path(root, account))
+    lock = FilesystemProcessLock(_lock_path(root, account))
     lock.acquire()
     lock.release()
 
@@ -126,7 +126,7 @@ async def test_same_account_lock_rejects_second_login_without_opening_engine(
 ) -> None:
     store = LocalAccountStore(tmp_path)
     account = store.add("alice")
-    held_lock = WorkerProcessLock(_lock_path(tmp_path, account))
+    held_lock = FilesystemProcessLock(_lock_path(tmp_path, account))
     held_lock.acquire()
     engine = _FakeEngine()
     runtime = LocalRuntime(tmp_path, store, engine)
@@ -145,7 +145,7 @@ async def test_different_account_lock_does_not_block_login(tmp_path: Path) -> No
     store = LocalAccountStore(tmp_path)
     first = store.add("alice")
     second = store.add("bob")
-    held_lock = WorkerProcessLock(_lock_path(tmp_path, first))
+    held_lock = FilesystemProcessLock(_lock_path(tmp_path, first))
     held_lock.acquire()
     engine = _FakeEngine()
     runtime = LocalRuntime(tmp_path, store, engine)

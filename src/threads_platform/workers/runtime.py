@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID
 
+from threads_platform.application.ports.process_lock import ProcessLock
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAgentPresence,
@@ -15,7 +16,6 @@ from threads_platform.application.ports.worker_agent import (
     WorkerJobHandler,
     WorkerJobSnapshot,
     WorkerLocalState,
-    WorkerProcessLock,
     WorkerReconcileHandler,
 )
 from threads_platform.domain.workers import BrowserSessionState, WorkerStatus
@@ -65,7 +65,7 @@ class WorkerAgent:
         identity_store: WorkerIdentityStore,
         key_store: WorkerKeyStore,
         state_store: WorkerLocalState,
-        process_lock: WorkerProcessLock,
+        process_lock: ProcessLock,
         control_client: WorkerControlClient,
         *,
         job_handler: WorkerJobHandler | None = None,

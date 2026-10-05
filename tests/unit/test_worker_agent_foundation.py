@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
 from threads_platform.application.ports.worker_agent import (
     LocalRecoveryEntry,
     LocalSessionState,
@@ -26,6 +27,7 @@ from threads_platform.domain.workers import (
     WorkerNode,
     WorkerStatus,
 )
+from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
 from threads_platform.infrastructure.worker_agent.identity import (
     WorkerIdentityFileStore,
     WorkerIdentityStoreError,
@@ -37,10 +39,6 @@ from threads_platform.infrastructure.worker_agent.local_state import (
     ProfileOwnershipError,
     SessionCapacityError,
     WorkerLocalStateStore,
-)
-from threads_platform.infrastructure.worker_agent.process_lock import (
-    WorkerProcessAlreadyRunning,
-    WorkerProcessLock,
 )
 from threads_platform.infrastructure.worker_agent.windows_keys import (
     DPAPIWorkerKeyStore,
@@ -307,16 +305,30 @@ def test_concurrent_session_opens_cannot_exceed_local_capacity(tmp_path: Path) -
 
 def test_process_lock_prevents_a_second_local_agent(tmp_path: Path) -> None:
     lock_path = tmp_path / "worker" / "agent.lock"
-    first = WorkerProcessLock(lock_path)
-    second = WorkerProcessLock(lock_path)
+    first = FilesystemProcessLock(lock_path)
+    second = FilesystemProcessLock(lock_path)
+    assert not first.held
+    assert not second.held
+
     first.acquire()
+    assert first.held
     try:
-        with pytest.raises(WorkerProcessAlreadyRunning):
+        with pytest.raises(
+            ProcessAlreadyRunning,
+            match="^another Worker Agent process holds the local lock$",
+        ):
             second.acquire()
+        assert not second.held
     finally:
         first.release()
+    assert not first.held
+
+    first.release()
+    assert not first.held
     second.acquire()
+    assert second.held
     second.release()
+    assert not second.held
 
 
 def test_worker_protocol_v1_and_v2_compatibility() -> None:
@@ -494,7 +506,7 @@ def test_worker_runtime_reauthenticates_reconciles_and_never_claims_offline(
             identity_store,
             _FakeKeyStore(),
             state_store,
-            WorkerProcessLock(root.child("worker", "agent.lock")),
+            FilesystemProcessLock(root.child("worker", "agent.lock")),
             client,
             job_handler=handle,
             clock=lambda: now,
@@ -566,7 +578,7 @@ def test_worker_runtime_reports_session_transitions_and_shutdown(tmp_path: Path)
             identity_store,
             _FakeKeyStore(),
             state_store,
-            WorkerProcessLock(root.child("worker", "agent.lock")),
+            FilesystemProcessLock(root.child("worker", "agent.lock")),
             client,
         )
         manager = LocalBrowserSessionManager(
@@ -658,7 +670,7 @@ def test_worker_agent_finishes_current_handler_then_closes_sessions_and_complete
             identity_store,
             _FakeKeyStore(),
             state_store,
-            WorkerProcessLock(root.child("worker", "agent.lock")),
+            FilesystemProcessLock(root.child("worker", "agent.lock")),
             client,
             job_handler=handle,
             clock=lambda: now,
@@ -714,7 +726,7 @@ def test_worker_agent_resumes_drain_finalization_after_network_failure(
             identity_store,
             _FakeKeyStore(),
             WorkerLocalStateStore(root, identity_store.worker_id),
-            WorkerProcessLock(root.child("worker", "agent.lock")),
+            FilesystemProcessLock(root.child("worker", "agent.lock")),
             client,
             clock=lambda: now,
         )

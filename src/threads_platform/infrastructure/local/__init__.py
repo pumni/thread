@@ -1,0 +1,1 @@
+"""Generic local infrastructure adapters."""

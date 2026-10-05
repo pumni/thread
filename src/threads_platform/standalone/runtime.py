@@ -7,12 +7,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
 from threads_platform.domain.workers import NetworkProtocol
 from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
-from threads_platform.infrastructure.worker_agent.process_lock import (
-    WorkerProcessAlreadyRunning,
-    WorkerProcessLock,
-)
+from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 from threads_platform.workers.browser import (
     BrowserAdapterError,
@@ -56,11 +54,11 @@ class LocalRuntime:
         wait_for_operator: Callable[[str], None] = _DEFAULT_OPERATOR_WAITER,
     ) -> None:
         account = self._accounts.get(alias)
-        lock = WorkerProcessLock(self._lock_path(account))
+        lock = FilesystemProcessLock(self._lock_path(account))
         try:
             try:
                 lock.acquire()
-            except WorkerProcessAlreadyRunning:
+            except ProcessAlreadyRunning:
                 raise StandaloneRuntimeError("ACCOUNT_BUSY") from None
             except OSError:
                 raise StandaloneRuntimeError("LOCAL_PROFILE_UNAVAILABLE") from None

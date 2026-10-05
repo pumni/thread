@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
+from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
 from threads_platform.infrastructure.worker_agent.identity import WorkerIdentityFileStore
 from threads_platform.infrastructure.worker_agent.local_media import LocalMediaFileResolver
 from threads_platform.infrastructure.worker_agent.local_state import (
@@ -13,7 +14,6 @@ from threads_platform.infrastructure.worker_agent.local_state import (
     LocalProfileDirectoryResolver,
     WorkerLocalStateStore,
 )
-from threads_platform.infrastructure.worker_agent.process_lock import WorkerProcessLock
 from threads_platform.infrastructure.worker_agent.windows_keys import DPAPIWorkerKeyStore
 from threads_platform.workers.browser import (
     ManagedPlaywrightBrowserSessionManager,
@@ -143,7 +143,7 @@ async def _run(host_config: WorkerHostConfig | None = None) -> None:
         identity_store,
         DPAPIWorkerKeyStore(data_root),
         state_store,
-        WorkerProcessLock(data_root.child("worker", "agent.lock")),
+        FilesystemProcessLock(data_root.child("worker", "agent.lock")),
         client,
         job_handler=job_handler,
     )
