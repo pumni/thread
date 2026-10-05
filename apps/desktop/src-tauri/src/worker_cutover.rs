@@ -181,7 +181,7 @@ pub(super) async fn takeover<B: WorkerCutoverBackend>(backend: &mut B) -> Result
     }
 
     match wait_for_desktop_online(backend).await {
-        Ok(()) => backend.mark_desktop_online(),
+        Ok(()) => commit_desktop_online(backend),
         Err(diagnostic) => {
             backend.mark_intervention(diagnostic);
             Err("worker_cutover_rollback_required".to_string())
@@ -267,9 +267,7 @@ pub(super) async fn restart_desktop_worker<B: WorkerCutoverBackend>(
     }
 
     match wait_for_desktop_online(backend).await {
-        Ok(()) => backend
-            .mark_desktop_online()
-            .map_err(|_| "worker_cutover_rollback_required".to_string()),
+        Ok(()) => commit_desktop_online(backend),
         Err(diagnostic) => {
             backend.mark_intervention(diagnostic);
             Err("worker_cutover_rollback_required".to_string())
@@ -599,6 +597,16 @@ async fn wait_for_desktop_online<B: WorkerCutoverBackend>(
     Err("worker_startup_timeout")
 }
 
+fn commit_desktop_online<B: WorkerCutoverBackend>(backend: &mut B) -> Result<(), String> {
+    match backend.mark_desktop_online() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            backend.mark_intervention(lifecycle_failure_diagnostic(&error));
+            Err("worker_cutover_rollback_required".to_string())
+        }
+    }
+}
+
 async fn wait_for_desktop_exit<B: WorkerCutoverBackend>(backend: &mut B) -> Result<(), String> {
     for attempt in 0..LOCAL_EXIT_POLL_LIMIT {
         if backend.inspect_task().await? != LegacyTaskState::Disabled {
@@ -872,6 +880,7 @@ mod tests {
         runtime: WorkerRuntimeObservation,
         desktop_start_error: Option<String>,
         task_start_error: Option<(String, bool)>,
+        mark_desktop_online_error: Option<String>,
         drain_in_progress: bool,
         desktop_exits_after_offline: bool,
         desktop_job_empty_after_offline: bool,
@@ -925,6 +934,7 @@ mod tests {
                 },
                 desktop_start_error: None,
                 task_start_error: None,
+                mark_desktop_online_error: None,
                 drain_in_progress: false,
                 desktop_exits_after_offline: true,
                 desktop_job_empty_after_offline: true,
@@ -1100,6 +1110,9 @@ mod tests {
 
         fn mark_desktop_online(&mut self) -> Result<(), String> {
             self.events.push(Event::MarkDesktopOnline);
+            if let Some(error) = self.mark_desktop_online_error.take() {
+                return Err(error);
+            }
             self.runtime.server_online_verified = true;
             Ok(())
         }
@@ -1930,6 +1943,77 @@ mod tests {
             assert!(backend
                 .events
                 .contains(&Event::Intervention("worker_startup_timeout")));
+        });
+    }
+
+    #[test]
+    fn restart_terminal_online_commit_failure_records_local_diagnostic_without_logout_or_fallback()
+    {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::desktop(&[
+                WorkerStatus::Online,
+                WorkerStatus::Draining,
+                WorkerStatus::Draining,
+                WorkerStatus::Offline,
+                WorkerStatus::Offline,
+                WorkerStatus::Registering,
+                WorkerStatus::Online,
+            ]);
+            backend.mark_desktop_online_error = Some("worker_process_exited".to_string());
+            let logout_called = std::cell::Cell::new(false);
+
+            let result = crate::worker_lifecycle_then_logout(
+                restart_desktop_worker(&mut backend),
+                || async { logout_called.set(true) },
+            )
+            .await;
+
+            assert_eq!(result, Err("worker_cutover_rollback_required".to_string()));
+            assert!(backend.events.contains(&Event::Get("ONLINE")));
+            assert!(backend.events.contains(&Event::MarkDesktopOnline));
+            assert!(backend
+                .events
+                .contains(&Event::Intervention("worker_process_exited")));
+            assert_eq!(backend.task_state, LegacyTaskState::Disabled);
+            assert!(!backend.operations.iter().any(|operation| matches!(
+                operation,
+                TaskOperation::Enable | TaskOperation::Start
+            )));
+            assert_eq!(backend.requested, ["DESKTOP_RESTART"]);
+            assert!(!logout_called.get());
+        });
+    }
+
+    #[test]
+    fn takeover_terminal_online_commit_failure_keeps_legacy_disabled_and_records_diagnostic() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::running(&[
+                WorkerStatus::Online,
+                WorkerStatus::Online,
+                WorkerStatus::Draining,
+                WorkerStatus::Offline,
+                WorkerStatus::Offline,
+                WorkerStatus::Registering,
+                WorkerStatus::Degraded,
+                WorkerStatus::Online,
+            ]);
+            backend.mark_desktop_online_error =
+                Some("worker_process_lock_not_acquired".to_string());
+
+            assert_eq!(
+                takeover(&mut backend).await,
+                Err("worker_cutover_rollback_required".to_string())
+            );
+            assert!(backend.events.contains(&Event::Get("ONLINE")));
+            assert!(backend.events.contains(&Event::MarkDesktopOnline));
+            assert!(backend
+                .events
+                .contains(&Event::Intervention("worker_process_lock_not_acquired")));
+            assert_eq!(backend.task_state, LegacyTaskState::Disabled);
+            assert!(!backend.operations.iter().any(|operation| matches!(
+                operation,
+                TaskOperation::Enable | TaskOperation::Start
+            )));
         });
     }
 
