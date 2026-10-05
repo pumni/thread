@@ -7,6 +7,16 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from threads_platform.application.ports.browser import (
+    BROWSER_FEED_ORIGIN,
+    BrowserContractError,
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
+    BrowserSurface,
+    FeedAncestorObservation,
+    FeedCandidateObservation,
+    RemoteSessionStateUncertain,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAccountContext,
@@ -14,15 +24,9 @@ from threads_platform.application.ports.worker_agent import (
     WorkerJobSnapshot,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
-from threads_platform.domain.workers import BrowserSessionState, NetworkProtocol
+from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.workers.browser import (
-    BROWSER_FEED_ORIGIN,
-    BrowserContractError,
     BrowserNavigationPolicy,
-    BrowserSurface,
-    FeedAncestorObservation,
-    FeedCandidateObservation,
-    RemoteSessionStateUncertain,
     WorkerBrowserSession,
     WorkerJobExecution,
     WorkerJobLeaseLost,
@@ -39,7 +43,7 @@ from threads_platform.workers.feed_browse import (
     FeedWorkerControlClient,
     normalize_feed_candidates,
 )
-from threads_platform.workers.sessions import BrowserSessionOpenResult, NetworkRoute
+from threads_platform.workers.sessions import BrowserSessionOpenResult, WorkerNetworkRoute
 
 
 def test_permalink_pivot_uses_nearest_unique_bounded_ancestor() -> None:
@@ -390,7 +394,10 @@ async def test_browser_operation_does_not_start_after_worker_job_lease_loss(
             1,
             datetime.now(UTC),
         ),
-        NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+        WorkerNetworkRoute(
+            account_id,
+            BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+        ),
     )
     engine = _MemoryEngineSession()
 
@@ -645,7 +652,10 @@ class _MemorySessionManager:
                 1,
                 now,
             ),
-            NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+            WorkerNetworkRoute(
+                account_id,
+                BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            ),
         )
         self.session = _MemorySession(
             account_id,

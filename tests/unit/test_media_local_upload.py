@@ -10,6 +10,18 @@ from uuid import UUID, uuid4
 import pytest
 
 import threads_platform.workers.media_local_upload as media_worker_module
+from threads_platform.application.ports.browser import (
+    BrowserAdapterError,
+    BrowserContractError,
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
+    BrowserNetworkRouteUnsupported,
+    BrowserProcessCrashed,
+    BrowserSurface,
+    MediaUploadFailed,
+    PreparedMediaComposer,
+    RemoteSessionStateUncertain,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalRecoveryEntry,
     LocalSessionState,
@@ -19,29 +31,19 @@ from threads_platform.application.ports.worker_agent import (
     WorkerLocalState,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
-from threads_platform.domain.workers import BrowserSessionState, NetworkProtocol
+from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.infrastructure.worker_agent.local_media import (
     LocalMediaFileResolver,
 )
 from threads_platform.infrastructure.worker_agent.local_state import LocalDataRoot
-from threads_platform.workers.browser import (
-    BrowserAdapterError,
-    BrowserContractError,
-    BrowserNetworkRouteUnsupported,
-    BrowserProcessCrashed,
-    BrowserSurface,
-    MediaUploadFailed,
-    PreparedMediaComposer,
-    RemoteSessionStateUncertain,
-    WorkerBrowserSession,
-)
+from threads_platform.workers.browser import WorkerBrowserSession
 from threads_platform.workers.media_local_upload import (
     MEDIA_LOCAL_UPLOAD_ALLOWED_FAILURE_CODES,
     MEDIA_LOCAL_UPLOAD_CAPABILITY_NAME,
     BrowserLocalMediaUploadWorker,
     parse_media_ref,
 )
-from threads_platform.workers.sessions import BrowserSessionOpenResult, NetworkRoute
+from threads_platform.workers.sessions import BrowserSessionOpenResult, WorkerNetworkRoute
 
 
 def test_media_ref_is_one_bounded_logical_filename() -> None:
@@ -535,7 +537,10 @@ class _MemorySessionManager:
                 1,
                 now,
             ),
-            NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+            WorkerNetworkRoute(
+                account_id,
+                BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            ),
         )
         self.engine = _MemoryEngineSession(
             has_composer=has_composer,

@@ -11,6 +11,11 @@ from threads_platform.application.browser_capabilities import (
     BROWSER_CAPABILITY_CONTRACTS,
     BrowserTargetOpenResultV1,
 )
+from threads_platform.application.ports.browser import (
+    BROWSER_FEED_ORIGIN,
+    BrowserAdapterError,
+    BrowserContractError,
+)
 from threads_platform.application.ports.worker_agent import (
     WorkerAccountContext,
     WorkerControlClient,
@@ -20,9 +25,6 @@ from threads_platform.application.ports.worker_agent import (
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety
 from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.workers.browser import (
-    BROWSER_FEED_ORIGIN,
-    BrowserAdapterError,
-    BrowserContractError,
     BrowserNavigationPolicy,
     WorkerBrowserSession,
     WorkerJobExecution,

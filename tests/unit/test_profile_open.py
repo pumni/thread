@@ -8,6 +8,17 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from threads_platform.application.ports.browser import (
+    BROWSER_FEED_ORIGIN,
+    BrowserAdapterError,
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
+    BrowserNetworkRouteUnsupported,
+    BrowserSurface,
+    ChallengeDetected,
+    RemoteSessionStateUncertain,
+    SessionExpired,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAccountContext,
@@ -16,18 +27,9 @@ from threads_platform.application.ports.worker_agent import (
     WorkerJobSnapshot,
 )
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety, WorkerJobStatus
-from threads_platform.domain.workers import BrowserSessionState, NetworkProtocol
+from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.workers.__main__ import enabled_browser_capabilities
-from threads_platform.workers.browser import (
-    BROWSER_FEED_ORIGIN,
-    BrowserAdapterError,
-    BrowserNetworkRouteUnsupported,
-    BrowserSurface,
-    ChallengeDetected,
-    RemoteSessionStateUncertain,
-    SessionExpired,
-    WorkerBrowserSession,
-)
+from threads_platform.workers.browser import WorkerBrowserSession
 from threads_platform.workers.profile_open import (
     PROFILE_OPEN_ALLOWED_FAILURE_CODES,
     PROFILE_OPEN_ANCESTOR_BOUND,
@@ -38,7 +40,7 @@ from threads_platform.workers.profile_open import (
     ProfileOpenWorkerControlClient,
     parse_profile_ref,
 )
-from threads_platform.workers.sessions import BrowserSessionOpenResult, NetworkRoute
+from threads_platform.workers.sessions import BrowserSessionOpenResult, WorkerNetworkRoute
 
 
 def test_profile_ref_is_relative_bounded_and_normalized() -> None:
@@ -468,7 +470,10 @@ class _MemorySessionManager:
                 1,
                 now,
             ),
-            NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+            WorkerNetworkRoute(
+                account_id,
+                BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            ),
         )
         self.engine = _MemoryEngineSession()
         self.session = WorkerBrowserSession(

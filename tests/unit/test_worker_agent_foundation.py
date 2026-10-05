@@ -9,6 +9,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from threads_platform.application.ports.browser import (
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
+    BrowserProxyCredentials,
+)
 from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
 from threads_platform.application.ports.worker_agent import (
     LocalRecoveryEntry,
@@ -53,7 +58,6 @@ from threads_platform.workers.sessions import (
     InvalidSessionTransition,
     LocalBrowserSessionManager,
     NetworkProfileApplication,
-    ProxyCredentials,
 )
 
 
@@ -241,7 +245,9 @@ def test_profile_session_transitions_capacity_and_network_boundary(tmp_path: Pat
     assert isinstance(opened, BrowserSessionOpenResult)
     assert opened.state.state is BrowserSessionState.LOGIN_REQUIRED
     assert opened.state.state.requires_intervention
-    assert opened.network_route.protocol is NetworkProtocol.HTTPS
+    assert opened.network_route.browser_route.protocol is BrowserNetworkProtocol.HTTPS
+    assert opened.network_route.browser_route.host == "proxy.example.test"
+    assert opened.network_route.browser_route.port == 8443
     assert opened.network_route.credential_ref == "secret-store://account/proxy"
     assert "secret-store://account/proxy" not in repr(opened.network_route)
     with pytest.raises(ValueError, match="cannot be moved"):
@@ -252,7 +258,9 @@ def test_profile_session_transitions_capacity_and_network_boundary(tmp_path: Pat
     other_context = WorkerAccountContext(other_account_id, worker_id, "profile-other", None)
     other_opened = asyncio.run(manager.open(other_context))
     assert other_opened.state.state is BrowserSessionState.LOGIN_REQUIRED
-    assert other_opened.network_route.protocol is NetworkProtocol.DIRECT
+    assert other_opened.network_route.browser_route == BrowserNetworkRoute(
+        BrowserNetworkProtocol.DIRECT, None, None
+    )
     assert store.active_session_count() == 2
     third_context = WorkerAccountContext(third_account_id, worker_id, "profile-third", None)
     with pytest.raises(SessionCapacityError):
@@ -744,7 +752,7 @@ def test_worker_agent_resumes_drain_finalization_after_network_failure(
 
 
 def test_secret_diagnostic_representations_are_redacted() -> None:
-    credentials = ProxyCredentials(username="proxy-user", password="proxy-pass")
+    credentials = BrowserProxyCredentials(username="proxy-user", password="proxy-pass")
     error = WorkerControlClientError("SESSION_REPORT_STALE", status_code=409)
     assert "proxy-user" not in repr(credentials)
     assert "proxy-pass" not in repr(credentials)

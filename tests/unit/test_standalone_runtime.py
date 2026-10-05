@@ -1,34 +1,28 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Never
 
 import pytest
 
-from threads_platform.domain.workers import NetworkProtocol
-from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
-from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
-from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
-from threads_platform.workers.browser import (
+from threads_platform.application.ports.browser import (
     BrowserAdapterError,
     BrowserEngineSession,
     BrowserLaunchRequest,
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
 )
-from threads_platform.workers.sessions import NetworkRoute
+from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
+from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
+from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
 
 class _FakeSession:
     def __init__(self) -> None:
         self.close_calls = 0
         self.navigate_calls = 0
-        self.inspect_calls = 0
 
     async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None:
         self.navigate_calls += 1
-
-    async def inspect_surface(self) -> Never:
-        self.inspect_calls += 1
-        raise AssertionError("standalone login must not inspect authentication state")
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -84,19 +78,18 @@ async def test_login_uses_headed_direct_persistent_profile_and_manual_waiter(
     first_request, second_request = engine.requests
     expected_profile = root / "profiles" / str(account.id)
     assert first_request.headless is False
-    assert first_request.network_route == NetworkRoute(
-        account.id, NetworkProtocol.DIRECT, None, None
+    assert first_request.network_route == BrowserNetworkRoute(
+        BrowserNetworkProtocol.DIRECT, None, None
     )
-    assert first_request.account_id == account.id
-    assert first_request.worker_id == account.id
-    assert first_request.profile_ref == str(account.id)
     assert first_request.profile_directory == expected_profile
     assert second_request.profile_directory == expected_profile
     assert first_request.profile_directory.is_dir()
     assert first_request.proxy_credentials is None
+    assert not hasattr(first_request, "worker_id")
+    assert not hasattr(first_request, "account_id")
+    assert not hasattr(first_request, "profile_ref")
     assert [session.close_calls for session in engine.sessions] == [1, 1]
     assert all(session.navigate_calls == 0 for session in engine.sessions)
-    assert all(session.inspect_calls == 0 for session in engine.sessions)
     assert account_file.read_bytes() == account_before
     _assert_lock_can_be_acquired(root, account)
 
@@ -153,7 +146,10 @@ async def test_different_account_lock_does_not_block_login(tmp_path: Path) -> No
     try:
         await runtime.login("bob", wait_for_operator=lambda _: None)
         assert len(engine.requests) == 1
-        assert engine.requests[0].account_id == second.id
+        assert engine.requests[0].profile_directory == (tmp_path / "profiles" / str(second.id))
+        assert not hasattr(engine.requests[0], "account_id")
+        assert not hasattr(engine.requests[0], "worker_id")
+        assert not hasattr(engine.requests[0], "profile_ref")
         assert engine.sessions[0].close_calls == 1
     finally:
         held_lock.release()

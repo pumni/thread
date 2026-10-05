@@ -7,18 +7,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
-from threads_platform.domain.workers import NetworkProtocol
-from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
-from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
-from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
-from threads_platform.workers.browser import (
+from threads_platform.application.ports.browser import (
     BrowserAdapterError,
     BrowserEngine,
     BrowserEngineSession,
     BrowserLaunchRequest,
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
 )
-from threads_platform.workers.sessions import NetworkRoute
+from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
+from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
+from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
+from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 
 _SAFE_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _DEFAULT_OPERATOR_WAITER = cast(Callable[[str], None], input)
@@ -71,16 +71,8 @@ class LocalRuntime:
             profile_directory = self._profile_directory(account)
 
             request = BrowserLaunchRequest(
-                worker_id=account.id,
-                account_id=account.id,
-                profile_ref=str(account.id),
                 profile_directory=profile_directory,
-                network_route=NetworkRoute(
-                    account.id,
-                    NetworkProtocol.DIRECT,
-                    None,
-                    None,
-                ),
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                 proxy_credentials=None,
                 headless=False,
             )

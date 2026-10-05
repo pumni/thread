@@ -4,7 +4,7 @@ import ipaddress
 import json
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -12,6 +12,69 @@ from typing import Protocol, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from threads_platform.application.ports.browser import (
+    BrowserAdapterError as _BrowserAdapterError,
+)
+from threads_platform.application.ports.browser import (
+    BrowserContractError as _BrowserContractError,
+)
+from threads_platform.application.ports.browser import (
+    BrowserEngine as _BrowserEngine,
+)
+from threads_platform.application.ports.browser import (
+    BrowserEngineSession as _BrowserEngineSession,
+)
+from threads_platform.application.ports.browser import (
+    BrowserFeedEngineSession as _BrowserFeedEngineSession,
+)
+from threads_platform.application.ports.browser import (
+    BrowserLaunchRequest as _BrowserLaunchRequest,
+)
+from threads_platform.application.ports.browser import (
+    BrowserMediaEngineSession as _BrowserMediaEngineSession,
+)
+from threads_platform.application.ports.browser import (
+    BrowserNetworkRouteUnsupported as _BrowserNetworkRouteUnsupported,
+)
+from threads_platform.application.ports.browser import (
+    BrowserProcessCrashed as _BrowserProcessCrashed,
+)
+from threads_platform.application.ports.browser import (
+    BrowserProfileOpenEngineSession as _BrowserProfileOpenEngineSession,
+)
+from threads_platform.application.ports.browser import (
+    BrowserProxyCredentials as _BrowserProxyCredentials,
+)
+from threads_platform.application.ports.browser import (
+    BrowserRuntimeUnavailable as _BrowserRuntimeUnavailable,
+)
+from threads_platform.application.ports.browser import (
+    BrowserSurface as _BrowserSurface,
+)
+from threads_platform.application.ports.browser import (
+    BrowserThreadOpenEngineSession as _BrowserThreadOpenEngineSession,
+)
+from threads_platform.application.ports.browser import (
+    ChallengeDetected as _ChallengeDetected,
+)
+from threads_platform.application.ports.browser import (
+    FeedCandidateObservation as _FeedCandidateObservation,
+)
+from threads_platform.application.ports.browser import (
+    LocatorNotFound as _LocatorNotFound,
+)
+from threads_platform.application.ports.browser import (
+    PreparedMediaComposer as _PreparedMediaComposer,
+)
+from threads_platform.application.ports.browser import (
+    RemoteSessionStateUncertain as _RemoteSessionStateUncertain,
+)
+from threads_platform.application.ports.browser import (
+    SessionExpired as _SessionExpired,
+)
+from threads_platform.application.ports.browser import (
+    UnsupportedUIState as _UnsupportedUIState,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalRecoveryEntry,
     LocalSessionState,
@@ -26,101 +89,34 @@ from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.workers.sessions import (
     BrowserSessionManager,
     BrowserSessionOpenResult,
-    NetworkRoute,
     ProxyCredentialProvider,
-    ProxyCredentials,
 )
 
 SUPPORTED_UI_CONTRACT_ID = "worker.synthetic"
 SUPPORTED_UI_CONTRACT_VERSION = 1
-BROWSER_FEED_ORIGIN = "https://www.threads.com"
-BROWSER_FEED_CANDIDATE_BOUND = 100
 _SAFE_CHECKPOINT_FIELDS = frozenset({"phase", "contract_id", "contract_version", "reason_code"})
 _RECOVERY_AMBIGUOUS_PHASES = frozenset({"MUTATION_STARTED", "MUTATION_CONFIRMED"})
 _CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _ResultT = TypeVar("_ResultT")
 
 
-class BrowserAdapterError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        if not _CODE.fullmatch(code):
-            raise ValueError("browser adapter error code must be bounded and safe")
-        super().__init__(code)
-        self.code = code
-
-
-class BrowserContractError(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("BROWSER_CONTRACT_MISMATCH")
-
-
-class LocatorNotFound(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("BROWSER_REQUIRED_MARKER_NOT_FOUND")
-
-
-class SessionExpired(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("SESSION_EXPIRED")
-
-
-class ChallengeDetected(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("CHALLENGE_REQUIRED")
-
-
-class RemoteSessionStateUncertain(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("REMOTE_STATE_UNCERTAIN")
-
-
-class NavigationTimeout(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("BROWSER_NAVIGATION_TIMEOUT")
-
-
-class ActionOutcomeAmbiguous(BrowserAdapterError):
+class ActionOutcomeAmbiguous(_BrowserAdapterError):
     def __init__(self, *, intervention_recorded: bool) -> None:
         super().__init__("ACTION_OUTCOME_AMBIGUOUS")
         self.intervention_recorded = intervention_recorded
 
 
-class MediaUploadFailed(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("MEDIA_UPLOAD_FAILED")
-
-
-class UnsupportedUIState(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("UNSUPPORTED_UI_STATE")
-
-
-class BrowserProcessCrashed(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("BROWSER_PROCESS_CRASHED")
-
-
-class BrowserRuntimeUnavailable(BrowserAdapterError):
-    def __init__(self, code: str = "BROWSER_RUNTIME_UNAVAILABLE") -> None:
-        super().__init__(code)
-
-
-class BrowserNetworkRouteUnsupported(BrowserAdapterError):
-    def __init__(self) -> None:
-        super().__init__("BROWSER_NETWORK_ROUTE_UNSUPPORTED")
-
-
-class BrowserAccountAffinityMismatch(BrowserAdapterError):
+class BrowserAccountAffinityMismatch(_BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("BROWSER_ACCOUNT_AFFINITY_MISMATCH")
 
 
-class WorkerJobLeaseLost(BrowserAdapterError):
+class WorkerJobLeaseLost(_BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("WORKER_JOB_LEASE_LOST")
 
 
-class WorkerJobRetrySafetyViolation(BrowserAdapterError):
+class WorkerJobRetrySafetyViolation(_BrowserAdapterError):
     def __init__(self) -> None:
         super().__init__("WORKER_JOB_RETRY_SAFETY_MISMATCH")
 
@@ -132,86 +128,8 @@ class BrowserSurfaceState(StrEnum):
     CHALLENGE_REQUIRED = "CHALLENGE_REQUIRED"
 
 
-@dataclass(frozen=True, slots=True)
-class BrowserSurface:
-    contract_id: str | None
-    contract_version: str | None
-    session_state: str | None
-    required_root_present: bool
-
-
-@dataclass(frozen=True, slots=True)
-class FeedAncestorObservation:
-    """Bounded semantic evidence extracted from one permalink ancestor."""
-
-    hrefs: tuple[str, ...]
-    text_regions: tuple[str, ...]
-    links_truncated: bool = False
-    text_regions_truncated: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class FeedCandidateObservation:
-    """A post permalink and its nearest-first bounded ancestor evidence."""
-
-    permalink_href: str
-    ancestors: tuple[FeedAncestorObservation, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class BrowserLaunchRequest:
-    worker_id: UUID
-    account_id: UUID
-    profile_ref: str
-    profile_directory: Path
-    network_route: NetworkRoute
-    proxy_credentials: ProxyCredentials | None = field(default=None, repr=False)
-    headless: bool = False
-
-
-class BrowserEngineSession(Protocol):
-    async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None: ...
-
-    async def inspect_surface(self) -> BrowserSurface: ...
-
-    async def close(self) -> None: ...
-
-
-class BrowserFeedEngineSession(BrowserEngineSession, Protocol):
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]: ...
-
-    async def scroll_feed(self) -> None: ...
-
-
-class BrowserThreadOpenEngineSession(BrowserEngineSession, Protocol):
-    async def verify_thread_target(
-        self, *, target_ref: str, author_username: str, ancestor_bound: int
-    ) -> None: ...
-
-
-class BrowserProfileOpenEngineSession(BrowserEngineSession, Protocol):
-    async def verify_profile_target(self, *, target_ref: str, ancestor_bound: int) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedMediaComposer:
-    """Opaque, process-local handle for one verified composer dialog."""
-
-    token: UUID
-
-
-class BrowserMediaEngineSession(BrowserEngineSession, Protocol):
-    async def prepare_media_composer(self) -> PreparedMediaComposer | None: ...
-
-    async def stage_local_media(self, composer: PreparedMediaComposer, file_path: Path) -> None: ...
-
-    async def discard_media_composer(self, composer: PreparedMediaComposer) -> None: ...
-
-
-class BrowserEngine(Protocol):
-    async def open(self, request: BrowserLaunchRequest) -> BrowserEngineSession: ...
+class WorkerSurfaceEngineSession(Protocol):
+    async def inspect_surface(self) -> _BrowserSurface: ...
 
 
 class ManagedProfilePathResolver(Protocol):
@@ -237,22 +155,22 @@ class BrowserNavigationPolicy:
             or parsed.password is not None
             or parsed.fragment
         ):
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         origin = f"{parsed.scheme}://{parsed.netloc}".lower()
         if parsed.scheme == "https":
             if origin not in self.allowed_origins:
-                raise UnsupportedUIState()
+                raise _UnsupportedUIState()
             return
         try:
             is_loopback = ipaddress.ip_address(hostname).is_loopback
         except ValueError:
             is_loopback = hostname.lower() == "localhost"
         if not is_loopback:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         try:
             port = parsed.port
         except ValueError as error:
-            raise UnsupportedUIState() from error
+            raise _UnsupportedUIState() from error
         host_for_origin = hostname.lower()
         if ":" in host_for_origin:
             host_for_origin = f"[{host_for_origin}]"
@@ -260,28 +178,28 @@ class BrowserNavigationPolicy:
         if port is not None:
             origin = f"{origin}:{port}"
         if origin not in self.allowed_origins:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
 
 
-def classify_browser_surface(surface: BrowserSurface) -> BrowserSurfaceState:
+def classify_browser_surface(surface: _BrowserSurface) -> BrowserSurfaceState:
     if not surface.required_root_present:
-        raise LocatorNotFound()
+        raise _LocatorNotFound()
     if surface.contract_id is None or surface.contract_version is None:
-        raise BrowserContractError()
+        raise _BrowserContractError()
     if surface.contract_id != SUPPORTED_UI_CONTRACT_ID or surface.contract_version != str(
         SUPPORTED_UI_CONTRACT_VERSION
     ):
-        raise UnsupportedUIState()
+        raise _UnsupportedUIState()
     if surface.session_state is None:
-        raise LocatorNotFound()
+        raise _LocatorNotFound()
     try:
         state = BrowserSurfaceState(surface.session_state)
     except ValueError as error:
-        raise UnsupportedUIState() from error
+        raise _UnsupportedUIState() from error
     if state is BrowserSurfaceState.SESSION_EXPIRED:
-        raise SessionExpired()
+        raise _SessionExpired()
     if state is BrowserSurfaceState.CHALLENGE_REQUIRED:
-        raise ChallengeDetected()
+        raise _ChallengeDetected()
     return state
 
 
@@ -626,7 +544,7 @@ class WorkerBrowserSession:
         self,
         account_id: UUID,
         opened: BrowserSessionOpenResult,
-        engine_session: BrowserEngineSession,
+        engine_session: _BrowserEngineSession,
         transition: SessionTransition,
         close_session: SessionClose,
         job_execution: WorkerJobExecution | None,
@@ -652,16 +570,16 @@ class WorkerBrowserSession:
 
     async def navigate(self, url: str, policy: BrowserNavigationPolicy) -> None:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         policy.validate(url)
         if self._job_execution is not None:
             await self._job_execution.before_browser_action()
         try:
             await self._engine_session.navigate(url, allowed_origins=policy.allowed_origins)
-        except RemoteSessionStateUncertain:
+        except _RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
-        except BrowserProcessCrashed:
+        except _BrowserProcessCrashed:
             await self._set_state(BrowserSessionState.ERROR)
             if self._job_execution is not None:
                 if self._job_execution.mutation_may_have_started:
@@ -677,57 +595,57 @@ class WorkerBrowserSession:
 
     async def collect_feed_candidates(
         self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]:
+    ) -> tuple[_FeedCandidateObservation, ...]:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
         await self._job_execution.before_browser_action()
-        engine_session = cast(BrowserFeedEngineSession, self._engine_session)
+        engine_session = cast(_BrowserFeedEngineSession, self._engine_session)
         try:
             return await engine_session.collect_feed_candidates(ancestor_bound=ancestor_bound)
-        except SessionExpired:
+        except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
             )
             raise
-        except ChallengeDetected:
+        except _ChallengeDetected:
             await self._report_state_and_intervention(
                 BrowserSessionState.CHALLENGE_REQUIRED,
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
             raise
-        except RemoteSessionStateUncertain:
+        except _RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
     async def scroll_feed(self) -> None:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
         await self._job_execution.before_browser_action()
-        engine_session = cast(BrowserFeedEngineSession, self._engine_session)
+        engine_session = cast(_BrowserFeedEngineSession, self._engine_session)
         try:
             await engine_session.scroll_feed()
-        except SessionExpired:
+        except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
             )
             raise
-        except ChallengeDetected:
+        except _ChallengeDetected:
             await self._report_state_and_intervention(
                 BrowserSessionState.CHALLENGE_REQUIRED,
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
             raise
-        except RemoteSessionStateUncertain:
+        except _RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
@@ -735,109 +653,109 @@ class WorkerBrowserSession:
         self, *, target_ref: str, author_username: str, ancestor_bound: int
     ) -> None:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
         await self._job_execution.before_browser_action()
-        engine_session = cast(BrowserThreadOpenEngineSession, self._engine_session)
+        engine_session = cast(_BrowserThreadOpenEngineSession, self._engine_session)
         try:
             await engine_session.verify_thread_target(
                 target_ref=target_ref,
                 author_username=author_username,
                 ancestor_bound=ancestor_bound,
             )
-        except SessionExpired:
+        except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
             )
             raise
-        except ChallengeDetected:
+        except _ChallengeDetected:
             await self._report_state_and_intervention(
                 BrowserSessionState.CHALLENGE_REQUIRED,
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
             raise
-        except RemoteSessionStateUncertain:
+        except _RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
     async def verify_profile_target(self, *, target_ref: str, ancestor_bound: int) -> None:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
         await self._job_execution.before_browser_action()
-        engine_session = cast(BrowserProfileOpenEngineSession, self._engine_session)
+        engine_session = cast(_BrowserProfileOpenEngineSession, self._engine_session)
         try:
             await engine_session.verify_profile_target(
                 target_ref=target_ref,
                 ancestor_bound=ancestor_bound,
             )
-        except SessionExpired:
+        except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
             )
             raise
-        except ChallengeDetected:
+        except _ChallengeDetected:
             await self._report_state_and_intervention(
                 BrowserSessionState.CHALLENGE_REQUIRED,
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
             raise
-        except RemoteSessionStateUncertain:
+        except _RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
-    async def prepare_media_composer(self) -> PreparedMediaComposer | None:
+    async def prepare_media_composer(self) -> _PreparedMediaComposer | None:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
         await self._job_execution.before_browser_action()
-        engine_session = cast(BrowserMediaEngineSession, self._engine_session)
+        engine_session = cast(_BrowserMediaEngineSession, self._engine_session)
         try:
             return await engine_session.prepare_media_composer()
-        except SessionExpired:
+        except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
             )
             raise
-        except ChallengeDetected:
+        except _ChallengeDetected:
             await self._report_state_and_intervention(
                 BrowserSessionState.CHALLENGE_REQUIRED,
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
             raise
-        except RemoteSessionStateUncertain:
+        except _RemoteSessionStateUncertain:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
-    async def stage_local_media(self, composer: PreparedMediaComposer, file_path: Path) -> None:
+    async def stage_local_media(self, composer: _PreparedMediaComposer, file_path: Path) -> None:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
-            raise UnsupportedUIState()
+            raise _UnsupportedUIState()
         if self._job_execution is None or self._job_execution.account_id != self._account_id:
             raise BrowserAccountAffinityMismatch()
-        engine_session = cast(BrowserMediaEngineSession, self._engine_session)
+        engine_session = cast(_BrowserMediaEngineSession, self._engine_session)
         await engine_session.stage_local_media(composer, file_path)
 
-    async def discard_media_composer(self, composer: PreparedMediaComposer) -> None:
-        engine_session = cast(BrowserMediaEngineSession, self._engine_session)
+    async def discard_media_composer(self, composer: _PreparedMediaComposer) -> None:
+        engine_session = cast(_BrowserMediaEngineSession, self._engine_session)
         await engine_session.discard_media_composer(composer)
 
     async def inspect_contract(self) -> BrowserSurfaceState:
         if self._closed:
-            raise BrowserProcessCrashed()
+            raise _BrowserProcessCrashed()
         if self._session_state in {
             BrowserSessionState.LOGIN_REQUIRED,
             BrowserSessionState.SESSION_EXPIRED,
@@ -846,22 +764,23 @@ class WorkerBrowserSession:
         }:
             await self._set_state(BrowserSessionState.STARTING)
         try:
-            state = classify_browser_surface(await self._engine_session.inspect_surface())
-        except SessionExpired:
+            engine_session = cast(WorkerSurfaceEngineSession, self._engine_session)
+            state = classify_browser_surface(await engine_session.inspect_surface())
+        except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED,
                 "SESSION_EXPIRED",
                 "SESSION_EXPIRED",
             )
             raise
-        except ChallengeDetected:
+        except _ChallengeDetected:
             await self._report_state_and_intervention(
                 BrowserSessionState.CHALLENGE_REQUIRED,
                 "CHALLENGE_REQUIRED",
                 "CHALLENGE_REQUIRED",
             )
             raise
-        except BrowserProcessCrashed:
+        except _BrowserProcessCrashed:
             await self._set_state(BrowserSessionState.ERROR)
             if self._job_execution is not None:
                 if self._job_execution.mutation_may_have_started:
@@ -874,7 +793,7 @@ class WorkerBrowserSession:
                     retryable=True,
                 )
             raise
-        except BrowserAdapterError as error:
+        except _BrowserAdapterError as error:
             await self._set_state(BrowserSessionState.ERROR)
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", error.code)
             raise
@@ -896,7 +815,7 @@ class WorkerBrowserSession:
         self._closed = True
         try:
             await self._engine_session.close()
-        except BrowserAdapterError:
+        except _BrowserAdapterError:
             try:
                 await self._set_state(BrowserSessionState.ERROR)
             finally:
@@ -935,7 +854,7 @@ class PlaywrightBrowserAdapter:
         self,
         worker_id: UUID,
         profile_resolver: ManagedProfilePathResolver,
-        engine: BrowserEngine,
+        engine: _BrowserEngine,
         *,
         credential_provider: ProxyCredentialProvider | None = None,
     ) -> None:
@@ -996,22 +915,19 @@ class PlaywrightBrowserAdapter:
                 context.worker_id, context.account_id, context.profile_ref
             )
             route = opened.network_route
-            credentials: ProxyCredentials | None = None
+            credentials: _BrowserProxyCredentials | None = None
             if route.credential_ref is not None:
                 if self._credential_provider is None:
-                    raise BrowserNetworkRouteUnsupported()
+                    raise _BrowserNetworkRouteUnsupported()
                 credentials = await self._credential_provider.credentials_for(route.credential_ref)
-            request = BrowserLaunchRequest(
-                worker_id=context.worker_id,
-                account_id=context.account_id,
-                profile_ref=context.profile_ref,
+            request = _BrowserLaunchRequest(
                 profile_directory=profile_directory,
-                network_route=route,
+                network_route=route.browser_route,
                 proxy_credentials=credentials,
                 headless=headless,
             )
             engine_session = await self._engine.open(request)
-        except BrowserAdapterError:
+        except _BrowserAdapterError:
             await self._release_failed_reservation(
                 reservation_account_id, transition, close_session
             )
@@ -1020,7 +936,7 @@ class PlaywrightBrowserAdapter:
             await self._release_failed_reservation(
                 reservation_account_id, transition, close_session
             )
-            raise BrowserRuntimeUnavailable("BROWSER_START_FAILED") from None
+            raise _BrowserRuntimeUnavailable("BROWSER_START_FAILED") from None
         browser_session = WorkerBrowserSession(
             context.account_id,
             opened,
@@ -1083,7 +999,7 @@ class ManagedPlaywrightBrowserSessionManager:
         try:
             if browser_session is not None:
                 await browser_session.close_engine_only()
-        except BrowserAdapterError:
+        except _BrowserAdapterError:
             pass
         return await self._session_manager.close(account_id)
 
