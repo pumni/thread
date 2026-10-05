@@ -46,6 +46,16 @@ pub(super) struct SupervisorSnapshot {
     pub worker_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct WorkerRuntimeObservation {
+    pub runtime_installed: bool,
+    pub startup_cleanup_pending: bool,
+    pub process_alive: Option<bool>,
+    pub job_process_count: Option<u32>,
+    pub process_exit_proven: bool,
+    pub server_online_verified: bool,
+}
+
 impl SupervisorSnapshot {
     pub fn not_applicable() -> Self {
         Self {
@@ -111,6 +121,11 @@ struct WorkerRuntime {
     _identity_guard: worker_host::IdentityFileGuard,
 }
 
+pub(super) struct WorkerCutoverContext {
+    pub helper: PathBuf,
+    pub binding: WorkerHostBinding,
+}
+
 pub(super) struct Supervisor {
     lifecycle: Lifecycle,
     worker_runtime: Option<WorkerRuntime>,
@@ -119,6 +134,8 @@ pub(super) struct Supervisor {
     worker_ownership: Option<WorkerOwnership>,
     legacy_task_state: Option<LegacyTaskState>,
     worker_binding: Option<WorkerHostBinding>,
+    worker_online_verified: bool,
+    worker_process_exit_proven: bool,
     controller: Option<ControllerRuntime>,
     data_root: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
@@ -135,6 +152,8 @@ impl Default for Supervisor {
             worker_ownership: None,
             legacy_task_state: None,
             worker_binding: None,
+            worker_online_verified: false,
+            worker_process_exit_proven: false,
             controller: None,
             data_root: None,
             runtime_root: None,
@@ -170,15 +189,41 @@ impl Supervisor {
             self.worker_startup_cleanup = None;
         }
 
-        if let Some(runtime) = &mut self.worker_runtime {
-            match runtime.child.try_wait() {
-                Ok(Some(_)) | Err(_) => {
-                    self.worker_runtime = None;
+        if self.worker_runtime.is_some() {
+            let process_state = self
+                .worker_runtime
+                .as_mut()
+                .expect("Worker runtime was checked")
+                .child
+                .try_wait();
+            match process_state {
+                Ok(Some(_)) => {
+                    let runtime = self
+                        .worker_runtime
+                        .as_mut()
+                        .expect("Worker runtime remains installed");
+                    let no_job_processes = runtime
+                        ._job
+                        .active_processes()
+                        .is_ok_and(|count| count == 0);
+                    let lock_released = self.worker_binding.as_ref().is_some_and(|binding| {
+                        worker_host::observe_process_lock(&binding.data_root)
+                            == ProcessLockObservation::NotHeld
+                    });
+                    if no_job_processes && lock_released && runtime._job.close_when_empty().is_ok()
+                    {
+                        self.worker_runtime = None;
+                        self.worker_process_exit_proven = true;
+                        self.worker_online_verified = false;
+                    }
                     self.lifecycle = Lifecycle::Degraded;
-                    self.worker_ownership = Some(WorkerOwnership::Blocked);
                     self.diagnostic_code = Some("worker_process_exited");
                 }
                 Ok(None) => {}
+                Err(_) => {
+                    self.lifecycle = Lifecycle::Degraded;
+                    self.diagnostic_code = Some("worker_process_exited");
+                }
             }
         }
 
@@ -373,9 +418,32 @@ impl Supervisor {
     }
 
     fn start_worker(&mut self) -> Result<(), String> {
+        self.start_worker_with_expected(None)
+    }
+
+    pub(super) fn start_worker_after_legacy_cutover(
+        &mut self,
+        expected_binding: &WorkerHostBinding,
+    ) -> Result<(), String> {
+        if self.worker_runtime.is_some() {
+            return Err(self.fail_worker("worker_process_lock_held"));
+        }
+        if self.worker_startup_cleanup.is_some() {
+            return Err(self.fail_worker("worker_startup_cleanup_failed"));
+        }
+        self.lifecycle = Lifecycle::Starting;
+        self.start_worker_with_expected(Some(expected_binding))
+    }
+
+    fn start_worker_with_expected(
+        &mut self,
+        expected_binding: Option<&WorkerHostBinding>,
+    ) -> Result<(), String> {
         self.legacy_task_state = None;
         self.worker_binding = None;
         self.worker_ownership = Some(WorkerOwnership::Blocked);
+        self.worker_online_verified = false;
+        self.worker_process_exit_proven = false;
         let Some(helper) = self.worker_task_helper.clone() else {
             return Err(self.fail_worker("worker_host_configuration_required"));
         };
@@ -419,6 +487,11 @@ impl Supervisor {
             Ok(binding) => binding,
             Err(code) => return Err(self.fail_worker(code)),
         };
+        if let Some(expected) = expected_binding {
+            if let Err(code) = worker_host::binding_match_failure(expected, &binding) {
+                return Err(self.fail_worker(code));
+            }
+        }
         self.worker_binding = Some(binding.clone());
         if let Some(code) = decision.diagnostic_code {
             self.lifecycle = Lifecycle::Degraded;
@@ -478,7 +551,7 @@ impl Supervisor {
                         || Instant::now() >= deadline,
                         thread::sleep,
                     )?;
-                    if !worker_host::binding_identity_unchanged(&binding) {
+                    if !worker_host::binding_unchanged(&binding) {
                         return Err("worker_identity_corrupt");
                     }
                     Ok(())
@@ -491,6 +564,8 @@ impl Supervisor {
     fn mark_worker_owned_unverified(&mut self) {
         self.worker_ownership = Some(WorkerOwnership::Desktop);
         self.lifecycle = Lifecycle::Starting;
+        self.worker_online_verified = false;
+        self.worker_process_exit_proven = false;
         self.diagnostic_code = None;
     }
 
@@ -549,6 +624,201 @@ impl Supervisor {
             .as_ref()
             .map(|binding| binding.worker_id.clone())
             .ok_or_else(|| "worker_host_configuration_required".to_string())
+    }
+
+    pub(super) fn worker_cutover_context(&self) -> Result<WorkerCutoverContext, String> {
+        if self.worker_runtime.is_some() {
+            return Err("worker_cutover_rollback_required".to_string());
+        }
+        if self.worker_startup_cleanup.is_some() {
+            return Err("worker_startup_cleanup_failed".to_string());
+        }
+        let helper = self
+            .worker_task_helper
+            .clone()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        let binding = self
+            .worker_binding
+            .clone()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        Ok(WorkerCutoverContext { helper, binding })
+    }
+
+    pub(super) fn worker_rollback_context(&mut self) -> Result<WorkerCutoverContext, String> {
+        let local = self.worker_runtime_observation();
+        if !local.runtime_installed
+            || local.startup_cleanup_pending
+            || local.process_alive != Some(true)
+            || !local.job_process_count.is_some_and(|count| count > 0)
+            || self.legacy_task_state != Some(LegacyTaskState::Disabled)
+        {
+            return Err("worker_cutover_rollback_required".to_string());
+        }
+        let helper = self
+            .worker_task_helper
+            .clone()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        let binding = self
+            .worker_binding
+            .clone()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        if worker_host::observe_process_lock(&binding.data_root) != ProcessLockObservation::Held {
+            return Err("worker_process_lock_not_acquired".to_string());
+        }
+        Ok(WorkerCutoverContext { helper, binding })
+    }
+
+    pub(super) fn worker_runtime_observation(&mut self) -> WorkerRuntimeObservation {
+        self.refresh_health();
+        let (process_alive, job_process_count) = self
+            .worker_runtime
+            .as_mut()
+            .map(|runtime| {
+                (
+                    runtime.child.try_wait().ok().map(|status| status.is_none()),
+                    runtime._job.active_processes().ok(),
+                )
+            })
+            .unwrap_or((None, Some(0)));
+        WorkerRuntimeObservation {
+            runtime_installed: self.worker_runtime.is_some(),
+            startup_cleanup_pending: self.worker_startup_cleanup.is_some(),
+            process_alive,
+            job_process_count,
+            process_exit_proven: self.worker_process_exit_proven,
+            server_online_verified: self.worker_online_verified,
+        }
+    }
+
+    pub(super) fn set_legacy_task_state(&mut self, state: LegacyTaskState) {
+        self.legacy_task_state = Some(state);
+    }
+
+    pub(super) fn mark_worker_server_online(&mut self, worker_id: &str) -> Result<(), String> {
+        let binding = self
+            .worker_binding
+            .as_ref()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        if binding.worker_id != worker_id {
+            return Err("worker_identity_corrupt".to_string());
+        }
+        let runtime = self
+            .worker_runtime
+            .as_mut()
+            .ok_or_else(|| "worker_process_exited".to_string())?;
+        if runtime
+            .child
+            .try_wait()
+            .map_err(|_| "worker_process_exited".to_string())?
+            .is_some()
+        {
+            return Err("worker_process_exited".to_string());
+        }
+        if runtime
+            ._job
+            .active_processes()
+            .map_err(|_| "worker_process_job_assign_failed".to_string())?
+            == 0
+        {
+            return Err("worker_process_job_assign_failed".to_string());
+        }
+        if worker_host::observe_process_lock(&binding.data_root) != ProcessLockObservation::Held {
+            return Err("worker_process_lock_not_acquired".to_string());
+        }
+        if self.legacy_task_state != Some(LegacyTaskState::Disabled) {
+            return Err("worker_legacy_task_invalid".to_string());
+        }
+        self.worker_online_verified = true;
+        self.lifecycle = Lifecycle::Running;
+        self.worker_ownership = Some(WorkerOwnership::Desktop);
+        self.diagnostic_code = None;
+        Ok(())
+    }
+
+    pub(super) fn mark_legacy_worker_active(&mut self, binding: WorkerHostBinding) {
+        self.worker_binding = Some(binding);
+        self.worker_runtime = None;
+        self.worker_startup_cleanup = None;
+        self.worker_online_verified = false;
+        self.worker_process_exit_proven = false;
+        self.legacy_task_state = Some(LegacyTaskState::Running);
+        self.worker_ownership = Some(WorkerOwnership::Legacy);
+        self.lifecycle = Lifecycle::Running;
+        self.diagnostic_code = None;
+    }
+
+    pub(super) fn mark_legacy_worker_ready(
+        &mut self,
+        binding: WorkerHostBinding,
+        diagnostic_code: &'static str,
+    ) {
+        self.worker_binding = Some(binding);
+        self.worker_runtime = None;
+        self.worker_startup_cleanup = None;
+        self.worker_online_verified = false;
+        self.worker_process_exit_proven = false;
+        self.legacy_task_state = Some(LegacyTaskState::Ready);
+        self.worker_ownership = Some(WorkerOwnership::TakeoverRequired);
+        self.lifecycle = Lifecycle::Degraded;
+        self.diagnostic_code = Some(diagnostic_code);
+    }
+
+    pub(super) fn mark_worker_cutover_intervention(&mut self, diagnostic_code: &'static str) {
+        self.lifecycle = Lifecycle::Degraded;
+        self.diagnostic_code = Some(diagnostic_code);
+        if self.worker_runtime.is_none() && self.worker_startup_cleanup.is_none() {
+            self.worker_ownership = Some(match self.legacy_task_state {
+                Some(LegacyTaskState::Running) => WorkerOwnership::Legacy,
+                Some(LegacyTaskState::Ready) => WorkerOwnership::TakeoverRequired,
+                Some(
+                    LegacyTaskState::Disabled
+                    | LegacyTaskState::Invalid
+                    | LegacyTaskState::NotRegistered,
+                )
+                | None => WorkerOwnership::Blocked,
+            });
+        }
+    }
+
+    pub(super) fn reap_worker_after_natural_exit(&mut self) -> Result<(), String> {
+        if self.worker_startup_cleanup.is_some() {
+            return Err("worker_startup_cleanup_failed".to_string());
+        }
+        if let Some(runtime) = self.worker_runtime.as_mut() {
+            if runtime
+                .child
+                .try_wait()
+                .map_err(|_| "worker_process_exit_timeout".to_string())?
+                .is_none()
+            {
+                return Err("worker_process_exit_timeout".to_string());
+            }
+            if runtime
+                ._job
+                .active_processes()
+                .map_err(|_| "worker_process_exit_timeout".to_string())?
+                != 0
+            {
+                return Err("worker_process_exit_timeout".to_string());
+            }
+            let lock_released = self.worker_binding.as_ref().is_some_and(|binding| {
+                worker_host::observe_process_lock(&binding.data_root)
+                    == ProcessLockObservation::NotHeld
+            });
+            if !lock_released {
+                return Err("worker_process_exit_timeout".to_string());
+            }
+            runtime
+                ._job
+                .close_when_empty()
+                .map_err(|_| "worker_process_exit_timeout".to_string())?;
+            self.worker_runtime = None;
+            self.worker_process_exit_proven = true;
+            self.worker_online_verified = false;
+        } else if !self.worker_process_exit_proven {
+            return Err("worker_process_exit_timeout".to_string());
+        }
+        Ok(())
     }
 
     fn fail(&mut self, code: &'static str) -> String {
@@ -1587,6 +1857,39 @@ impl ProcessJob {
         self.0 = std::ptr::null_mut();
         Ok(())
     }
+
+    fn active_processes(&self) -> Result<u32, ()> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        if self.0.is_null() {
+            return Ok(0);
+        }
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let success = unsafe {
+            QueryInformationJobObject(
+                self.0,
+                JobObjectBasicAccountingInformation,
+                &mut accounting as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if success == 0 {
+            Err(())
+        } else {
+            Ok(accounting.ActiveProcesses)
+        }
+    }
+
+    fn close_when_empty(&mut self) -> Result<(), ()> {
+        if self.active_processes()? != 0 {
+            return Err(());
+        }
+        self.close()
+    }
 }
 
 #[cfg(windows)]
@@ -1683,6 +1986,14 @@ impl ProcessJob {
 
     fn close(&mut self) -> Result<(), ()> {
         Ok(())
+    }
+
+    fn active_processes(&self) -> Result<u32, ()> {
+        Ok(0)
+    }
+
+    fn close_when_empty(&mut self) -> Result<(), ()> {
+        self.close()
     }
 }
 
@@ -1972,6 +2283,20 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn spawn_fast_exiting_worker_process() -> Child {
+        use std::os::windows::process::CommandExt;
+
+        Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x08000000 | 0x00000004)
+            .spawn()
+            .expect("spawn naturally exiting Worker process fixture")
+    }
+
+    #[cfg(windows)]
     fn worker_test_identity_guard() -> (
         tempfile::TempDir,
         WorkerHostBinding,
@@ -1998,6 +2323,7 @@ mod tests {
             worker_id: worker_id.to_string(),
             identity_marker_sha256: format!("{:x}", Sha256::digest(&marker)),
             protected_key_sha256: format!("{:x}", Sha256::digest(protected_key)),
+            host_config_sha256: "c".repeat(64),
         };
         let guard = worker_host::guard_identity_files(&binding).expect("guard identity files");
         (directory, binding, guard)
@@ -2445,6 +2771,63 @@ mod tests {
             supervisor.snapshot().diagnostic_code,
             Some("worker_drain_unavailable")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn natural_worker_reap_closes_the_job_only_after_all_processes_exit() {
+        let mut child = spawn_fast_exiting_worker_process();
+        let job = ProcessJob::new_worker().expect("create Worker Job Object");
+        assign_and_resume_worker(&job, &mut child).expect("assign and resume Worker");
+        let process_observer = WorkerProcessExitObserver::open(child.id());
+        let (identity_directory, binding, identity_guard) = worker_test_identity_guard();
+        let mut supervisor = Supervisor {
+            worker_binding: Some(binding),
+            worker_runtime: Some(WorkerRuntime {
+                child,
+                _job: job,
+                _identity_guard: identity_guard,
+            }),
+            ..Supervisor::default()
+        };
+
+        wait_for_worker_exit(
+            &mut supervisor
+                .worker_runtime
+                .as_mut()
+                .expect("Worker runtime remains installed")
+                .child,
+            Duration::from_secs(5),
+        )
+        .expect("Worker exits naturally");
+        assert!(process_observer.has_exited());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor
+            .worker_runtime
+            .as_ref()
+            .expect("job remains owned until reaped")
+            ._job
+            .active_processes()
+            .is_ok_and(|count| count != 0)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            supervisor
+                .worker_runtime
+                .as_ref()
+                .expect("job remains owned until reaped")
+                ._job
+                .active_processes(),
+            Ok(0)
+        );
+        supervisor
+            .reap_worker_after_natural_exit()
+            .expect("close an empty Job Object without terminating processes");
+        assert!(supervisor.worker_runtime.is_none());
+        assert!(supervisor.worker_process_exit_proven);
+        drop(identity_directory);
     }
 
     #[cfg(windows)]

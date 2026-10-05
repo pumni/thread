@@ -93,6 +93,8 @@ describe("desktop provisioning", () => {
       "operator_create_user",
       "operator_update_user",
       "operator_change_password",
+      "takeover_local_worker",
+      "rollback_local_worker_to_legacy",
       "request_local_worker_drain",
       "local_worker_drain_status",
       "controller_https_configure",

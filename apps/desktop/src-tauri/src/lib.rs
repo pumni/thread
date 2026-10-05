@@ -5,13 +5,17 @@ mod operator_client;
 mod startup_gate;
 mod supervisor;
 mod windows_crypto;
+mod worker_cutover;
 mod worker_host;
 
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[cfg(windows)]
@@ -31,6 +35,7 @@ use zeroize::Zeroizing;
 use operator_client::{
     CreatedOperatorUser, OperatorAuthState, OperatorIdentity, OperatorUser, WorkerDrainStatus,
 };
+use worker_cutover::{CutoverFuture, DurableDrainOfflineProof, WorkerCutoverBackend};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
@@ -266,9 +271,19 @@ struct DeviceStateInner {
     supervisor: Supervisor,
 }
 
+#[derive(Clone)]
 struct DeviceState {
     config_path: PathBuf,
-    inner: Mutex<DeviceStateInner>,
+    inner: Arc<Mutex<DeviceStateInner>>,
+    worker_operation_active: Arc<AtomicBool>,
+}
+
+struct WorkerOperationGuard(Arc<AtomicBool>);
+
+impl Drop for WorkerOperationGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl DeviceState {
@@ -299,7 +314,8 @@ impl DeviceState {
 
         Ok(Self {
             config_path,
-            inner: Mutex::new(DeviceStateInner { config, supervisor }),
+            inner: Arc::new(Mutex::new(DeviceStateInner { config, supervisor })),
+            worker_operation_active: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -310,6 +326,33 @@ impl DeviceState {
             .map_err(|_| "state_unavailable".to_string())?;
         inner.supervisor.refresh_health();
         Ok(DesktopSnapshot::from(&*inner))
+    }
+
+    fn begin_worker_operation(&self) -> Result<WorkerOperationGuard, String> {
+        self.worker_operation_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "worker_cutover_operation_in_progress".to_string())?;
+        Ok(WorkerOperationGuard(Arc::clone(
+            &self.worker_operation_active,
+        )))
+    }
+
+    fn worker_cutover_context(
+        &self,
+        rollback: bool,
+    ) -> Result<supervisor::WorkerCutoverContext, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Worker) {
+            return Err("worker_host_configuration_required".to_string());
+        }
+        if rollback {
+            inner.supervisor.worker_rollback_context()
+        } else {
+            inner.supervisor.worker_cutover_context()
+        }
     }
 
     fn provision(&self, role: ProvisionedRole) -> Result<DesktopSnapshot, String> {
@@ -525,6 +568,217 @@ impl DeviceState {
             return Err("restart_not_available_for_console".to_string());
         }
         inner.supervisor.restart(role)
+    }
+}
+
+struct DeviceWorkerCutover<'a> {
+    device: DeviceState,
+    operator: &'a OperatorAuthState,
+    helper: PathBuf,
+    binding: worker_host::WorkerHostBinding,
+}
+
+impl DeviceWorkerCutover<'_> {
+    fn spawn_blocking<T: Send + 'static>(
+        task: impl FnOnce() -> Result<T, String> + Send + 'static,
+        failure: &'static str,
+    ) -> CutoverFuture<'static, Result<T, String>> {
+        Box::pin(async move {
+            tauri::async_runtime::spawn_blocking(task)
+                .await
+                .map_err(|_| failure.to_string())?
+        })
+    }
+}
+
+impl WorkerCutoverBackend for DeviceWorkerCutover<'_> {
+    fn binding(&self) -> &worker_host::WorkerHostBinding {
+        &self.binding
+    }
+
+    fn inspect_task<'a>(
+        &'a mut self,
+    ) -> CutoverFuture<'a, Result<worker_host::LegacyTaskState, String>> {
+        let helper = self.helper.clone();
+        let binding = self.binding.clone();
+        let device = self.device.clone();
+        Box::pin(async move {
+            let state = Self::spawn_blocking(
+                move || {
+                    worker_host::inspect_matching_task(&helper, &binding)
+                        .map(|inspection| inspection.state)
+                        .map_err(str::to_string)
+                },
+                "worker_legacy_task_invalid",
+            )
+            .await?;
+            let mut inner = device
+                .inner
+                .lock()
+                .map_err(|_| "state_unavailable".to_string())?;
+            inner.supervisor.set_legacy_task_state(state);
+            Ok(state)
+        })
+    }
+
+    fn process_lock_observation(&mut self) -> worker_host::ProcessLockObservation {
+        worker_host::observe_process_lock(&self.binding.data_root)
+    }
+
+    fn task_operation<'a>(
+        &'a mut self,
+        operation: worker_host::TaskOperation,
+        expected_state: worker_host::LegacyTaskState,
+        offline_exit_proof: Option<DurableDrainOfflineProof>,
+    ) -> CutoverFuture<'a, Result<worker_host::LegacyTaskState, String>> {
+        let helper = self.helper.clone();
+        let binding = self.binding.clone();
+        let device = self.device.clone();
+        Box::pin(async move {
+            let state = tauri::async_runtime::spawn_blocking(move || {
+                let confirmed = if operation == worker_host::TaskOperation::Disable {
+                    offline_exit_proof.is_some_and(|proof| proof.matches(&binding))
+                } else {
+                    offline_exit_proof.is_none()
+                };
+                worker_host::run_task_operation(
+                    &helper,
+                    &binding,
+                    expected_state,
+                    operation,
+                    confirmed,
+                )
+                .map(|inspection| inspection.state)
+                .map_err(str::to_string)
+            })
+            .await
+            .map_err(|_| operation.failure_code().to_string())??;
+            let mut inner = device
+                .inner
+                .lock()
+                .map_err(|_| "state_unavailable".to_string())?;
+            inner.supervisor.set_legacy_task_state(state);
+            Ok(state)
+        })
+    }
+
+    fn worker_status<'a>(&'a mut self) -> CutoverFuture<'a, Result<WorkerDrainStatus, String>> {
+        let operator = self.operator;
+        let worker_id = self.binding.worker_id.clone();
+        Box::pin(async move { operator.local_worker_drain_status(&worker_id).await })
+    }
+
+    fn request_drain<'a>(
+        &'a mut self,
+        reason_code: &'static str,
+    ) -> CutoverFuture<'a, Result<WorkerDrainStatus, String>> {
+        let operator = self.operator;
+        let worker_id = self.binding.worker_id.clone();
+        Box::pin(async move {
+            operator
+                .request_local_worker_drain(&worker_id, reason_code)
+                .await
+        })
+    }
+
+    fn local_runtime<'a>(
+        &'a mut self,
+    ) -> CutoverFuture<'a, Result<supervisor::WorkerRuntimeObservation, String>> {
+        let device = self.device.clone();
+        Self::spawn_blocking(
+            move || {
+                let mut inner = device
+                    .inner
+                    .lock()
+                    .map_err(|_| "state_unavailable".to_string())?;
+                Ok(inner.supervisor.worker_runtime_observation())
+            },
+            "state_unavailable",
+        )
+    }
+
+    fn start_desktop_worker<'a>(&'a mut self) -> CutoverFuture<'a, Result<(), String>> {
+        let device = self.device.clone();
+        let binding = self.binding.clone();
+        Self::spawn_blocking(
+            move || {
+                let mut inner = device
+                    .inner
+                    .lock()
+                    .map_err(|_| "state_unavailable".to_string())?;
+                if inner.config.role != Some(ProvisionedRole::Worker) {
+                    return Err("worker_host_configuration_required".to_string());
+                }
+                inner.supervisor.start_worker_after_legacy_cutover(&binding)
+            },
+            "worker_process_start_failed",
+        )
+    }
+
+    fn reap_desktop_after_natural_exit<'a>(&'a mut self) -> CutoverFuture<'a, Result<(), String>> {
+        let device = self.device.clone();
+        Self::spawn_blocking(
+            move || {
+                let mut inner = device
+                    .inner
+                    .lock()
+                    .map_err(|_| "state_unavailable".to_string())?;
+                inner.supervisor.reap_worker_after_natural_exit()
+            },
+            "worker_process_exit_timeout",
+        )
+    }
+
+    fn mark_desktop_online(&mut self) -> Result<(), String> {
+        let mut inner = self
+            .device
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        inner
+            .supervisor
+            .mark_worker_server_online(&self.binding.worker_id)
+    }
+
+    fn mark_legacy_active(&mut self) -> Result<(), String> {
+        let mut inner = self
+            .device
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        inner
+            .supervisor
+            .mark_legacy_worker_active(self.binding.clone());
+        Ok(())
+    }
+
+    fn mark_legacy_ready(&mut self, diagnostic: &'static str) -> Result<(), String> {
+        let mut inner = self
+            .device
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        inner
+            .supervisor
+            .mark_legacy_worker_ready(self.binding.clone(), diagnostic);
+        Ok(())
+    }
+
+    fn mark_intervention(&mut self, diagnostic: &'static str) {
+        if let Ok(mut inner) = self.device.inner.lock() {
+            inner
+                .supervisor
+                .mark_worker_cutover_intervention(diagnostic);
+        }
+    }
+
+    fn pause<'a>(&'a mut self) -> CutoverFuture<'a, ()> {
+        Box::pin(async {
+            let _ = tauri::async_runtime::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            })
+            .await;
+        })
     }
 }
 
@@ -806,6 +1060,40 @@ async fn operator_change_password(
 }
 
 #[tauri::command]
+async fn takeover_local_worker(
+    device: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+) -> Result<(), String> {
+    operator.authorize_node_lifecycle(false).await?;
+    let _operation = device.begin_worker_operation()?;
+    let context = device.worker_cutover_context(false)?;
+    let mut backend = DeviceWorkerCutover {
+        device: device.inner().clone(),
+        operator: operator.inner(),
+        helper: context.helper,
+        binding: context.binding,
+    };
+    worker_cutover::takeover(&mut backend).await
+}
+
+#[tauri::command]
+async fn rollback_local_worker_to_legacy(
+    device: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+) -> Result<(), String> {
+    operator.authorize_node_lifecycle(false).await?;
+    let _operation = device.begin_worker_operation()?;
+    let context = device.worker_cutover_context(true)?;
+    let mut backend = DeviceWorkerCutover {
+        device: device.inner().clone(),
+        operator: operator.inner(),
+        helper: context.helper,
+        binding: context.binding,
+    };
+    worker_cutover::rollback_to_legacy(&mut backend).await
+}
+
+#[tauri::command]
 async fn request_local_worker_drain(
     device: State<'_, DeviceState>,
     operator: State<'_, OperatorAuthState>,
@@ -929,6 +1217,8 @@ pub fn run() {
             operator_create_user,
             operator_update_user,
             operator_change_password,
+            takeover_local_worker,
+            rollback_local_worker_to_legacy,
             request_local_worker_drain,
             local_worker_drain_status
         ])
@@ -1006,6 +1296,27 @@ mod tests {
             worker_task_helper_from_resolution(Some(helper.clone())),
             Some(helper),
         );
+    }
+
+    #[test]
+    fn worker_cutover_and_rollback_share_a_native_single_flight_guard() {
+        let directory = tempfile::tempdir().expect("temporary device directory");
+        let device = DeviceState::load(
+            directory.path().join("device-config.json"),
+            directory.path().join("Controller"),
+            directory.path().join("runtime"),
+        )
+        .expect("load device state");
+
+        let first = device
+            .begin_worker_operation()
+            .expect("first worker lifecycle operation acquires guard");
+        assert!(matches!(
+            device.begin_worker_operation(),
+            Err(error) if error == "worker_cutover_operation_in_progress"
+        ));
+        drop(first);
+        assert!(device.begin_worker_operation().is_ok());
     }
 
     #[test]

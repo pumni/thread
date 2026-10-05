@@ -126,6 +126,8 @@ export const DESKTOP_COMMANDS = [
   "operator_create_user",
   "operator_update_user",
   "operator_change_password",
+  "takeover_local_worker",
+  "rollback_local_worker_to_legacy",
   "request_local_worker_drain",
   "local_worker_drain_status",
   "controller_https_configure",
@@ -208,6 +210,14 @@ export function operatorUpdateUser(
 
 export function operatorChangePassword(newPassword: string): Promise<OperatorIdentity> {
   return invoke<OperatorIdentity>("operator_change_password", { newPassword });
+}
+
+export function takeoverLocalWorker(): Promise<void> {
+  return invoke<void>("takeover_local_worker");
+}
+
+export function rollbackLocalWorkerToLegacy(): Promise<void> {
+  return invoke<void>("rollback_local_worker_to_legacy");
 }
 
 export function requestLocalWorkerDrain(reasonCode: WorkerDrainReason): Promise<WorkerDrainStatus> {

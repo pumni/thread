@@ -69,6 +69,7 @@ pub(super) struct TaskInspection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkerOwnership {
+    Legacy,
     TakeoverRequired,
     Desktop,
     Blocked,
@@ -84,6 +85,7 @@ pub(super) enum ProcessLockObservation {
 impl WorkerOwnership {
     pub(super) fn map_label(self) -> &'static str {
         match self {
+            Self::Legacy => "LEGACY",
             Self::TakeoverRequired => "TAKEOVER_REQUIRED",
             Self::Desktop => "DESKTOP",
             Self::Blocked => "BLOCKED",
@@ -105,6 +107,46 @@ pub(super) struct WorkerHostBinding {
     pub worker_id: String,
     pub identity_marker_sha256: String,
     pub protected_key_sha256: String,
+    pub host_config_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TaskOperation {
+    Disable,
+    Enable,
+    Start,
+}
+
+impl TaskOperation {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Disable => "Disable",
+            Self::Enable => "Enable",
+            Self::Start => "Start",
+        }
+    }
+
+    pub(super) fn expected_state(self) -> LegacyTaskState {
+        match self {
+            Self::Disable => LegacyTaskState::Disabled,
+            Self::Enable => LegacyTaskState::Ready,
+            Self::Start => LegacyTaskState::Running,
+        }
+    }
+
+    pub(super) fn failure_code(self) -> &'static str {
+        match self {
+            Self::Disable => "worker_legacy_task_disable_failed",
+            Self::Enable => "worker_legacy_task_enable_failed",
+            Self::Start => "worker_legacy_task_start_failed",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskOperationOutput {
+    result: String,
 }
 
 pub(super) struct IdentityFileGuard {
@@ -148,7 +190,7 @@ pub(super) fn inspect_legacy_task(helper_path: &Path) -> Result<TaskInspection, 
 
     #[cfg(windows)]
     {
-        let output = task_helper_command(helper_path)
+        let output = task_helper_command(helper_path, "InspectJson")
             .output()
             .map_err(|_| "worker_legacy_task_invalid")?;
         if !output.status.success() || output.stdout.len() > 65_536 {
@@ -164,14 +206,14 @@ pub(super) fn inspect_legacy_task(helper_path: &Path) -> Result<TaskInspection, 
 }
 
 #[cfg(windows)]
-fn task_helper_command(helper_path: &Path) -> Command {
+fn task_helper_command(helper_path: &Path, operation: &str) -> Command {
     let mut command = Command::new("powershell.exe");
     command
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-File")
         .arg(helper_path)
-        .arg("InspectJson")
+        .arg(operation)
         .creation_flags(0x08000000)
         .stdin(Stdio::null())
         .stderr(Stdio::null());
@@ -228,6 +270,7 @@ fn validate_task_binding_with(
     validate_worker_package(package_root, &executable)?;
     let data_root = validate_host_config(&host_config)?;
     let identity = validate_identity_files(&data_root, validate_key)?;
+    let host_config_bytes = fs::read(&host_config).map_err(|_| "worker_host_config_invalid")?;
 
     Ok(WorkerHostBinding {
         executable,
@@ -236,7 +279,105 @@ fn validate_task_binding_with(
         worker_id: identity.worker_id,
         identity_marker_sha256: identity.marker_sha256,
         protected_key_sha256: identity.key_sha256,
+        host_config_sha256: sha256_hex(&host_config_bytes),
     })
+}
+
+pub(super) fn inspect_matching_task(
+    helper_path: &Path,
+    expected: &WorkerHostBinding,
+) -> Result<TaskInspection, &'static str> {
+    let inspection = inspect_legacy_task(helper_path)?;
+    let actual = validate_task_binding(&inspection)?;
+    binding_match_failure(expected, &actual)?;
+    Ok(inspection)
+}
+
+pub(super) fn binding_match_failure(
+    expected: &WorkerHostBinding,
+    actual: &WorkerHostBinding,
+) -> Result<(), &'static str> {
+    if expected.executable != actual.executable
+        || expected.host_config != actual.host_config
+        || expected.data_root != actual.data_root
+    {
+        return Err("worker_legacy_task_invalid");
+    }
+    if expected.host_config_sha256 != actual.host_config_sha256 {
+        return Err("worker_host_config_invalid");
+    }
+    if expected.worker_id != actual.worker_id
+        || expected.identity_marker_sha256 != actual.identity_marker_sha256
+        || expected.protected_key_sha256 != actual.protected_key_sha256
+    {
+        return Err("worker_identity_corrupt");
+    }
+    Ok(())
+}
+
+pub(super) fn run_task_operation(
+    helper_path: &Path,
+    expected_binding: &WorkerHostBinding,
+    expected_state: LegacyTaskState,
+    operation: TaskOperation,
+    confirm_durable_drain_offline: bool,
+) -> Result<TaskInspection, &'static str> {
+    let failure = operation.failure_code();
+    if (operation == TaskOperation::Disable) != confirm_durable_drain_offline {
+        return Err(failure);
+    }
+    let required_before = match operation {
+        TaskOperation::Disable | TaskOperation::Start => LegacyTaskState::Ready,
+        TaskOperation::Enable => LegacyTaskState::Disabled,
+    };
+    if expected_state != required_before {
+        return Err(failure);
+    }
+    let before = inspect_matching_task(helper_path, expected_binding).map_err(|_| failure)?;
+    if before.state != expected_state {
+        return Err(failure);
+    }
+    process_lock_is_available(&expected_binding.data_root).map_err(|code| match code {
+        "worker_process_lock_held" | "worker_process_lock_unavailable" => code,
+        _ => failure,
+    })?;
+
+    #[cfg(windows)]
+    {
+        let mut command = task_helper_command(helper_path, operation.argument());
+        if operation == TaskOperation::Disable {
+            command.arg("-ConfirmDurableDrainOffline");
+        }
+        let output = command.output().map_err(|_| failure)?;
+        if !output.status.success() || output.stdout.len() > 16_384 {
+            return Err(failure);
+        }
+        parse_task_operation_output(&output.stdout, operation)?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = helper_path;
+        return Err("worker_platform_unsupported");
+    }
+
+    let after = inspect_matching_task(helper_path, expected_binding).map_err(|_| failure)?;
+    if after.state != operation.expected_state() {
+        return Err(failure);
+    }
+    Ok(after)
+}
+
+fn parse_task_operation_output(
+    output: &[u8],
+    operation: TaskOperation,
+) -> Result<(), &'static str> {
+    let parsed: TaskOperationOutput =
+        serde_json::from_slice(output).map_err(|_| operation.failure_code())?;
+    if parsed.result == operation.expected_state().label() {
+        Ok(())
+    } else {
+        Err(operation.failure_code())
+    }
 }
 
 fn absolute_path(value: &str) -> Option<PathBuf> {
@@ -622,6 +763,18 @@ pub(super) fn binding_identity_unchanged(binding: &WorkerHostBinding) -> bool {
         && protected_key.is_ok_and(|bytes| sha256_hex(&bytes) == binding.protected_key_sha256)
 }
 
+pub(super) fn binding_unchanged(binding: &WorkerHostBinding) -> bool {
+    binding_identity_unchanged(binding) && host_config_unchanged(binding)
+}
+
+fn host_config_unchanged(binding: &WorkerHostBinding) -> bool {
+    fs::read(&binding.host_config).is_ok_and(|bytes| {
+        sha256_hex(&bytes) == binding.host_config_sha256
+            && validate_host_config(&binding.host_config)
+                .is_ok_and(|data_root| data_root == binding.data_root)
+    })
+}
+
 pub(super) fn guard_identity_files(
     binding: &WorkerHostBinding,
 ) -> Result<IdentityFileGuard, &'static str> {
@@ -844,6 +997,29 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn task_helper_command_uses_fixed_powershell_argv_without_shell_text() {
+        let helper =
+            PathBuf::from(r"C:\Program Files\Threads Desktop\Manage-ThreadsWorkerTask.ps1");
+        let command = task_helper_command(&helper, TaskOperation::Disable.argument());
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                r"C:\Program Files\Threads Desktop\Manage-ThreadsWorkerTask.ps1",
+                "Disable"
+            ]
+        );
+        assert!(args.iter().all(|argument| !argument.contains(";")));
+    }
+
     fn write_manifest(package: &Path, sha: &str) {
         let manifest = serde_json::json!({
             "artifact_schema": "threads-worker-package-v1",
@@ -949,6 +1125,89 @@ mod tests {
         assert!(serde_json::from_str::<TaskInspection>(
             r#"{"state":"RUNNING","same_user":false,"executable_path":null,"host_config_path":null,"working_directory":null,"xml":"secret"}"#,
         ).is_err());
+    }
+
+    #[test]
+    fn task_mutation_output_is_strict_and_matches_the_fixed_operation_state() {
+        assert_eq!(
+            parse_task_operation_output(br#"{"result":"DISABLED"}"#, TaskOperation::Disable),
+            Ok(())
+        );
+        assert_eq!(
+            parse_task_operation_output(
+                br#"{"result":"READY","extra":"unexpected"}"#,
+                TaskOperation::Enable
+            ),
+            Err("worker_legacy_task_enable_failed")
+        );
+        assert_eq!(
+            parse_task_operation_output(br#"{"result":"READY"}"#, TaskOperation::Start),
+            Err("worker_legacy_task_start_failed")
+        );
+    }
+
+    #[test]
+    fn task_binding_comparison_detects_host_config_and_identity_drift() {
+        let expected = WorkerHostBinding {
+            executable: PathBuf::from(r"C:\Worker\threads-worker.exe"),
+            host_config: PathBuf::from(r"C:\Worker\host.json"),
+            data_root: PathBuf::from(r"C:\Users\operator\ThreadsOperations"),
+            worker_id: "12345678-1234-4234-8234-123456789abc".to_string(),
+            identity_marker_sha256: "a".repeat(64),
+            protected_key_sha256: "b".repeat(64),
+            host_config_sha256: "c".repeat(64),
+        };
+        let mut actual = expected.clone();
+        assert_eq!(binding_match_failure(&expected, &actual), Ok(()));
+
+        actual.host_config_sha256 = "d".repeat(64);
+        assert_eq!(
+            binding_match_failure(&expected, &actual),
+            Err("worker_host_config_invalid")
+        );
+        actual = expected.clone();
+        actual.protected_key_sha256 = "e".repeat(64);
+        assert_eq!(
+            binding_match_failure(&expected, &actual),
+            Err("worker_identity_corrupt")
+        );
+        actual = expected.clone();
+        actual.executable = PathBuf::from(r"C:\Other\threads-worker.exe");
+        assert_eq!(
+            binding_match_failure(&expected, &actual),
+            Err("worker_legacy_task_invalid")
+        );
+    }
+
+    #[test]
+    fn host_config_change_after_preflight_is_detected_without_modifying_it() {
+        let directory = tempfile::tempdir().expect("host config fixture");
+        let data_root = directory.path().join("existing-worker-root");
+        fs::create_dir(&data_root).expect("create existing Worker root");
+        let host_config = directory.path().join("host.json");
+        let original = serde_json::json!({
+            "schema": "threads-worker-host-v1",
+            "control_plane_url": "https://controller.example.test",
+            "data_root": data_root,
+            "feed_browse_enabled": false
+        })
+        .to_string();
+        fs::write(&host_config, &original).expect("write host config");
+        let binding = WorkerHostBinding {
+            executable: directory.path().join("threads-worker.exe"),
+            host_config: host_config.clone(),
+            data_root,
+            worker_id: "12345678-1234-4234-8234-123456789abc".to_string(),
+            identity_marker_sha256: "a".repeat(64),
+            protected_key_sha256: "b".repeat(64),
+            host_config_sha256: sha256_hex(original.as_bytes()),
+        };
+
+        assert!(host_config_unchanged(&binding));
+        let changed = original.replace("controller.example.test", "other.example.test");
+        fs::write(&host_config, &changed).expect("simulate host config drift");
+        assert!(!host_config_unchanged(&binding));
+        assert_eq!(fs::read_to_string(host_config).unwrap(), changed);
     }
 
     #[test]
@@ -1152,6 +1411,7 @@ mod tests {
             worker_id: "12345678-1234-4234-8234-123456789abc".to_string(),
             identity_marker_sha256: "a".repeat(64),
             protected_key_sha256: "b".repeat(64),
+            host_config_sha256: "c".repeat(64),
         };
         let mut command = worker_launch_command(&binding);
         let args = command
