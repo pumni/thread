@@ -50,6 +50,43 @@ def test_readme_and_docs_only_changes_do_not_run_worker_gates() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        (["docs/ARCHITECTURE.md"], False),
+        (["AGENTS.md"], False),
+        (["README.md"], False),
+        ([".agents/skills/ci/SKILL.md"], False),
+        ([".github/ISSUE_TEMPLATE/bug.yml"], False),
+        ([".github/PULL_REQUEST_TEMPLATE.md"], False),
+        (["src/threads_platform/standalone/runtime.py"], False),
+        (["tests/unit/test_standalone_runtime.py"], False),
+        (["docs/ARCHITECTURE.md", "src/threads_platform/standalone/runtime.py"], False),
+        (["apps/desktop/src/App.tsx"], True),
+        (["apps/desktop/src-tauri/src/main.rs"], True),
+        (["packaging/windows_desktop/build_runtime.py"], True),
+        ([".github/workflows/desktop.yml"], True),
+        ([".github/workflows/pr-acceptance.yml"], True),
+        ([".github/workflows/main-verification.yml"], True),
+        (["scripts/ci_changed_paths.py"], True),
+        (["tests/unit/test_ci_changed_paths.py"], True),
+        (["pyproject.toml"], True),
+        (["uv.lock"], True),
+        (["src/threads_platform/scheduler.py"], True),
+        (["migrations/versions/20261003_0017_operator_auth_sessions.py"], True),
+        (["tests/unit/test_threads_api.py"], True),
+        (["tests/unit/test_standalone.py"], True),
+        ([".github/actions/checkout/action.yml"], True),
+        (["unknown/new_component.py"], True),
+        (["docs/ARCHITECTURE.md", "apps/desktop/src/App.tsx"], True),
+    ],
+)
+def test_desktop_path_classifier_uses_only_the_narrow_safe_set(
+    paths: list[str], expected: bool
+) -> None:
+    assert ci_changed_paths.desktop_diagnostic_relevant(paths) is expected
+
+
 def test_pull_request_uses_merge_base_and_exact_head(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, ...]] = []
 
@@ -81,6 +118,18 @@ def test_main_zero_before_sha_fails_open_without_git(
     assert "enabling Worker gates" in capsys.readouterr().err
 
 
+def test_main_zero_before_sha_fails_open_for_desktop_without_git(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unexpected_git(*arguments: str) -> str:
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(ci_changed_paths, "_git_output", unexpected_git)
+
+    assert ci_changed_paths.classify_desktop_change("main", ci_changed_paths.ZERO_SHA, HEAD_SHA)
+    assert "Desktop Diagnostic" in capsys.readouterr().err
+
+
 def test_main_uses_before_to_exact_head_range(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, ...]] = []
 
@@ -98,6 +147,25 @@ def test_main_uses_before_to_exact_head_range(monkeypatch: pytest.MonkeyPatch) -
     assert calls[1] == ("diff", "--name-only", "--no-renames", "-z", f"{BASE_SHA}..{HEAD_SHA}")
 
 
+def test_main_desktop_classification_uses_before_to_exact_head_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def git_output(*arguments: str) -> str:
+        calls.append(arguments)
+        if arguments == ("rev-parse", "HEAD"):
+            return HEAD_SHA
+        if arguments == ("diff", "--name-only", "--no-renames", "-z", f"{BASE_SHA}..{HEAD_SHA}"):
+            return "docs/only.md\x00"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(ci_changed_paths, "_git_output", git_output)
+
+    assert not ci_changed_paths.classify_desktop_change("main", BASE_SHA, HEAD_SHA)
+    assert calls[1] == ("diff", "--name-only", "--no-renames", "-z", f"{BASE_SHA}..{HEAD_SHA}")
+
+
 def test_unresolvable_main_range_fails_open(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -110,6 +178,20 @@ def test_unresolvable_main_range_fails_open(
 
     assert ci_changed_paths.classify_worker_change("main", BASE_SHA, HEAD_SHA)
     assert "enabling Worker gates" in capsys.readouterr().err
+
+
+def test_unresolvable_pull_request_comparison_fails_open_for_desktop(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def missing_merge_base(*arguments: str) -> str:
+        if arguments == ("rev-parse", "HEAD"):
+            return HEAD_SHA
+        raise subprocess.CalledProcessError(128, arguments)
+
+    monkeypatch.setattr(ci_changed_paths, "_git_output", missing_merge_base)
+
+    assert ci_changed_paths.classify_desktop_change("pull_request", BASE_SHA, HEAD_SHA)
+    assert "Desktop Diagnostic" in capsys.readouterr().err
 
 
 def test_cli_appends_worker_result_to_github_output(
@@ -128,4 +210,6 @@ def test_cli_appends_worker_result_to_github_output(
         ci_changed_paths.main(["--mode", "main", "--base-sha", BASE_SHA, "--head-sha", HEAD_SHA])
         == 0
     )
-    assert output_path.read_text(encoding="utf-8") == "existing=value\nworker=false\n"
+    assert output_path.read_text(encoding="utf-8") == (
+        "existing=value\nworker=false\ndesktop=false\n"
+    )

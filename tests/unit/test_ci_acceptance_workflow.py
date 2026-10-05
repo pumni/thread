@@ -222,7 +222,7 @@ def test_gitleaks_composite_verifies_pinned_release_and_redacts_both_scans() -> 
     assert action_text.count("--redact") == 2
 
 
-def test_orchestrations_call_shared_components_and_gate_worker_paths() -> None:
+def test_orchestrations_call_shared_components_and_gate_heavy_paths() -> None:
     expected_calls = {
         "python-quality": "./.github/workflows/ci.yml",
         "docker-control-plane": "./.github/workflows/docker-control-plane-smoke.yml",
@@ -240,10 +240,20 @@ def test_orchestrations_call_shared_components_and_gate_worker_paths() -> None:
                 "${{ github.event.pull_request.head.sha }}",
                 "${{ github.sha }}",
             }
+        changes = jobs["changes"]
+        assert changes["outputs"] == {
+            "worker": "${{ steps.classify.outputs.worker }}",
+            "desktop": "${{ steps.classify.outputs.desktop }}",
+        }
         worker = jobs["worker-package"]
         assert worker["uses"] == "./.github/workflows/windows-worker-package.yml"
         assert "needs.changes.outputs.worker == 'true'" in worker["if"]
         assert "changes" in worker["needs"]
+        desktop = jobs["desktop"]
+        assert desktop["if"] == "${{ needs.changes.outputs.desktop == 'true' }}"
+        assert "changes" in desktop["needs"]
+        for mandatory_job in ("python-quality", "docker-control-plane"):
+            assert "if" not in jobs[mandatory_job]
         gate = jobs[gate_id]
         assert set(gate["needs"]) >= {
             "changes",
@@ -252,6 +262,23 @@ def test_orchestrations_call_shared_components_and_gate_worker_paths() -> None:
             "desktop",
             "worker-package",
         }
+        gate_run = gate["steps"][0]["run"]
+        gate_env = gate["steps"][0]["env"]
+        assert gate_env["DESKTOP_NEEDED"] == "${{ needs.changes.outputs.desktop }}"
+        assert '[[ "$DESKTOP_NEEDED" == "true" ]]' in gate_run
+        assert '[[ "$DESKTOP_NEEDED" == "false" ]]' in gate_run
+        assert "desktop_component_required_but_not_successful" in gate_run
+        assert "desktop_component_should_be_skipped" in gate_run
+        assert "worker_component_required_but_not_successful" in gate_run
+        assert "worker_component_should_be_skipped" in gate_run
+        mandatory_results = (
+            'for result in "$PREFLIGHT_RESULT" "$CHANGES_RESULT" '
+            '"$PYTHON_RESULT" "$DOCKER_RESULT"; do'
+            if gate_id == "acceptance-gate"
+            else 'for result in "$CHANGES_RESULT" "$PYTHON_RESULT" '
+            '"$DOCKER_RESULT" "$SECRET_RESULT"; do'
+        )
+        assert mandatory_results in gate_run
 
     main = _workflow(".github/workflows/main-verification.yml")
     main_secret = _jobs(main)["main-secret-scan"]

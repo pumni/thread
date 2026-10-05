@@ -1,4 +1,4 @@
-"""Classify whether a source change requires the Windows Worker gates."""
+"""Classify whether a source change requires the Windows Worker or Desktop gates."""
 
 from __future__ import annotations
 
@@ -35,14 +35,47 @@ _WORKER_PATH_PREFIXES = (
     "src/threads_platform/infrastructure/worker_agent/",
     "src/threads_platform/infrastructure/browser/",
 )
+_DESKTOP_SAFE_EXACT_PATHS = frozenset(
+    {
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "AGENTS.md",
+        "README.md",
+    }
+)
+_DESKTOP_SAFE_PATH_PREFIXES = (
+    ".agents/",
+    ".github/ISSUE_TEMPLATE/",
+    "docs/",
+    "src/threads_platform/standalone/",
+)
+
+
+def _normalize_path(raw_path: str) -> str:
+    return raw_path.replace("\\", "/").removeprefix("./")
 
 
 def worker_package_relevant(paths: Iterable[str]) -> bool:
     """Return whether any changed repository path affects Worker packaging/tests."""
     for raw_path in paths:
-        path = raw_path.replace("\\", "/").removeprefix("./")
+        path = _normalize_path(raw_path)
         if path in _WORKER_EXACT_PATHS or path.startswith(_WORKER_PATH_PREFIXES):
             return True
+    return False
+
+
+def desktop_diagnostic_relevant(paths: Iterable[str]) -> bool:
+    """Return whether any changed path is outside the reviewed Desktop skip set."""
+    for raw_path in paths:
+        path = _normalize_path(raw_path)
+        if path in _DESKTOP_SAFE_EXACT_PATHS or path.startswith(_DESKTOP_SAFE_PATH_PREFIXES):
+            continue
+        if (
+            path.startswith("tests/unit/")
+            and path.endswith(".py")
+            and Path(path).name.startswith("test_standalone_")
+        ):
+            continue
+        return True
     return False
 
 
@@ -78,22 +111,37 @@ def _changed_paths(mode: str, base_sha: str, head_sha: str) -> list[str]:
     return [path for path in output.split("\x00") if path]
 
 
-def classify_worker_change(mode: str, base_sha: str, head_sha: str) -> bool:
-    """Fail open to Worker execution if an exact comparison cannot be proven."""
+def classify_changes(mode: str, base_sha: str, head_sha: str) -> tuple[bool, bool]:
+    """Fail open to both heavy gates if an exact comparison cannot be proven."""
     if mode == "main" and base_sha == ZERO_SHA:
         print(
-            "changed-path range starts at the all-zero SHA; enabling Worker gates", file=sys.stderr
-        )
-        return True
-
-    try:
-        return worker_package_relevant(_changed_paths(mode, base_sha, head_sha))
-    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
-        print(
-            f"changed-path range unavailable ({type(exc).__name__}); enabling Worker gates",
+            "changed-path range starts at the all-zero SHA; "
+            "enabling Worker gates and Desktop Diagnostic",
             file=sys.stderr,
         )
-        return True
+        return True, True
+
+    try:
+        paths = _changed_paths(mode, base_sha, head_sha)
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(
+            "changed-path range unavailable "
+            f"({type(exc).__name__}); enabling Worker gates and Desktop Diagnostic",
+            file=sys.stderr,
+        )
+        return True, True
+
+    return worker_package_relevant(paths), desktop_diagnostic_relevant(paths)
+
+
+def classify_worker_change(mode: str, base_sha: str, head_sha: str) -> bool:
+    """Fail open to Worker execution if an exact comparison cannot be proven."""
+    return classify_changes(mode, base_sha, head_sha)[0]
+
+
+def classify_desktop_change(mode: str, base_sha: str, head_sha: str) -> bool:
+    """Fail open to Desktop Diagnostic if an exact comparison cannot be proven."""
+    return classify_changes(mode, base_sha, head_sha)[1]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -103,8 +151,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--head-sha", required=True)
     args = parser.parse_args(argv)
 
-    worker = classify_worker_change(args.mode, args.base_sha, args.head_sha)
-    output = f"worker={str(worker).lower()}\n"
+    worker, desktop = classify_changes(args.mode, args.base_sha, args.head_sha)
+    output = f"worker={str(worker).lower()}\ndesktop={str(desktop).lower()}\n"
     output_path = os.environ.get("GITHUB_OUTPUT")
     if output_path:
         with Path(output_path).open("a", encoding="utf-8", newline="\n") as output_file:
