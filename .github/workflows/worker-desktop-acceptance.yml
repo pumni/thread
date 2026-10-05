@@ -1,0 +1,213 @@
+name: Worker Desktop Acceptance Component
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact source commit to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DX07_SOURCE_SHA: ${{ inputs.source_sha }}
+
+jobs:
+  worker-desktop-scenario:
+    name: Worker Desktop ${{ matrix.scenario }} (Windows x64)
+    runs-on: windows-2025
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - legacy_running_cutover
+          - legacy_ready_cutover
+          - legacy_disabled_desktop_start
+          - no_task_fail_closed
+          - identity_key_fail_closed
+          - duplicate_process_lock
+          - graceful_busy_drain_quit
+          - drain_failure_force_interrupt
+          - desktop_crash_logout_recovery
+          - rollback_legacy_task
+          - headed_chromium_profile_continuity
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Assert exact source SHA and isolated hosted runner
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) { throw "checkout_sha_mismatch" }
+          if ($env:GITHUB_ACTIONS -ne "true" -or $env:RUNNER_ENVIRONMENT -ne "github-hosted" -or
+              $env:RUNNER_OS -ne "Windows" -or $env:RUNNER_ARCH -ne "X64" -or
+              -not [Environment]::Is64BitOperatingSystem) {
+            throw "worker_desktop_requires_github_hosted_windows_x64"
+          }
+
+      - name: Set up locked Python environment
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.21"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked fixture and validation dependencies
+        run: uv sync --locked
+
+      - name: Install locked headed Chromium fixture
+        if: ${{ contains(fromJSON('["graceful_busy_drain_quit","drain_failure_force_interrupt","headed_chromium_profile_continuity"]'), matrix.scenario) }}
+        run: uv run --locked playwright install chromium
+
+      - name: Download exact-SHA Desktop executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: dx04-desktop-${{ inputs.source_sha }}
+          path: build/dx07/desktop
+
+      - name: Download exact-SHA shared runtime fixture
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: dx03-candidates-${{ inputs.source_sha }}
+          path: build/dx07/candidates
+
+      - name: Download exact-SHA Windows Worker package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: windows-worker-package-${{ inputs.source_sha }}
+          path: build/dx07/worker-package
+
+      - name: Validate package checksum and manifest, then stage immutable Worker release
+        id: worker-release
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE "build\dx07\worker-release.json"
+          uv run --locked python packaging/windows_desktop/verify_worker_desktop_inputs.py `
+            --package-root "$env:GITHUB_WORKSPACE\build\dx07\worker-package" `
+            --release-root "$env:ProgramFiles\ThreadsWorker\releases" `
+            --output-json $manifestPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $release = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          "release_directory=$($release.release_directory)" >> $env:GITHUB_OUTPUT
+
+      - name: Stage Desktop executable with the Tauri Worker task resource
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $desktopExecutable = Join-Path $env:GITHUB_WORKSPACE "build\dx07\desktop\threads-desktop.exe"
+          $destination = Join-Path $env:GITHUB_WORKSPACE "build\dx07\desktop-test-artifact"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          ./packaging/windows_desktop/Stage-WorkerDesktopTestArtifact.ps1 `
+            -DesktopExecutable $desktopExecutable `
+            -Destination $destination
+          $taskHelper = Join-Path $destination "Manage-ThreadsWorkerTask.ps1"
+          if (-not (Test-Path -LiteralPath $taskHelper -PathType Leaf)) {
+            throw "worker_desktop_task_resource_missing_from_runnable_artifact"
+          }
+
+      - name: Run isolated Worker Desktop lifecycle scenario as a standard user
+        id: scenario
+        if: ${{ success() }}
+        shell: pwsh
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_DIRECTORY: ${{ steps.worker-release.outputs.release_directory }}
+        run: |
+          ./packaging/windows_desktop/smoke_worker_desktop_lifecycle.ps1 `
+            -RepositoryRoot $env:GITHUB_WORKSPACE `
+            -DesktopArtifactRoot "$env:GITHUB_WORKSPACE\build\dx07\desktop-test-artifact" `
+            -WorkerReleaseDirectory $env:RELEASE_DIRECTORY `
+            -RuntimeRoot "$env:GITHUB_WORKSPACE\build\dx07\candidates\shared" `
+            -ExpectedSourceRevision $env:SOURCE_SHA `
+            -Scenario $env:SCENARIO `
+            -EvidencePath "$env:GITHUB_WORKSPACE\build\dx07\evidence\worker-desktop.json"
+
+      - name: Write fail-closed evidence if setup did not reach the scenario
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $evidence = "$env:GITHUB_WORKSPACE\build\dx07\evidence\worker-desktop.json"
+          if (-not (Test-Path -LiteralPath $evidence -PathType Leaf)) {
+            uv run --locked python packaging/windows_desktop/aggregate_worker_desktop_scenarios.py `
+              --write-blocker-evidence $evidence `
+              --source-sha $env:SOURCE_SHA `
+              --scenario $env:SCENARIO `
+              --failure-code worker_desktop_harness_setup_failed
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Upload exact-SHA scenario evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dx07-worker-desktop-${{ inputs.source_sha }}-${{ matrix.scenario }}
+          path: build/dx07/evidence/worker-desktop.json
+          if-no-files-found: error
+          retention-days: 14
+
+  worker-desktop-aggregate:
+    name: Worker Desktop exact-SHA evidence aggregate
+    if: always()
+    needs:
+      - worker-desktop-scenario
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Assert exact aggregate source revision
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "$SOURCE_SHA" ]]; then
+            echo "checkout_sha_mismatch" >&2
+            exit 1
+          fi
+
+      - name: Download every exact-SHA Worker Desktop scenario artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dx07-worker-desktop-${{ inputs.source_sha }}-*
+          path: build/dx07/scenario-artifacts
+          merge-multiple: false
+
+      - name: Validate and assemble Worker Desktop evidence
+        if: always()
+        run: >-
+          python3 packaging/windows_desktop/aggregate_worker_desktop_scenarios.py
+          --artifact-root build/dx07/scenario-artifacts
+          --source-sha "$DX07_SOURCE_SHA"
+          --output-root build/dx07/aggregate
+
+      - name: Upload combined exact-SHA Worker Desktop evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dx07-worker-desktop-${{ inputs.source_sha }}
+          path: build/dx07/aggregate
+          if-no-files-found: error
+          retention-days: 14

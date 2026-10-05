@@ -14,12 +14,14 @@ REUSABLE_COMPONENTS = (
     ".github/workflows/docker-control-plane-smoke.yml",
     ".github/workflows/desktop.yml",
     ".github/workflows/windows-worker-package.yml",
+    ".github/workflows/worker-desktop-acceptance.yml",
 )
 ACCEPTANCE_WORKFLOWS = (
     ".github/workflows/ci.yml",
     ".github/workflows/docker-control-plane-smoke.yml",
     ".github/workflows/desktop.yml",
     ".github/workflows/windows-worker-package.yml",
+    ".github/workflows/worker-desktop-acceptance.yml",
     ".github/workflows/secret-scan.yml",
     ".github/workflows/pr-head-guard.yml",
     ".github/workflows/pr-acceptance.yml",
@@ -116,6 +118,7 @@ def test_heavy_components_are_reusable_and_exact_sha_bound() -> None:
             in {
                 ".github/workflows/ci.yml",
                 ".github/workflows/docker-control-plane-smoke.yml",
+                ".github/workflows/worker-desktop-acceptance.yml",
             }
             else {"workflow_call", "workflow_dispatch"}
         )
@@ -154,6 +157,17 @@ def test_heavy_components_are_reusable_and_exact_sha_bound() -> None:
     assert set(worker["on"]) == {"workflow_call", "workflow_dispatch"}
     assert worker["on"]["workflow_dispatch"]["inputs"]["source_sha"]["required"] == "true"
     assert "${{ inputs.source_sha }}" in _text(".github/workflows/windows-worker-package.yml")
+
+    worker_desktop = _workflow(".github/workflows/worker-desktop-acceptance.yml")
+    assert set(worker_desktop["on"]) == {"workflow_call"}
+    assert worker_desktop["on"]["workflow_call"]["inputs"]["source_sha"]["required"] == "true"
+    scenario_job = _jobs(worker_desktop)["worker-desktop-scenario"]
+    assert scenario_job["runs-on"] == "windows-2025"
+    assert scenario_job["strategy"]["fail-fast"] == "false"
+    assert len(scenario_job["strategy"]["matrix"]["scenario"]) == 11
+    workflow_text = _text(".github/workflows/worker-desktop-acceptance.yml")
+    assert "dx04-desktop-${{ inputs.source_sha }}" in workflow_text
+    assert "windows-worker-package-${{ inputs.source_sha }}" in workflow_text
 
 
 def test_docker_smoke_uses_locked_project_environment() -> None:
@@ -244,6 +258,24 @@ def test_orchestrations_call_shared_components_and_gate_worker_paths() -> None:
         assert worker["uses"] == "./.github/workflows/windows-worker-package.yml"
         assert "needs.changes.outputs.worker == 'true'" in worker["if"]
         assert "changes" in worker["needs"]
+        changes = jobs["changes"]
+        assert changes["outputs"] == {
+            "worker": "${{ steps.classify.outputs.worker }}",
+            "desktop": "${{ steps.classify.outputs.desktop }}",
+        }
+        desktop = jobs["desktop"]
+        assert desktop["if"] == "${{ needs.changes.outputs.desktop == 'true' }}"
+        assert "changes" in desktop["needs"]
+        worker_desktop = jobs["worker-desktop"]
+        assert worker_desktop["uses"] == "./.github/workflows/worker-desktop-acceptance.yml"
+        assert worker_desktop["with"]["source_sha"] in {
+            "${{ github.event.pull_request.head.sha }}",
+            "${{ github.sha }}",
+        }
+        assert "needs.changes.outputs.worker == 'true'" in worker_desktop["if"]
+        assert "needs.desktop.result == 'success'" in worker_desktop["if"]
+        assert "needs.worker-package.result == 'success'" in worker_desktop["if"]
+        assert set(worker_desktop["needs"]) == {"changes", "desktop", "worker-package"}
         gate = jobs[gate_id]
         assert set(gate["needs"]) >= {
             "changes",
@@ -251,7 +283,18 @@ def test_orchestrations_call_shared_components_and_gate_worker_paths() -> None:
             "docker-control-plane",
             "desktop",
             "worker-package",
+            "worker-desktop",
         }
+        gate_env = gate["steps"][0]["env"]
+        gate_run = gate["steps"][0]["run"]
+        assert gate_env["DESKTOP_NEEDED"] == "${{ needs.changes.outputs.desktop }}"
+        assert '[[ "$DESKTOP_NEEDED" == "true" ]]' in gate_run
+        assert '[[ "$DESKTOP_NEEDED" == "false" ]]' in gate_run
+        assert "desktop_component_required_but_not_successful" in gate_run
+        assert "desktop_component_should_be_skipped" in gate_run
+        assert "worker_component_required_but_not_successful" in gate_run
+        assert "worker_desktop_component_required_but_not_successful" in gate_run
+        assert "worker_components_should_be_skipped" in gate_run
 
     main = _workflow(".github/workflows/main-verification.yml")
     main_secret = _jobs(main)["main-secret-scan"]
@@ -279,8 +322,10 @@ def test_orchestrations_call_shared_components_and_gate_worker_paths() -> None:
     assert "sort_by([.created_at, .id]) | last" in evidence_run
     assert 'conclusion" != "success"' in evidence_run
     pr_gate_run = _jobs(pr)["acceptance-gate"]["steps"][0]["run"]
+    assert "desktop_component_should_be_skipped" in pr_gate_run
     assert "worker_component_required_but_not_successful" in pr_gate_run
-    assert "worker_component_should_be_skipped" in pr_gate_run
+    assert "worker_desktop_component_required_but_not_successful" in pr_gate_run
+    assert "worker_components_should_be_skipped" in pr_gate_run
 
     main_changes = _jobs(main)["changes"]
     main_checkout = next(
