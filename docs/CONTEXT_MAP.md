@@ -2,128 +2,98 @@
 
 Purpose: load the **smallest sufficient context** for the current task.
 
-Do not treat this as another mandatory reading list. Start with root `AGENTS.md`, current handoff, and the authorized issue; then follow the row that matches the task.
+Do not treat this as a mandatory reading list. Start with the authorized GitHub issue / coordinator instruction, root `AGENTS.md` (and nearest nested `AGENTS.md` if working within a subtree), and current code/tests; then follow only the route that matches your task.
 
-## Always
+## Task & Capability Routes
 
-Read:
-- `/AGENTS.md`
-- `docs/PROJECT_STATE_HANDOFF.md`
-- authorized GitHub issue/batch + coordinator comments
-- current code/tests in the area being changed
+### 1. Domain & Application Behavior
+- **Trigger:** Core domain models, command processing, account activities, business validation policies, pure logic.
+- **Skill:** None (pure domain logic; standard linters and tests apply).
+- **Canonical Docs:** `docs/ARCHITECTURE.md` (Domain/Application sections), `docs/FEATURE_PARITY_MATRIX.md`.
+- **Implementation Truth:** `src/threads_platform/domain/`, `src/threads_platform/application/`, `tests/unit/`.
+- **Key Invariants:** Pure domain boundary: never import FastAPI, httpx, SQLAlchemy, WebSockets, browser libraries, Windows APIs, or Meta DTOs into domain.
 
-Use README only when you need a human-facing project overview.
+### 2. PostgreSQL, Schemas & Migrations
+- **Trigger:** Adding/modifying tables, columns, indexes, Alembic migration revisions, SQLAlchemy models.
+- **Skill:** [`.agents/skills/database-migration/SKILL.md`](../.agents/skills/database-migration/SKILL.md).
+- **Canonical Docs:** `docs/ACCEPTANCE_AND_REVIEW.md` (Section 3 Data Integrity), `scripts/windows_local_preflight.ps1`.
+- **Implementation Truth:** `migrations/versions/`, `src/threads_platform/infrastructure/persistence/models.py`, `tests/integration/`.
+- **Key Invariants:** PostgreSQL is authoritative business state; all migrations must be reversible; UTC timestamps; verify with `uv run alembic check`.
 
-## C1 — Distributed Worker Foundation (#21, #22, #23)
+### 3. Worker, WorkerJob & Distributed Ownership
+- **Trigger:** WorkerJob lifecycle, claim transactions, lease renewals, fencing tokens, stale recovery, execution modes.
+- **Skill:** [`.agents/skills/worker-protocol/SKILL.md`](../.agents/skills/worker-protocol/SKILL.md).
+- **Canonical Docs:** [`docs/adr/0003-distributed-hybrid-execution.md`](adr/0003-distributed-hybrid-execution.md), [`docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`](adr/0004-persistent-worker-affinity-and-worker-jobs.md), `docs/ARCHITECTURE.md` (WorkerJob section).
+- **Implementation Truth:** `src/threads_platform/application/worker_jobs.py`, `src/threads_platform/domain/worker_job.py`, `tests/unit/test_worker_jobs.py`.
+- **Key Invariants:** `Command` is business intent; `WorkerJob` is remote execution; independent lease/fencing/checkpoint semantics; stale lease claim fails closed; persistent account -> worker/profile affinity.
 
-Primary:
-- `docs/ARCHITECTURE.md` — worker/runtime sections
-- `docs/protocols/WORKER_PROTOCOL_V1.md`
-- `docs/adr/0003-distributed-hybrid-execution.md`
-- `docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`
+### 4. Worker Protocol, Auth, Enrollment, Drain & Pairing
+- **Trigger:** Worker WebSocket framing, protocol v1/v2 messages, 256-bit enrollment tokens, device authentication, worker draining.
+- **Skill:** [`.agents/skills/worker-protocol/SKILL.md`](../.agents/skills/worker-protocol/SKILL.md).
+- **Canonical Docs:** [`docs/protocols/WORKER_PROTOCOL_V1.md`](protocols/WORKER_PROTOCOL_V1.md), `docs/WORKER_UPDATE_RUNBOOK.md`.
+- **Implementation Truth:** `src/threads_platform/application/worker_protocol.py`, `src/threads_platform/transport/http/workers.py`, `src/threads_platform/infrastructure/security/worker_auth.py`.
+- **Key Invariants:** WebSocket is notification/presence only (never queue or state authority); 256-bit entropy for enrollment tokens; additive version negotiation; row-locked DRAINING quiescence handshake.
 
-Review/verification:
-- `docs/ACCEPTANCE_AND_REVIEW.md` — WorkerJob/auth/data gates
-- `docs/handoffs/C1_CODEX_BRIEF.md`
+### 5. Browser Capabilities & UI Contracts
+- **Trigger:** Browser automation capabilities (`threads.browser.*`), Playwright DOM interactions, synthetic UI contracts, staged mutations.
+- **Skill:** [`.agents/skills/browser-capability/SKILL.md`](../.agents/skills/browser-capability/SKILL.md).
+- **Canonical Docs:** [`docs/adr/0005-browser-capability-boundary.md`](adr/0005-browser-capability-boundary.md), [`docs/adr/0006-playwright-browser-adapter.md`](adr/0006-playwright-browser-adapter.md), `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md`.
+- **Implementation Truth:** `src/threads_platform/workers/browser.py`, `tests/unit/`.
+- **Key Invariants:** Browser/UI recognition mismatch or ambiguity must fail closed; login and session challenges route to human intervention, never bypass; bound ancestor depth traversal; no generated CSS classes; no anti-detect/evasion.
 
-Usually unnecessary for C1:
-- Threads API capability spike
-- browser-engine ADR work
-- discovery/lead details
+### 6. Scheduler & Background Work
+- **Trigger:** Periodic work generation, AccountActivityPlan recurrence, due occurrence materialization, worker presence expiry, outbox delivery.
+- **Skill:** None (or `database-migration` if altering scheduler tables).
+- **Canonical Docs:** `docs/ARCHITECTURE.md` (Scheduler section), `docs/MASTER_PLAN.md` (Section 2, 7).
+- **Implementation Truth:** `src/threads_platform/application/scheduler.py`, `tests/unit/`.
+- **Key Invariants:** Control Plane/Scheduler creates business actions (workers do not); deterministic fixed intervals; presence expiry is separate from WorkerJob lease; bounded sequential outbox delivery.
 
-## C2 — Capability Router (#24)
+### 7. External Threads API Behavior
+- **Trigger:** Official Meta Threads Graph API client, token exchange/refresh, rate limiting, Graph API webhook handling.
+- **Skill:** [`.agents/skills/threads-api-contract/SKILL.md`](../.agents/skills/threads-api-contract/SKILL.md).
+- **Canonical Docs:** `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/THREADS_CREDENTIAL_OPERATIONS.md`, `docs/THREADS_LIVE_VALIDATION_RUNBOOK.md`.
+- **Implementation Truth:** `src/threads_platform/infrastructure/threads_api/client.py`, `src/threads_platform/infrastructure/threads_api/credentials.py`.
+- **Key Invariants:** Official Threads API preferred where suitable; test fixtures labeled `documentation-contract` vs scrubbed live evidence; token values never stored plaintext in PostgreSQL.
 
-Primary:
-- `docs/ARCHITECTURE.md` — capabilities/account execution mode
-- `docs/FEATURE_PARITY_MATRIX.md`
-- ADR-0003 and ADR-0004
+### 8. Observability, Health & Deployment
+- **Trigger:** Health/readiness checks (`/health`, `/ready`), Prometheus metrics (`/metrics`), OpenTelemetry tracing, Docker Compose deployment.
+- **Skill:** None.
+- **Canonical Docs:** `docs/OBSERVABILITY_RUNBOOK.md`, `docs/CONTROL_PLANE_DEPLOYMENT_RUNBOOK.md`.
+- **Implementation Truth:** `src/threads_platform/infrastructure/observability/`, `deploy/`.
+- **Key Invariants:** `/health` is process liveness; `/ready` reports persisted state fail-closed; structured log redaction; bounded metrics/tracing without leaking payloads or credentials.
 
-Read Worker Protocol only where routing creates/coordinates WorkerJobs.
+### 9. Desktop React / UI
+- **Trigger:** Operator console React components, session lock, operator authentication UI, status badges.
+- **Subtree Instruction:** [`apps/desktop/AGENTS.md`](../apps/desktop/AGENTS.md).
+- **Skill:** None.
+- **Canonical Docs:** `apps/desktop/README.md`, `docs/desktop/ACCEPTANCE_MATRIX.md`.
+- **Implementation Truth:** `apps/desktop/src/`, `apps/desktop/tests/`.
+- **Key Invariants:** Server authorization state over UI Automation tree presence; operator session lock semantics.
 
-## C3 — Windows Worker / Browser Foundation (#25, #26)
+### 10. Desktop Rust, Native Supervisor, Process & Security
+- **Trigger:** Tauri supervisor process tree, Windows DPAPI credentials, local TLS private CA, packaging scripts, Windows rehearsal.
+- **Subtree Instruction:** [`apps/desktop/AGENTS.md`](../apps/desktop/AGENTS.md).
+- **Skill:** [`.agents/skills/desktop-acceptance/SKILL.md`](../.agents/skills/desktop-acceptance/SKILL.md).
+- **Canonical Docs:** [`docs/adr/0007-windows-first-single-app-desktop.md`](adr/0007-windows-first-single-app-desktop.md), `docs/desktop/SECURITY_AND_PROTOCOLS.md`, `docs/desktop/WINDOWS_REHEARSAL.md`.
+- **Implementation Truth:** `apps/desktop/src-tauri/`, `scripts/windows_local_preflight.ps1`.
+- **Key Invariants:** Windows-first desktop single app; current-user DPAPI isolation; dedicated Windows runtime user; graceful Quit vs crash PostgreSQL WAL recovery.
 
-Primary:
-- `docs/ARCHITECTURE.md` — worker/browser/session/network sections
-- `docs/protocols/WORKER_PROTOCOL_V1.md`
-- `docs/adr/0003-distributed-hybrid-execution.md`
-- `docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`
-- `docs/adr/0005-browser-capability-boundary.md`
+### 11. Hosted CI & Acceptance Failure
+- **Trigger:** GitHub Actions run failure, PR Acceptance triage, interpreting Windows Desktop diagnostic runner artifacts.
+- **Skill:** [`.agents/skills/ci-failure-triage/SKILL.md`](../.agents/skills/ci-failure-triage/SKILL.md).
+- **Canonical Docs:** [`docs/CI_AGENT_WORKFLOW.md`](CI_AGENT_WORKFLOW.md), `.github/workflows/pr-acceptance.yml`.
+- **Key Invariants:** Hosted CI failure is a hard stop; record primary failure signature; classify as product/harness/environment; two consecutive identical signatures require coordinator escalation.
 
-Also read C2 routing contracts in code before implementing executor integration.
+### 12. Architecture & Security Review
+- **Trigger:** Proposed architectural changes, trust boundary reviews, new ADR drafting, security model changes.
+- **Canonical Docs:** `docs/adr/`, `docs/ACCEPTANCE_AND_REVIEW.md`, `docs/MASTER_PLAN.md`.
+- **Key Invariants:** All 14 non-negotiable invariants in root [`AGENTS.md`](../AGENTS.md). Structural changes require an approved ADR before implementation.
 
-## C4 — Discovery / Leads (#8)
+---
 
-Primary:
-- `docs/FEATURE_PARITY_MATRIX.md` — discovery rows
-- `docs/THREADS_API_CAPABILITY_SPIKE.md`
-- discovery sections in `docs/ARCHITECTURE.md`
+## Historical & Archival References
 
-Read browser ADRs only if the authorized scope includes browser enrichment.
-
-## C5 — Browser Capabilities / AccountActivityPlan (#27, #28)
-
-Primary:
-- `docs/adr/0005-browser-capability-boundary.md`
-- browser/activity sections in `docs/ARCHITECTURE.md`
-- relevant rows in `docs/FEATURE_PARITY_MATRIX.md`
-
-Also inspect the C2/C3 implementation contracts; do not recreate routing/session abstractions.
-
-## C6 — Scheduler / Operations (#9, #10)
-
-Primary:
-- scheduling/operations sections in `docs/MASTER_PLAN.md` and `docs/ARCHITECTURE.md`
-- `docs/ACCEPTANCE_AND_REVIEW.md`
-- Worker Protocol where fleet lifecycle/update behavior is involved
-
-## TP-002 live Meta validation / external API changes (#3)
-
-Primary:
-- `docs/THREADS_API_CAPABILITY_SPIKE.md`
-- current official Meta Threads developer docs/changelog
-- relevant API adapter/contract tests
-
-Only update `FEATURE_PARITY_MATRIX.md` when verified evidence changes a capability status/contract.
-
-## Release certification (#11)
-
-This is intentionally broad. Read:
-- project handoff
-- master plan
-- architecture
-- capability matrix
-- work breakdown
-- acceptance protocol
-- relevant ADRs/protocols
-- open release/security/API gates
-
-Release is one of the few tasks where broad context is appropriate.
-
-## DX — Windows-first Desktop v1 (epic #94 / planning PR #93)
-
-**Fresh-session start:** read `docs/desktop/SESSION_HANDOFF.md` and `docs/desktop/PREIMPLEMENTATION_AUDIT.md` from latest `main`; PR #93 was accepted and merged at `ed90ce7cfc3d26c40a94d153b5ff17653c3e6e1a`. Implement only an explicitly authorized DX issue.
-
-Read in order for Desktop tasks:
-- `docs/desktop/README.md` — Vietnamese overview and links;
-- `docs/desktop/ISSUE_MAP.md` and the **authorized DX issue** — exact scope, dependencies and status;
-- `docs/adr/0007-windows-first-single-app-desktop.md` — proposed architecture, only binding after review/acceptance;
-- `docs/desktop/DELIVERY_PLAN.md` — phases, M1–M4 gates and definition of done.
-
-Additional focused context:
-- DX-02/03/04/07/12: `docs/desktop/WINDOWS_REHEARSAL.md`, `docs/WORKER_AGENT_WINDOWS.md`, current package scripts/Windows CI;
-- DX-05/06/08/09/10: `docs/desktop/SECURITY_AND_PROTOCOLS.md`, current account/Worker auth/session domain and protocol, existing C1/C3 ADRs;
-- DX-11/13/14: `docs/desktop/ACCEPTANCE_MATRIX.md`, Operator API contracts, relevant existing runbooks and accepted scope.
-
-Read current `docs/PROJECT_STATE_HANDOFF.md` and current main first. Planning PR does not itself authorize implementation, close external release gates, or change the existing Worker service/Task Scheduler contract.
-
-## Documentation-only changes
-
-Read only the document being edited plus its direct source-of-truth dependencies.
-
-Do not copy the same rule into multiple docs merely to make it more visible. Prefer one canonical definition plus links.
-
-## When uncertain
-
-Search the repository for the relevant type, protocol, invariant, test, or ADR before adding context.
-
-If two sources disagree, use the source-of-truth order documented in `docs/MASTER_PLAN.md`; stop for coordinator decision when the conflict is architectural.
+For historical context on earlier completed milestones or past planning baselines:
+- **Milestone History Archive (Batches A/B, TP-004A, C1–C6):** [`docs/handoffs/PROJECT_STATE_HISTORY_2026-10.md`](handoffs/PROJECT_STATE_HISTORY_2026-10.md).
+- **Desktop Planning Baseline:** [`docs/desktop/SESSION_HANDOFF.md`](desktop/SESSION_HANDOFF.md) and [`docs/desktop/PREIMPLEMENTATION_AUDIT.md`](desktop/PREIMPLEMENTATION_AUDIT.md).
+- **Compatibility Pointer:** [`docs/PROJECT_STATE_HANDOFF.md`](PROJECT_STATE_HANDOFF.md).

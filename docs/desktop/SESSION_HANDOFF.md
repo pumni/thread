@@ -4,7 +4,7 @@
 
 ## 1. Read order; never start from old conversation reconstruction
 
-1. Read `AGENTS.md` and the **current live** `docs/PROJECT_STATE_HANDOFF.md` on latest main (the historical handoff may be outdated; follow its dated Desktop pointer).
+1. Read root `AGENTS.md`, `apps/desktop/AGENTS.md`, and the authorized DX issue and coordinator comments on latest main. (Past milestone handoffs like `docs/PROJECT_STATE_HANDOFF.md` and `docs/handoffs/` provide historical background, but are not live task authorization).
 2. Verify latest main SHA and PR #93 acceptance/merge. Read this handoff and [PREIMPLEMENTATION_AUDIT.md](PREIMPLEMENTATION_AUDIT.md) from latest main; inspect live issue comments and work only on an explicitly authorized issue.
 3. Read [ADR-0007](../adr/0007-windows-first-single-app-desktop.md), [DELIVERY_PLAN.md](DELIVERY_PLAN.md), [SECURITY_AND_PROTOCOLS.md](SECURITY_AND_PROTOCOLS.md), [ACCEPTANCE_MATRIX.md](ACCEPTANCE_MATRIX.md), [WINDOWS_REHEARSAL.md](WINDOWS_REHEARSAL.md) and [ISSUE_MAP.md](ISSUE_MAP.md) **at the same ref**.
 4. Fetch live epic #94, scope/acceptance and comments on **DX-01 issue #95**. Inspect current implementation in scope. For a later task, read only its expressly authorized DX issue and linked focused docs rather than all Desktop material every time.

@@ -408,9 +408,11 @@ Browser changes additionally require:
 
 `AGENTS.md` and `docs/CONTEXT_MAP.md` are **navigation/instruction layers**, not architecture encyclopedias. They tell agents what to load; they do not replace the detailed sources below.
 
-For current state, use:
-1. `docs/PROJECT_STATE_HANDOFF.md`;
-2. active authorized GitHub issue/batch.
+For live task authority and implementation state, use:
+1. active authorized GitHub issue/batch and coordinator instructions (task authorization);
+2. current code and passing tests on the active branch (implementation truth).
+
+(`docs/PROJECT_STATE_HANDOFF.md` serves as a durable compatibility pointer and index, not live task authorization).
 
 For durable design, use:
 1. accepted ADRs;
