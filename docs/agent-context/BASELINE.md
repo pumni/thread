@@ -239,7 +239,7 @@ A model cannot safely infer these invariants from generic software engineering p
 5. [x] **Persistent account -> worker/profile affinity & no automatic migration:** Browser accounts maintain persistent affinity to an assigned worker and logical browser profile; silent, implicit, or automatic profile migration across workers is prohibited. Explicit reassignment is permitted only through authorized Controller operations requiring coordinated drain/quiescence, account unassignment, and a fresh profile with operator-assisted human login (as specified in ADR-0004 and Desktop security contracts).
 6. [x] **Strict execution modes:** Each account operates in exactly one explicit mode (`API_ONLY`, `BROWSER_ONLY`, `HYBRID`, `MANUAL`).
 7. [x] **Workers do not invent business actions:** The Control Plane Scheduler alone generates business commands; workers execute bounded, authorized assignments.
-8. [x] **API-first principle:** The official Threads API is the preferred executor where supported; browser automation is strictly reserved for capabilities absent from the API.
+8. [x] **API-first, not API-only architecture:** Prefer the official Threads API where it is the suitable and approved executor, but recognize that accounts operate under explicit execution policies (`API_ONLY`, `BROWSER_ONLY`, `HYBRID`, `MANUAL`). Browser execution is allowed only through explicitly approved browser capabilities and account execution policy. Under `HYBRID` mode, fallback or complementary browser execution is bounded by capability policy and must never be inferred automatically from arbitrary API failures.
 9. [x] **Browser automation scope boundary:** Browser automation is restricted to approved Worker boundaries and authorized capabilities only (C3+).
 10. [x] **Human intervention for login / challenge:** Captchas, 2FA, session challenges, or re-authentication require human operator intervention; automated challenge evasion or bypass is strictly prohibited.
 11. [x] **No anti-detect / fingerprint spoofing:** No human-emulation-for-evasion, canvas spoofing, or stealth plugins.
@@ -306,7 +306,7 @@ Assessment of the six candidate skills proposed in #146, grounded in repository 
 
 ## 8. Representative Evaluation Fixtures
 
-Twelve representative task fixtures covering diverse repository workflows, grounded strictly in repository paths present at baseline commit `96cb2e28a00b17c54fa9a33fde54b4826adda529`. These fixtures serve as the benchmark for CTX-02 through CTX-06 to ensure progressive disclosure succeeds without losing critical invariants.
+Twelve representative task fixtures covering diverse repository workflows. All current canonical source, test, and documentation paths are grounded strictly in files present at baseline commit `96cb2e28a00b17c54fa9a33fde54b4826adda529` (with `apps/desktop/AGENTS.md` explicitly noted as a planned target to be introduced in CTX-02). These fixtures serve as the benchmark for CTX-02 through CTX-06 to ensure progressive disclosure succeeds without losing critical invariants.
 
 ---
 
