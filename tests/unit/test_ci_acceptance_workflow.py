@@ -336,7 +336,8 @@ def test_preflight_cheap_gate_evidence_is_scoped_to_current_pr() -> None:
 def test_ci_process_docs_describe_the_single_acceptance_gate() -> None:
     agents = _text("AGENTS.md")
     process = _text("docs/CI_AGENT_WORKFLOW.md")
-    assert "PR Acceptance" in agents and "Main Verification" in agents
+    assert "PR Acceptance" in process and "Main Verification" in process
+    assert "CI_AGENT_WORKFLOW.md" in agents
     for phrase in (
         "Secret scan + PR Head Guard only",
         "single merge-authoritative",
@@ -352,7 +353,7 @@ def test_ci_process_docs_describe_the_single_acceptance_gate() -> None:
 
 def test_agent_and_windows_preflight_contract_remains_repository_visible() -> None:
     preflight = _text("scripts/windows_local_preflight.ps1")
-    assert "two consecutive hosted attempts" in _text("AGENTS.md")
+    assert "two consecutive hosted attempts" in _text("docs/CI_AGENT_WORKFLOW.md")
     assert "THREADS_PLATFORM_TEST_DATABASE_URL" in preflight
     assert "--basetemp=" in preflight
     assert "SpecialFolder]::LocalApplicationData" in preflight
