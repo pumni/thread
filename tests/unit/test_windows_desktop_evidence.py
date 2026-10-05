@@ -2482,7 +2482,8 @@ def test_desktop_workflow_runs_independent_exact_sha_controller_scenarios() -> N
         assert f"          - {scenario}" in scenario_job
     assert "-ControllerScenario ${{ matrix.scenario }}" in scenario_job
     assert (
-        "name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-${{ matrix.scenario }}" in scenario_job
+        "name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-${{ matrix.scenario }}-attempt-"
+        "${{ github.run_attempt }}" in scenario_job
     )
     assert "if: always()" in scenario_job
     assert "-RuntimeLayout shared" in scenario_job
@@ -2490,10 +2491,13 @@ def test_desktop_workflow_runs_independent_exact_sha_controller_scenarios() -> N
 
     assert "if: ${{ always() && inputs.runtime_layout == 'shared' }}" in aggregate_job
     assert "name: Shared Controller acceptance join (Windows x64)" in aggregate_job
-    assert "pattern: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-*" in aggregate_job
+    assert "pattern: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}-*-attempt-*" in aggregate_job
     assert "aggregate_controller_scenarios.py" in aggregate_job
     assert "--source-sha ${{ env.DESKTOP_SOURCE_SHA }}" in aggregate_job
-    assert "name: dx04-evidence-${{ env.DESKTOP_SOURCE_SHA }}" in aggregate_job
+    assert (
+        "name: dx04-controller-acceptance-${{ env.DESKTOP_SOURCE_SHA }}-attempt-"
+        "${{ github.run_attempt }}" in aggregate_job
+    )
     assert "controller-acceptance-manifest.json" in SCENARIO_AGGREGATOR.read_text(encoding="utf-8")
     assert (REPO_ROOT / ".github" / "workflows" / "pr-acceptance.yml").read_text(
         encoding="utf-8"
@@ -2507,7 +2511,7 @@ def test_controller_scenario_aggregate_requires_all_exact_sha_clean_profile_evid
     revision = "e" * 40
     artifact_root = tmp_path / "artifacts"
     for scenario in CONTROLLER_SCENARIOS:
-        evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}"
+        evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}-attempt-1"
         evidence_dir.mkdir(parents=True)
         _write_json(
             evidence_dir / "controller-lifecycle.json",
@@ -2534,13 +2538,14 @@ def test_controller_scenario_aggregate_requires_all_exact_sha_clean_profile_evid
     assert tuple(manifest["required_scenarios"]) == CONTROLLER_SCENARIOS
     assert set(manifest["observed_scenarios"]) == set(CONTROLLER_SCENARIOS)
     assert all(row["result"] == "PASS" for row in manifest["scenarios"])
+    assert all(row["selected_attempt"] == 1 for row in manifest["scenarios"])
     assert (output_root / "controller-acceptance-manifest.json").is_file()
     for scenario in CONTROLLER_SCENARIOS:
         assert (
             output_root / "controller-scenarios" / scenario / "controller-lifecycle.json"
         ).is_file()
 
-    missing = artifact_root / f"dx04-evidence-{revision}-{CONTROLLER_SCENARIOS[-1]}"
+    missing = artifact_root / f"dx04-evidence-{revision}-{CONTROLLER_SCENARIOS[-1]}-attempt-1"
     shutil.rmtree(missing)
     blocked = aggregator.aggregate_scenarios(artifact_root, revision, tmp_path / "missing")
     assert blocked["result"] == "BLOCKER"
@@ -2561,7 +2566,7 @@ def test_controller_scenario_aggregate_writes_blocker_manifest_for_invalid_artif
     artifact_root = tmp_path / "artifacts"
     scenario_dirs: dict[str, Path] = {}
     for scenario in CONTROLLER_SCENARIOS:
-        evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}"
+        evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}-attempt-1"
         scenario_dirs[scenario] = evidence_dir
         evidence: dict[str, Any] = {
             "schema_version": 2,
@@ -2646,3 +2651,108 @@ def test_controller_scenario_aggregate_writes_blocker_manifest_for_invalid_artif
     assert (combined_scenarios / CONTROLLER_SCENARIOS[1] / "controller-lifecycle.json").is_file()
     if failure == "blocker":
         assert (combined_scenarios / expected_scenario / "controller-lifecycle.json").is_file()
+
+
+def test_controller_scenario_aggregate_prefers_newer_pass_over_stale_blocker(
+    tmp_path: Path,
+) -> None:
+    aggregator = _load_scenario_aggregator()
+    revision = "a" * 40
+    artifact_root = tmp_path / "artifacts"
+    for scenario in CONTROLLER_SCENARIOS:
+        _write_controller_scenario_evidence(
+            artifact_root,
+            revision,
+            scenario,
+            attempt=1,
+            result="BLOCKER" if scenario == "restart_renewal" else "PASS",
+            failure_code="stale_attempt_blocker" if scenario == "restart_renewal" else None,
+        )
+    _write_controller_scenario_evidence(artifact_root, revision, "restart_renewal", attempt=2)
+
+    output_root = tmp_path / "combined"
+    manifest = aggregator.aggregate_scenarios(artifact_root, revision, output_root)
+    assert manifest["result"] == "PASS"
+    row = next(row for row in manifest["scenarios"] if row["scenario"] == "restart_renewal")
+    assert row["artifact_count"] == 2
+    assert row["available_attempts"] == [1, 2]
+    assert row["selected_attempt"] == 2
+    assert row["result"] == "PASS"
+
+
+def test_controller_scenario_aggregate_uses_highest_attempt_available_per_scenario(
+    tmp_path: Path,
+) -> None:
+    aggregator = _load_scenario_aggregator()
+    revision = "b" * 40
+    artifact_root = tmp_path / "artifacts"
+    for scenario in CONTROLLER_SCENARIOS:
+        attempt = 2 if scenario in {"restart_renewal", "unwritable_root"} else 1
+        _write_controller_scenario_evidence(artifact_root, revision, scenario, attempt)
+
+    manifest = aggregator.aggregate_scenarios(artifact_root, revision, tmp_path / "combined")
+    assert manifest["result"] == "PASS"
+    selected_attempts = {row["scenario"]: row["selected_attempt"] for row in manifest["scenarios"]}
+    assert selected_attempts["restart_renewal"] == 2
+    assert selected_attempts["unwritable_root"] == 2
+    assert all(
+        attempt == 1
+        for scenario, attempt in selected_attempts.items()
+        if scenario not in {"restart_renewal", "unwritable_root"}
+    )
+
+
+def test_controller_scenario_aggregate_does_not_fall_back_from_latest_blocker(
+    tmp_path: Path,
+) -> None:
+    aggregator = _load_scenario_aggregator()
+    revision = "d" * 40
+    artifact_root = tmp_path / "artifacts"
+    for scenario in CONTROLLER_SCENARIOS:
+        _write_controller_scenario_evidence(artifact_root, revision, scenario, attempt=1)
+    _write_controller_scenario_evidence(
+        artifact_root,
+        revision,
+        "restart_renewal",
+        attempt=2,
+        result="BLOCKER",
+        failure_code="latest_attempt_blocker",
+    )
+
+    manifest = aggregator.aggregate_scenarios(artifact_root, revision, tmp_path / "combined")
+    assert manifest["result"] == "BLOCKER"
+    row = next(row for row in manifest["scenarios"] if row["scenario"] == "restart_renewal")
+    assert row["available_attempts"] == [1, 2]
+    assert row["selected_attempt"] == 2
+    assert row["result"] == "BLOCKER"
+    assert row["primary_failure_code"] == "latest_attempt_blocker"
+
+
+def _write_controller_scenario_evidence(
+    artifact_root: Path,
+    revision: str,
+    scenario: str,
+    attempt: int,
+    result: str = "PASS",
+    failure_code: str | None = None,
+) -> None:
+    evidence_dir = artifact_root / f"dx04-evidence-{revision}-{scenario}-attempt-{attempt}"
+    evidence_dir.mkdir(parents=True)
+    _write_json(
+        evidence_dir / "controller-lifecycle.json",
+        {
+            "schema_version": 2,
+            "source_revision": revision,
+            "scenario": scenario,
+            "runner": {
+                "github_hosted": True,
+                "windows_x64": True,
+                "non_administrator": True,
+                "clean_profile": True,
+            },
+            "checks": {"fixture": True},
+            "failure_codes": [] if failure_code is None else [failure_code],
+            "failure_code": failure_code,
+            "result": result,
+        },
+    )
