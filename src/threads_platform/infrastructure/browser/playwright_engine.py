@@ -27,13 +27,13 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-from threads_platform.domain.workers import NetworkProtocol
-from threads_platform.workers.browser import (
+from threads_platform.application.ports.browser import (
     BROWSER_FEED_CANDIDATE_BOUND,
     BROWSER_FEED_ORIGIN,
     BrowserContractError,
     BrowserEngineSession,
     BrowserLaunchRequest,
+    BrowserNetworkProtocol,
     BrowserNetworkRouteUnsupported,
     BrowserProcessCrashed,
     BrowserRuntimeUnavailable,
@@ -809,23 +809,21 @@ def _verify_profile_target_result(payload: object) -> None:
 def playwright_proxy_settings(request: BrowserLaunchRequest) -> ProxySettings | None:
     route = request.network_route
     credentials = request.proxy_credentials
-    if route.account_id != request.account_id:
-        raise BrowserNetworkRouteUnsupported()
-    if route.protocol is NetworkProtocol.DIRECT:
+    if route.protocol is BrowserNetworkProtocol.DIRECT:
         if route.host is not None or route.port is not None or credentials is not None:
             raise BrowserNetworkRouteUnsupported()
         return None
     if not route.host or route.port is None:
         raise BrowserNetworkRouteUnsupported()
     scheme = {
-        NetworkProtocol.HTTP: "http",
-        NetworkProtocol.HTTPS: "https",
-        NetworkProtocol.SOCKS5: "socks5",
+        BrowserNetworkProtocol.HTTP: "http",
+        BrowserNetworkProtocol.HTTPS: "https",
+        BrowserNetworkProtocol.SOCKS5: "socks5",
     }.get(route.protocol)
     if scheme is None:
         raise BrowserNetworkRouteUnsupported()
     if (
-        route.protocol is NetworkProtocol.SOCKS5
+        route.protocol is BrowserNetworkProtocol.SOCKS5
         and credentials is not None
         and (credentials.username is not None or credentials.password is not None)
     ):

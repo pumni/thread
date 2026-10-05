@@ -3,13 +3,18 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from threads_platform.application.ports.browser import (
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
+    BrowserProxyCredentials,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     ManagedProfileDirectory,
     WorkerAccountContext,
     WorkerLocalState,
 )
-from threads_platform.domain.workers import BrowserSessionState, NetworkProfile, NetworkProtocol
+from threads_platform.domain.workers import BrowserSessionState, NetworkProfile
 
 _SESSION_TRANSITIONS: dict[BrowserSessionState, frozenset[BrowserSessionState]] = {
     BrowserSessionState.UNINITIALIZED: frozenset(
@@ -81,45 +86,42 @@ class InvalidSessionTransition(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class NetworkRoute:
+class WorkerNetworkRoute:
     account_id: UUID
-    protocol: NetworkProtocol
-    host: str | None
-    port: int | None
+    browser_route: BrowserNetworkRoute
     credential_ref: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class BrowserSessionOpenResult:
     state: LocalSessionState
-    network_route: NetworkRoute
+    network_route: WorkerNetworkRoute
 
 
 class NetworkProfileApplication:
     """Resolves account routing metadata without retrieving proxy credentials."""
 
-    def resolve(self, account_id: UUID, profile: NetworkProfile | None) -> NetworkRoute:
+    def resolve(self, account_id: UUID, profile: NetworkProfile | None) -> WorkerNetworkRoute:
         if profile is None:
-            return NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None)
+            return WorkerNetworkRoute(
+                account_id,
+                BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            )
         if profile.account_id != account_id:
             raise ValueError("NetworkProfile belongs to a different account")
-        return NetworkRoute(
+        return WorkerNetworkRoute(
             account_id,
-            profile.protocol,
-            profile.host,
-            profile.port,
+            BrowserNetworkRoute(
+                BrowserNetworkProtocol(profile.protocol.value),
+                profile.host,
+                profile.port,
+            ),
             profile.credential_ref,
         )
 
 
 class ProxyCredentialProvider(Protocol):
-    async def credentials_for(self, credential_ref: str) -> ProxyCredentials: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ProxyCredentials:
-    username: str | None = field(default=None, repr=False)
-    password: str | None = field(default=None, repr=False)
+    async def credentials_for(self, credential_ref: str) -> BrowserProxyCredentials: ...
 
 
 class BrowserSessionManager(Protocol):

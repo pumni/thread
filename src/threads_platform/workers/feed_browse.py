@@ -13,6 +13,13 @@ from threads_platform.application.browser_capabilities import (
     BrowserFeedItemResultV1,
     BrowserFeedResultV1,
 )
+from threads_platform.application.ports.browser import (
+    BROWSER_FEED_CANDIDATE_BOUND,
+    BROWSER_FEED_ORIGIN,
+    BrowserAdapterError,
+    BrowserContractError,
+    FeedCandidateObservation,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
     WorkerAccountContext,
@@ -23,12 +30,7 @@ from threads_platform.application.ports.worker_agent import (
 from threads_platform.domain.worker_jobs import WorkerJobRetrySafety
 from threads_platform.domain.workers import BrowserSessionState
 from threads_platform.workers.browser import (
-    BROWSER_FEED_CANDIDATE_BOUND,
-    BROWSER_FEED_ORIGIN,
-    BrowserAdapterError,
-    BrowserContractError,
     BrowserNavigationPolicy,
-    FeedCandidateObservation,
     WorkerBrowserSession,
     WorkerJobExecution,
     WorkerJobLeaseLost,

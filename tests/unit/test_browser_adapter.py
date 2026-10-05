@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 import time
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +16,30 @@ from uuid import UUID, uuid4
 import pytest
 
 import threads_platform.infrastructure.browser.playwright_engine as playwright_engine
+from threads_platform.application.ports.browser import (
+    BrowserAdapterError,
+    BrowserContractError,
+    BrowserEngineSession,
+    BrowserFeedEngineSession,
+    BrowserLaunchRequest,
+    BrowserMediaEngineSession,
+    BrowserNetworkProtocol,
+    BrowserNetworkRoute,
+    BrowserNetworkRouteUnsupported,
+    BrowserProcessCrashed,
+    BrowserProfileOpenEngineSession,
+    BrowserProxyCredentials,
+    BrowserSurface,
+    BrowserThreadOpenEngineSession,
+    ChallengeDetected,
+    FeedCandidateObservation,
+    LocatorNotFound,
+    MediaUploadFailed,
+    NavigationTimeout,
+    RemoteSessionStateUncertain,
+    SessionExpired,
+    UnsupportedUIState,
+)
 from threads_platform.application.ports.worker_agent import (
     LocalRecoveryEntry,
     LocalSessionState,
@@ -37,28 +61,10 @@ from threads_platform.infrastructure.worker_agent.local_state import (
 from threads_platform.workers.browser import (
     ActionOutcomeAmbiguous,
     BrowserAccountAffinityMismatch,
-    BrowserAdapterError,
-    BrowserContractError,
-    BrowserFeedEngineSession,
-    BrowserLaunchRequest,
-    BrowserMediaEngineSession,
     BrowserNavigationPolicy,
-    BrowserNetworkRouteUnsupported,
-    BrowserProcessCrashed,
-    BrowserProfileOpenEngineSession,
-    BrowserSurface,
     BrowserSurfaceState,
-    BrowserThreadOpenEngineSession,
-    ChallengeDetected,
-    FeedCandidateObservation,
-    LocatorNotFound,
     ManagedPlaywrightBrowserSessionManager,
-    MediaUploadFailed,
-    NavigationTimeout,
     PlaywrightBrowserAdapter,
-    RemoteSessionStateUncertain,
-    SessionExpired,
-    UnsupportedUIState,
     WorkerBrowserSession,
     WorkerJobExecution,
     WorkerJobLeaseLost,
@@ -70,8 +76,7 @@ from threads_platform.workers.feed_browse import normalize_feed_candidates
 from threads_platform.workers.sessions import (
     BrowserSessionOpenResult,
     LocalBrowserSessionManager,
-    NetworkRoute,
-    ProxyCredentials,
+    WorkerNetworkRoute,
 )
 
 
@@ -83,6 +88,25 @@ def synthetic_redirect_target_requests() -> list[str]:
 @pytest.fixture
 def synthetic_upload_count() -> list[int]:
     return []
+
+
+def test_shared_browser_contract_shapes_are_topology_neutral() -> None:
+    assert tuple(field.name for field in fields(BrowserLaunchRequest)) == (
+        "profile_directory",
+        "network_route",
+        "proxy_credentials",
+        "headless",
+    )
+    assert tuple(field.name for field in fields(BrowserNetworkRoute)) == (
+        "protocol",
+        "host",
+        "port",
+    )
+    assert tuple(field.name for field in fields(BrowserProxyCredentials)) == (
+        "username",
+        "password",
+    )
+    assert not hasattr(BrowserEngineSession, "inspect_surface")
 
 
 @pytest.fixture
@@ -233,14 +257,10 @@ def test_playwright_redirect_requests_intervention_without_following_target(
     async def scenario() -> None:
         profile_directory = tmp_path / "redirect-profile"
         profile_directory.mkdir()
-        account_id = uuid4()
         session = await PlaywrightBrowserEngine(navigation_timeout_ms=5_000).open(
             BrowserLaunchRequest(
-                worker_id=uuid4(),
-                account_id=account_id,
-                profile_ref="redirect-profile",
                 profile_directory=profile_directory,
-                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                 headless=True,
             )
         )
@@ -265,7 +285,6 @@ def test_playwright_media_upload_waits_for_matching_response_and_same_dialog_pre
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        worker_id, account_id = uuid4(), uuid4()
         profile_directory = tmp_path / "media-profile"
         profile_directory.mkdir()
         file_path = tmp_path / "sample.png"
@@ -274,11 +293,8 @@ def test_playwright_media_upload_waits_for_matching_response_and_same_dialog_pre
             BrowserMediaEngineSession,
             await PlaywrightBrowserEngine(navigation_timeout_ms=2_000).open(
                 BrowserLaunchRequest(
-                    worker_id=worker_id,
-                    account_id=account_id,
-                    profile_ref="media-profile",
                     profile_directory=profile_directory,
-                    network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                    network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                     headless=True,
                 )
             ),
@@ -327,7 +343,6 @@ def test_playwright_media_upload_requires_one_exact_successful_response(
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        account_id = uuid4()
         profile_directory = tmp_path / f"profile-{uuid4()}"
         profile_directory.mkdir()
         file_path = tmp_path / "sample.png"
@@ -336,11 +351,8 @@ def test_playwright_media_upload_requires_one_exact_successful_response(
             BrowserMediaEngineSession,
             await PlaywrightBrowserEngine(navigation_timeout_ms=2_000).open(
                 BrowserLaunchRequest(
-                    worker_id=uuid4(),
-                    account_id=account_id,
-                    profile_ref="media-profile",
                     profile_directory=profile_directory,
-                    network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                    network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                     headless=True,
                 )
             ),
@@ -378,18 +390,14 @@ def test_playwright_media_composer_precondition_is_exact_and_bounded(
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        account_id = uuid4()
         profile_directory = tmp_path / f"profile-{uuid4()}"
         profile_directory.mkdir()
         engine_session = cast(
             BrowserMediaEngineSession,
             await PlaywrightBrowserEngine(navigation_timeout_ms=2_000).open(
                 BrowserLaunchRequest(
-                    worker_id=uuid4(),
-                    account_id=account_id,
-                    profile_ref="media-profile",
                     profile_directory=profile_directory,
-                    network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                    network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                     headless=True,
                 )
             ),
@@ -480,16 +488,12 @@ def test_playwright_feed_without_reviewed_permalink_evidence_is_uncertain(
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        account_id = uuid4()
         profile_directory = tmp_path / "session-transition-profile"
         profile_directory.mkdir()
         session = await PlaywrightBrowserEngine().open(
             BrowserLaunchRequest(
-                worker_id=uuid4(),
-                account_id=account_id,
-                profile_ref="session-transition-profile",
                 profile_directory=profile_directory,
-                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                 headless=True,
             )
         )
@@ -515,16 +519,12 @@ def test_playwright_feed_scan_uses_reviewed_semantic_markers_only(
 ) -> None:
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        worker_id, account_id = uuid4(), uuid4()
         profile_directory = tmp_path / "feed-profile"
         profile_directory.mkdir()
         session = await PlaywrightBrowserEngine().open(
             BrowserLaunchRequest(
-                worker_id=worker_id,
-                account_id=account_id,
-                profile_ref="feed-profile",
                 profile_directory=profile_directory,
-                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                 headless=True,
             )
         )
@@ -557,16 +557,12 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
         error: type[Exception] | None = None,
     ) -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        account_id = uuid4()
         profile_directory = tmp_path / f"thread-{uuid4()}"
         profile_directory.mkdir()
         session = await PlaywrightBrowserEngine(navigation_timeout_ms=1_000).open(
             BrowserLaunchRequest(
-                worker_id=uuid4(),
-                account_id=account_id,
-                profile_ref="thread-profile",
                 profile_directory=profile_directory,
-                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                 headless=True,
             )
         )
@@ -655,16 +651,12 @@ def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
         ancestor_bound: int = 8,
     ) -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
-        account_id = uuid4()
         profile_directory = tmp_path / f"profile-open-{uuid4()}"
         profile_directory.mkdir()
         session = await PlaywrightBrowserEngine(navigation_timeout_ms=1_000).open(
             BrowserLaunchRequest(
-                worker_id=uuid4(),
-                account_id=account_id,
-                profile_ref="profile-open-test",
                 profile_directory=profile_directory,
-                network_route=NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
                 headless=True,
             )
         )
@@ -893,8 +885,8 @@ def test_playwright_credentials_stay_in_memory_and_are_account_scoped(tmp_path: 
         manager = LocalBrowserSessionManager(worker_id, 2, store, resolver)
         provider = _MemoryProxyCredentials(
             {
-                "secret://first-account": ProxyCredentials("first-user", "first-secret"),
-                "secret://second-account": ProxyCredentials("second-user", "second-secret"),
+                "secret://first-account": BrowserProxyCredentials("first-user", "first-secret"),
+                "secret://second-account": BrowserProxyCredentials("second-user", "second-secret"),
             }
         )
         engine = _MemoryBrowserEngine()
@@ -919,6 +911,8 @@ def test_playwright_credentials_stay_in_memory_and_are_account_scoped(tmp_path: 
             )
             context = WorkerAccountContext(account_id, worker_id, profile_ref, network)
             opened = await manager.open(context)
+            assert opened.network_route.account_id == account_id
+            assert opened.network_route.credential_ref == credential_ref
             sessions.append(
                 await adapter.open_reserved_session(
                     context,
@@ -929,14 +923,14 @@ def test_playwright_credentials_stay_in_memory_and_are_account_scoped(tmp_path: 
                 )
             )
         assert provider.requested_refs == ["secret://first-account", "secret://second-account"]
-        assert [request.account_id for request in engine.requests] == [
-            first_account,
-            second_account,
+        assert [request.network_route for request in engine.requests] == [
+            BrowserNetworkRoute(BrowserNetworkProtocol.HTTPS, "proxy.example.test", 8443),
+            BrowserNetworkRoute(BrowserNetworkProtocol.HTTPS, "proxy.example.test", 8443),
         ]
-        assert engine.requests[0].proxy_credentials == ProxyCredentials(
+        assert engine.requests[0].proxy_credentials == BrowserProxyCredentials(
             "first-user", "first-secret"
         )
-        assert engine.requests[1].proxy_credentials == ProxyCredentials(
+        assert engine.requests[1].proxy_credentials == BrowserProxyCredentials(
             "second-user", "second-secret"
         )
         diagnostic = repr(engine.requests)
@@ -954,14 +948,10 @@ def test_playwright_credentials_stay_in_memory_and_are_account_scoped(tmp_path: 
 
 
 def test_credentialed_socks5_is_rejected_without_secret_in_error() -> None:
-    account_id = uuid4()
     request = BrowserLaunchRequest(
-        uuid4(),
-        account_id,
-        "profile",
         Path("unused"),
-        NetworkRoute(account_id, NetworkProtocol.SOCKS5, "proxy.example.test", 1080),
-        proxy_credentials=ProxyCredentials("proxy-user", "proxy-password"),
+        BrowserNetworkRoute(BrowserNetworkProtocol.SOCKS5, "proxy.example.test", 1080),
+        proxy_credentials=BrowserProxyCredentials("proxy-user", "proxy-password"),
     )
     with pytest.raises(BrowserNetworkRouteUnsupported) as error:
         from threads_platform.infrastructure.browser.playwright_engine import (
@@ -1000,19 +990,55 @@ def test_browser_adapter_rejects_profile_from_another_account(tmp_path: Path) ->
     asyncio.run(scenario())
 
 
+def test_browser_adapter_rejects_network_route_for_another_account(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        worker_id, account_id, other_account_id = uuid4(), uuid4(), uuid4()
+        context, manager, store, resolver, _ = await _managed_session(
+            tmp_path,
+            worker_id,
+            account_id,
+            "network-affinity-profile",
+            open_session=False,
+        )
+        opened = await manager.open(context)
+        mismatched = replace(
+            opened,
+            network_route=WorkerNetworkRoute(
+                other_account_id,
+                opened.network_route.browser_route,
+                opened.network_route.credential_ref,
+            ),
+        )
+        engine = _MemoryBrowserEngine()
+        adapter = PlaywrightBrowserAdapter(worker_id, resolver, engine)
+
+        with pytest.raises(BrowserAccountAffinityMismatch):
+            await adapter.open_reserved_session(
+                context,
+                mismatched,
+                transition=manager.transition,
+                close_session=manager.close,
+                headless=True,
+            )
+
+        assert engine.requests == []
+        closed = store.get_session(account_id)
+        assert closed is not None and closed.state is BrowserSessionState.STOPPED
+
+    asyncio.run(scenario())
+
+
 def test_http_proxy_credentials_are_passed_only_to_engine_in_memory() -> None:
     from threads_platform.infrastructure.browser.playwright_engine import (
         playwright_proxy_settings,
     )
 
-    account_id = uuid4()
     request = BrowserLaunchRequest(
-        uuid4(),
-        account_id,
-        "logical-profile",
         Path("unused"),
-        NetworkRoute(account_id, NetworkProtocol.HTTPS, "proxy.example.test", 8443, "vault-ref"),
-        proxy_credentials=ProxyCredentials("route-user", "route-password"),
+        BrowserNetworkRoute(BrowserNetworkProtocol.HTTPS, "proxy.example.test", 8443),
+        proxy_credentials=BrowserProxyCredentials("route-user", "route-password"),
         headless=True,
     )
     settings = playwright_proxy_settings(request)
@@ -1023,7 +1049,6 @@ def test_http_proxy_credentials_are_passed_only_to_engine_in_memory() -> None:
         "password": "route-password",
     }
     assert "route-password" not in repr(request)
-    assert "vault-ref" not in repr(request)
 
 
 def test_unknown_ui_contracts_and_missing_markers_fail_closed() -> None:
@@ -1317,7 +1342,10 @@ async def _managed_session(
                 1,
                 datetime.now(UTC),
             ),
-            NetworkRoute(account_id, NetworkProtocol.DIRECT, None, None),
+            WorkerNetworkRoute(
+                account_id,
+                BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+            ),
         )
     return context, manager, store, resolver, opened
 
@@ -1622,11 +1650,11 @@ class _MemoryBrowserEngine:
 
 
 class _MemoryProxyCredentials:
-    def __init__(self, credentials: dict[str, ProxyCredentials]) -> None:
+    def __init__(self, credentials: dict[str, BrowserProxyCredentials]) -> None:
         self._credentials = credentials
         self.requested_refs: list[str] = []
 
-    async def credentials_for(self, credential_ref: str) -> ProxyCredentials:
+    async def credentials_for(self, credential_ref: str) -> BrowserProxyCredentials:
         self.requested_refs.append(credential_ref)
         return self._credentials[credential_ref]
 

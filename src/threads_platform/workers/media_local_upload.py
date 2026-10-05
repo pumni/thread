@@ -10,6 +10,13 @@ from threads_platform.application.browser_capabilities import (
     BROWSER_CAPABILITY_CONTRACTS,
     BrowserMediaStageResultV1,
 )
+from threads_platform.application.ports.browser import (
+    BrowserAdapterError,
+    ChallengeDetected,
+    PreparedMediaComposer,
+    RemoteSessionStateUncertain,
+    SessionExpired,
+)
 from threads_platform.application.ports.worker_agent import (
     WorkerAccountContext,
     WorkerControlClient,
@@ -27,11 +34,6 @@ from threads_platform.infrastructure.worker_agent.local_media import (
 )
 from threads_platform.workers.browser import (
     ActionOutcomeAmbiguous,
-    BrowserAdapterError,
-    ChallengeDetected,
-    PreparedMediaComposer,
-    RemoteSessionStateUncertain,
-    SessionExpired,
     WorkerBrowserSession,
     WorkerJobExecution,
     WorkerJobLeaseLost,
