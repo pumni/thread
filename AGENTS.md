@@ -1,56 +1,69 @@
 # AGENTS.md
 
-This file is the repository-wide map for coding agents. Keep it short. Detailed knowledge belongs in `docs/`.
+This file is the repository-wide constitution and router for coding agents. Detailed knowledge belongs in `docs/` and specialized project skills.
 
 ## Project
 
 `pumni/thread` is a Distributed Hybrid Threads Operations Tool:
-- centralized Control Plane + PostgreSQL source of truth;
-- official Threads API where it is the best supported executor;
-- distributed Windows-first Worker Agents for approved local/browser capabilities;
-- human intervention as a valid execution outcome.
+- Centralized Control Plane + PostgreSQL source of truth;
+- Official Threads API preferred where it satisfies the capability;
+- Distributed Windows-first Worker Agents for approved local/browser capabilities;
+- Human intervention as a valid, fail-closed execution outcome.
 
-Do not infer current milestone/status from this file. Read `docs/PROJECT_STATE_HANDOFF.md`.
+## Authority by information type
 
-## Start every task
+- **Task authorization:** Current user instruction, authorized GitHub issue, and coordinator comments define *what to do now*. Static handoff/history documents never grant authorization.
+- **Implementation truth:** Current code and passing tests on the checkout branch define *how the system behaves now*.
+- **Accepted contracts:** Accepted ADRs (`docs/adr/`) and versioned protocol specifications (`docs/protocols/`) define durable architecture.
+- **Subtree rules:** The nearest nested `AGENTS.md` (e.g. `apps/desktop/AGENTS.md`) governs localized component rules.
 
-1. Read `docs/PROJECT_STATE_HANDOFF.md`.
-2. Read the authorized GitHub issue/batch and coordinator comments.
-3. Use `docs/CONTEXT_MAP.md` to load only the docs relevant to the task.
-4. Inspect the current implementation/tests before designing new abstractions.
-5. If external Threads behavior matters, verify current official Meta docs/changelog.
+## Starting a task
 
-Do not preload every document in `docs/` unless the task genuinely spans the whole architecture.
+1. Identify scope from the authorized GitHub issue / coordinator comment or direct user request.
+2. Read this root `AGENTS.md`, and the nearest nested `AGENTS.md` if working within a subtree.
+3. Inspect current code and tests in the target area before designing abstractions.
+4. Load matching project skills (`.agents/skills/`) and canonical documentation just in time only when the task requires them.
+5. Do not preload the full documentation set by default.
 
 ## Non-negotiable invariants
 
-- PostgreSQL is authoritative business state.
+- PostgreSQL is authoritative business state; memory, WebSockets, and worker journals are not.
 - `Command` is business intent; `WorkerJob` is remote execution. Do not collapse them.
-- WorkerJob has independent lease/fencing/checkpoint semantics.
+- WorkerJob has independent lease/fencing/checkpoint semantics; stale-owner updates fail closed.
 - WebSocket is notification/presence, never the durable queue or source of truth.
-- Browser accounts use persistent account -> worker/profile affinity; no automatic profile migration.
+- Browser accounts use persistent account -> worker/profile affinity; no automatic profile migration; explicit reassignment requires authorized Controller flow and fresh human login per ADR-0004.
 - Each account has its own execution mode: `API_ONLY`, `BROWSER_ONLY`, `HYBRID`, or `MANUAL`.
 - Workers do not invent business actions; Control Plane/Scheduler creates them.
-- API-first means preferred executor where suitable, not API-only architecture.
+- API-first means preferred executor where suitable, not API-only architecture; `HYBRID` fallback is bounded by capability policy and never inferred automatically from arbitrary API failures.
 - Browser automation is allowed only in the approved Worker/browser boundary and only from C3 onward.
-- Login/session challenges require intervention; do not bypass them.
+- Login/session challenges require human intervention; do not bypass them.
 - No anti-detect, fingerprint spoofing, or human-emulation-for-evasion subsystem.
 - Domain code must not import FastAPI, httpx, SQLAlchemy, WebSocket/browser libraries, Windows APIs, or Meta DTOs.
+- External side effects require explicit idempotency/recovery behavior; timeout is not proof of failure.
+- Keep secrets, tokens, private keys, proxy credentials, and Authorization headers out of Git/logs/fixtures.
 
 ## Change discipline
 
-- Implement only the explicitly authorized issue/batch.
+- Implement only the explicitly authorized issue/batch; stop at the designated checkpoint.
 - Prefer the smallest coherent change that satisfies the contract.
-- Reuse existing ports/state machines/patterns before introducing new frameworks.
-- Do not add Redis, a broker, microservices, automatic profile migration, or a new auth model without an approved architecture decision.
+- Reuse existing ports, services, and patterns before adding abstractions.
+- Do not add Redis, a broker, microservices, or new auth architecture without an approved ADR.
 - Schema changes require Alembic migrations and integration coverage.
-- External side effects require explicit idempotency/recovery behavior; timeout is not proof of failure.
-- Keep secrets, tokens, private keys, proxy credentials, and Authorization headers out of Git/logs/fixtures.
-- If an accepted contract changes, update the relevant source-of-truth document/ADR in the same change.
+- If an accepted contract changes, update the relevant ADR/source-of-truth document in the same change.
 
-## Validation
+## Progressive disclosure & skills
 
-Standard gate:
+Load specialized skills under `.agents/skills/` only when triggered:
+- `database-migration`: PostgreSQL schemas, Alembic revisions, SQLAlchemy models.
+- `worker-protocol`: Worker WebSocket framing, protocol v1/v2, 256-bit enrollment, lease/fencing tokens.
+- `browser-capability`: Fail-closed Threads browser capabilities, Playwright DOM contracts, staged mutations.
+- `threads-api-contract`: Official Meta Threads Graph API client, OAuth credentials, API test fixtures.
+- `ci-failure-triage`: Hosted CI failure triage, runner artifacts, root-cause classification, repeated-signature stop rule.
+- `desktop-acceptance`: Windows Desktop local preflight, packaging smoke tests, native supervisor acceptance evidence.
+
+## Validation & hosted CI
+
+Run narrow deterministic checks during implementation. When required by the issue or checkpoint, verify the standard gate:
 
 ```bash
 uv sync --locked
@@ -61,42 +74,21 @@ uv run alembic check
 uv run pytest
 ```
 
-Also run task-specific migration, PostgreSQL, concurrency, protocol, recovery, or browser-contract tests described by the issue/context map.
-
-## Hosted CI discipline
-
-Before opening/advancing a PR or reacting to hosted CI, read `docs/CI_AGENT_WORKFLOW.md`.
-
-- Local PASS is preflight, never hosted acceptance. Do not call local validation complete if a required PostgreSQL/Alembic gate was skipped for missing environment.
-- Keep implementation PRs Draft while iterating. Draft pushes run only Secret scan and PR Head Guard; Ready starts one merge-authoritative PR Acceptance gate, and main pushes start one Main Verification gate. Do not use hosted CI as a remote debugger.
-- Reusable CI components must check out the exact `source_sha`. Desktop manual diagnostics require an explicit source SHA; reopening a PR does not start heavy acceptance.
-- Any hosted failure is a hard stop for the coding agent. Download/read the evidence, record the exact primary failure signature, classify it as product/harness/environment, then report. Do not push or rerun a corrective hosted attempt without coordinator authorization.
-- If two consecutive hosted attempts have the same primary failure signature, do not make a third attempt. Escalate to the coordinator with both artifacts and the changed hypothesis.
-- UI/control presence is not proof of authentication/session/process truth when authoritative server/database/native-process evidence exists.
-- Before another expensive hosted attempt, add a deterministic regression test or a narrowly targeted diagnostic seam whenever the failure can be reproduced below the full smoke.
+Local PASS is preflight only, never hosted acceptance. Hosted CI failure is a hard stop: do not push speculative fixes or rerun workflows hoping timing changes. If a hosted run fails, stop, load the `ci-failure-triage` skill, and follow `docs/CI_AGENT_WORKFLOW.md`.
 
 ## Stop instead of improvising
 
 Stop the affected work and report when:
-- source-of-truth docs/ADRs conflict with the requested implementation;
-- a safe recovery/idempotency path cannot be established;
-- production credentials/data are required;
-- browser automation would be needed before C3;
-- implementation would require evasion/bypass behavior;
-- a new distributed-system dependency or breaking protocol/security change appears necessary;
-- current official API/UI behavior materially contradicts the accepted contract;
-- quality gates can pass only by weakening correctness, typing, tests, or security.
+- Requirements conflict with accepted ADRs or source-of-truth documents;
+- A safe recovery or idempotency path cannot be established;
+- Production credentials or live external data are required;
+- Browser automation would be needed before C3;
+- Implementation would require evasion or bypass behavior;
+- External Threads API or UI behavior materially contradicts the accepted contract;
+- Quality gates can pass only by weakening correctness, typing, tests, or security.
 
 ## Delivery
 
-- Roadmap entries are not automatic authorization.
+- Roadmap entries and milestone lists are not authorization.
 - Keep issue -> commit -> test evidence traceable.
-- Do not self-merge unless the user/coordinator explicitly authorizes merge.
-- Stop at the checkpoint named in the authorized batch.
-
-## Context maintenance
-
-- `AGENTS.md` is a map, not an encyclopedia.
-- Put durable architecture/product knowledge in `docs/`, not here.
-- Avoid generic advice the model already knows.
-- Add nested `AGENTS.md` only when a subtree develops stable, genuinely local rules that cannot be expressed cleanly in normal docs.
+- Do not self-merge unless the user or coordinator explicitly authorizes merge.

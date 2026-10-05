@@ -46,7 +46,7 @@ Core principles:
 
 ## Agent context and source of truth
 
-Coding agents should start with `AGENTS.md`, then `docs/PROJECT_STATE_HANDOFF.md`, the authorized issue, and `docs/CONTEXT_MAP.md`. The context map points to the smallest relevant subset of detailed docs for the task.
+Coding agents start with the authorized GitHub issue / user instruction, root `AGENTS.md`, nearest nested `AGENTS.md` (e.g. `apps/desktop/AGENTS.md`), and current code/tests. Specialized project skills (`.agents/skills/`) and canonical `docs/` are retrieved just in time only as needed for the specific task.
 
 Detailed durable knowledge lives in `docs/`:
 - `MASTER_PLAN.md` — product decisions and C1-C6 roadmap.
