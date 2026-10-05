@@ -10,6 +10,7 @@ import {
   controllerTrustSummary,
   getDesktopSnapshot,
   listenForTrayQuit,
+  localWorkerDrainStatus,
   operatorBootstrapOwner,
   operatorChangePassword,
   operatorCreateUser,
@@ -20,9 +21,12 @@ import {
   operatorLogout,
   operatorUpdateUser,
   provisionRole,
+  forceStopWorker,
+  rollbackLocalWorkerToLegacy,
   resetUiPreferences,
   requestQuit,
   requestRestart,
+  takeoverLocalWorker,
   type CreatedOperatorUser,
   type ControllerHttpsSummary,
   type DesktopSnapshot,
@@ -52,12 +56,53 @@ const roleDetails: Record<ProvisionedRole, { label: string; description: string 
 };
 
 const availableRoles: ProvisionedRole[] = ["CONTROLLER", "WORKER", "CONSOLE"];
+const workerLifecycleRoles: OperatorRole[] = ["OWNER", "ADMIN", "OPERATOR"];
+const stableWorkerErrorCodes = new Set([
+  "worker_host_configuration_required",
+  "worker_legacy_task_not_registered",
+  "worker_legacy_task_invalid",
+  "worker_legacy_task_running",
+  "worker_legacy_task_disable_failed",
+  "worker_legacy_task_enable_failed",
+  "worker_legacy_task_start_failed",
+  "worker_package_invalid",
+  "worker_host_config_invalid",
+  "worker_identity_missing",
+  "worker_identity_not_enrolled",
+  "worker_identity_corrupt",
+  "worker_device_key_unprotect_failed",
+  "worker_process_lock_held",
+  "worker_process_lock_not_acquired",
+  "worker_process_lock_unavailable",
+  "worker_process_job_create_failed",
+  "worker_process_job_assign_failed",
+  "worker_process_exited",
+  "worker_process_exit_timeout",
+  "worker_process_start_failed",
+  "worker_drain_unavailable",
+  "worker_drain_request_failed",
+  "worker_drain_response_invalid",
+  "worker_drain_timeout",
+  "worker_drain_interrupted",
+  "worker_startup_cleanup_failed",
+  "worker_startup_timeout",
+  "worker_cutover_rollback_required",
+  "worker_rollback_failed",
+  "worker_force_confirmation_required",
+  "worker_forced_interruption",
+  "operator_authentication_required",
+  "operator_session_revoked",
+  "operator_password_change_required",
+  "operator_forbidden",
+  "operator_api_unavailable",
+]);
 const operatorAccessMessages: Record<string, string> = {
-  operator_authentication_required: "Sign in with a Controller Owner or Admin account to continue.",
+  operator_authentication_required:
+    "Sign in with an Operator account authorized for this node to continue.",
   operator_session_revoked:
     "This Operator session expired or was revoked. Sign in again before stopping this node.",
   operator_password_change_required: "Change your Workspace password before stopping this node.",
-  operator_forbidden: "Only a Controller Owner or Admin can perform this operation.",
+  operator_forbidden: "This Operator account is not authorized to perform this node action.",
   operator_api_unavailable:
     "The Controller could not verify Operator access. Try again when it is available.",
   operator_request_failed: "The Controller could not verify Operator access. Try again.",
@@ -80,6 +125,21 @@ const operatorAccessMessages: Record<string, string> = {
     "The Controller identity changed during confirmation. Probe it again and compare fingerprints.",
   controller_trust_store_invalid: "The saved Controller trust record is invalid.",
 };
+
+function nativeErrorCode(error: unknown): string | null {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = error.message;
+    return typeof message === "string" ? message : null;
+  }
+  return null;
+}
+
+function stableWorkerErrorCode(error: unknown): string {
+  const code = nativeErrorCode(error);
+  return code && stableWorkerErrorCodes.has(code) ? code : "worker_action_failed";
+}
 
 function canonicalHttpsOrigin(value: string): string | null {
   try {
@@ -111,6 +171,13 @@ function App() {
   const [operator, setOperator] = useState<OperatorIdentity | null>(null);
   const [operatorLoaded, setOperatorLoaded] = useState(false);
   const [sessionLocked, setSessionLocked] = useState(false);
+  const [workerTransition, setWorkerTransition] = useState<"takeover" | "rollback" | null>(null);
+  const [workerActionError, setWorkerActionError] = useState<string | null>(null);
+  const [quitBusy, setQuitBusy] = useState(false);
+  const [restartBusy, setRestartBusy] = useState(false);
+  const [forceStopRequested, setForceStopRequested] = useState(false);
+  const [forceStopPhrase, setForceStopPhrase] = useState("");
+  const [forceStopBusy, setForceStopBusy] = useState(false);
   const [apiUrl, setApiUrl] = useState("");
   const [controllerHttps, setControllerHttps] = useState<ControllerHttpsSummary | null>(null);
   const [lanAddress, setLanAddress] = useState("");
@@ -137,6 +204,56 @@ function App() {
     refetchInterval: 1_000,
     retry: false,
   });
+  const workerSessionAuthorized =
+    snapshotQuery.data?.role === "WORKER" &&
+    operator !== null &&
+    !operator.mustChangePassword &&
+    !sessionLocked &&
+    workerLifecycleRoles.includes(operator.role);
+  const workerDrainStatusQuery = useQuery({
+    queryKey: ["local-worker-drain-status"],
+    queryFn: localWorkerDrainStatus,
+    enabled: workerSessionAuthorized,
+    refetchInterval: (query) => {
+      const code = nativeErrorCode(query.state.error);
+      if (
+        code === "operator_forbidden" ||
+        code === "operator_session_revoked" ||
+        code === "operator_authentication_required"
+      ) {
+        return false;
+      }
+      return workerSessionAuthorized ? 5_000 : false;
+    },
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (!workerSessionAuthorized) {
+      queryClient.removeQueries({ queryKey: ["local-worker-drain-status"] });
+    }
+  }, [queryClient, workerSessionAuthorized]);
+
+  useEffect(() => {
+    if (!workerSessionAuthorized || !workerDrainStatusQuery.isError) return;
+    const code = nativeErrorCode(workerDrainStatusQuery.error);
+    if (code !== "operator_session_revoked" && code !== "operator_authentication_required") {
+      return;
+    }
+    loginGeneration.current += 1;
+    nativeLockNotification.current += 1;
+    setOperator(null);
+    setOperatorLoaded(true);
+    setOperatorUsers([]);
+    setCreatedOperatorUser(null);
+    setNewOperatorUsername("");
+    setLoginUsername("");
+    setFirstOwnerSetup(false);
+    setNewPassword("");
+    setLoginPassword("");
+    setActionError(null);
+    setSessionLocked(true);
+  }, [workerDrainStatusQuery.error, workerDrainStatusQuery.isError, workerSessionAuthorized]);
 
   const handleNativeSessionLock = useCallback(async () => {
     const notification = ++nativeLockNotification.current;
@@ -292,28 +409,89 @@ function App() {
 
   async function handleDecommission() {
     if (resetPhrase !== "RESET THIS DEVICE") return;
+    if (snapshot?.role === "WORKER") {
+      setActionError(null);
+      try {
+        const updated = await decommissionDevice(resetPhrase);
+        queryClient.setQueryData(["desktop-snapshot"], updated);
+        await handleOperatorLogout();
+        setResetRequested(false);
+        setResetPhrase("");
+      } catch (error) {
+        const code = stableWorkerErrorCode(error);
+        setActionError(`Worker decommission did not complete. Diagnostic code: ${code}.`);
+        await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+        if (code === "operator_session_revoked" || code === "operator_authentication_required") {
+          await handleOperatorLogout();
+        }
+      }
+      return;
+    }
     const completed = await updateSnapshot(() => decommissionDevice(resetPhrase));
     if (!completed) return;
     setResetRequested(false);
     setResetPhrase("");
   }
 
+  async function handleWorkerOwnershipAction(action: "takeover" | "rollback") {
+    setWorkerTransition(action);
+    setWorkerActionError(null);
+    try {
+      if (action === "takeover") await takeoverLocalWorker();
+      else await rollbackLocalWorkerToLegacy();
+    } catch (error) {
+      setWorkerActionError(stableWorkerErrorCode(error));
+    } finally {
+      setWorkerTransition(null);
+      await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+    }
+  }
+
+  async function handleForceStopWorker() {
+    if (forceStopPhrase !== "FORCE STOP WORKER") return;
+    setForceStopBusy(true);
+    setWorkerActionError(null);
+    try {
+      const updated = await forceStopWorker(forceStopPhrase);
+      queryClient.setQueryData(["desktop-snapshot"], updated);
+      setForceStopRequested(false);
+      setForceStopPhrase("");
+      await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+    } catch (error) {
+      setWorkerActionError(stableWorkerErrorCode(error));
+      await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
+    } finally {
+      setForceStopBusy(false);
+    }
+  }
+
   async function handleQuit() {
+    setQuitBusy(true);
     setActionError(null);
     try {
       await requestQuit();
       setQuitRequested(false);
     } catch (error) {
-      await handleOperatorLogout();
-      setQuitRequested(false);
       const errorCode =
         typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      if (
+        snapshot?.role !== "WORKER" ||
+        errorCode === "operator_session_revoked" ||
+        errorCode === "operator_authentication_required"
+      ) {
+        await handleOperatorLogout();
+        setQuitRequested(false);
+      }
       setActionError(
-        errorCode === "operator_forbidden" && snapshot?.role === "CONTROLLER"
-          ? "Only an Owner or Admin can stop this Controller."
-          : (operatorAccessMessages[errorCode] ??
+        snapshot?.role === "WORKER"
+          ? `Worker graceful quit did not complete. Diagnostic code: ${stableWorkerErrorCode(error)}.`
+          : errorCode === "operator_forbidden" && snapshot?.role === "CONTROLLER"
+            ? "Only an Owner or Admin can stop this Controller."
+            : (operatorAccessMessages[errorCode] ??
               "The node could not stop cleanly. Check the runtime status before retrying."),
       );
+    } finally {
+      setQuitBusy(false);
     }
   }
 
@@ -536,18 +714,31 @@ function App() {
   }
 
   async function handleRestart() {
+    setRestartBusy(true);
     setActionError(null);
     try {
       await requestRestart();
       setRestartRequested(false);
       await handleOperatorLogout();
       await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
-    } catch {
-      await handleOperatorLogout();
-      setRestartRequested(false);
+    } catch (error) {
+      const errorCode =
+        typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      if (
+        snapshot?.role !== "WORKER" ||
+        errorCode === "operator_session_revoked" ||
+        errorCode === "operator_authentication_required"
+      ) {
+        await handleOperatorLogout();
+        setRestartRequested(false);
+      }
       setActionError(
-        "An active Operator session with permission to restart this node is required.",
+        snapshot?.role === "WORKER"
+          ? `Worker restart did not complete. Diagnostic code: ${stableWorkerErrorCode(error)}.`
+          : "An active Operator session with permission to restart this node is required.",
       );
+    } finally {
+      setRestartBusy(false);
     }
   }
 
@@ -587,6 +778,43 @@ function App() {
   }
 
   const snapshot = snapshotQuery.data;
+  const workerStatusErrorCode = nativeErrorCode(workerDrainStatusQuery.error);
+  const workerStatusForbidden = workerStatusErrorCode === "operator_forbidden";
+  const canOperateWorker = workerSessionAuthorized && !workerStatusForbidden;
+  const workerOwnership = snapshot.supervisor.workerOwnership;
+  const legacyTaskState = snapshot.supervisor.legacyTaskState;
+  const canTakeOverWorker =
+    canOperateWorker &&
+    workerOwnership === "TAKEOVER_REQUIRED" &&
+    (legacyTaskState === "RUNNING" || legacyTaskState === "READY");
+  const canRollbackWorker =
+    canOperateWorker && workerOwnership === "DESKTOP" && legacyTaskState === "DISABLED";
+  const workerHasIntervention =
+    snapshot.supervisor.state === "degraded" ||
+    snapshot.supervisor.state === "failed" ||
+    snapshot.supervisor.diagnosticCode !== null;
+  const canForceStopWorker =
+    canOperateWorker &&
+    workerOwnership === "DESKTOP" &&
+    legacyTaskState === "DISABLED" &&
+    workerHasIntervention;
+  const workerStatusDisplay = !workerSessionAuthorized
+    ? operator?.role === "VIEWER"
+      ? "UNAUTHORIZED"
+      : operator?.mustChangePassword
+        ? "PASSWORD CHANGE REQUIRED"
+        : sessionLocked
+          ? "SIGN IN REQUIRED"
+          : "SIGN IN REQUIRED"
+    : workerDrainStatusQuery.isError
+      ? workerStatusForbidden
+        ? "UNAUTHORIZED"
+        : "UNAVAILABLE"
+      : (workerDrainStatusQuery.data?.status ?? "CHECKING");
+  const workerStatusValuesAvailable =
+    workerSessionAuthorized &&
+    !workerDrainStatusQuery.isError &&
+    workerDrainStatusQuery.data !== undefined;
   const canonicalEndpoint = canonicalHttpsOrigin(apiUrl);
   const remoteTrustReady =
     trustedController?.trusted === true && trustedController.endpoint === canonicalEndpoint;
@@ -658,7 +886,7 @@ function App() {
 
         <div className="sidebar-footer">
           <div className="version-line">
-            <span>Desktop scaffold</span>
+            <span>{snapshot.role === "WORKER" ? "Worker Desktop" : "Desktop scaffold"}</span>
             <span>v0.1</span>
           </div>
           <button
@@ -683,7 +911,10 @@ function App() {
               <span className="environment-dot" />
               LOCAL RUNTIME
             </span>
-            {snapshot.role && snapshot.role !== "CONSOLE" && !operator?.mustChangePassword && (
+            {((snapshot.role === "CONTROLLER" && !operator?.mustChangePassword) ||
+              (snapshot.role === "WORKER" &&
+                canOperateWorker &&
+                workerOwnership === "DESKTOP")) && (
               <button
                 type="button"
                 className="quiet-link"
@@ -692,9 +923,11 @@ function App() {
                 Restart…
               </button>
             )}
-            <button type="button" className="quiet-link" onClick={() => setQuitRequested(true)}>
-              Quit…
-            </button>
+            {(snapshot.role !== "WORKER" || canOperateWorker) && (
+              <button type="button" className="quiet-link" onClick={() => setQuitRequested(true)}>
+                Quit…
+              </button>
+            )}
             {operator ? (
               <button
                 type="button"
@@ -897,10 +1130,10 @@ function App() {
                   </div>
                   <p className="card-copy">
                     {snapshot.role === "CONSOLE"
-                      ? "Console mode is client-only and starts no local helper process."
+                      ? "Console mode is client-only and starts no local Worker or Controller runtime."
                       : snapshot.role === "CONTROLLER"
                         ? "The private PostgreSQL cluster, direct Uvicorn HTTPS/WSS listener, and scheduler run as separately supervised Windows processes."
-                        : "The Worker lifecycle remains on its DX-02 mock boundary until its own implementation issue."}
+                        : "Desktop supervises the existing enrolled Worker package under this Windows user. Server health is shown separately from the local process."}
                   </p>
                   <div className="runtime-facts">
                     <div>
@@ -934,18 +1167,42 @@ function App() {
                           </strong>
                         </div>
                       </>
+                    ) : snapshot.role === "WORKER" ? (
+                      <>
+                        <div>
+                          <span>Desktop Worker PID</span>
+                          <strong>
+                            {snapshot.supervisor.processId
+                              ? `PID ${snapshot.supervisor.processId}`
+                              : workerOwnership === "LEGACY" ||
+                                  workerOwnership === "TAKEOVER_REQUIRED"
+                                ? "Not owned by Desktop"
+                                : workerOwnership === "BLOCKED"
+                                  ? "Ownership unresolved"
+                                  : "Stopped"}
+                          </strong>
+                        </div>
+                        <div>
+                          <span>Ownership</span>
+                          <strong>{workerOwnership ?? "UNKNOWN"}</strong>
+                        </div>
+                        <div>
+                          <span>Legacy task</span>
+                          <strong>{legacyTaskState ?? "UNKNOWN"}</strong>
+                        </div>
+                        <div>
+                          <span>Supervisor lifecycle</span>
+                          <strong>{snapshot.supervisor.state}</strong>
+                        </div>
+                        <div>
+                          <span>Worker UUID</span>
+                          <strong>{snapshot.supervisor.workerId ?? "Not available"}</strong>
+                        </div>
+                      </>
                     ) : (
                       <div>
-                        <span>
-                          {snapshot.role === "WORKER" ? "Helper process" : "Local runtime"}
-                        </span>
-                        <strong>
-                          {snapshot.role === "WORKER"
-                            ? snapshot.supervisor.processId
-                              ? `PID ${snapshot.supervisor.processId}`
-                              : "Stopped"
-                            : "None"}
-                        </strong>
+                        <span>Local runtime</span>
+                        <strong>None</strong>
                       </div>
                     )}
                     <div>
@@ -1196,6 +1453,172 @@ function App() {
                 </article>
               </section>
 
+              {snapshot.role === "WORKER" && (
+                <section
+                  className="surface-card worker-operations-card"
+                  aria-label="Worker server status and ownership controls"
+                >
+                  <div className="card-heading">
+                    <div>
+                      <p className="eyebrow">WORKER AGENT</p>
+                      <h2>Server status and host ownership</h2>
+                    </div>
+                    <span className="status-badge status-badge-neutral">Controller status</span>
+                  </div>
+                  <p className="card-copy">
+                    Server status comes from the trusted Controller. The local PID only describes
+                    the process on this PC and does not establish server health.
+                  </p>
+                  <div className="runtime-facts worker-status-facts">
+                    <div>
+                      <span>Worker server status</span>
+                      <strong>{workerStatusDisplay}</strong>
+                    </div>
+                    <div>
+                      <span>Active browser sessions</span>
+                      <strong>
+                        {workerStatusValuesAvailable
+                          ? workerDrainStatusQuery.data.activeBrowserSessions
+                          : "Unavailable"}
+                      </strong>
+                    </div>
+                    <div>
+                      <span>Running WorkerJobs</span>
+                      <strong>
+                        {workerStatusValuesAvailable
+                          ? workerDrainStatusQuery.data.runningWorkerJobs
+                          : "Unavailable"}
+                      </strong>
+                    </div>
+                    <div>
+                      <span>Quiescent</span>
+                      <strong>
+                        {workerStatusValuesAvailable
+                          ? String(workerDrainStatusQuery.data.quiescent)
+                          : "Unavailable"}
+                      </strong>
+                    </div>
+                  </div>
+                  {!workerSessionAuthorized ? (
+                    <p className="card-copy" role="status">
+                      {operator?.role === "VIEWER"
+                        ? "Worker status and lifecycle controls are unavailable to VIEWER accounts."
+                        : operator?.mustChangePassword
+                          ? "Change your password before viewing protected Worker status or using lifecycle controls."
+                          : sessionLocked
+                            ? "The Operator session is locked. Sign in again to view protected Worker status."
+                            : "Sign in as an OWNER, ADMIN, or OPERATOR to view protected Worker status."}
+                    </p>
+                  ) : workerDrainStatusQuery.isError ? (
+                    <p className="card-copy" role="status">
+                      {workerStatusForbidden
+                        ? "Unauthorized: the Controller denied this Operator access to Worker status."
+                        : "Worker status is unavailable because the Controller could not verify it."}
+                    </p>
+                  ) : workerDrainStatusQuery.isPending ? (
+                    <p className="card-copy" role="status">
+                      Checking Worker status with the Controller…
+                    </p>
+                  ) : null}
+
+                  {workerOwnership === "LEGACY" && (
+                    <p className="card-copy" role="status">
+                      The legacy Task Scheduler Worker remains the owner. Desktop will not stop or
+                      force that process.
+                    </p>
+                  )}
+                  {workerOwnership === "TAKEOVER_REQUIRED" && !canTakeOverWorker && (
+                    <p className="card-copy" role="status">
+                      Takeover is unavailable for this task state. Setup or intervention is
+                      required; Desktop will not repair the task automatically.
+                    </p>
+                  )}
+                  {workerOwnership === "BLOCKED" && (
+                    <p className="card-copy" role="status">
+                      Worker ownership is blocked. Review the diagnostic above; no automatic repair
+                      action is available.
+                    </p>
+                  )}
+                  {(legacyTaskState === "INVALID" || legacyTaskState === "NOT_REGISTERED") && (
+                    <p className="card-copy" role="status">
+                      The legacy task is {legacyTaskState}. Desktop will not discover or replace a
+                      Worker host automatically.
+                    </p>
+                  )}
+
+                  {workerActionError && (
+                    <p className="diagnostic-code" role="alert">
+                      Worker action failed. Diagnostic code: {workerActionError}
+                    </p>
+                  )}
+                  <div className="worker-actions">
+                    {canTakeOverWorker && (
+                      <>
+                        <p className="card-copy">
+                          Takeover drains the existing Worker first, then starts the same enrolled
+                          identity and durable browser/profile data under Desktop ownership. The
+                          legacy task is disabled only after the old process exits safely.
+                        </p>
+                        <button
+                          type="button"
+                          className="button button-primary"
+                          disabled={workerTransition !== null}
+                          onClick={() => void handleWorkerOwnershipAction("takeover")}
+                        >
+                          {workerTransition === "takeover"
+                            ? "Taking over Worker…"
+                            : "Take over existing Worker"}
+                        </button>
+                      </>
+                    )}
+                    {canRollbackWorker && (
+                      <>
+                        <p className="card-copy">
+                          Restore the preserved legacy Task Scheduler launch path after a graceful
+                          drain. This keeps the existing Worker identity and data.
+                        </p>
+                        <button
+                          type="button"
+                          className="button button-secondary"
+                          disabled={workerTransition !== null}
+                          onClick={() => void handleWorkerOwnershipAction("rollback")}
+                        >
+                          {workerTransition === "rollback"
+                            ? "Restoring legacy Worker…"
+                            : "Restore legacy Worker host"}
+                        </button>
+                      </>
+                    )}
+                    {workerTransition && (
+                      <p className="card-copy" role="status">
+                        {workerTransition === "takeover"
+                          ? "Waiting for authoritative OFFLINE, clean legacy exit, and ONLINE from the same Worker."
+                          : "Waiting for Desktop drain and clean exit before restoring legacy ownership."}
+                      </p>
+                    )}
+                    {canForceStopWorker && (
+                      <div className="worker-force-area">
+                        <p className="card-copy">
+                          Forced interruption is available because Desktop owns this Worker and an
+                          intervention is recorded. It is separate from graceful Quit and never
+                          confirms server OFFLINE.
+                        </p>
+                        <button
+                          type="button"
+                          className="button button-danger-quiet"
+                          onClick={() => {
+                            setForceStopPhrase("");
+                            setForceStopRequested(true);
+                          }}
+                        >
+                          Force stop Worker (abnormal)…
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
+
               {operator &&
                 !sessionLocked &&
                 !operator.mustChangePassword &&
@@ -1345,17 +1768,20 @@ function App() {
                 <div>
                   <strong>Change this device’s role</strong>
                   <span>
-                    Decommissioning stops the local runtime and clears the role selection. It does
-                    not delete Controller data.
+                    {snapshot.role === "WORKER"
+                      ? "Decommissioning safely drains a Desktop-owned Worker and restores the preserved legacy launch path when possible. A legacy-owned Worker remains in place; its identity, journal, and browser profiles are not deleted. The operation fails closed if safe restoration cannot be proven."
+                      : "Decommissioning stops the local runtime and clears the role selection. It does not delete Controller data."}
                   </span>
                 </div>
-                <button
-                  type="button"
-                  className="button button-danger-quiet"
-                  onClick={() => setResetRequested(true)}
-                >
-                  Decommission device
-                </button>
+                {(snapshot.role !== "WORKER" || canOperateWorker) && (
+                  <button
+                    type="button"
+                    className="button button-danger-quiet"
+                    onClick={() => setResetRequested(true)}
+                  >
+                    Decommission device
+                  </button>
+                )}
               </section>
             </>
           )}
@@ -1378,10 +1804,22 @@ function App() {
               {snapshot.role === "CONTROLLER"
                 ? "The Controller stops its scheduler, HTTP process, and PostgreSQL database before the desktop exits."
                 : snapshot.role === "WORKER"
-                  ? "The Worker helper stops before the desktop exits."
+                  ? workerOwnership === "LEGACY" || workerOwnership === "TAKEOVER_REQUIRED"
+                    ? legacyTaskState === "RUNNING"
+                      ? "The legacy Task Scheduler Worker remains the owner and continues running. Quitting Desktop leaves it untouched."
+                      : legacyTaskState === "READY"
+                        ? "The legacy Task Scheduler task remains enabled and ready. Quitting Desktop leaves it unchanged and does not start the Worker."
+                        : "The legacy Task Scheduler remains the recorded owner. Quitting Desktop leaves its task state unchanged."
+                    : "Desktop requests a graceful Worker drain and waits for authoritative OFFLINE, clean process exit, and lock release before exiting. A failure leaves Desktop open; it never forces a stop automatically."
                   : "Threads Desktop exits."}{" "}
               Closing this window only hides it to the tray.
             </p>
+            {snapshot.role === "WORKER" && !canOperateWorker && (
+              <p className="card-copy" role="status">
+                Sign in with an unlocked OWNER, ADMIN, or OPERATOR account to quit this Worker
+                Desktop.
+              </p>
+            )}
             <div className="dialog-actions">
               <button
                 type="button"
@@ -1393,9 +1831,19 @@ function App() {
               <button
                 type="button"
                 className="button button-primary"
+                disabled={quitBusy || (snapshot.role === "WORKER" && !canOperateWorker)}
                 onClick={() => void handleQuit()}
               >
-                Stop node and quit
+                {quitBusy
+                  ? snapshot.role === "WORKER"
+                    ? "Draining Worker…"
+                    : "Stopping node…"
+                  : snapshot.role === "WORKER" &&
+                      (workerOwnership === "LEGACY" || workerOwnership === "TAKEOVER_REQUIRED")
+                    ? "Quit Desktop"
+                    : snapshot.role === "WORKER"
+                      ? "Gracefully drain and quit"
+                      : "Stop node and quit"}
               </button>
             </div>
           </section>
@@ -1419,7 +1867,7 @@ function App() {
             <p>
               {snapshot.role === "CONTROLLER"
                 ? "The Controller scheduler, HTTP process, and PostgreSQL database will stop and start again."
-                : "The Worker helper will stop and start again."}{" "}
+                : "Worker Restart drains to authoritative OFFLINE, waits for clean exit, restarts the same enrolled Worker and waits for ONLINE."}{" "}
               An authorized Operator login is required.
             </p>
             <div className="dialog-actions">
@@ -1433,9 +1881,66 @@ function App() {
               <button
                 type="button"
                 className="button button-primary"
+                disabled={restartBusy}
                 onClick={() => void handleRestart()}
               >
-                Authenticate and restart
+                {restartBusy
+                  ? snapshot.role === "WORKER"
+                    ? "Draining and restarting Worker…"
+                    : "Restarting…"
+                  : "Authenticate and restart"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {forceStopRequested && (
+        <div className="dialog-backdrop" role="presentation">
+          <section
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="force-stop-title"
+          >
+            <div className="dialog-symbol dialog-symbol-danger" aria-hidden="true">
+              !
+            </div>
+            <h2 id="force-stop-title">Force stop Worker?</h2>
+            <p>
+              This is an abnormal interruption of the Desktop-owned Worker process tree. It is not
+              graceful, does not prove server OFFLINE, and does not complete a drain. Use it only to
+              intervene in the recorded Worker failure.
+            </p>
+            <label className="confirm-field">
+              Type <strong className="confirm-phrase">FORCE STOP WORKER</strong> to continue
+              <input
+                value={forceStopPhrase}
+                onChange={(event) => setForceStopPhrase(event.currentTarget.value)}
+                autoComplete="off"
+              />
+            </label>
+            <div className="dialog-actions">
+              <button
+                type="button"
+                className="button button-secondary"
+                disabled={forceStopBusy}
+                onClick={() => {
+                  setForceStopRequested(false);
+                  setForceStopPhrase("");
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="button button-danger"
+                disabled={
+                  forceStopPhrase !== "FORCE STOP WORKER" || forceStopBusy || !canForceStopWorker
+                }
+                onClick={() => void handleForceStopWorker()}
+              >
+                {forceStopBusy ? "Interrupting Worker…" : "Force stop Worker"}
               </button>
             </div>
           </section>
@@ -1455,8 +1960,9 @@ function App() {
             </div>
             <h2 id="reset-title">Decommission this device?</h2>
             <p>
-              This scaffold will stop its mock node and clear only the local role selection. It does
-              not delete Controller data.
+              {snapshot.role === "WORKER"
+                ? "Desktop-owned Worker is drained before the preserved legacy Task Scheduler host is restored. A Worker still owned by the legacy task remains with that task. Decommission does not delete the Worker identity, journal, or browser profiles, and fails closed if safe restoration cannot be proven."
+                : "This scaffold will stop its mock node and clear only the local role selection. It does not delete Controller data."}
             </p>
             <label className="confirm-field">
               Type <strong className="confirm-phrase">RESET THIS DEVICE</strong> to continue
@@ -1479,7 +1985,10 @@ function App() {
               <button
                 type="button"
                 className="button button-danger"
-                disabled={resetPhrase !== "RESET THIS DEVICE"}
+                disabled={
+                  resetPhrase !== "RESET THIS DEVICE" ||
+                  (snapshot.role === "WORKER" && !canOperateWorker)
+                }
                 onClick={() => void handleDecommission()}
               >
                 Decommission
@@ -1532,9 +2041,7 @@ function runtimeTitle(snapshot: DesktopSnapshot): string {
     if (snapshot.supervisor.state === "owner_bootstrap_required") return "Create the first Owner";
     return "Controller runtime is stopped";
   }
-  return snapshot.supervisor.state === "running"
-    ? "Worker mock is running"
-    : "Worker mock is stopped";
+  return "Worker runtime";
 }
 
 function roleSymbol(role: ProvisionedRole): string {

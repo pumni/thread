@@ -29,7 +29,7 @@ rcgen = { version = "0.14.10", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.10"
 tempfile = "3"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 x509-parser = { version = "0.18", features = ["verify"] }
 zeroize = "1"
 
@@ -40,6 +40,8 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_JobObjects",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_IO",
   "Win32_System_RemoteDesktop",
   "Win32_System_Threading",
   "Win32_UI_Shell",

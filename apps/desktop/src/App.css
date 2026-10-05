@@ -369,6 +369,28 @@ input:focus-visible {
 .diagnostics-card {
   padding: 21px 22px;
 }
+.worker-operations-card {
+  margin-bottom: 14px;
+  padding: 21px 22px;
+}
+.worker-status-facts {
+  margin-bottom: 16px;
+}
+.worker-actions {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  margin-top: 16px;
+}
+.worker-force-area {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  width: 100%;
+  margin-top: 8px;
+  padding-top: 16px;
+  border-top: 1px solid #f0d7d5;
+}
 .card-heading {
   display: flex;
   align-items: flex-start;
@@ -411,6 +433,10 @@ input:focus-visible {
   color: #777a86;
   font-size: 11px;
   line-height: 1.65;
+}
+.worker-actions > .card-copy,
+.worker-force-area > .card-copy {
+  margin: 0;
 }
 .runtime-facts {
   display: grid;

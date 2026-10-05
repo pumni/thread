@@ -35,7 +35,27 @@ export interface DesktopSnapshot {
     endpoint: string | null;
     databasePort: number | null;
     diagnosticCode: string | null;
+    workerOwnership: "LEGACY" | "TAKEOVER_REQUIRED" | "DESKTOP" | "BLOCKED" | null;
+    legacyTaskState: "RUNNING" | "READY" | "DISABLED" | "INVALID" | "NOT_REGISTERED" | null;
+    workerId: string | null;
   };
+}
+
+export type WorkerStatus =
+  | "REGISTERING"
+  | "ONLINE"
+  | "DEGRADED"
+  | "DRAINING"
+  | "OFFLINE"
+  | "DISABLED"
+  | "UPGRADE_REQUIRED";
+
+export interface WorkerDrainStatus {
+  workerId: string;
+  status: WorkerStatus;
+  activeBrowserSessions: number;
+  runningWorkerJobs: number;
+  quiescent: boolean;
 }
 
 export type OperatorRole = "OWNER" | "ADMIN" | "OPERATOR" | "VIEWER";
@@ -92,6 +112,7 @@ export const DESKTOP_COMMANDS = [
   "decommission_device",
   "request_quit",
   "request_restart",
+  "force_stop_worker",
   "operator_login",
   "operator_bootstrap_owner",
   "operator_current",
@@ -101,6 +122,9 @@ export const DESKTOP_COMMANDS = [
   "operator_create_user",
   "operator_update_user",
   "operator_change_password",
+  "takeover_local_worker",
+  "rollback_local_worker_to_legacy",
+  "local_worker_drain_status",
   "controller_https_configure",
   "controller_https_reconfigure",
   "controller_https_summary",
@@ -131,6 +155,10 @@ export function requestQuit(): Promise<void> {
 
 export function requestRestart(): Promise<void> {
   return invoke<void>("request_restart");
+}
+
+export function forceStopWorker(confirmation: string): Promise<DesktopSnapshot> {
+  return invoke<DesktopSnapshot>("force_stop_worker", { confirmation });
 }
 
 export function operatorCurrent(): Promise<OperatorIdentity | null> {
@@ -181,6 +209,18 @@ export function operatorUpdateUser(
 
 export function operatorChangePassword(newPassword: string): Promise<OperatorIdentity> {
   return invoke<OperatorIdentity>("operator_change_password", { newPassword });
+}
+
+export function takeoverLocalWorker(): Promise<void> {
+  return invoke<void>("takeover_local_worker");
+}
+
+export function rollbackLocalWorkerToLegacy(): Promise<void> {
+  return invoke<void>("rollback_local_worker_to_legacy");
+}
+
+export function localWorkerDrainStatus(): Promise<WorkerDrainStatus> {
+  return invoke<WorkerDrainStatus>("local_worker_drain_status");
 }
 
 export function controllerHttpsConfigure(
