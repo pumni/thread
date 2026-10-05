@@ -34,12 +34,19 @@ Do not treat this as a mandatory reading list. Start with the authorized GitHub 
 - **Implementation Truth:** `src/threads_platform/application/worker_protocol.py`, `src/threads_platform/transport/http/workers.py`, `src/threads_platform/infrastructure/security/worker_auth.py`.
 - **Key Invariants:** WebSocket is notification/presence only (never queue or state authority); 256-bit entropy for enrollment tokens; additive version negotiation; row-locked DRAINING quiescence handshake.
 
-### 5. Browser Capabilities & UI Contracts
-- **Trigger:** Browser automation capabilities (`threads.browser.*`), Playwright DOM interactions, synthetic UI contracts, staged mutations.
+### 5. Distributed Worker Browser Capabilities & UI Contracts
+- **Trigger:** Distributed Worker browser automation capabilities (`threads.browser.*`), Playwright DOM interactions, synthetic UI contracts, staged mutations.
 - **Skill:** [`.agents/skills/browser-capability/SKILL.md`](../.agents/skills/browser-capability/SKILL.md).
 - **Canonical Docs:** [`docs/adr/0005-browser-capability-boundary.md`](adr/0005-browser-capability-boundary.md), [`docs/adr/0006-playwright-browser-adapter.md`](adr/0006-playwright-browser-adapter.md), `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md`.
 - **Implementation Truth:** `src/threads_platform/workers/browser.py`, `tests/unit/`.
-- **Key Invariants:** Browser/UI recognition mismatch or ambiguity must fail closed; login and session challenges route to human intervention, never bypass; bound ancestor depth traversal; no generated CSS classes; no anti-detect/evasion.
+- **Key Invariants:** Distributed browser/UI recognition mismatch or ambiguity must fail closed; login and session challenges route to human intervention, never bypass; bound ancestor depth traversal; no generated CSS classes; no anti-detect/evasion.
+
+### 5A. Standalone Local Execution
+- **Trigger:** `src/threads_platform/standalone/`, `threads-local`, standalone local account/profile execution.
+- **Skill:** `browser-capability` only when the task touches browser engine/UI contracts; `threads-api-contract` only when the task touches official API behavior.
+- **Canonical Docs:** [ADR-0008](adr/0008-standalone-local-execution.md); browser [ADR-0005](adr/0005-browser-capability-boundary.md) / [ADR-0006](adr/0006-playwright-browser-adapter.md) only for browser work.
+- **Implementation Truth:** `src/threads_platform/standalone/` plus reused low-level adapters named by the authorized LOCAL issue.
+- **Key Invariants:** No Control Plane/Command/WorkerJob dependency; local state is not PostgreSQL authority; profiles are not shared with Worker mode; human login; fail-closed browser behavior; no evasion.
 
 ### 6. Scheduler & Background Work
 - **Trigger:** Periodic work generation, AccountActivityPlan recurrence, due occurrence materialization, worker presence expiry, outbox delivery.

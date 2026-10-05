@@ -61,6 +61,14 @@ Responsibilities:
 
 A Worker Agent does not own authoritative business state.
 
+### Standalone Local Runtime
+
+[ADR-0008](adr/0008-standalone-local-execution.md) defines an optional, developer-operated topology:
+
+`CLI -> LocalRuntime -> reviewed browser/API adapter`
+
+It uses local account metadata, a persistent account profile, and a local profile lock. Standalone actions do not require PostgreSQL, the Control Plane, Scheduler, or WorkerJob. Local metadata is not fleet or business authority. Distributed mode remains unchanged.
+
 ## 4. Core domain/application modules
 
 ### accounts
