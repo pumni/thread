@@ -13,10 +13,11 @@ concurrency:
 
 jobs:
   changes:
-    name: Classify Worker paths
+    name: Classify Worker and Desktop paths
     runs-on: ubuntu-24.04
     outputs:
       worker: ${{ steps.classify.outputs.worker }}
+      desktop: ${{ steps.classify.outputs.desktop }}
     steps:
       - name: Check out exact main commit and full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,7 +25,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Classify Worker-relevant changes
+      - name: Classify Worker and Desktop relevance
         id: classify
         shell: bash
         env:
@@ -54,6 +55,8 @@ jobs:
 
   desktop:
     name: Desktop Diagnostic Component
+    needs: changes
+    if: ${{ needs.changes.outputs.desktop == 'true' }}
     uses: ./.github/workflows/desktop.yml
     with:
       source_sha: ${{ github.sha }}
@@ -124,6 +127,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           WORKER_NEEDED: ${{ needs.changes.outputs.worker }}
+          DESKTOP_NEEDED: ${{ needs.changes.outputs.desktop }}
           PYTHON_RESULT: ${{ needs.python-quality.result }}
           DOCKER_RESULT: ${{ needs.docker-control-plane.result }}
           DESKTOP_RESULT: ${{ needs.desktop.result }}
@@ -131,17 +135,31 @@ jobs:
           SECRET_RESULT: ${{ needs.main-secret-scan.result }}
         run: |
           set -euo pipefail
-          printf 'source_sha=%s\nchanges=%s\npython=%s\ndocker=%s\ndesktop=%s\nworker_needed=%s\nworker=%s\nsecret_scan=%s\n' \
+          printf 'source_sha=%s\nchanges=%s\npython=%s\ndocker=%s\ndesktop_needed=%s\ndesktop=%s\nworker_needed=%s\nworker=%s\nsecret_scan=%s\n' \
             "$SOURCE_SHA" "$CHANGES_RESULT" "$PYTHON_RESULT" \
-            "$DOCKER_RESULT" "$DESKTOP_RESULT" "$WORKER_NEEDED" \
+            "$DOCKER_RESULT" "$DESKTOP_NEEDED" "$DESKTOP_RESULT" "$WORKER_NEEDED" \
             "$WORKER_RESULT" "$SECRET_RESULT"
 
-          for result in "$CHANGES_RESULT" "$PYTHON_RESULT" "$DOCKER_RESULT" "$DESKTOP_RESULT" "$SECRET_RESULT"; do
+          for result in "$CHANGES_RESULT" "$PYTHON_RESULT" "$DOCKER_RESULT" "$SECRET_RESULT"; do
             if [[ "$result" != "success" ]]; then
               echo "required_main_verification_component_not_successful: $result" >&2
               exit 1
             fi
           done
+          if [[ "$DESKTOP_NEEDED" == "true" ]]; then
+            [[ "$DESKTOP_RESULT" == "success" ]] || {
+              echo "desktop_component_required_but_not_successful: $DESKTOP_RESULT" >&2
+              exit 1
+            }
+          elif [[ "$DESKTOP_NEEDED" == "false" ]]; then
+            [[ "$DESKTOP_RESULT" == "skipped" ]] || {
+              echo "desktop_component_should_be_skipped: $DESKTOP_RESULT" >&2
+              exit 1
+            }
+          else
+            echo "invalid_desktop_requirement: $DESKTOP_NEEDED" >&2
+            exit 1
+          fi
           if [[ "$WORKER_NEEDED" == "true" ]]; then
             [[ "$WORKER_RESULT" == "success" ]] || {
               echo "worker_component_required_but_not_successful: $WORKER_RESULT" >&2
