@@ -159,11 +159,13 @@ class BrowserNetworkProtocol(StrEnum):
     HTTPS = "HTTPS"
     SOCKS5 = "SOCKS5"
 
+
 @dataclass(frozen=True, slots=True)
 class BrowserNetworkRoute:
     protocol: BrowserNetworkProtocol
     host: str | None
     port: int | None
+
 
 @dataclass(frozen=True, slots=True)
 class BrowserProxyCredentials:
