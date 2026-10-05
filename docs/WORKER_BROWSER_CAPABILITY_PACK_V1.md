@@ -4,19 +4,27 @@
 
 The C5-01 catalog contains four v1 names. PR #39's
 `threads.browser.feed.browse` v1 and PR #40's `threads.browser.thread.open` v1
-are accepted and merged, and DONE for their checkpoints. Both are available
-only through their reviewed, bounded, account-affine WorkerJob paths and
-require explicit worker opt-in via
+are accepted and merged, and DONE for their checkpoints. For distributed
+Worker execution, both are available only through their reviewed, bounded,
+account-affine WorkerJob paths and require explicit worker opt-in via
 `THREADS_WORKER_FEED_BROWSE_ENABLED` and `THREADS_WORKER_THREAD_OPEN_ENABLED`
 (both default false). PR #41's `threads.browser.profile.open` v1 is accepted
-and merged, DONE for its checkpoint, and available only through the same
-account-affine WorkerJob path with explicit opt-in via
+and merged, DONE for its checkpoint, and for distributed Worker execution is
+available only through the same account-affine WorkerJob path with explicit
+opt-in via
 `THREADS_WORKER_PROFILE_OPEN_ENABLED` (default false). PR #43's
 `threads.browser.media.local_upload` v1 is accepted and merged, DONE for its
-checkpoint, and available only through the reviewed bounded account-affine
-WorkerJob path with `THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED` (default
-false). C3's `worker.synthetic` contract remains a local fixture, not
-production UI evidence.
+checkpoint, and for distributed Worker execution is available only through
+the reviewed bounded account-affine WorkerJob path with
+`THREADS_WORKER_MEDIA_LOCAL_UPLOAD_ENABLED` (default false). Local media
+staging is not authorized for standalone. C3's `worker.synthetic` contract
+remains a local fixture, not production UI evidence.
+
+ADR-0008 defines a separate standalone execution topology. Standalone
+capability authorization comes from LOCAL checkpoints, not from this Worker
+pack; its initial browser scope is read-only feed browse, profile open, and
+thread open. WorkerJob lease/session/intervention requirements in this
+document remain mandatory for distributed Worker execution.
 
 The `ui_contract_id` values below are application contract names. The feed and
 thread-open, profile-open, and image-only local-upload version 1 contracts are
@@ -253,11 +261,12 @@ contracts.
 PR #41's `threads.browser.profile.open` v1 and PR #43's
 `threads.browser.media.local_upload` v1 have been accepted and merged.
 `threads.browser.feed.browse`, `threads.browser.thread.open`, and
-`threads.browser.profile.open` are DONE for their checkpoints and available
-only through the reviewed bounded account-affine WorkerJob path with explicit
-worker opt-in. `threads.browser.media.local_upload` is also DONE for its
-checkpoint and available only through the same bounded account-affine
-WorkerJob path with explicit worker opt-in. It is image-only and stages into an
+`threads.browser.profile.open` are DONE for their checkpoints and, for
+distributed Worker execution, are available only through the reviewed bounded
+account-affine WorkerJob path with explicit worker opt-in.
+`threads.browser.media.local_upload` is also DONE for its checkpoint and, for
+distributed Worker execution, is available only through the same bounded
+account-affine WorkerJob path with explicit worker opt-in. It is image-only and stages into an
 operator-opened composer after proving dialog/input association and a correlated
 successful upload response plus same-composer preview. It never publishes,
 submits, or removes staged media. Synthetic fixtures are not production

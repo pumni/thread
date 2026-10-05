@@ -8,6 +8,7 @@ This file is the repository-wide constitution and router for coding agents. Deta
 - Centralized Control Plane + PostgreSQL source of truth;
 - Official Threads API preferred where it satisfies the capability;
 - Distributed Windows-first Worker Agents for approved local/browser capabilities;
+- Reviewed developer-operated standalone local execution is an optional topology alongside distributed Worker execution;
 - Human intervention as a valid, fail-closed execution outcome.
 
 ## Authority by information type
@@ -27,15 +28,15 @@ This file is the repository-wide constitution and router for coding agents. Deta
 
 ## Non-negotiable invariants
 
-- PostgreSQL is authoritative business state; memory, WebSockets, and worker journals are not.
-- `Command` is business intent; `WorkerJob` is remote execution. Do not collapse them.
-- WorkerJob has independent lease/fencing/checkpoint semantics; stale-owner updates fail closed.
+- PostgreSQL is authoritative business state for distributed/Control Plane operation. Standalone local metadata is operational machine-local state only, is not a PostgreSQL replica, and never claims distributed business authority.
+- In distributed execution, `Command` is business intent and `WorkerJob` is remote execution. Do not collapse them.
+- In distributed execution, WorkerJob has independent lease/fencing/checkpoint semantics; stale-owner updates fail closed.
 - WebSocket is notification/presence, never the durable queue or source of truth.
 - Browser accounts use persistent account -> worker/profile affinity; no automatic profile migration; explicit reassignment requires authorized Controller flow and fresh human login per ADR-0004.
 - Each account has its own execution mode: `API_ONLY`, `BROWSER_ONLY`, `HYBRID`, or `MANUAL`.
-- Workers do not invent business actions; Control Plane/Scheduler creates them.
+- Workers do not invent business actions; Control Plane/Scheduler creates them in distributed mode. Standalone actions originate only from explicit local operator invocation or separately reviewed local workflow composition.
 - API-first means preferred executor where suitable, not API-only architecture; `HYBRID` fallback is bounded by capability policy and never inferred automatically from arbitrary API failures.
-- Browser automation is allowed only in the approved Worker/browser boundary and only from C3 onward.
+- Browser automation is allowed only through the distributed reviewed Worker/browser boundary (C3+) or the reviewed standalone path under ADR-0008 and explicitly authorized LOCAL capabilities.
 - Browser/UI recognition mismatch or ambiguity must fail closed; login/session challenges require human intervention, never bypass.
 - No anti-detect, fingerprint spoofing, or human-emulation-for-evasion subsystem.
 - Domain code must not import FastAPI, httpx, SQLAlchemy, WebSocket/browser libraries, Windows APIs, or Meta DTOs.
