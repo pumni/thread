@@ -58,7 +58,7 @@ When a task touches the Windows Desktop application (`apps/desktop/` or `packagi
    - `docs/desktop/ACCEPTANCE_MATRIX.md`
    - `docs/desktop/WINDOWS_REHEARSAL.md`
    - `docs/desktop/ISSUE_MAP.md`
-3. If an agent follows this chain literally, it reads over **195 KB and 2,000 lines** of governance and architecture text before reading the authorized issue or inspecting code.
+3. If an agent follows this chain literally, it reads **179,033 bytes / 1,714 lines** without CI workflow (or **186,767 bytes / 1,836 lines** including `docs/CI_AGENT_WORKFLOW.md`) of governance and architecture text before reading the authorized issue or inspecting code.
 
 ---
 
@@ -87,16 +87,16 @@ Measurements taken from exact repository checkout at commit `96cb2e28a00b17c54fa
 1. **Standard Default Pre-Task Payload (General / Backend)**
    - Strict "Start every task" path (`AGENTS.md` + `PROJECT_STATE_HANDOFF.md` + `CONTEXT_MAP.md`):
      - **41,937 bytes / 791 lines**
-   - With mandatory CI workflow preflight (`+ docs/CI_AGENT_WORKFLOW.md`):
+   - With mandatory CI workflow preflight (`+ docs/CI_AGENT_WORKFLOW.md` [7,734 B / 122 lines]):
      - **49,671 bytes / 913 lines**
 
 2. **Desktop Task Default Pre-Task Payload**
-   - Direct Desktop fresh-session entry (`Standard Default` + `SESSION_HANDOFF.md` + `PREIMPLEMENTATION_AUDIT.md`):
+   - Direct Desktop fresh-session entry (`Standard Default` + `SESSION_HANDOFF.md` [12,519 B / 65 lines] + `PREIMPLEMENTATION_AUDIT.md` [17,739 B / 81 lines]):
      - **72,195 bytes / 937 lines** (without CI doc)
      - **79,929 bytes / 1,059 lines** (with CI doc)
-   - Expanded Desktop chain (if following `SESSION_HANDOFF.md` section 1 links):
-     - Adding ADR-0007 (14,958 B), DELIVERY_PLAN (32,583 B), SECURITY_AND_PROTOCOLS (21,175 B), ACCEPTANCE_MATRIX (15,099 B), WINDOWS_REHEARSAL (15,830 B), ISSUE_MAP (7,193 B):
-     - **186,767 bytes / 1,937 lines** (before issue inspection)
+   - Expanded Desktop chain (adding the 6 linked Desktop docs: ADR-0007 [14,958 B / 101 lines], DELIVERY_PLAN [32,583 B / 251 lines], SECURITY_AND_PROTOCOLS [21,175 B / 149 lines], ACCEPTANCE_MATRIX [15,099 B / 84 lines], WINDOWS_REHEARSAL [15,830 B / 126 lines], ISSUE_MAP [7,193 B / 66 lines]):
+     - **Without CI workflow doc:** **179,033 bytes / 1,714 lines**
+     - **With mandatory CI workflow doc (`+ docs/CI_AGENT_WORKFLOW.md` [7,734 B / 122 lines]):** **186,767 bytes / 1,836 lines**
 
 ---
 
@@ -109,7 +109,7 @@ This matrix resolves ambiguity between competing sources of truth across informa
 | **Current Task / Scope Authorization** | `PROJECT_STATE_HANDOFF.md`, `docs/desktop/SESSION_HANDOFF.md`, `docs/WORK_BREAKDOWN.md`, GitHub issues/comments | **Authorized GitHub issue, coordinator comments, direct user instruction** | Static documents cannot authorize work. Roadmaps and milestone handoffs describe history or planning; only live issue/comment authorizes execution. |
 | **Global Architecture Invariants** | `AGENTS.md`, `CODEX_EXECUTION_GUIDE.md`, `ACCEPTANCE_AND_REVIEW.md`, `docs/ARCHITECTURE.md` | **Root `AGENTS.md`** | High-signal, load-bearing invariants reside concisely in root `AGENTS.md`. Detailed rationales live in ADRs. |
 | **Subtree-Specific Rules** | `SESSION_HANDOFF.md`, `PREIMPLEMENTATION_AUDIT.md`, `docs/desktop/README.md`, scattered comments | **Nearest nested `AGENTS.md` (e.g. `apps/desktop/AGENTS.md`)** | Desktop/Tauri/Rust rules apply only within that subtree and should not pollute root ambient context. |
-| **Architecture Decisions** | Re-summaries in `ARCHITECTURE.md`, `MASTER_PLAN.md`, `PROJECT_STATE_HANDOFF.md`, `docs/adr/*.md` | **Accepted ADRs (`docs/adr/0001` through `0007`)** | ADRs are immutable accepted decisions. Prose summaries in other docs must link to ADRs rather than paraphrasing. |
+| **Architecture Decisions** | Re-summaries in `ARCHITECTURE.md`, `MASTER_PLAN.md`, `PROJECT_STATE_HANDOFF.md`, `docs/adr/*.md` | **Accepted ADRs (`docs/adr/0001` through `0007`)** | Accepted ADRs are the canonical architectural decision record. A changed decision requires explicit coordinator authorization and an updated or superseding ADR created/modified in the same change. Prose summaries in other docs must link to ADRs rather than paraphrasing. |
 | **Versioned Protocol Contracts** | `docs/protocols/WORKER_PROTOCOL_V1.md`, `docs/desktop/SECURITY_AND_PROTOCOLS.md`, code | **Versioned protocol docs (`docs/protocols/*`) + verified code/tests** | Protocol documents define the wire specification. Filenames reflect versioning; code implements active protocol. |
 | **CI & Acceptance Procedure** | `AGENTS.md` ("Hosted CI discipline"), `docs/CI_AGENT_WORKFLOW.md`, `docs/ACCEPTANCE_AND_REVIEW.md` | **`docs/CI_AGENT_WORKFLOW.md` (process) + `docs/ACCEPTANCE_AND_REVIEW.md` (criteria)** | `AGENTS.md` provides a concise pointer and hard-stop rule; detailed triage and failure protocols belong in specialized docs / skills. |
 | **Current Project State** | `PROJECT_STATE_HANDOFF.md`, `docs/desktop/SESSION_HANDOFF.md`, Git log, GitHub issues | **Git tree (`main` commit SHA) + GitHub issues/milestones** | Code and git commit graph are historical ground truth. Documents should not require manual updating of closed PR hashes on every commit. |
@@ -222,15 +222,21 @@ Later CTX checkpoints must preserve compatibility with:
 
 ---
 
-## 6. Load-Bearing Invariant Checklist
+## 6. Load-Bearing Invariant & Guardrail Checklist
 
-The refactor must preserve the following non-negotiable project invariants in immediately visible, always-on context (root `AGENTS.md` or subtree `AGENTS.md`). A model cannot safely infer these from generic software engineering principles:
+To preserve correctness while enabling progressive disclosure, core requirements are partitioned into:
+1. **Architecture & Security Invariants:** Non-negotiable system rules that must remain immediately visible in root `AGENTS.md` (or nearest nested `AGENTS.md`); and
+2. **Workflow & Process Guardrails:** Detailed operational procedures that belong in specialized workflow documents / skills accessed JIT, with only an essential fail-closed trigger retained in root context.
+
+### 6.1 Load-Bearing Architecture & Security Invariants (Always-On in `AGENTS.md`)
+
+A model cannot safely infer these invariants from generic software engineering principles:
 
 1. [x] **PostgreSQL is authoritative business state:** Control Plane + PostgreSQL is the sole durable source of truth. In-memory state, WebSockets, and worker local journals are volatile or secondary.
 2. [x] **`Command` != `WorkerJob`:** `Command` represents business intent; `WorkerJob` represents remote execution assignment. They must never be collapsed or combined into a single entity.
 3. [x] **WorkerJob lease / fencing / checkpoint semantics:** WorkerJob execution is governed by independent lease tokens, monotonic fencing tokens, attempt limits, and safe checkpoint acknowledgement to prevent stale-worker overwrites.
 4. [x] **WebSocket is notification / presence only:** WebSocket is never a durable queue or source of truth. Missed notifications or disconnections must recover via PostgreSQL polling and HTTP endpoints.
-5. [x] **Persistent account -> worker/profile affinity:** Browser accounts have immutable affinity to a specific worker and logical browser profile; automatic profile migration between workers is prohibited.
+5. [x] **Persistent account -> worker/profile affinity & no automatic migration:** Browser accounts maintain persistent affinity to an assigned worker and logical browser profile; silent, implicit, or automatic profile migration across workers is prohibited. Explicit reassignment is permitted only through authorized Controller operations requiring coordinated drain/quiescence, account unassignment, and a fresh profile with operator-assisted human login (as specified in ADR-0004 and Desktop security contracts).
 6. [x] **Strict execution modes:** Each account operates in exactly one explicit mode (`API_ONLY`, `BROWSER_ONLY`, `HYBRID`, `MANUAL`).
 7. [x] **Workers do not invent business actions:** The Control Plane Scheduler alone generates business commands; workers execute bounded, authorized assignments.
 8. [x] **API-first principle:** The official Threads API is the preferred executor where supported; browser automation is strictly reserved for capabilities absent from the API.
@@ -240,24 +246,31 @@ The refactor must preserve the following non-negotiable project invariants in im
 12. [x] **Domain dependency isolation:** Domain code must never import FastAPI, httpx, SQLAlchemy, Playwright/Chromium, WebSocket libraries, Windows APIs, or Meta DTOs.
 13. [x] **External side-effect idempotency & recovery:** Network timeouts or ambiguous responses do not prove failure; mutations require idempotency keys, duplicate checks, and explicit reconciliation.
 14. [x] **Secret & credential hygiene:** Secrets, OAuth tokens, private keys, proxy credentials, and Authorization headers must never be logged, committed to Git, or exposed in plain repr.
-15. [x] **Hosted CI discipline:** Draft PRs run cheap checks; Ready marks merge-authoritative PR Acceptance; exact-SHA checkout; hard stop on hosted failure; escalation after two consecutive failures with the same signature.
+
+### 6.2 Workflow & Process Guardrails (JIT Routing via Skills & Workflow Docs)
+
+These operational procedures must remain strictly reachable via JIT context without cluttering root ambient instructions:
+
+- **Hosted CI Failure Hard Stop & Escalation:** Hosted CI failure is a hard stop; download/read evidence, record primary failure signature, and classify as product/harness/environment before altering code. Two consecutive hosted attempts with the same primary failure signature require coordinator escalation. Detailed Draft/Ready/exact-SHA state machine is routed JIT via `ci-failure-triage` and [`docs/CI_AGENT_WORKFLOW.md`](../CI_AGENT_WORKFLOW.md); root `AGENTS.md` retains only the essential stop-and-triage rule.
+- **Local Preflight vs Acceptance:** Local PASS is preflight only, never final hosted acceptance. Required database/migration preflight must not be silently skipped.
+- **Stop Instead of Improvising:** Stop the affected work and report when requirements conflict with accepted ADRs, safe recovery cannot be established, production credentials/data are required, or quality gates can pass only by weakening standards.
 
 ---
 
 ## 7. Skill Candidate Analysis
 
-Assessment of the six candidate skills proposed in #146:
+Assessment of the six candidate skills proposed in #146, grounded in repository paths that exist at baseline SHA `96cb2e28a00b17c54fa9a33fde54b4826adda529`:
 
 ### 7.1 `postgres-migration`
 - **Trigger:** Schema changes, table alterations, new models, index creation, Alembic migration authoring or debugging.
-- **Canonical References:** `alembic/`, `src/threads_platform/infrastructure/models.py`, `docs/ACCEPTANCE_AND_REVIEW.md` (Section 3), `scripts/windows_local_preflight.ps1`.
+- **Canonical References:** `migrations/` (and `migrations/versions/`), `src/threads_platform/infrastructure/persistence/models.py`, `docs/ACCEPTANCE_AND_REVIEW.md` (Section 3), `scripts/windows_local_preflight.ps1`.
 - **Justification:** Repository has specific database practices: reversible migrations, UTC timestamps, claim/routing indexes, test DB spinup via local preflight, avoiding business data loss, schema check gates (`alembic check`).
 - **Overlap:** None. Cleanly scoped to database schema operations.
 - **Verdict:** **KEEP** as a narrow specialized skill.
 
 ### 7.2 `worker-protocol-change`
 - **Trigger:** Modifications to Worker WebSocket messages, framing, enrollment handshakes, capacity reporting, or lease renewal payloads.
-- **Canonical References:** `docs/protocols/WORKER_PROTOCOL_V1.md`, `src/threads_platform/application/worker_protocol.py`, `src/threads_platform/transport/websocket/server.py`.
+- **Canonical References:** `docs/protocols/WORKER_PROTOCOL_V1.md`, `src/threads_platform/application/worker_protocol.py`, `src/threads_platform/transport/http/workers.py` (Worker WebSocket endpoint).
 - **Justification:** Worker protocol requires strict additive version negotiation (v1 vs v2), schema validation, fencing token propagation, and fail-closed handling of unknown frames. A generic coding agent easily breaks backward compatibility without this guidance.
 - **Overlap:** Clear boundary with `postgres-migration` and `browser-capability`.
 - **Verdict:** **KEEP** as a narrow specialized skill.
@@ -271,7 +284,7 @@ Assessment of the six candidate skills proposed in #146:
 
 ### 7.4 `threads-api-contract`
 - **Trigger:** Interacting with official Meta Threads Graph API, webhook handlers, OAuth credential management, or rate limiting.
-- **Canonical References:** `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/THREADS_CREDENTIAL_OPERATIONS.md`, `docs/THREADS_LIVE_VALIDATION_RUNBOOK.md`, `src/threads_platform/infrastructure/threads_api.py`.
+- **Canonical References:** `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/THREADS_CREDENTIAL_OPERATIONS.md`, `docs/THREADS_LIVE_VALIDATION_RUNBOOK.md`, `src/threads_platform/infrastructure/threads_api/client.py`, `src/threads_platform/infrastructure/threads_api/credentials.py`.
 - **Justification:** Distinguishes documentation-contract fixtures from scrubbed live evidence; documents Meta error subcodes, pagination cursors, and the opt-in environment token provider (#70).
 - **Overlap:** Completely orthogonal to browser automation and worker protocols.
 - **Verdict:** **KEEP** as a narrow specialized skill.
@@ -285,7 +298,7 @@ Assessment of the six candidate skills proposed in #146:
 
 ### 7.6 `desktop-acceptance`
 - **Trigger:** Desktop application verification, Tauri/Rust/React integration testing, Windows packaging smoke (`scripts/windows_local_preflight.ps1`), Controller HTTPS trust setup.
-- **Canonical References:** `docs/desktop/ACCEPTANCE_MATRIX.md`, `docs/desktop/WINDOWS_REHEARSAL.md`, `packaging/windows_desktop/`.
+- **Canonical References:** `docs/desktop/ACCEPTANCE_MATRIX.md`, `docs/desktop/WINDOWS_REHEARSAL.md`, `packaging/windows_desktop/smoke_desktop_lifecycle.ps1`, `packaging/windows_desktop/smoke_controller_lifecycle.ps1`.
 - **Overlap Analysis:** Risk of overlap with `ci-failure-triage` and `apps/desktop/AGENTS.md`. If it focuses on hosted CI, it duplicates `ci-failure-triage`.
 - **Verdict:** **KEEP WITH NARROW SCOPE.** Scope strictly to *Desktop local preflight, packaging verification, and native supervisor lifecycle*, leaving hosted CI triage to `ci-failure-triage`.
 
@@ -293,92 +306,92 @@ Assessment of the six candidate skills proposed in #146:
 
 ## 8. Representative Evaluation Fixtures
 
-Twelve representative task fixtures covering diverse repository workflows. These fixtures serve as the benchmark for CTX-02 through CTX-06 to ensure progressive disclosure succeeds without losing critical invariants.
+Twelve representative task fixtures covering diverse repository workflows, grounded strictly in repository paths present at baseline commit `96cb2e28a00b17c54fa9a33fde54b4826adda529`. These fixtures serve as the benchmark for CTX-02 through CTX-06 to ensure progressive disclosure succeeds without losing critical invariants.
 
 ---
 
 ### Fixture 1: Trivial / Local Backend Fix
-- **Prompt:** "Fix a typo in error message formatting in `src/threads_platform/application/accounts.py` and ensure formatting remains clean."
+- **Prompt:** "Fix a typo in error message formatting in `src/threads_platform/domain/accounts.py` and ensure formatting passes linters."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** None.
-- **Expected Canonical Docs:** None needed; target source file and unit test only.
+- **Expected Canonical Docs:** None needed; target source file (`src/threads_platform/domain/accounts.py`) and unit tests (`tests/unit/test_account_activities.py`).
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, `CONTEXT_MAP.md`, `CI_AGENT_WORKFLOW.md`, `CODEX_EXECUTION_GUIDE.md`, Desktop docs.
-- **Critical Invariants to Preserve:** Domain dependency boundary (no infrastructure imports in domain/application), code formatting passes `ruff`.
+- **Critical Invariants to Preserve:** Domain dependency boundary (no infrastructure imports in domain), code formatting passes `ruff`.
 
 ---
 
 ### Fixture 2: Domain Behavior Change
-- **Prompt:** "Add a new lifecycle validation rule to `LeadCandidate` in domain logic ensuring disqualified leads cannot transition directly to converted."
+- **Prompt:** "Add a validation rule to `DiscoveryTarget` in `src/threads_platform/domain/discovery.py` ensuring invalid query characters fail closed."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** None.
-- **Expected Canonical Docs:** Target domain file (`domain/leads.py`), corresponding domain tests (`tests/unit/test_leads.py`).
+- **Expected Canonical Docs:** Target domain file (`src/threads_platform/domain/discovery.py`), corresponding domain tests (`tests/unit/test_discovery_domain_and_policy.py`).
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, `CI_AGENT_WORKFLOW.md`, Desktop docs, browser docs.
 - **Critical Invariants to Preserve:** Domain dependency boundary (pure domain logic; no FastAPI, httpx, or SQLAlchemy imports).
 
 ---
 
 ### Fixture 3: PostgreSQL / Alembic Migration
-- **Prompt:** "Add an indexed nullable `last_synced_at` column to `accounts` table with a reversible Alembic migration."
+- **Prompt:** "Add an indexed nullable `last_synced_at` column to `accounts` table with a reversible Alembic migration in `migrations/versions/`."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `postgres-migration`.
-- **Expected Canonical Docs:** `alembic/versions/*`, `src/threads_platform/infrastructure/models.py`.
+- **Expected Canonical Docs:** `migrations/versions/`, `src/threads_platform/infrastructure/persistence/models.py`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, Desktop docs, browser docs, `THREADS_API_CAPABILITY_SPIKE.md`.
 - **Critical Invariants to Preserve:** PostgreSQL is authoritative business state, migration must be reversible, UTC timestamps, schema check gate (`alembic check`).
 
 ---
 
 ### Fixture 4: WorkerJob Lease / Fencing Change
-- **Prompt:** "Update WorkerJob lease renewal timeout logic in `WorkerControlService` to enforce monotonic fencing token check on heartbeats."
+- **Prompt:** "Update WorkerJob lease renewal timeout logic in `WorkerJobService` (`src/threads_platform/application/worker_jobs.py`) to enforce monotonic fencing token check on heartbeats."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `worker-protocol-change`.
-- **Expected Canonical Docs:** `docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`, `src/threads_platform/application/worker_control.py`, `tests/unit/test_worker_control.py`.
+- **Expected Canonical Docs:** `docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`, `src/threads_platform/application/worker_jobs.py`, `tests/unit/test_worker_jobs.py`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, Desktop docs, browser capability pack, `THREADS_API_CAPABILITY_SPIKE.md`.
 - **Critical Invariants to Preserve:** `Command != WorkerJob`, WorkerJob independent lease/fencing/checkpoint semantics, stale lease claim must fail closed.
 
 ---
 
 ### Fixture 5: Worker Protocol / Auth / Drain Change
-- **Prompt:** "Extend Worker protocol v2 to add an explicit `drain_reason` field to the worker draining status frame."
+- **Prompt:** "Extend Worker protocol v2 to add an explicit `drain_reason` field to the worker draining status frame in `src/threads_platform/application/worker_protocol.py`."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `worker-protocol-change`.
-- **Expected Canonical Docs:** `docs/protocols/WORKER_PROTOCOL_V1.md` (v2 extension section), `src/threads_platform/application/worker_protocol.py`.
+- **Expected Canonical Docs:** `docs/protocols/WORKER_PROTOCOL_V1.md` (v2 extension section), `src/threads_platform/application/worker_protocol.py`, `src/threads_platform/transport/http/workers.py`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, Desktop docs, browser adapter files.
 - **Critical Invariants to Preserve:** WebSocket is notification/presence only (not durable queue), additive protocol versioning, fail-closed handling on unknown fields.
 
 ---
 
 ### Fixture 6: Browser Capability Contract
-- **Prompt:** "Implement a read-only browser capability for recognizing the target user's follower count from public profile header."
+- **Prompt:** "Implement a read-only browser capability for recognizing target follower count in `src/threads_platform/workers/browser.py`."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `browser-capability`.
-- **Expected Canonical Docs:** `docs/adr/0005-browser-capability-boundary.md`, `docs/adr/0006-playwright-browser-adapter.md`, `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md`.
+- **Expected Canonical Docs:** `docs/adr/0005-browser-capability-boundary.md`, `docs/adr/0006-playwright-browser-adapter.md`, `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md`, `src/threads_platform/workers/browser.py`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, `CI_AGENT_WORKFLOW.md`, `THREADS_API_CAPABILITY_SPIKE.md`, Desktop UI docs.
 - **Critical Invariants to Preserve:** Fail-closed on UI mismatch, no generated CSS selectors, bound ancestor traversal, human intervention on challenge/login, no anti-detect/evasion.
 
 ---
 
 ### Fixture 7: External Meta Threads API Contract
-- **Prompt:** "Handle Meta Graph API subcode 2207051 (token expired) in Threads API client to trigger re-authorization event."
+- **Prompt:** "Handle Meta Graph API subcode 2207051 (token expired) in Threads API client (`src/threads_platform/infrastructure/threads_api/client.py`) to trigger re-authorization event."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `threads-api-contract`.
-- **Expected Canonical Docs:** `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/THREADS_CREDENTIAL_OPERATIONS.md`, `src/threads_platform/infrastructure/threads_api.py`.
+- **Expected Canonical Docs:** `docs/THREADS_API_CAPABILITY_SPIKE.md`, `docs/THREADS_CREDENTIAL_OPERATIONS.md`, `src/threads_platform/infrastructure/threads_api/client.py`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, Desktop docs, browser capability docs, `WORKER_PROTOCOL_V1.md`.
 - **Critical Invariants to Preserve:** API-first executor preference, official Meta API behavior verification, test fixtures labeled `documentation-contract` vs scrubbed live.
 
 ---
 
 ### Fixture 8: Desktop React / UI Change
-- **Prompt:** "Update the Operator Console worker status card in React to display the worker node's active connection protocol version."
+- **Prompt:** "Update the Operator Console UI in `apps/desktop/src/App.tsx` and `apps/desktop/src/SessionGate.tsx` to display worker node connection protocol version."
 - **Expected Always-On Files:** Root `AGENTS.md`, `apps/desktop/AGENTS.md` (once introduced).
 - **Expected Optional Skill:** None (handled by local `apps/desktop/AGENTS.md`).
-- **Expected Canonical Docs:** `apps/desktop/src/components/*`, `apps/desktop/src/desktop.ts`.
+- **Expected Canonical Docs:** `apps/desktop/src/App.tsx`, `apps/desktop/src/SessionGate.tsx`, `apps/desktop/src/desktop.ts`, `apps/desktop/tests/desktop.test.tsx`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, `docs/desktop/PREIMPLEMENTATION_AUDIT.md`, `WORKER_BROWSER_CAPABILITY_PACK_V1.md`, Python backend docs.
 - **Critical Invariants to Preserve:** Server authorization state over UI Automation tree presence, UI session lock semantics.
 
 ---
 
 ### Fixture 9: Desktop Rust / Native Lifecycle Change
-- **Prompt:** "Adjust Tauri supervisor process tree teardown in `supervisor.rs` to ensure PostgreSQL child process is gracefully stopped on explicit app Quit."
+- **Prompt:** "Adjust Tauri supervisor process tree teardown in `apps/desktop/src-tauri/src/supervisor.rs` to ensure PostgreSQL child process is gracefully stopped on explicit app Quit."
 - **Expected Always-On Files:** Root `AGENTS.md`, `apps/desktop/AGENTS.md` (once introduced).
 - **Expected Optional Skill:** `desktop-acceptance`.
 - **Expected Canonical Docs:** `docs/adr/0007-windows-first-single-app-desktop.md`, `apps/desktop/src-tauri/src/supervisor.rs`.
@@ -388,10 +401,10 @@ Twelve representative task fixtures covering diverse repository workflows. These
 ---
 
 ### Fixture 10: Hosted CI Failure Triage
-- **Prompt:** "PR #145 failed on hosted `PR Acceptance` in `Desktop Diagnostic (windows-latest)` with error `ProcessExitCodeException: 1` during Controller HTTPS smoke."
+- **Prompt:** "Hosted `PR Acceptance` failed in `Desktop Diagnostic (windows-latest)` with error `ProcessExitCodeException: 1` during Controller HTTPS smoke."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `ci-failure-triage`.
-- **Expected Canonical Docs:** `docs/CI_AGENT_WORKFLOW.md`, workflow run artifacts / logs.
+- **Expected Canonical Docs:** `docs/CI_AGENT_WORKFLOW.md`, `.github/workflows/pr-acceptance.yml`, `scripts/windows_local_preflight.ps1`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, `docs/desktop/PREIMPLEMENTATION_AUDIT.md`, unrelated domain docs.
 - **Critical Invariants to Preserve:** Draft PR discipline, record primary failure signature, classify as product/harness/env, two-consecutive identical signatures require coordinator escalation, no speculative retries.
 
@@ -411,7 +424,7 @@ Twelve representative task fixtures covering diverse repository workflows. These
 - **Prompt:** "Review a proposed design for remote Worker enrollment via mobile QR code for potential RBAC bypass or token leakage."
 - **Expected Always-On Files:** Root `AGENTS.md`.
 - **Expected Optional Skill:** `worker-protocol-change`.
-- **Expected Canonical Docs:** `docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`, `docs/protocols/WORKER_PROTOCOL_V1.md`, `docs/ACCEPTANCE_AND_REVIEW.md` (Section 6).
+- **Expected Canonical Docs:** `docs/adr/0004-persistent-worker-affinity-and-worker-jobs.md`, `docs/protocols/WORKER_PROTOCOL_V1.md`, `docs/ACCEPTANCE_AND_REVIEW.md` (Section 6), `src/threads_platform/infrastructure/security/worker_auth.py`.
 - **Files That Should NOT Be Preloaded:** `PROJECT_STATE_HANDOFF.md`, browser automation docs, React UI files.
 - **Critical Invariants to Preserve:** 256-bit entropy for enrollment tokens, no static shared passwords, no private keys in DB/logs, server-derived actor attribution (no caller-supplied audit identity).
 
@@ -423,7 +436,7 @@ Risks identified for the upcoming CTX refactoring checkpoints (#148–#152) and 
 
 | ID | Risk | Severity | Impact | Mitigation Strategy |
 |---|---|---|---|---|
-| **R-01** | **Loss of load-bearing invariants** | **HIGH** | Trimming `AGENTS.md` might accidentally remove subtle invariants (e.g. lease fencing, domain isolation, human intervention) leading to architecture drift. | Strict check against Section 6 Load-Bearing Invariant Checklist in every CTX PR. Root `AGENTS.md` retains invariants while shedding workflow manuals. |
+| **R-01** | **Loss of load-bearing invariants** | **HIGH** | Trimming `AGENTS.md` might accidentally remove subtle invariants (e.g. lease fencing, domain isolation, human intervention) leading to architecture drift. | Strict check against Section 6.1 Load-Bearing Invariant Checklist in every CTX PR. Root `AGENTS.md` retains invariants while shedding workflow manuals. |
 | **R-02** | **Overly broad skills triggering universally** | **MEDIUM** | If skill descriptions are generic, agents load them for every task, recreating context bloat under a new name. | Narrow trigger conditions defined in Section 7. Reject generic skills ("clean-code", "python-style"). Ensure each skill has exclusive trigger keywords. |
 | **R-03** | **Stale GitHub / live-state coupling** | **HIGH** | Documentation referencing specific PR numbers, commit SHAs, or completed issues quickly goes out of date, confusing coding agents. | Move dynamic milestone history out of the mandatory boot path. Rely on git history and GitHub issue state rather than maintaining a monolithic handoff document. |
 | **R-04** | **Breaking active Desktop links / DX workflow** | **HIGH** | Moving or renaming `SESSION_HANDOFF.md` or `PREIMPLEMENTATION_AUDIT.md` breaks in-flight Desktop issues (#95–#108) and PR #145. | Maintain backward-compatible paths and stubs until active Desktop implementation reaches an explicit resting checkpoint. |
