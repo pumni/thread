@@ -1,6 +1,6 @@
 ---
 name: threads-api-contract
-description: Use this skill when modifying official Meta Threads Graph API client integrations, handling Meta rate limits or error subcodes, updating OAuth credential rotation and storage, or working with Threads publishing and conversation sync API contracts. Do NOT use for browser automation, worker protocol changes, or internal database migrations.
+description: Integrate or update official Meta Threads Graph API client endpoints, OAuth credential handling, and API test fixtures. Not for browser scraping.
 ---
 
 # Threads API Contract Skill
@@ -29,7 +29,7 @@ Inspect these sources before modifying API client contracts:
 - `src/threads_platform/infrastructure/threads_api/client.py`.
 - `src/threads_platform/infrastructure/threads_api/credentials.py`.
 - Official Meta Threads Developer Documentation and Changelog.
-- Tests: `tests/unit/test_threads_discovery_contract.py`.
+- Tests: `tests/unit/test_threads_discovery_contract.py`, `tests/unit/test_threads_api_contract.py`.
 
 ## Invariants & Design Rules
 1. **API-First, Not API-Only:** Prefer the official Threads API where it is the suitable and approved executor, while respecting account execution modes (`API_ONLY`, `BROWSER_ONLY`, `HYBRID`, `MANUAL`). Bounded `HYBRID` fallback must follow capability policy, not arbitrary error inference.
@@ -44,5 +44,5 @@ Inspect these sources before modifying API client contracts:
 3. **Update credential handling:** If token refresh or rotation is involved, ensure credentials update atomically without leaking tokens.
 4. **Verify tests:**
    ```bash
-   uv run pytest tests/unit/test_threads_discovery_contract.py
+   uv run pytest tests/unit/test_threads_discovery_contract.py tests/unit/test_threads_api_contract.py
    ```

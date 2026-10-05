@@ -1,6 +1,6 @@
 ---
 name: ci-failure-triage
-description: Use this skill when investigating, classifying, or resolving hosted GitHub Actions CI workflow failures (PR Acceptance, Main Verification, Desktop Diagnostic), analyzing runner failure artifacts, or following the mandatory hosted failure and repeated-signature triage protocol. Do NOT use for routine local test failures before a PR is opened.
+description: Investigate and classify hosted GitHub Actions CI workflow failures, parse runner artifacts, and apply the stop protocol. Not for local unit tests.
 ---
 
 # CI Failure Triage Skill
@@ -47,5 +47,7 @@ Inspect these sources when triaging CI failures:
    - **Harness:** Flaky test harness, timing window in test runner, or incorrect test assertion.
    - **Environment:** Runner resource exhaustion, network partition, or OS configuration discrepancy.
 4. **Formulate single hypothesis:** Define one falsifiable hypothesis explaining all evidence.
-5. **Reproduce locally:** Author or run a deterministic local test or targeted diagnostic to prove/disprove the hypothesis before changing code.
+5. **Prove or disprove hypothesis:**
+   - Prefer authoring or running the smallest deterministic local/unit/integration test or diagnostic seam when possible.
+   - If the failure materially depends on hosted Windows/runtime behavior that cannot be reproduced locally, follow `docs/CI_AGENT_WORKFLOW.md` to run an authorized targeted hosted diagnostic (`Desktop Diagnostic` via `workflow_dispatch` with exact `source_sha` and bounded hypothesis). Never make local reproduction an unconditional barrier when the issue is hosted-specific.
 6. **Report to coordinator:** Present the classification, evidence, and proposed fix before pushing changes.

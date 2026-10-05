@@ -1,6 +1,6 @@
 ---
 name: database-migration
-description: Use this skill when modifying PostgreSQL schemas, authoring or reviewing Alembic migrations, updating SQLAlchemy persistence models, adding database constraints or indexes, or resolving database schema conflicts. Do NOT use for general query execution or application service logic without schema changes.
+description: Modify PostgreSQL schemas, author or review Alembic migrations, and update SQLAlchemy persistence models. Not for query-only changes.
 ---
 
 # Database Migration Skill
@@ -30,7 +30,7 @@ Inspect these sources before authoring schema changes:
 - `scripts/windows_local_preflight.ps1` (disposable PostgreSQL test cluster).
 
 ## Invariants & Design Rules
-1. **PostgreSQL is authoritative:** Database constraints (unique, foreign key, check constraints) enforce business invariants at rest.
+1. **PostgreSQL is Authoritative:** Database constraints (unique, foreign key, check constraints) enforce business invariants at rest.
 2. **Reversibility:** Every migration must implement a safe, functional `downgrade()` function where practically feasible.
 3. **UTC Timestamps:** All timestamp columns must use timezone-aware UTC (`sa.DateTime(timezone=True)`).
 4. **Index Discipline:** Add composite indexes for high-frequency queries, particularly WorkerJob claim queries, command leasing, and account status lookups.

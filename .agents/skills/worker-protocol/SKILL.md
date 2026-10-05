@@ -1,6 +1,6 @@
 ---
 name: worker-protocol
-description: Use this skill when implementing or modifying distributed Worker WebSocket message framing, enrollment authentication, worker status/capacity reporting, lease renewal/fencing payloads, graceful draining, or protocol versioning. Do NOT use for internal worker browser automation logic, Playwright locators, or Control Plane business scheduler changes.
+description: Implement or modify Worker WebSocket framing, protocol v1/v2 schemas, worker enrollment, and lease/fencing tokens. Not for browser automation.
 ---
 
 # Worker Protocol Skill
