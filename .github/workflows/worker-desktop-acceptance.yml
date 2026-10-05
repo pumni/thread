@@ -98,6 +98,7 @@ jobs:
           uv run --locked python packaging/windows_desktop/verify_worker_desktop_inputs.py `
             --package-root "$env:GITHUB_WORKSPACE\build\dx07\worker-package" `
             --release-root "$env:ProgramFiles\ThreadsWorker\releases" `
+            --expected-source-sha "$env:DX07_SOURCE_SHA" `
             --output-json $manifestPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $release = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json

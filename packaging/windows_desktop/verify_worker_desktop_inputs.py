@@ -27,6 +27,7 @@ package_archive_name = _CONTRACT.package_archive_name
 validate_package_tree = _CONTRACT.validate_package_tree
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _is_reparse(path: Path) -> bool:
@@ -68,7 +69,11 @@ def _validate_archive_entries(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]
     return files
 
 
-def verify_and_extract(package_root: Path, release_root: Path) -> tuple[Path, dict[str, Any]]:
+def verify_and_extract(
+    package_root: Path, release_root: Path, expected_source_sha: str
+) -> tuple[Path, dict[str, Any]]:
+    if not _SOURCE_SHA.fullmatch(expected_source_sha):
+        raise ValueError("worker_package_expected_source_sha_invalid")
     package_root = package_root.resolve(strict=True)
     if (
         not package_root.is_dir()
@@ -97,6 +102,8 @@ def verify_and_extract(package_root: Path, release_root: Path) -> tuple[Path, di
         raise ValueError("worker_package_checksum_mismatch")
 
     outer_manifest = _validate_manifest(outer_manifest_path)
+    if outer_manifest["git_sha"] != expected_source_sha:
+        raise ValueError("worker_package_source_sha_mismatch")
     expected_archive_name = package_archive_name(
         outer_manifest["project_version"], outer_manifest["git_sha"]
     )
@@ -154,11 +161,26 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--package-root", type=Path, required=True)
     parser.add_argument("--release-root", type=Path, required=True)
+    parser.add_argument("--expected-source-sha", required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     args = parser.parse_args()
     try:
-        release, manifest = verify_and_extract(args.package_root, args.release_root)
-    except OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError:
+        release, manifest = verify_and_extract(
+            args.package_root, args.release_root, args.expected_source_sha
+        )
+    except ValueError as error:
+        code = (
+            str(error)
+            if str(error)
+            in {
+                "worker_package_expected_source_sha_invalid",
+                "worker_package_source_sha_mismatch",
+            }
+            else "worker_package_verification_failed"
+        )
+        print(code)
+        return 2
+    except OSError, zipfile.BadZipFile, json.JSONDecodeError:
         print("worker_package_verification_failed")
         return 2
     result = {

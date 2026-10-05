@@ -406,10 +406,12 @@ $script:ScenarioChecks = @{
         "graceful_failure_intervention", "no_automatic_force_fallback", "exact_force_phrase_required",
         "explicit_force_operation_invoked", "offline_not_fabricated", "drain_complete_not_fabricated",
         "legacy_task_remains_disabled", "identity_and_data_preserved", "process_tree_terminated",
-        "forced_interruption_diagnostic"
+        "forced_interruption_diagnostic", "operator_api_live_after_drain_failure",
+        "force_authorization_rechecked"
     )
     desktop_crash_logout_recovery = @(
-        "desktop_parent_abnormal_exit", "job_object_reaped_worker_descendants", "disabled_task_binding_unchanged",
+        "desktop_parent_abnormal_exit", "captured_descendants_alive_at_crash",
+        "job_object_reaped_worker_descendants", "disabled_task_binding_unchanged",
         "identity_key_root_unchanged", "journal_profile_preserved", "worker_reconciliation_observed",
         "no_duplicate_identity_tree", "not_reported_as_graceful_offline"
     )
@@ -420,7 +422,11 @@ $script:ScenarioChecks = @{
     headed_chromium_profile_continuity = @(
         "packaged_worker_browser_capability_executed", "chromium_started_headed", "not_session_zero_or_service",
         "worker_and_chromium_interactive_user", "desktop_hide_did_not_stop_worker",
-        "profile_sentinel_survived_boundary", "profile_not_copied_or_reinitialized", "same_identity_across_boundary"
+        "worker_restart_requested", "restart_drain_post_once", "restart_authoritative_offline",
+        "old_worker_natural_exit", "restart_process_lock_released", "legacy_task_disabled_through_restart",
+        "new_worker_pid_after_restart", "restart_reused_identity_and_root", "restarted_worker_online",
+        "second_profile_capability_executed", "profile_sentinel_survived_boundary",
+        "profile_not_copied_or_reinitialized", "same_identity_across_boundary"
     )
 }
 $script:Checks = [ordered]@{}
@@ -439,6 +445,8 @@ $script:Facts = [ordered]@{
     process_ids = [ordered]@{ desktop = $null; worker = $null; chromium = [System.Collections.Generic.List[int]]::new() }
     drain_post_count = 0
     drain_status_get_count = 0
+    operator_me_get_count = 0
+    worker_pid_timeline = [System.Collections.Generic.List[int]]::new()
     status_counts_timeline = [System.Collections.Generic.List[object]]::new()
 }
 $script:Processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -453,6 +461,8 @@ $script:PgStarted = $false
 $script:RootCertificate = $null
 $script:CertificateStore = $null
 $script:PageReleaseFile = $null
+$script:PageProcess = $null
+$script:DrainFaultFile = $null
 $script:WorkerStatusBeforeCleanup = $null
 
 function Assert-ScenarioCheck([string]$Name, [bool]$Condition, [string]$FailureCode) {
@@ -567,6 +577,26 @@ function Get-AnyWorkerProcesses {
     return @(
         Get-CimInstance -ClassName Win32_Process -Filter "Name = 'threads-worker.exe'"
     )
+}
+
+function Get-ProcessById([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $null }
+    return Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+}
+
+function Test-ProcessIdAlive([int]$ProcessId) {
+    return $null -ne (Get-ProcessById $ProcessId)
+}
+
+function Test-InteractiveProcessOwner([object[]]$Processes, [string]$UserSid, [int]$SessionId) {
+    if ($Processes.Count -eq 0 -or $SessionId -le 0) { return $false }
+    foreach ($process in $Processes) {
+        $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+        if (-not $owner -or $owner.Sid -ne $UserSid -or [int]$process.SessionId -ne $SessionId) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-ChromiumProcesses {
@@ -822,6 +852,7 @@ function Start-ControlPlaneFixture {
     $script:Facts.profile_tree_sha256 = Get-TreeSha256 ([string]$script:Fixture.profile_directory)
     $script:InitialDataTreeHash = Get-TreeSha256 $script:DataRoot
     $script:PageReleaseFile = Join-Path $script:WorkRoot "release-page.request"
+    $script:DrainFaultFile = Join-Path $script:FixtureRoot "reject-drain-post.request"
     $script:StatusTimelineFile = Join-Path $script:FixtureRoot "status-observations.json"
     $null = Start-FixtureProcess "worker-status-observer" @(
         "watch-status", "--worker-id", [string]$script:Fixture.worker_id,
@@ -843,7 +874,7 @@ function Start-ControlPlaneFixture {
         "serve-api", "--host", "127.0.0.1", "--port", [string]$script:ControlPort,
         "--certificate", [string]$script:Fixture.tls.leaf_certificate,
         "--private-key", [string]$script:Fixture.tls.leaf_private_key,
-        "--request-counts", $counterPath
+        "--request-counts", $counterPath, "--drain-fault-file", $script:DrainFaultFile
     )
     if (-not (Wait-TcpPort $script:ControlPort)) { throw "worker_desktop_fixture_control_plane_unavailable" }
 
@@ -869,13 +900,31 @@ function Start-ControlPlaneFixture {
 function Start-PageFixture {
     if (Wait-TcpPort 443 1) { throw "worker_desktop_fixture_profile_page_port_unavailable" }
     $script:PagePort = 443
-    $null = Start-FixtureProcess "synthetic-threads-page" @(
+    $script:PageProcess = Start-FixtureProcess "synthetic-threads-page" @(
         "serve-page", "--host", "127.0.0.1", "--port", [string]$script:PagePort,
         "--certificate", [string]$script:Fixture.tls.leaf_certificate,
         "--private-key", [string]$script:Fixture.tls.leaf_private_key,
         "--release-file", $script:PageReleaseFile, "--maximum-wait-seconds", "90"
     )
     if (-not (Wait-TcpPort $script:PagePort 5)) { throw "worker_desktop_fixture_profile_page_unavailable" }
+}
+
+function Restart-PageFixture {
+    if ($script:PageProcess) {
+        $script:PageProcess.Refresh()
+        if (-not $script:PageProcess.HasExited) {
+            Stop-Process -Id $script:PageProcess.Id -Force -ErrorAction SilentlyContinue
+            if (-not $script:PageProcess.WaitForExit(10000)) {
+                throw "worker_desktop_fixture_profile_page_stop_timeout"
+            }
+        }
+        $script:PageProcess.Dispose()
+        $script:PageProcess = $null
+    }
+    if (Test-Path -LiteralPath $script:PageReleaseFile) {
+        Remove-Item -LiteralPath $script:PageReleaseFile -Force
+    }
+    Start-PageFixture
 }
 
 function Set-HostConfigRoot([string]$Root) {
@@ -1075,8 +1124,10 @@ function Get-IdentityEvidence {
     $markerText = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop
     $workerId = ($markerText -split "`r?`n")[0]
     $keyPath = Join-Path (Join-Path $script:DataRoot "worker") "$workerId.device-key.dpapi"
+    $hostConfig = Get-Content -LiteralPath ([string]$script:Fixture.host_config_path) -Raw | ConvertFrom-Json -ErrorAction Stop
     return [ordered]@{
         worker_id = $workerId.ToLowerInvariant()
+        data_root = [IO.Path]::GetFullPath([string]$hostConfig.data_root)
         marker_hash = Get-Sha256 $markerPath
         key_hash = Get-Sha256 $keyPath
         data_tree_hash = Get-TreeSha256 $script:DataRoot
@@ -1524,18 +1575,27 @@ function Test-DrainFailureForceInterrupt {
     Sign-InOperator
     $workerPid = [int](Get-WorkerProcesses)[0].ProcessId
     $script:Facts.process_ids.worker = $workerPid
-    Stop-Process -Id $script:ApiProcess.Id -Force -ErrorAction SilentlyContinue
-    $script:ApiProcess.WaitForExit(10000) | Out-Null
+    $countsBeforeDrain = Get-RequestCounts
+    New-Item -ItemType File -Path $script:DrainFaultFile | Out-Null
     Invoke-UiButton $desktopId "Quit…"
     Invoke-UiButton $desktopId "Gracefully drain and quit"
-    $drainFailure = Wait-DesktopDiagnostic @("worker_drain_request_failed", "worker_drain_unavailable") 20
+    $drainFailure = Wait-DesktopDiagnostic @("worker_drain_request_failed") 20
     $workerStillAlive = (Get-WorkerProcesses).Count -eq 1
     $desktopStillAlive = $null -ne (Get-DesktopProcess $desktopId)
     $taskStillDisabled = (Get-TaskBinding).state -eq "DISABLED"
     $countsBeforeForce = Get-RequestCounts
+    $statusBeforeForce = Get-WorkerStatus -Record
     $initialAudit = Get-DrainAuditCounts
     Assert-ScenarioCheck "graceful_failure_intervention" ($null -ne $drainFailure -and $desktopStillAlive) "worker_desktop_graceful_failure_not_reported"
-    Assert-ScenarioCheck "no_automatic_force_fallback" ($workerStillAlive -and $countsBeforeForce.drain_post_count -eq 0) "worker_desktop_automatic_force_or_post_observed"
+    Assert-ScenarioCheck "operator_api_live_after_drain_failure" (
+        [int]$countsBeforeForce.operator_me_get_count -gt [int]$countsBeforeDrain.operator_me_get_count -and
+        $statusBeforeForce.status -eq "ONLINE" -and
+        [int]$initialAudit.drain_completion_audit_count -eq 0
+    ) "worker_desktop_operator_api_or_worker_state_unavailable_after_drain_fault"
+    Assert-ScenarioCheck "no_automatic_force_fallback" (
+        $workerStillAlive -and [int]$countsBeforeForce.drain_post_count -eq 1 -and
+        [int]$initialAudit.drain_completion_audit_count -eq 0
+    ) "worker_desktop_automatic_force_or_post_observed"
     if (-not $desktopStillAlive -or -not $workerStillAlive -or -not $taskStillDisabled) {
         throw "worker_desktop_force_precondition_invalid"
     }
@@ -1551,6 +1611,7 @@ function Test-DrainFailureForceInterrupt {
     $forceButton = Find-UiElement (Get-DesktopWindow $desktopId) "Force stop Worker" ([System.Windows.Automation.ControlType]::Button)
     $wrongPhraseDisabled = $forceButton -and -not $forceButton.Current.IsEnabled
     Set-LastUiEdit $desktopId "FORCE STOP WORKER"
+    $meCountBeforeForce = [int](Get-RequestCounts).operator_me_get_count
     Invoke-UiButton $desktopId "Force stop Worker"
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
@@ -1566,6 +1627,7 @@ function Test-DrainFailureForceInterrupt {
     $requestCounts = Get-RequestCounts
     $script:Facts.drain_post_count = [int]$requestCounts.drain_post_count
     $script:Facts.drain_status_get_count = [int]$requestCounts.drain_status_get_count
+    $script:Facts.operator_me_get_count = [int]$requestCounts.operator_me_get_count
     Assert-ScenarioCheck "exact_force_phrase_required" ($phraseRequired -and $phraseInitiallyDisabled -and $wrongPhraseDisabled) "worker_desktop_force_confirmation_not_strong"
     Assert-ScenarioCheck "explicit_force_operation_invoked" ((Get-WorkerProcesses).Count -eq 0 -and (Get-DesktopProcess $desktopId)) "worker_desktop_force_operation_not_observed"
     Assert-ScenarioCheck "offline_not_fabricated" ($statusAfterForce.status -ne "OFFLINE") "worker_desktop_force_fabricated_offline"
@@ -1578,6 +1640,11 @@ function Test-DrainFailureForceInterrupt {
     ) "worker_desktop_force_changed_identity_or_data"
     Assert-ScenarioCheck "process_tree_terminated" ((Get-WorkerProcesses).Count -eq 0 -and (Get-ChromiumProcesses).Count -eq 0) "worker_desktop_force_left_process_tree"
     Assert-ScenarioCheck "forced_interruption_diagnostic" ($diagnostic -eq "worker_forced_interruption") "worker_desktop_force_diagnostic_missing"
+    Assert-ScenarioCheck "force_authorization_rechecked" (
+        [int]$requestCounts.operator_me_get_count -gt $meCountBeforeForce -and
+        (Get-DesktopProcess $desktopId) -and
+        (Get-WorkerProcesses).Count -eq 0
+    ) "worker_desktop_force_authorization_not_rechecked"
 }
 
 function Watch-DesktopRollback([int]$DesktopWorkerPid) {
@@ -1716,7 +1783,7 @@ function Test-DesktopCrashLogoutRecovery {
     if ($chromiumBefore.Count -eq 0) { throw "worker_desktop_crash_browser_fixture_not_established" }
     $chromiumPids = @($chromiumBefore | ForEach-Object { [int]$_.ProcessId })
     $script:Facts.process_ids.chromium.Clear()
-    foreach ($pid in $chromiumPids) { $script:Facts.process_ids.chromium.Add($pid) }
+    foreach ($processId in $chromiumPids) { $script:Facts.process_ids.chromium.Add($processId) }
 
     Invoke-UiButton $desktopId "Sign out"
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -1733,16 +1800,42 @@ function Test-DesktopCrashLogoutRecovery {
             [IO.Path]::GetFullPath($DesktopExecutable), [StringComparison]::OrdinalIgnoreCase
         ) }).Count -eq 1
 
-    Release-BlockedPage
+    $taskBeforeCrash = Get-TaskBinding
+    $workerBeforeCrash = @(Get-WorkerProcesses | Where-Object { [int]$_.ProcessId -eq $workerPid })
+    $chromiumBeforeCrash = @(Get-ChromiumProcesses | Where-Object { [int]$_.ProcessId -in $chromiumPids })
+    $crashWorkerStatus = Get-WorkerStatus
+    $blockedJobStatus = Invoke-Fixture @("job-status", "--worker-job-id", $script:ActiveJobId)
+    $crashSession = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $crashSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $capturedDescendantsAlive = (
+        $taskBeforeCrash.state -eq "DISABLED" -and
+        $workerBeforeCrash.Count -eq 1 -and
+        $chromiumBeforeCrash.Count -eq $chromiumPids.Count -and
+        (Test-ProcessIdAlive $workerPid) -and
+        (@($chromiumPids | Where-Object { -not (Test-ProcessIdAlive $_) }).Count -eq 0) -and
+        $crashWorkerStatus.status -eq "ONLINE" -and
+        [int]$crashWorkerStatus.active_browser_sessions -gt 0 -and
+        $blockedJobStatus.worker_job_status -eq "RUNNING" -and
+        (Test-InteractiveProcessOwner (@($workerBeforeCrash) + @($chromiumBeforeCrash)) $crashSid $crashSession)
+    )
+    Assert-ScenarioCheck "captured_descendants_alive_at_crash" $capturedDescendantsAlive "worker_desktop_crash_descendants_not_alive_at_parent_exit"
+    if (-not $capturedDescendantsAlive) { throw "worker_desktop_crash_descendants_not_alive_at_parent_exit" }
+
     Stop-Process -Id $desktopId -Force -ErrorAction SilentlyContinue
     if (-not (Wait-DesktopExit $desktopId 15)) { throw "worker_desktop_parent_crash_not_observed" }
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     do {
-        if ((Get-WorkerProcesses).Count -eq 0 -and (Get-ChromiumProcesses).Count -eq 0 -and
+        $capturedWorkerAlive = Test-ProcessIdAlive $workerPid
+        $capturedChromiumAlive = @($chromiumPids | Where-Object { Test-ProcessIdAlive $_ }).Count -gt 0
+        if (-not $capturedWorkerAlive -and -not $capturedChromiumAlive -and
+            (Get-AnyWorkerProcesses).Count -eq 0 -and (Get-ChromiumProcesses).Count -eq 0 -and
             (Observe-Lock) -eq "NOT_HELD") { break }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
-    $reaped = (Get-WorkerProcesses).Count -eq 0 -and (Get-ChromiumProcesses).Count -eq 0 -and
+    $capturedWorkerGone = -not (Test-ProcessIdAlive $workerPid)
+    $capturedChromiumGone = @($chromiumPids | Where-Object { Test-ProcessIdAlive $_ }).Count -eq 0
+    $reaped = $capturedWorkerGone -and $capturedChromiumGone -and
+        (Get-AnyWorkerProcesses).Count -eq 0 -and (Get-ChromiumProcesses).Count -eq 0 -and
         (Observe-Lock) -eq "NOT_HELD"
     $taskAfterCrash = Get-TaskBinding
     $auditAfterCrash = Get-DrainAuditCounts
@@ -1754,6 +1847,10 @@ function Test-DesktopCrashLogoutRecovery {
         throw "worker_desktop_crash_fabricated_drain"
     }
     $crashIdentity = Get-IdentityEvidence
+    if ($script:DesktopProcess) {
+        $script:DesktopProcess.Dispose()
+        $script:DesktopProcess = $null
+    }
 
     $restartedDesktop = Open-Desktop -ExpectStartupWorker
     $recoveredStatus = Wait-WorkerStatus @("ONLINE") 45
@@ -1792,31 +1889,144 @@ function Test-DesktopCrashLogoutRecovery {
     Set-EvidenceIdentity $identityAfter
 }
 
+function Watch-DesktopWorkerRestart(
+    [int]$OldWorkerPid,
+    [System.Diagnostics.Process]$OldWorkerHandle,
+    [object]$IdentityBefore,
+    [object]$TaskBefore
+) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    $seenDraining = $false
+    $seenOffline = $false
+    $oldExitedNaturally = $false
+    $lockReleased = $false
+    $taskStayedDisabled = $true
+    $newWorkerPid = 0
+    $finalStatus = $null
+    $lastTaskCheck = [DateTime]::MinValue
+    do {
+        try { Read-StatusTimeline } catch { }
+        $seenOnlineAfterOffline = $false
+        foreach ($observation in $script:Facts.status_counts_timeline) {
+            if ($observation.status -eq "DRAINING") { $seenDraining = $true }
+            if ($seenDraining -and $observation.status -eq "OFFLINE" -and
+                [int]$observation.active_browser_sessions -eq 0 -and
+                [int]$observation.running_worker_jobs -eq 0) {
+                $seenOffline = $true
+            }
+            if ($seenOffline -and $observation.status -eq "ONLINE") {
+                $seenOnlineAfterOffline = $true
+            }
+        }
+
+        $OldWorkerHandle.Refresh()
+        if ($OldWorkerHandle.HasExited -and $seenOffline -and $OldWorkerHandle.ExitCode -eq 0) {
+            $oldExitedNaturally = $true
+        }
+        if ($seenOffline -and $oldExitedNaturally -and (Observe-Lock) -eq "NOT_HELD") {
+            $lockReleased = $true
+        }
+
+        if (([DateTime]::UtcNow - $lastTaskCheck).TotalMilliseconds -ge 300) {
+            $task = Get-TaskBinding
+            $lastTaskCheck = [DateTime]::UtcNow
+            if ($task.state -ne "DISABLED" -or
+                $task.executable_path -ne $TaskBefore.executable_path -or
+                $task.host_config_path -ne $TaskBefore.host_config_path -or
+                $task.working_directory -ne $TaskBefore.working_directory) {
+                $taskStayedDisabled = $false
+                throw "worker_desktop_restart_legacy_task_changed"
+            }
+        }
+
+        $workers = Get-WorkerProcesses
+        if ($workers.Count -gt 1) { throw "worker_desktop_duplicate_worker_process" }
+        if ($seenOffline -and $oldExitedNaturally -and $lockReleased -and
+            $taskStayedDisabled -and $workers.Count -eq 1 -and
+            [int]$workers[0].ProcessId -ne $OldWorkerPid) {
+            $newWorkerPid = [int]$workers[0].ProcessId
+            $script:Facts.process_ids.worker = $newWorkerPid
+            if ($seenOnlineAfterOffline) {
+                try { $finalStatus = Get-WorkerStatus } catch { $finalStatus = $null }
+                if ($finalStatus -and $finalStatus.status -eq "ONLINE") { break }
+            }
+        }
+        Start-Sleep -Milliseconds 20
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    $requestCounts = Get-RequestCounts
+    $auditCounts = Get-DrainAuditCounts
+    $newWorkers = Get-WorkerProcesses
+    $taskAfter = Get-TaskBinding
+    $identityAfter = Get-IdentityEvidence
+    $lockHeldByNewWorker = (Observe-Lock) -eq "HELD"
+    $newLaunchValid = $newWorkers.Count -eq 1 -and
+        [int]$newWorkers[0].ProcessId -eq $newWorkerPid -and
+        (Test-ExactWorkerLaunch $newWorkers[0])
+    $bindingAndIdentityReused = (
+        $identityAfter.worker_id -eq $IdentityBefore.worker_id -and
+        $identityAfter.marker_hash -eq $IdentityBefore.marker_hash -and
+        $identityAfter.key_hash -eq $IdentityBefore.key_hash -and
+        $identityAfter.host_config_hash -eq $IdentityBefore.host_config_hash -and
+        $identityAfter.data_root -eq $IdentityBefore.data_root -and
+        $identityAfter.data_root -eq [IO.Path]::GetFullPath([string]$script:Fixture.data_root) -and
+        $taskAfter.executable_path -eq $TaskBefore.executable_path -and
+        $taskAfter.host_config_path -eq $TaskBefore.host_config_path -and
+        $taskAfter.working_directory -eq $TaskBefore.working_directory
+    )
+
+    $script:Facts.drain_post_count = [int]$requestCounts.drain_post_count
+    $script:Facts.drain_status_get_count = [int]$requestCounts.drain_status_get_count
+    $script:Facts.worker_pid_timeline.Clear()
+    $script:Facts.worker_pid_timeline.Add($OldWorkerPid)
+    if ($newWorkerPid -gt 0) { $script:Facts.worker_pid_timeline.Add($newWorkerPid) }
+
+    Assert-ScenarioCheck "worker_restart_requested" $seenDraining "worker_desktop_restart_drain_not_requested"
+    Assert-ScenarioCheck "restart_drain_post_once" (
+        [int]$requestCounts.drain_post_count -eq 1 -and
+        [int]$requestCounts.drain_status_get_count -gt 0 -and
+        [int]$auditCounts.drain_request_audit_count -eq 1 -and
+        [int]$auditCounts.drain_completion_audit_count -eq 1
+    ) "worker_desktop_restart_drain_request_count_invalid"
+    Assert-ScenarioCheck "restart_authoritative_offline" $seenOffline "worker_desktop_restart_offline_not_observed"
+    Assert-ScenarioCheck "old_worker_natural_exit" $oldExitedNaturally "worker_desktop_restart_old_process_not_natural_exit"
+    Assert-ScenarioCheck "restart_process_lock_released" $lockReleased "worker_desktop_restart_lock_not_released"
+    Assert-ScenarioCheck "legacy_task_disabled_through_restart" (
+        $taskStayedDisabled -and $taskAfter.state -eq "DISABLED"
+    ) "worker_desktop_restart_changed_legacy_task"
+    Assert-ScenarioCheck "new_worker_pid_after_restart" ($newWorkerPid -gt 0 -and $newLaunchValid) "worker_desktop_restart_new_process_not_observed"
+    Assert-ScenarioCheck "restart_reused_identity_and_root" $bindingAndIdentityReused "worker_desktop_restart_changed_identity_or_root"
+    Assert-ScenarioCheck "restarted_worker_online" (
+        $finalStatus -and $finalStatus.status -eq "ONLINE" -and
+        $finalStatus.worker_id -eq $script:Fixture.worker_id -and
+        $lockHeldByNewWorker -and $taskAfter.state -eq "DISABLED"
+    ) "worker_desktop_restart_online_not_observed"
+}
+
 function Test-HeadedChromiumProfileContinuity {
     $identityBefore = Get-IdentityEvidence
-    $null = Install-DisabledTask
+    $taskBefore = Install-DisabledTask
+    if ($taskBefore.state -ne "DISABLED") { throw "worker_desktop_profile_task_not_disabled" }
     $null = Start-PageFixture
     $desktopId = Open-Desktop -ExpectStartupWorker
     Sign-InOperator
     $workerBefore = Get-WorkerProcesses
+    if ($workerBefore.Count -ne 1) { throw "worker_desktop_profile_worker_missing" }
+    $workerPid = [int]$workerBefore[0].ProcessId
+    $workerHandle = [Diagnostics.Process]::GetProcessById($workerPid)
     $profileBefore = Get-IdentityEvidence
     $null = Queue-BlockedProfileJob
     $chromium = Get-ChromiumProcesses
-    $workerPid = [int]$workerBefore[0].ProcessId
-    $chromiumPids = @($chromium | ForEach-Object { [int]$_.ProcessId })
+    $firstChromiumPids = @($chromium | ForEach-Object { [int]$_.ProcessId })
+    if ($chromium.Count -eq 0) { throw "worker_desktop_profile_chromium_missing" }
     $processSession = [Diagnostics.Process]::GetCurrentProcess().SessionId
     $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $interactiveOwners = $true
-    foreach ($process in @($workerBefore) + @($chromium)) {
-        $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
-        if (-not $owner -or $owner.Sid -ne $currentSid -or [int]$process.SessionId -ne $processSession) {
-            $interactiveOwners = $false
-        }
-        if ($process.Name -like "chrome*.exe" -and [string]$process.CommandLine -match "--headless(?:=|\s|$)") {
-            $interactiveOwners = $false
-        }
-    }
-    $hideDidNotStop = Test-WorkerHide $desktopId $workerPid $chromiumPids
+    $interactiveOwners = Test-InteractiveProcessOwner (@($workerBefore) + @($chromium)) $currentSid $processSession
+    $firstHeaded = @($chromium | Where-Object {
+        [string]$_.CommandLine -notmatch "--headless(?:=|\s|$)" -and
+        [string]$_.CommandLine -match [regex]::Escape([string]$script:Fixture.profile_directory)
+    }).Count -eq $chromium.Count
+    $hideDidNotStop = Test-WorkerHide $desktopId $workerPid $firstChromiumPids
     $reopened = Start-Process -FilePath $DesktopExecutable -PassThru
     $reopened.Dispose()
     $windowVisible = $false
@@ -1840,27 +2050,63 @@ function Test-HeadedChromiumProfileContinuity {
     if ((Wait-ForJobStatus $script:ActiveJobId @("COMPLETED") 40) -ne "COMPLETED") {
         throw "worker_desktop_profile_job_did_not_complete"
     }
+
+    $beforeRestart = Get-IdentityEvidence
+    $taskBeforeRestart = Get-TaskBinding
+    if ($taskBeforeRestart.state -ne "DISABLED") { throw "worker_desktop_profile_task_not_disabled" }
+    Invoke-UiButton $desktopId "Restart…"
+    Invoke-UiButton $desktopId "Authenticate and restart"
+    Watch-DesktopWorkerRestart $workerPid $workerHandle $beforeRestart $taskBeforeRestart
+    if (-not (Wait-ForNoChromium 20) -or
+        @($firstChromiumPids | Where-Object { Test-ProcessIdAlive $_ }).Count -gt 0) {
+        throw "worker_desktop_restart_chromium_not_reaped"
+    }
+    $null = Restart-PageFixture
+
+    $profileAtRestart = Get-IdentityEvidence
+    $null = Queue-BlockedProfileJob
+    $secondWorker = Get-WorkerProcesses
+    $secondChromium = Get-ChromiumProcesses
+    $secondWorkerPid = if ($secondWorker.Count -eq 1) { [int]$secondWorker[0].ProcessId } else { 0 }
+    $secondInteractiveOwners = Test-InteractiveProcessOwner (@($secondWorker) + @($secondChromium)) $currentSid $processSession
+    $secondHeaded = $secondChromium.Count -gt 0 -and @($secondChromium | Where-Object {
+        [string]$_.CommandLine -notmatch "--headless(?:=|\s|$)" -and
+        [string]$_.CommandLine -match [regex]::Escape([string]$script:Fixture.profile_directory)
+    }).Count -eq $secondChromium.Count
+    $secondChromiumPids = @($secondChromium | ForEach-Object { [int]$_.ProcessId })
+    Release-BlockedPage
+    if ((Wait-ForJobStatus $script:ActiveJobId @("COMPLETED") 40) -ne "COMPLETED") {
+        throw "worker_desktop_profile_second_job_did_not_complete"
+    }
     $status = Wait-WorkerStatus @("ONLINE") 30
     $profileAfter = Get-IdentityEvidence
-    $requestCounts = Get-RequestCounts
-    $script:Facts.drain_post_count = [int]$requestCounts.drain_post_count
-    $script:Facts.drain_status_get_count = [int]$requestCounts.drain_status_get_count
-    $script:Facts.process_ids.worker = $workerPid
+    $completedJob = Invoke-Fixture @("job-status", "--worker-job-id", $script:ActiveJobId)
+    $script:Facts.process_ids.desktop = $desktopId
+    $script:Facts.process_ids.worker = $secondWorkerPid
     $script:Facts.process_ids.chromium.Clear()
-    foreach ($pid in $chromiumPids) { $script:Facts.process_ids.chromium.Add($pid) }
+    $allChromiumPids = @($firstChromiumPids) + @($secondChromiumPids)
+    foreach ($processId in @($allChromiumPids | Select-Object -Unique)) {
+        $script:Facts.process_ids.chromium.Add([int]$processId)
+    }
+
     Assert-ScenarioCheck "packaged_worker_browser_capability_executed" (
-        $status.worker_id -eq $script:Fixture.worker_id -and (Invoke-Fixture @("job-status", "--worker-job-id", $script:ActiveJobId)).worker_job_status -eq "COMPLETED"
+        $status.worker_id -eq $script:Fixture.worker_id -and $completedJob.worker_job_status -eq "COMPLETED"
     ) "worker_desktop_profile_capability_not_completed"
-    Assert-ScenarioCheck "chromium_started_headed" ($chromium.Count -gt 0 -and $interactiveOwners) "worker_desktop_chromium_not_headed"
+    Assert-ScenarioCheck "chromium_started_headed" ($firstHeaded -and $secondHeaded) "worker_desktop_chromium_not_headed"
     Assert-ScenarioCheck "not_session_zero_or_service" ([Environment]::UserInteractive -and $processSession -gt 0) "worker_desktop_process_not_interactive"
-    Assert-ScenarioCheck "worker_and_chromium_interactive_user" $interactiveOwners "worker_desktop_process_principal_or_session_invalid"
+    Assert-ScenarioCheck "worker_and_chromium_interactive_user" ($interactiveOwners -and $secondInteractiveOwners) "worker_desktop_process_principal_or_session_invalid"
     Assert-ScenarioCheck "desktop_hide_did_not_stop_worker" ($hideDidNotStop -and $windowVisible -and $singleDesktop) "worker_desktop_hide_stopped_runtime_or_duplicate"
+    Assert-ScenarioCheck "second_profile_capability_executed" (
+        $secondWorkerPid -gt 0 -and $secondWorkerPid -ne $workerPid -and
+        $secondChromium.Count -gt 0 -and $completedJob.worker_job_status -eq "COMPLETED"
+    ) "worker_desktop_profile_second_capability_not_completed"
     Assert-ScenarioCheck "profile_sentinel_survived_boundary" (
-        $profileBefore.profile_sentinel_hash -eq $profileAfter.profile_sentinel_hash -and
+        $profileBefore.profile_sentinel_hash -eq $profileAtRestart.profile_sentinel_hash -and
+        $profileAtRestart.profile_sentinel_hash -eq $profileAfter.profile_sentinel_hash -and
         $profileAfter.profile_sentinel_hash -eq $script:Fixture.profile_sentinel_sha256
     ) "worker_desktop_profile_sentinel_changed"
     $matchingSentinels = @(Get-ChildItem -LiteralPath $script:DataRoot -Filter "dx07-profile-continuity.sentinel" -File -Recurse -Force)
-    $profileCommandMatch = @($chromium | Where-Object {
+    $profileCommandMatch = @($secondChromium | Where-Object {
         [string]$_.CommandLine -match [regex]::Escape([string]$script:Fixture.profile_directory)
     }).Count -gt 0
     Assert-ScenarioCheck "profile_not_copied_or_reinitialized" (
@@ -1871,9 +2117,12 @@ function Test-HeadedChromiumProfileContinuity {
     Assert-ScenarioCheck "same_identity_across_boundary" (
         $identityBefore.worker_id -eq $profileAfter.worker_id -and
         $identityBefore.marker_hash -eq $profileAfter.marker_hash -and
-        $identityBefore.key_hash -eq $profileAfter.key_hash
+        $identityBefore.key_hash -eq $profileAfter.key_hash -and
+        $identityBefore.data_root -eq $profileAfter.data_root -and
+        $identityBefore.host_config_hash -eq $profileAfter.host_config_hash
     ) "worker_desktop_profile_boundary_changed_identity"
     Set-EvidenceIdentity $profileAfter
+    $workerHandle.Dispose()
 }
 
 function Complete-SafeScenarioCleanup {
@@ -2020,6 +2269,7 @@ try {
             $counts = Get-RequestCounts
             $script:Facts.drain_post_count = [int]$counts.drain_post_count
             $script:Facts.drain_status_get_count = [int]$counts.drain_status_get_count
+            $script:Facts.operator_me_get_count = [int]$counts.operator_me_get_count
         }
     } catch {
         if (-not $FailureCode) { $FailureCode = "worker_desktop_request_count_evidence_unavailable" }

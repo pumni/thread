@@ -102,9 +102,12 @@ SCENARIO_CHECKS: dict[str, tuple[str, ...]] = {
         "identity_and_data_preserved",
         "process_tree_terminated",
         "forced_interruption_diagnostic",
+        "operator_api_live_after_drain_failure",
+        "force_authorization_rechecked",
     ),
     "desktop_crash_logout_recovery": (
         "desktop_parent_abnormal_exit",
+        "captured_descendants_alive_at_crash",
         "job_object_reaped_worker_descendants",
         "disabled_task_binding_unchanged",
         "identity_key_root_unchanged",
@@ -129,6 +132,16 @@ SCENARIO_CHECKS: dict[str, tuple[str, ...]] = {
         "not_session_zero_or_service",
         "worker_and_chromium_interactive_user",
         "desktop_hide_did_not_stop_worker",
+        "worker_restart_requested",
+        "restart_drain_post_once",
+        "restart_authoritative_offline",
+        "old_worker_natural_exit",
+        "restart_process_lock_released",
+        "legacy_task_disabled_through_restart",
+        "new_worker_pid_after_restart",
+        "restart_reused_identity_and_root",
+        "restarted_worker_online",
+        "second_profile_capability_executed",
         "profile_sentinel_survived_boundary",
         "profile_not_copied_or_reinitialized",
         "same_identity_across_boundary",
@@ -164,6 +177,8 @@ _FACT_FIELDS = {
     "process_ids",
     "drain_post_count",
     "drain_status_get_count",
+    "operator_me_get_count",
+    "worker_pid_timeline",
     "status_counts_timeline",
 }
 
@@ -203,6 +218,8 @@ def _safe_stub(
             "process_ids": {"desktop": None, "worker": None, "chromium": []},
             "drain_post_count": 0,
             "drain_status_get_count": 0,
+            "operator_me_get_count": 0,
+            "worker_pid_timeline": [],
             "status_counts_timeline": [],
         },
     }
@@ -323,10 +340,36 @@ def validate_evidence(value: object, source_sha: str, scenario: str) -> str | No
         for item in (process_ids["desktop"], process_ids["worker"])
     ) or any(not _valid_integer(pid, minimum=1) for pid in cast(list[object], chromium_pids)):
         return "worker_desktop_safe_facts_invalid"
-    if not _valid_integer(facts.get("drain_post_count")) or not _valid_integer(
-        facts.get("drain_status_get_count")
+    if (
+        not _valid_integer(facts.get("drain_post_count"))
+        or not _valid_integer(facts.get("drain_status_get_count"))
+        or not _valid_integer(facts.get("operator_me_get_count"))
     ):
         return "worker_desktop_safe_facts_invalid"
+    worker_pid_timeline = facts.get("worker_pid_timeline")
+    if not isinstance(worker_pid_timeline, list) or any(
+        not _valid_integer(pid, minimum=1) for pid in cast(list[object], worker_pid_timeline)
+    ):
+        return "worker_desktop_safe_facts_invalid"
+    if scenario == "headed_chromium_profile_continuity" and data.get("result") == "PASS":
+        if (
+            len(worker_pid_timeline) != 2
+            or worker_pid_timeline[0] == worker_pid_timeline[1]
+            or facts.get("drain_post_count") != 1
+        ):
+            return "worker_desktop_profile_restart_boundary_invalid"
+        worker_statuses = facts.get("worker_status_timeline")
+        if not isinstance(worker_statuses, list):
+            return "worker_desktop_profile_restart_boundary_invalid"
+        statuses = cast(list[str], worker_statuses)
+        try:
+            draining_index = statuses.index("DRAINING")
+            offline_index = statuses.index("OFFLINE", draining_index + 1)
+            online_index = statuses.index("ONLINE", offline_index + 1)
+        except ValueError:
+            return "worker_desktop_profile_restart_boundary_invalid"
+        if not draining_index < offline_index < online_index:
+            return "worker_desktop_profile_restart_boundary_invalid"
     counts = facts.get("status_counts_timeline")
     if not isinstance(counts, list):
         return "worker_desktop_safe_facts_invalid"

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import json
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -28,6 +29,13 @@ if INPUT_VERIFIER_SPEC is None or INPUT_VERIFIER_SPEC.loader is None:
 INPUT_VERIFIER_MODULE = importlib.util.module_from_spec(INPUT_VERIFIER_SPEC)
 INPUT_VERIFIER_SPEC.loader.exec_module(INPUT_VERIFIER_MODULE)
 worker_desktop_input_verifier: Any = INPUT_VERIFIER_MODULE
+FIXTURE_PATH = ROOT / "packaging" / "windows_desktop" / "worker_desktop_fixture.py"
+FIXTURE_SPEC = importlib.util.spec_from_file_location("worker_desktop_fixture", FIXTURE_PATH)
+if FIXTURE_SPEC is None or FIXTURE_SPEC.loader is None:
+    raise RuntimeError("Could not load Worker Desktop fixture")
+FIXTURE_MODULE = importlib.util.module_from_spec(FIXTURE_SPEC)
+FIXTURE_SPEC.loader.exec_module(FIXTURE_MODULE)
+worker_desktop_fixture: Any = FIXTURE_MODULE
 
 
 def _evidence(scenario: str, **overrides: object) -> dict[str, Any]:
@@ -59,6 +67,10 @@ def _evidence(scenario: str, **overrides: object) -> dict[str, Any]:
             "process_ids": {"desktop": 1200, "worker": 1300, "chromium": [1400]},
             "drain_post_count": 1,
             "drain_status_get_count": 3,
+            "operator_me_get_count": 2,
+            "worker_pid_timeline": [1300, 1301]
+            if scenario == "headed_chromium_profile_continuity"
+            else [1300],
             "status_counts_timeline": [
                 {
                     "status": "DRAINING",
@@ -245,6 +257,42 @@ def test_worker_desktop_safe_evidence_rejects_secret_fields_and_untyped_values()
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("worker_pid_timeline", [1300]),
+        ("worker_pid_timeline", [1300, 1300]),
+        ("worker_status_timeline", ["ONLINE", "OFFLINE", "ONLINE"]),
+        ("drain_post_count", 0),
+    ],
+)
+def test_profile_evidence_requires_a_real_worker_restart_boundary(
+    field: str, value: object
+) -> None:
+    evidence = _evidence("headed_chromium_profile_continuity")
+    evidence["facts"][field] = value
+
+    assert (
+        MODULE.validate_evidence(evidence, SOURCE_SHA, "headed_chromium_profile_continuity")
+        == "worker_desktop_profile_restart_boundary_invalid"
+    )
+
+
+def test_profile_blocker_evidence_can_report_failure_before_restart_boundary() -> None:
+    evidence = _evidence(
+        "headed_chromium_profile_continuity",
+        result="BLOCKER",
+        failure_code="worker_desktop_restart_drain_not_requested",
+    )
+    evidence["facts"]["worker_pid_timeline"] = []
+    evidence["facts"]["worker_status_timeline"] = []
+    evidence["facts"]["drain_post_count"] = 0
+
+    assert (
+        MODULE.validate_evidence(evidence, SOURCE_SHA, "headed_chromium_profile_continuity") is None
+    )
+
+
 def test_worker_desktop_aggregate_requires_lowercase_full_source_sha(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="source_sha"):
         MODULE.aggregate_scenarios(tmp_path, "A" * 40, tmp_path / "combined")
@@ -264,17 +312,99 @@ def test_worker_desktop_workflow_uses_staged_helper_and_secret_free_fixture_boun
         "THREADS_WORKER_ENROLLMENT_CODE",
         "THREADS_WORKER_CONTROL_PLANE_URL",
         "THREADS_WORKER_DATA_ROOT",
+        "--expected-source-sha",
+        "captured_descendants_alive_at_crash",
+        "worker_restart_requested",
+        "restart_drain_post_once",
+        "Restart-PageFixture",
     ):
         assert required in workflow + harness
     assert "github.event.pull_request.head.sha" not in workflow
     assert "workflow_dispatch:" not in workflow
 
 
+def test_worker_desktop_crash_and_profile_scenarios_cross_real_process_boundaries() -> None:
+    harness = (
+        ROOT / "packaging" / "windows_desktop" / "smoke_worker_desktop_lifecycle.ps1"
+    ).read_text(encoding="utf-8")
+    crash = harness.split("function Test-DesktopCrashLogoutRecovery {", 1)[1].split(
+        "function Watch-DesktopWorkerRestart(", 1
+    )[0]
+    profile = harness.split("function Test-HeadedChromiumProfileContinuity {", 1)[1].split(
+        "function Complete-SafeScenarioCleanup", 1
+    )[0]
+
+    assert "Release-BlockedPage" not in crash
+    assert crash.index('Assert-ScenarioCheck "captured_descendants_alive_at_crash"') < crash.index(
+        "Stop-Process -Id $desktopId -Force"
+    )
+    assert "Test-ProcessIdAlive $workerPid" in crash
+    assert "Test-ProcessIdAlive $_" in crash
+    assert 'Invoke-UiButton $desktopId "Restart…"' in profile
+    assert 'Invoke-UiButton $desktopId "Authenticate and restart"' in profile
+    assert "Watch-DesktopWorkerRestart" in profile
+    assert "Queue-BlockedProfileJob" in profile.split("Watch-DesktopWorkerRestart", 1)[1]
+
+
+def test_drain_fault_fixture_rejects_only_drain_post_and_keeps_operator_reads_live(
+    tmp_path: Path,
+) -> None:
+    counter_path = tmp_path / "request-counts.json"
+    fault_path = tmp_path / "reject-drain-post"
+    fault_path.touch()
+    passed_through: list[tuple[str, str]] = []
+
+    async def control_plane(scope: dict[str, object], _receive: Any, send: Any) -> None:
+        passed_through.append((str(scope["method"]), str(scope["path"])))
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    app = worker_desktop_fixture._DrainFaultControlPlaneApp(control_plane, counter_path, fault_path)
+    responses: dict[str, int] = {}
+
+    async def request(method: str, path: str) -> None:
+        messages: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            messages.append(message)
+
+        await app(
+            {"type": "http", "method": method, "path": path},
+            None,
+            send,
+        )
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        responses[f"{method} {path}"] = cast(int, start["status"])
+
+    drain_path = "/v1/workers/12345678-1234-4234-8234-123456789abc/drain"
+    asyncio.run(request("GET", "/v1/operator/me"))
+    asyncio.run(request("GET", drain_path))
+    asyncio.run(request("POST", drain_path))
+
+    assert responses == {
+        "GET /v1/operator/me": 200,
+        f"GET {drain_path}": 200,
+        f"POST {drain_path}": 503,
+    }
+    assert passed_through == [("GET", "/v1/operator/me"), ("GET", drain_path)]
+    assert json.loads(counter_path.read_text(encoding="utf-8")) == {
+        "drain_post_count": 1,
+        "drain_status_get_count": 1,
+        "operator_me_get_count": 1,
+    }
+
+
 def _write_worker_package_artifact(root: Path) -> tuple[str, str]:
     root.mkdir()
     package_name = "threads-worker-windows-x64"
     project_version = "0.1.0"
-    worker_sha = "b" * 40
+    worker_sha = SOURCE_SHA
     manifest = {
         "artifact_schema": "threads-worker-package-v1",
         "project_version": project_version,
@@ -315,7 +445,7 @@ def test_worker_desktop_package_verifier_checks_exact_archive_before_release_sta
     monkeypatch.setenv("ProgramFiles", str(program_files))
 
     release, manifest = worker_desktop_input_verifier.verify_and_extract(
-        package_root, program_files / "ThreadsWorker" / "releases"
+        package_root, program_files / "ThreadsWorker" / "releases", SOURCE_SHA
     )
 
     assert release.name.endswith(worker_sha)
@@ -337,7 +467,7 @@ def test_worker_desktop_package_verifier_rejects_checksum_and_path_traversal(
 
     with pytest.raises(ValueError, match="worker_package_checksum_mismatch"):
         worker_desktop_input_verifier.verify_and_extract(
-            package_root, program_files / "ThreadsWorker" / "releases"
+            package_root, program_files / "ThreadsWorker" / "releases", SOURCE_SHA
         )
 
     checksum = hashlib.sha256((package_root / archive_name).read_bytes()).hexdigest()
@@ -350,8 +480,28 @@ def test_worker_desktop_package_verifier_rejects_checksum_and_path_traversal(
 
     with pytest.raises(ValueError, match="worker_package_archive_entry_invalid"):
         worker_desktop_input_verifier.verify_and_extract(
-            package_root, program_files / "ThreadsWorker" / "releases"
+            package_root, program_files / "ThreadsWorker" / "releases", SOURCE_SHA
         )
+
+
+def test_worker_desktop_package_verifier_rejects_self_consistent_package_for_other_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = tmp_path / "artifact"
+    archive_name, worker_sha = _write_worker_package_artifact(package_root)
+    program_files = tmp_path / "Program Files"
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+
+    assert worker_sha == SOURCE_SHA
+    with pytest.raises(ValueError, match="worker_package_source_sha_mismatch"):
+        worker_desktop_input_verifier.verify_and_extract(
+            package_root, program_files / "ThreadsWorker" / "releases", "c" * 40
+        )
+
+    assert not (
+        program_files / "ThreadsWorker" / "releases" / f"windows-x64-0.1.0-{worker_sha}"
+    ).exists()
+    assert (package_root / archive_name).is_file()
 
 
 def test_worker_desktop_preflight_needs_worker_paths_to_run_both_gates() -> None:

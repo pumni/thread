@@ -314,6 +314,63 @@ def _seed_identity_only(args: argparse.Namespace) -> dict[str, str]:
     }
 
 
+class _DrainFaultControlPlaneApp:
+    def __init__(
+        self,
+        app: Any,
+        counter_path: Path,
+        drain_fault_file: Path | None,
+    ) -> None:
+        self._app = app
+        self._counter_path = counter_path
+        self._drain_fault_file = drain_fault_file
+        self._counts = {
+            "drain_post_count": 0,
+            "drain_status_get_count": 0,
+            "operator_me_get_count": 0,
+        }
+        self._counter_lock = Lock()
+        self._drain_route = re.compile(r"^/v1/workers/[0-9a-f-]{36}/drain$")
+
+    def _record(self, key: str) -> None:
+        with self._counter_lock:
+            self._counts[key] += 1
+            temporary = self._counter_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self._counts, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(self._counter_path)
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        path = str(scope.get("path", ""))
+        method = scope.get("method")
+        if method == "POST" and self._drain_route.fullmatch(path):
+            self._record("drain_post_count")
+            if self._drain_fault_file is not None and self._drain_fault_file.exists():
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 503,
+                        "headers": [(b"content-type", b"application/json")],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"detail":"fixture_drain_post_rejected"}',
+                    }
+                )
+                return
+        elif method == "GET" and self._drain_route.fullmatch(path):
+            self._record("drain_status_get_count")
+        elif method == "GET" and path == "/v1/operator/me":
+            self._record("operator_me_get_count")
+
+        await self._app(scope, receive, send)
+
+
 def _serve_api(args: argparse.Namespace) -> None:
     import uvicorn
 
@@ -321,34 +378,15 @@ def _serve_api(args: argparse.Namespace) -> None:
 
     counter_path = args.request_counts
     counter_path.parent.mkdir(parents=True, exist_ok=True)
-    counts = {"drain_post_count": 0, "drain_status_get_count": 0}
-    counter_lock = Lock()
+    counts = {
+        "drain_post_count": 0,
+        "drain_status_get_count": 0,
+        "operator_me_get_count": 0,
+    }
     counter_path.write_text(json.dumps(counts, sort_keys=True) + "\n", encoding="utf-8")
-    drain_route = re.compile(r"^/v1/workers/[0-9a-f-]{36}/drain$")
-
-    class CountDrainRequests:
-        async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-            if scope.get("type") == "http" and drain_route.fullmatch(str(scope.get("path", ""))):
-                method = scope.get("method")
-                key = (
-                    "drain_post_count"
-                    if method == "POST"
-                    else "drain_status_get_count"
-                    if method == "GET"
-                    else None
-                )
-                if key is not None:
-                    with counter_lock:
-                        counts[key] += 1
-                        temporary = counter_path.with_suffix(".tmp")
-                        temporary.write_text(
-                            json.dumps(counts, sort_keys=True) + "\n", encoding="utf-8"
-                        )
-                        temporary.replace(counter_path)
-            await control_plane_app(scope, receive, send)
 
     config = uvicorn.Config(
-        CountDrainRequests(),
+        _DrainFaultControlPlaneApp(control_plane_app, counter_path, args.drain_fault_file),
         host=args.host,
         port=args.port,
         ssl_certfile=str(args.certificate),
@@ -366,9 +404,11 @@ def _request_counts(args: argparse.Namespace) -> dict[str, int]:
     if not isinstance(value, dict):
         raise RuntimeError("worker_desktop_fixture_request_counts_invalid")
     counts = cast(dict[str, Any], value)
-    if set(counts) != {"drain_post_count", "drain_status_get_count"} or any(
-        type(count) is not int or count < 0 for count in counts.values()
-    ):
+    if set(counts) != {
+        "drain_post_count",
+        "drain_status_get_count",
+        "operator_me_get_count",
+    } or any(type(count) is not int or count < 0 for count in counts.values()):
         raise RuntimeError("worker_desktop_fixture_request_counts_invalid")
     return cast(dict[str, int], counts)
 
@@ -601,6 +641,7 @@ def main() -> int:
     api.add_argument("--certificate", type=Path, required=True)
     api.add_argument("--private-key", type=Path, required=True)
     api.add_argument("--request-counts", type=Path, required=True)
+    api.add_argument("--drain-fault-file", type=Path)
     request_counts = commands.add_parser("request-counts")
     request_counts.add_argument("--counter-file", type=Path, required=True)
     drain_audits = commands.add_parser("drain-audit-counts")
