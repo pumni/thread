@@ -171,7 +171,7 @@ def repository_path(path: Path | str) -> str:
 def package_for_source(path: Path) -> str:
     parts = path.relative_to(SOURCE_ROOT).with_suffix("").parts
     if parts[-1] == "__init__":
-        return ".".join(parts)
+        return ".".join(parts[:-1])
     return ".".join(parts[:-1])
 
 
@@ -387,6 +387,7 @@ def class_contract_violations(
     expected_annotations: Mapping[str, str] | None = None,
     expected_defaults: Mapping[str, str | None] | None = None,
     expected_methods: tuple[str, ...] | None = None,
+    expected_bases: tuple[str, ...] | None = None,
     forbidden_members: frozenset[str] = frozenset(),
     require_dataclass: bool = False,
 ) -> list[str]:
@@ -417,6 +418,10 @@ def class_contract_violations(
             violations.append(f"{label}: forbidden {class_name} field defaults")
     if require_dataclass and not dataclass_decorator(class_node):
         violations.append(f"{label}: forbidden {class_name} dataclass contract")
+    if expected_bases is not None:
+        actual_bases = tuple(dotted_name(base) or "<non-name-base>" for base in class_node.bases)
+        if actual_bases != expected_bases:
+            violations.append(f"{label}: forbidden {class_name} base shape")
     if expected_methods is not None:
         methods = tuple(
             statement.name
@@ -649,6 +654,23 @@ def test_production_import_boundaries() -> None:
     assert_no_violations(violations)
 
 
+def test_package_init_relative_worker_import_is_resolved_and_rejected() -> None:
+    init_path = THREADS_PACKAGE_ROOT / "standalone" / "__init__.py"
+    package = package_for_source(init_path)
+    assert package == "threads_platform.standalone"
+
+    tree = ast.parse("from ..workers.browser import WorkerBrowserSession")
+    references = collect_import_references(tree, package)
+    violations = import_violations(
+        init_path,
+        references,
+        forbidden_prefixes=("threads_platform.workers",),
+    )
+    assert any("threads_platform.workers.browser" in violation for violation in violations), (
+        violations
+    )
+
+
 def test_shared_browser_contract_shapes() -> None:
     browser_port = THREADS_PACKAGE_ROOT / "application" / "ports" / "browser.py"
     tree, _ = parse_source(browser_port)
@@ -661,6 +683,7 @@ def test_shared_browser_contract_shapes() -> None:
             expected_fields=LAUNCH_REQUEST_FIELDS,
             expected_annotations=LAUNCH_REQUEST_ANNOTATIONS,
             expected_defaults=LAUNCH_REQUEST_DEFAULTS,
+            expected_bases=(),
             require_dataclass=True,
         )
     )
@@ -669,6 +692,7 @@ def test_shared_browser_contract_shapes() -> None:
             browser_port,
             tree,
             "BrowserEngineSession",
+            expected_bases=("Protocol",),
             expected_methods=("navigate", "close"),
             forbidden_members=frozenset({"inspect_surface"}),
         )
@@ -681,6 +705,7 @@ def test_shared_browser_contract_shapes() -> None:
             expected_fields=NETWORK_ROUTE_FIELDS,
             expected_annotations=NETWORK_ROUTE_ANNOTATIONS,
             expected_defaults=NETWORK_ROUTE_DEFAULTS,
+            expected_bases=(),
             require_dataclass=True,
         )
     )
@@ -692,6 +717,7 @@ def test_shared_browser_contract_shapes() -> None:
             expected_fields=PROXY_CREDENTIAL_FIELDS,
             expected_annotations=PROXY_CREDENTIAL_ANNOTATIONS,
             expected_defaults=PROXY_CREDENTIAL_DEFAULTS,
+            expected_bases=(),
             require_dataclass=True,
         )
     )
@@ -895,6 +921,68 @@ def test_contract_helpers_reject_synthetic_shape_violations(
         expected_methods=expected_methods,
     )
     assert any(target in violation for violation in violations), violations
+
+
+@pytest.mark.parametrize(
+    ("case", "source", "class_name", "expected_bases", "expected_methods"),
+    [
+        (
+            "BrowserLaunchRequest inherits worker identity",
+            "from dataclasses import dataclass, field\n"
+            "@dataclass\n"
+            "class BrowserLaunchRequest(WorkerIdentityBase):\n"
+            "    profile_directory: Path\n"
+            "    network_route: BrowserNetworkRoute\n"
+            "    proxy_credentials: BrowserProxyCredentials | None = "
+            "field(default=None, repr=False)\n"
+            "    headless: bool = False",
+            "BrowserLaunchRequest",
+            (),
+            None,
+        ),
+        (
+            "BrowserEngineSession inherits worker surface inspection",
+            "class BrowserEngineSession(WorkerSurfaceEngineSession, Protocol):\n"
+            "    async def navigate(self, url: str, *, "
+            "allowed_origins: frozenset[str]) -> None: ...\n"
+            "    async def close(self) -> None: ...",
+            "BrowserEngineSession",
+            ("Protocol",),
+            ("navigate", "close"),
+        ),
+    ],
+    ids=("launch-request-base", "engine-session-base"),
+)
+def test_contract_helper_rejects_synthetic_inheritance(
+    case: str,
+    source: str,
+    class_name: str,
+    expected_bases: tuple[str, ...],
+    expected_methods: tuple[str, ...] | None,
+) -> None:
+    tree = ast.parse(source)
+    if class_name == "BrowserLaunchRequest":
+        violations = class_contract_violations(
+            f"synthetic/{case.replace(' ', '_')}.py",
+            tree,
+            class_name,
+            expected_fields=LAUNCH_REQUEST_FIELDS,
+            expected_annotations=LAUNCH_REQUEST_ANNOTATIONS,
+            expected_defaults=LAUNCH_REQUEST_DEFAULTS,
+            expected_bases=expected_bases,
+            require_dataclass=True,
+        )
+    else:
+        violations = class_contract_violations(
+            f"synthetic/{case.replace(' ', '_')}.py",
+            tree,
+            class_name,
+            expected_bases=expected_bases,
+            expected_methods=expected_methods,
+        )
+    assert any(f"forbidden {class_name} base shape" in violation for violation in violations), (
+        violations
+    )
 
 
 @pytest.mark.parametrize(
