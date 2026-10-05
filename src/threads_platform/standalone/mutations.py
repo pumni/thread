@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -301,7 +302,6 @@ class LocalThreadsMutationRuntime:
         _validate_post_text(text)
         account = self._accounts.get(alias)
         lock = FilesystemProcessLock(_account_lock_path(self._root, account.id))
-        operation_id: UUID | None = None
         try:
             lock.acquire()
         except ProcessAlreadyRunning:
@@ -318,7 +318,6 @@ class LocalThreadsMutationRuntime:
                 raise StandaloneMutationError("THREADS_PUBLISHING_QUOTA_REACHED")
 
             operation = self._operations.create_received(account.id)
-            operation_id = operation.id
             try:
                 container = await self._api.create_container(
                     token,
@@ -343,6 +342,8 @@ class LocalThreadsMutationRuntime:
             )
             try:
                 media_id = await self._api.publish_container(token, container_id)
+            except asyncio.CancelledError:
+                self._raise_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
             except Exception as error:
                 self._raise_ambiguous(publish_requested, _safe_exception_code(error))
             if not _valid_remote_id(media_id):
@@ -359,7 +360,9 @@ class LocalThreadsMutationRuntime:
             try:
                 lock.release()
             except OSError:
-                raise StandaloneMutationError("LOCAL_OPERATION_UNAVAILABLE", operation_id) from None
+                # The lock implementation closes its stream even when unlock fails.
+                # Cleanup must not replace the primary publish outcome.
+                pass
 
     def _persist_required(self, operation: LocalOperation) -> LocalOperation:
         try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import cast
@@ -57,7 +58,7 @@ class _FakeAPI:
         *,
         quota: PublishingQuota | None = None,
         create_error: Exception | None = None,
-        publish_error: Exception | None = None,
+        publish_error: BaseException | None = None,
         container_id: str = "container-123",
         media_id: str = "media-123",
     ) -> None:
@@ -127,7 +128,7 @@ def _setup(
     quota: PublishingQuota | None = None,
     resolver: _FakeResolver | None = None,
     create_error: Exception | None = None,
-    publish_error: Exception | None = None,
+    publish_error: BaseException | None = None,
     container_id: str = "container-123",
     media_id: str = "media-123",
 ) -> tuple[
@@ -353,6 +354,80 @@ async def test_publish_failure_is_ambiguous_without_retry_or_reconciliation(
         "raw response sentinel"
         not in (tmp_path / "operations" / f"{operation.id}.json").read_text()
     )
+
+
+@pytest.mark.asyncio
+async def test_publish_cancellation_is_ambiguous_without_retry_or_reconciliation(
+    tmp_path: Path,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path, publish_error=asyncio.CancelledError("cancel sentinel")
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_text("alice", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    operation_id = caught.value.operation_id
+    assert operation_id is not None
+    assert api.calls == ["quota", "create", "publish"]
+    assert api.events == [
+        ("quota", None),
+        ("create", "RECEIVED"),
+        ("publish", "PUBLISH_REQUESTED"),
+    ]
+    operation = operations.get(operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    journal = (tmp_path / "operations" / f"{operation_id}.json").read_text(encoding="utf-8")
+    assert "cancel sentinel" not in journal
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_publish_outcome_wins_over_lock_release_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path, publish_error=ThreadsAPIError("THREADS_RATE_LIMITED")
+    )
+    real_release = FilesystemProcessLock.release
+
+    def release_then_fail(lock: FilesystemProcessLock) -> None:
+        real_release(lock)
+        raise OSError("cleanup failure")
+
+    monkeypatch.setattr(FilesystemProcessLock, "release", release_then_fail)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_text("alice", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    operation_id = caught.value.operation_id
+    assert operation_id is not None
+    assert api.calls == ["quota", "create", "publish"]
+    assert operations.get(operation_id).phase == "AMBIGUOUS"
+
+
+@pytest.mark.asyncio
+async def test_durable_published_result_wins_over_lock_release_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path)
+    real_release = FilesystemProcessLock.release
+
+    def release_then_fail(lock: FilesystemProcessLock) -> None:
+        real_release(lock)
+        raise OSError("cleanup failure")
+
+    monkeypatch.setattr(FilesystemProcessLock, "release", release_then_fail)
+
+    result = await runtime.publish_text("alice", _TEXT)
+
+    assert api.calls == ["quota", "create", "publish"]
+    assert result.media_id == "media-123"
+    operation = operations.get(result.operation_id)
+    assert operation.phase == "PUBLISHED"
+    assert operation.media_id == "media-123"
 
 
 @pytest.mark.asyncio
