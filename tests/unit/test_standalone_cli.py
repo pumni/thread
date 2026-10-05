@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import cast
@@ -28,13 +29,23 @@ from threads_platform.standalone.__main__ import main
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
 from threads_platform.standalone.mutations import (
     LocalOperationStore,
+    LocalThreadsMutationRuntime,
     PublishedTextResult,
+    StandaloneMutationError,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
 
 def _set_data_root(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
     monkeypatch.setenv("THREADS_LOCAL_DATA_ROOT", str(root))
+
+
+def _write_workflow(path: Path, steps: list[object], *, account: str = "alice") -> Path:
+    path.write_text(
+        json.dumps({"version": 1, "account": account, "steps": steps}),
+        encoding="utf-8",
+    )
+    return path
 
 
 class _FakeAsyncClientContext:
@@ -604,3 +615,283 @@ def test_cli_operation_show_invalid_id_has_safe_error_without_http(
     assert result == 1
     assert captured.out == ""
     assert captured.err == "ERROR OPERATION_NOT_FOUND\n"
+
+
+def test_cli_workflow_invalid_plan_is_rejected_before_settings_or_http_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    workflow_path = _write_workflow(
+        tmp_path / "private-workflow.json",
+        [{"action": "quota"}, {"action": "unknown"}],
+    )
+    calls: list[str] = []
+
+    def fail_settings() -> Settings:
+        calls.append("settings")
+        raise AssertionError("invalid workflow must be rejected before Settings")
+
+    def fail_client(_settings: Settings) -> httpx2.AsyncClient:
+        calls.append("http")
+        raise AssertionError("invalid workflow must be rejected before HTTP client")
+
+    monkeypatch.setattr(cli_module, "Settings", fail_settings)
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_WORKFLOW\n"
+    assert str(workflow_path) not in captured.out + captured.err
+    assert calls == []
+
+
+def test_cli_workflow_missing_account_is_rejected_before_http_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    workflow_path = _write_workflow(tmp_path / "workflow.json", [{"action": "quota"}])
+    calls: list[str] = []
+
+    def fail_client(_settings: Settings) -> httpx2.AsyncClient:
+        calls.append("http")
+        raise AssertionError("missing local account must fail before HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR ACCOUNT_NOT_FOUND\n"
+    assert calls == []
+
+
+def test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    account_module.LocalAccountStore(root).add("alice")
+    workflow_path = _write_workflow(
+        tmp_path / "workflow.json",
+        [
+            {"action": "quota"},
+            {"action": "media", "media_id": "media-1"},
+            {"action": "replies", "thread_id": "thread-1", "after": "cursor-in"},
+            {"action": "conversation", "thread_id": "thread-2"},
+        ],
+    )
+    context = _install_fake_api_client(monkeypatch)
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_quota(runtime: LocalThreadsApiRuntime, alias: str) -> PublishingQuota:
+        calls.append(("quota", alias))
+        return PublishingQuota(3, 100, None, 20)
+
+    async def fake_media(runtime: LocalThreadsApiRuntime, alias: str, media_id: str) -> RemoteMedia:
+        calls.append(("media", alias, media_id))
+        return RemoteMedia(
+            "media-1", "  public\n media text  ", "https://www.threads.com/t/1", "then"
+        )
+
+    async def fake_replies(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        thread_id: str,
+        *,
+        after: str | None = None,
+    ) -> ReplyPage:
+        calls.append(("replies", alias, thread_id, after))
+        return ReplyPage(
+            (RemoteReply("reply-1", "  reply\n text ", None, "root-1", None),), "cursor-out", True
+        )
+
+    async def fake_conversation(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        thread_id: str,
+        *,
+        after: str | None = None,
+    ) -> ReplyPage:
+        calls.append(("conversation", alias, thread_id, after))
+        return ReplyPage((), None, False)
+
+    def fail_if_browser_login(*args: object, **kwargs: object) -> None:
+        raise AssertionError("workflow commands must not invoke browser login")
+
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "media", fake_media)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "replies", fake_replies)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
+    monkeypatch.setattr(cli_module.LocalRuntime, "login", fail_if_browser_login)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        "workflow step=1 action=quota usage=3 total=100 reply_usage=- reply_total=20\n"
+        "workflow step=2 action=media id=media-1 timestamp=then "
+        "permalink=https://www.threads.com/t/1 text=public media text\n"
+        "workflow step=3 action=replies count=1 has_more=true next_cursor=cursor-out\n"
+        "workflow step=3 reply reply-1 timestamp=- root=root-1 parent=- text=reply text\n"
+        "workflow step=4 action=conversation count=0 has_more=false next_cursor=-\n"
+        "workflow completed steps=4\n"
+    )
+    assert captured.err == ""
+    assert calls == [
+        ("quota", "alice"),
+        ("media", "alice", "media-1"),
+        ("replies", "alice", "thread-1", "cursor-in"),
+        ("conversation", "alice", "thread-2", None),
+    ]
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+def test_cli_workflow_post_success_is_exact_and_never_echoes_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    account_module.LocalAccountStore(root).add("alice")
+    text_sentinel = "chosen workflow post text do not echo"
+    token_sentinel = "workflow-token-never-output"
+    monkeypatch.setenv("THREADS_PLATFORM_THREADS_TOKEN_WORKFLOW_TEST", token_sentinel)
+    workflow_path = _write_workflow(
+        tmp_path / "workflow.json",
+        [{"action": "post_text", "text": text_sentinel}],
+    )
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    calls: list[tuple[str, str]] = []
+
+    async def fake_publish(
+        runtime: LocalThreadsMutationRuntime, alias: str, text: str
+    ) -> PublishedTextResult:
+        calls.append((alias, text))
+        return PublishedTextResult(operation_id, "published-123")
+
+    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "publish_text", fake_publish)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("alice", text_sentinel)]
+    assert captured.out == (
+        f"workflow step=1 action=post_text published operation={operation_id} "
+        "media=published-123\nworkflow completed steps=1\n"
+    )
+    assert captured.err == ""
+    assert text_sentinel not in captured.out + captured.err
+    assert token_sentinel not in captured.out + captured.err
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+def test_cli_workflow_failure_discards_buffered_output_and_closes_http_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    account_module.LocalAccountStore(root).add("alice")
+    workflow_path = _write_workflow(
+        tmp_path / "workflow.json",
+        [
+            {"action": "quota"},
+            {"action": "media", "media_id": "media-1"},
+            {"action": "conversation", "thread_id": "thread-2"},
+        ],
+    )
+    context = _install_fake_api_client(monkeypatch)
+    calls: list[str] = []
+
+    async def fake_quota(runtime: LocalThreadsApiRuntime, alias: str) -> PublishingQuota:
+        calls.append("quota")
+        return PublishingQuota(3, 100)
+
+    async def fail_media(runtime: LocalThreadsApiRuntime, alias: str, media_id: str) -> RemoteMedia:
+        calls.append("media")
+        raise StandaloneApiError("INVALID_MEDIA_ID")
+
+    async def fake_conversation(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        thread_id: str,
+        *,
+        after: str | None = None,
+    ) -> ReplyPage:
+        calls.append("conversation")
+        return ReplyPage((), None, False)
+
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "media", fail_media)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_MEDIA_ID step=2\n"
+    assert calls == ["quota", "media"]
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+def test_cli_workflow_ambiguous_post_error_includes_step_and_operation_without_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    account_module.LocalAccountStore(root).add("alice")
+    text_sentinel = "workflow-post-private-text"
+    token_sentinel = "workflow-secret-token"
+    workflow_path = _write_workflow(
+        tmp_path / "private-workflow.json",
+        [{"action": "quota"}, {"action": "post_text", "text": text_sentinel}],
+    )
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+    async def fake_quota(runtime: LocalThreadsApiRuntime, alias: str) -> PublishingQuota:
+        return PublishingQuota(1, 100)
+
+    async def fail_publish(
+        runtime: LocalThreadsMutationRuntime, alias: str, text: str
+    ) -> PublishedTextResult:
+        assert text == text_sentinel
+        raise StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation_id)
+
+    monkeypatch.setenv("THREADS_PLATFORM_THREADS_TOKEN_WORKFLOW_TEST", token_sentinel)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "publish_text", fail_publish)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == (f"ERROR PUBLISH_OUTCOME_AMBIGUOUS step=2 operation={operation_id}\n")
+    assert str(workflow_path) not in captured.err
+    assert text_sentinel not in captured.out + captured.err
+    assert token_sentinel not in captured.out + captured.err
+    assert context.enter_count == 1
+    assert context.exit_count == 1
