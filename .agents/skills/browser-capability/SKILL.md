@@ -33,13 +33,13 @@ Inspect these sources before modifying browser capabilities:
 1. **Explicit & Versioned Capabilities:** Every browser action corresponds to an explicit, versioned capability approved in architecture.
 2. **Fail-Closed Recognition:** Never guess selectors or use unstable generated CSS classes. Ambiguous elements, redirects, unexpected DOM layouts, or missing target associations must fail closed.
 3. **Strict Human Intervention Boundary:** Captchas, 2FA, session challenges, login prompts, and account checkpoints require human operator intervention. Automated evasion, stealth plugins, and fingerprint spoofing are strictly prohibited.
-4. **Staged Mutation Safeguards:** Any browser action causing external mutations must establish pre-action validation, monitor network boundaries, and provide explicit reconciliation for ambiguous outcomes.
+4. **Contract-Driven Mutation Safeguards:** Any browser mutation must strictly adhere to that specific capability's declared preconditions, irreversible boundary, evidence-of-success contract, lease behavior, and reconciliation policy. Ambiguous post-boundary outcomes must trigger reconciliation or operator intervention rather than blind retries.
 5. **Lease Loss Discipline:** Lease expiration or heartbeat loss immediately blocks new irreversible browser actions.
 
 ## Step-by-Step Procedure
 1. **Inspect canonical contract:** Review the target capability specification in `docs/WORKER_BROWSER_CAPABILITY_PACK_V1.md` and inspect existing implementation in `src/threads_platform/workers/browser.py`.
 2. **Consult matching tests:** Examine existing contract tests for the capability (e.g. `tests/unit/test_browser_capabilities.py` or capability-specific unit tests).
-3. **Implement fail-closed behavior:** Ensure unmatched, ambiguous, or challenged states produce durable intervention requests or typed uncertain errors (`REMOTE_STATE_UNCERTAIN`).
+3. **Implement fail-closed behavior:** Ensure unmatched, ambiguous, redirected, or challenged states fail closed using the exact typed outcome or human intervention specified by the capability's contract (rather than hard-coding a generic error code).
 4. **Verify locally:**
    ```bash
    uv run pytest tests/unit/test_browser_adapter.py tests/unit/test_browser_capabilities.py
