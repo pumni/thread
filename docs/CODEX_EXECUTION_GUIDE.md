@@ -9,11 +9,13 @@
 
 | Topic / Requirement | Canonical Home | Purpose |
 |---|---|---|
-| **Live Task Authorization & Current State** | Authorized GitHub issue / coordinator instruction | Sole source of live task authority. |
+| **Live Task Authorization** | Authorized GitHub issue / user prompt / coordinator instruction | Sole authority defining current task scope and requirements. |
+| **Implementation Truth** | Code and passing tests on active checkout branch | Ground truth defining how the system currently behaves. |
 | **Global Architectural & Security Invariants** | Root [`AGENTS.md`](../AGENTS.md) | Universal laws, domain boundaries, stop conditions. |
 | **Component / Subtree Instructions** | Nearest nested `AGENTS.md` (e.g. [`apps/desktop/AGENTS.md`](../apps/desktop/AGENTS.md)) | Local subsystem guidelines and build constraints. |
 | **Task & Capability Documentation Routing** | [`docs/CONTEXT_MAP.md`](CONTEXT_MAP.md) | JIT capability-based document and skill router. |
-| **Specialized Workflows & Wire Protocols** | Project Skills ([`.agents/skills/`](../.agents/skills/)) | Specialized playbooks for DB migrations, worker protocol, browser capabilities, etc. |
+| **Specialized Workflows** | Project Skills ([`.agents/skills/`](../.agents/skills/)) | Specialized playbooks for DB migrations, browser capabilities, triage, etc. |
+| **Worker Wire & Protocol Contract** | [`docs/protocols/WORKER_PROTOCOL_V1.md`](protocols/WORKER_PROTOCOL_V1.md) & protocol docs | Additive framing, schemas, and versioning rules. |
 | **Hosted CI Failure Triage & Diagnostics** | [`docs/CI_AGENT_WORKFLOW.md`](CI_AGENT_WORKFLOW.md) & `ci-failure-triage` | Merge-authoritative CI gate, exact-SHA reporting, two-strike stop rule. |
 | **Review Severity & Acceptance Gates** | [`docs/ACCEPTANCE_AND_REVIEW.md`](ACCEPTANCE_AND_REVIEW.md) | Gate criteria (Architecture, Data, Reliability, Security, Browser). |
 | **Durable Architectural Decisions** | Accepted ADRs ([`docs/adr/`](adr/)) | Binding architectural contracts. |
