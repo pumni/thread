@@ -165,10 +165,10 @@ def test_atomic_write_failure_leaves_no_target_or_temporary_file(
 ) -> None:
     store = LocalAccountStore(tmp_path)
 
-    def fail_replace(source: Path, target: Path) -> None:
+    def fail_link(source: Path, target: Path) -> None:
         raise OSError("synthetic failure")
 
-    monkeypatch.setattr(account_module.os, "replace", fail_replace)
+    monkeypatch.setattr(account_module.os, "link", fail_link)
 
     with pytest.raises(StandaloneAccountError, match="^ACCOUNT_STATE_INVALID$"):
         store.add("alice")
@@ -176,3 +176,41 @@ def test_atomic_write_failure_leaves_no_target_or_temporary_file(
     accounts = tmp_path / "accounts"
     assert not (accounts / "alice.json").exists()
     assert list(accounts.iterdir()) == []
+
+
+def test_atomic_publish_never_overwrites_competing_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalAccountStore(tmp_path)
+    competing_document = (
+        json.dumps(
+            {
+                "version": 1,
+                "id": "00000000-0000-4000-8000-000000000001",
+                "alias": "alice",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(
+        account_module,
+        "uuid4",
+        lambda: UUID("00000000-0000-4000-8000-000000000002"),
+    )
+
+    def publish_competing_account(source: Path, target: Path) -> None:
+        target.write_text(competing_document, encoding="utf-8")
+        raise FileExistsError
+
+    monkeypatch.setattr(account_module.os, "link", publish_competing_account)
+
+    with pytest.raises(StandaloneAccountError, match="^ACCOUNT_ALREADY_EXISTS$") as error:
+        store.add("alice")
+
+    accounts = tmp_path / "accounts"
+    target = accounts / "alice.json"
+    assert error.value.code == "ACCOUNT_ALREADY_EXISTS"
+    assert target.read_text(encoding="utf-8") == competing_document
+    assert list(accounts.glob("*.tmp")) == []

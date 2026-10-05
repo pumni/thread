@@ -230,14 +230,10 @@ class LocalAccountStore:
                 stream.flush()
                 os.fsync(stream.fileno())
 
-            if self._path_exists(target):
-                raise StandaloneAccountError("ACCOUNT_ALREADY_EXISTS")
             try:
-                os.replace(temporary_path, target)
+                os.link(temporary_path, target)
             except FileExistsError:
-                if self._path_exists(target):
-                    raise StandaloneAccountError("ACCOUNT_ALREADY_EXISTS") from None
-                raise
+                raise StandaloneAccountError("ACCOUNT_ALREADY_EXISTS") from None
         except StandaloneAccountError:
             raise
         except OSError:
