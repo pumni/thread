@@ -9,7 +9,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypeGuard, cast
 from uuid import UUID, uuid4
 
 LOCAL_ACCOUNT_SCHEMA_VERSION = 1
@@ -28,6 +28,8 @@ _ERROR_CODES = frozenset(
 )
 _ALIAS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _ACCOUNT_KEYS = {"version", "id", "alias"}
+_ACCOUNT_CREDENTIAL_KEYS = _ACCOUNT_KEYS | {"credential_ref"}
+_MAX_CREDENTIAL_REF_LENGTH = 134
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +37,7 @@ class LocalAccount:
     version: int
     id: UUID
     alias: str
+    credential_ref: str | None = None
 
 
 class StandaloneAccountError(Exception):
@@ -79,6 +82,16 @@ def _validate_alias(alias: str) -> None:
         raise StandaloneAccountError("INVALID_ACCOUNT_ALIAS")
 
 
+def _is_valid_credential_ref_shape(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _MAX_CREDENTIAL_REF_LENGTH
+        and "\r" not in value
+        and "\n" not in value
+    )
+
+
 class LocalAccountStore:
     def __init__(self, data_root: Path) -> None:
         self._data_root = data_root
@@ -115,6 +128,62 @@ class LocalAccountStore:
         if not self._path_exists(target):
             raise StandaloneAccountError("ACCOUNT_NOT_FOUND")
         return self._read_account(target)
+
+    def set_credential_ref(self, alias: str, credential_ref: str) -> LocalAccount:
+        account = self.get(alias)
+        if not _is_valid_credential_ref_shape(credential_ref):
+            raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
+
+        updated = LocalAccount(
+            version=account.version,
+            id=account.id,
+            alias=account.alias,
+            credential_ref=credential_ref,
+        )
+        document = (
+            json.dumps(
+                {
+                    "version": updated.version,
+                    "id": str(updated.id),
+                    "alias": updated.alias,
+                    "credential_ref": updated.credential_ref,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        target = self._account_path(account.alias)
+        temporary_path: Path | None = None
+        descriptor: int | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=self._accounts_directory,
+            )
+            temporary_path = Path(temporary_name)
+            stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
+            descriptor = None
+            with stream:
+                stream.write(document)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, target)
+        except OSError:
+            raise StandaloneAccountError("ACCOUNT_STATE_INVALID") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return updated
 
     def list(self) -> tuple[LocalAccount, ...]:
         if not self._accounts_directory_exists():
@@ -192,7 +261,8 @@ class LocalAccountStore:
         if not isinstance(data, dict):
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
         account_data = cast(dict[str, object], data)
-        if set(account_data) != _ACCOUNT_KEYS:
+        account_keys = set(account_data)
+        if account_keys not in (_ACCOUNT_KEYS, _ACCOUNT_CREDENTIAL_KEYS):
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
         version = account_data["version"]
         raw_id = account_data["id"]
@@ -201,6 +271,12 @@ class LocalAccountStore:
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
         if not isinstance(raw_id, str) or not isinstance(alias, str):
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
+        credential_ref: str | None = None
+        if "credential_ref" in account_data:
+            raw_credential_ref = account_data["credential_ref"]
+            if not _is_valid_credential_ref_shape(raw_credential_ref):
+                raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
+            credential_ref = raw_credential_ref
         try:
             account_id = UUID(raw_id)
         except ValueError, AttributeError:
@@ -211,7 +287,12 @@ class LocalAccountStore:
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID") from None
         if path.name != f"{alias.casefold()}.json":
             raise StandaloneAccountError("ACCOUNT_STATE_INVALID")
-        return LocalAccount(version=version, id=account_id, alias=alias)
+        return LocalAccount(
+            version=version,
+            id=account_id,
+            alias=alias,
+            credential_ref=credential_ref,
+        )
 
     def _atomic_write(self, target: Path, document: str) -> None:
         temporary_path: Path | None = None
