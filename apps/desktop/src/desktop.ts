@@ -112,6 +112,7 @@ export const DESKTOP_COMMANDS = [
   "decommission_device",
   "request_quit",
   "request_restart",
+  "force_stop_worker",
   "operator_login",
   "operator_bootstrap_owner",
   "operator_current",
@@ -154,6 +155,10 @@ export function requestQuit(): Promise<void> {
 
 export function requestRestart(): Promise<void> {
   return invoke<void>("request_restart");
+}
+
+export function forceStopWorker(confirmation: string): Promise<DesktopSnapshot> {
+  return invoke<DesktopSnapshot>("force_stop_worker", { confirmation });
 }
 
 export function operatorCurrent(): Promise<OperatorIdentity | null> {

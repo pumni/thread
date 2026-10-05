@@ -2,7 +2,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App";
-import { DESKTOP_COMMANDS, operatorLock, type DesktopSnapshot } from "../src/desktop";
+import {
+  DESKTOP_COMMANDS,
+  forceStopWorker,
+  operatorLock,
+  type DesktopSnapshot,
+} from "../src/desktop";
 import { SessionGate } from "../src/SessionGate";
 
 const native = vi.hoisted(() => ({
@@ -84,6 +89,7 @@ describe("desktop provisioning", () => {
       "decommission_device",
       "request_quit",
       "request_restart",
+      "force_stop_worker",
       "operator_login",
       "operator_bootstrap_owner",
       "operator_current",
@@ -104,6 +110,16 @@ describe("desktop provisioning", () => {
       "controller_trust_summary",
     ]);
     expect(DESKTOP_COMMANDS).not.toContain("request_local_worker_drain");
+  });
+
+  it("exposes only the confirmed high-level Worker force operation", async () => {
+    native.invoke.mockResolvedValue(snapshot("WORKER"));
+
+    await forceStopWorker("FORCE STOP WORKER");
+
+    expect(native.invoke).toHaveBeenCalledWith("force_stop_worker", {
+      confirmation: "FORCE STOP WORKER",
+    });
   });
 
   it("shows explicit initial HTTPS configuration when no identity is provisioned", async () => {
@@ -470,6 +486,7 @@ describe("desktop provisioning", () => {
     native.invoke.mockImplementation(async (command: string) => {
       if (command === "get_desktop_snapshot") return snapshot("WORKER");
       if (command === "decommission_device") return snapshot();
+      if (command === "operator_logout") return undefined;
       throw new Error("unknown command");
     });
 
@@ -556,6 +573,42 @@ describe("desktop provisioning", () => {
         "An active Operator session with permission to stop this node is required.",
       ),
     ).not.toBeInTheDocument();
+  });
+
+  it("keeps the Worker Operator session available when graceful Quit needs intervention", async () => {
+    const listeners: Record<string, (event: unknown) => void> = {};
+    native.listen.mockImplementation(async (event: string, handler: (event: unknown) => void) => {
+      listeners[event] = handler;
+      return () => undefined;
+    });
+    native.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_snapshot") return snapshot("WORKER");
+      if (command === "operator_current") {
+        return {
+          id: "owner-id",
+          username: "worker-owner",
+          role: "OWNER",
+          mustChangePassword: false,
+          expiresAt: "2026-10-03T18:00:00Z",
+        };
+      }
+      if (command === "operator_list_users") return [];
+      if (command === "request_quit") throw "worker_drain_unavailable";
+      throw new Error(`unexpected native command: ${command}`);
+    });
+
+    renderDesktop();
+    expect(await screen.findByText("Signed in as worker-owner")).toBeInTheDocument();
+    await waitFor(() => expect(listeners["desktop://quit-requested"]).toBeDefined());
+    listeners["desktop://quit-requested"]({});
+    fireEvent.click(await screen.findByRole("button", { name: "Stop node and quit" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The node could not stop cleanly. Check the runtime status before retrying.",
+    );
+    expect(screen.getByText("Signed in as worker-owner")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Quit Threads Desktop?" })).toBeInTheDocument();
+    expect(native.invoke.mock.calls.map(([command]) => command)).not.toContain("operator_logout");
   });
 
   it("waits for session revocation before exposing the next sign-in form", async () => {

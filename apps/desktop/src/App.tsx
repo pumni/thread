@@ -295,6 +295,7 @@ function App() {
     if (resetPhrase !== "RESET THIS DEVICE") return;
     const completed = await updateSnapshot(() => decommissionDevice(resetPhrase));
     if (!completed) return;
+    if (snapshot?.role === "WORKER") await handleOperatorLogout();
     setResetRequested(false);
     setResetPhrase("");
   }
@@ -305,10 +306,16 @@ function App() {
       await requestQuit();
       setQuitRequested(false);
     } catch (error) {
-      await handleOperatorLogout();
-      setQuitRequested(false);
       const errorCode =
         typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      if (
+        snapshot?.role !== "WORKER" ||
+        errorCode === "operator_session_revoked" ||
+        errorCode === "operator_authentication_required"
+      ) {
+        await handleOperatorLogout();
+        setQuitRequested(false);
+      }
       setActionError(
         errorCode === "operator_forbidden" && snapshot?.role === "CONTROLLER"
           ? "Only an Owner or Admin can stop this Controller."
@@ -543,11 +550,22 @@ function App() {
       setRestartRequested(false);
       await handleOperatorLogout();
       await queryClient.invalidateQueries({ queryKey: ["desktop-snapshot"] });
-    } catch {
-      await handleOperatorLogout();
-      setRestartRequested(false);
+    } catch (error) {
+      const errorCode =
+        typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      if (
+        snapshot?.role !== "WORKER" ||
+        errorCode === "operator_session_revoked" ||
+        errorCode === "operator_authentication_required"
+      ) {
+        await handleOperatorLogout();
+        setRestartRequested(false);
+      }
       setActionError(
-        "An active Operator session with permission to restart this node is required.",
+        snapshot?.role === "WORKER"
+          ? (operatorAccessMessages[errorCode] ??
+              "The Worker could not restart cleanly. Check its runtime status before retrying.")
+          : "An active Operator session with permission to restart this node is required.",
       );
     }
   }

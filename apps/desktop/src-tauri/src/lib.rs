@@ -10,6 +10,7 @@ mod worker_host;
 
 use std::{
     fs,
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
     sync::{
@@ -36,6 +37,8 @@ use operator_client::{
     CreatedOperatorUser, OperatorAuthState, OperatorIdentity, OperatorUser, WorkerDrainStatus,
 };
 use worker_cutover::{CutoverFuture, DurableDrainOfflineProof, WorkerCutoverBackend};
+
+const FORCE_STOP_WORKER_CONFIRMATION: &str = "FORCE STOP WORKER";
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const QUIT_EVENT: &str = "desktop://quit-requested";
@@ -355,6 +358,55 @@ impl DeviceState {
         }
     }
 
+    fn worker_force_context(&self) -> Result<supervisor::WorkerCutoverContext, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Worker) {
+            return Err("worker_host_configuration_required".to_string());
+        }
+        inner.supervisor.worker_force_context()
+    }
+
+    fn worker_lifecycle_state(
+        &self,
+    ) -> Result<
+        (
+            Option<worker_host::WorkerOwnership>,
+            supervisor::WorkerRuntimeObservation,
+        ),
+        String,
+    > {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        if inner.config.role != Some(ProvisionedRole::Worker) {
+            return Err("worker_host_configuration_required".to_string());
+        }
+        let runtime = inner.supervisor.worker_runtime_observation();
+        Ok((inner.supervisor.worker_ownership(), runtime))
+    }
+
+    fn mark_worker_intervention(&self, code: &'static str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.supervisor.mark_worker_cutover_intervention(code);
+        }
+    }
+
+    fn force_worker_process_tree(
+        &self,
+        binding: &worker_host::WorkerHostBinding,
+    ) -> Result<DesktopSnapshot, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "state_unavailable".to_string())?;
+        inner.supervisor.force_stop_worker_process_tree(binding)?;
+        Ok(DesktopSnapshot::from(&*inner))
+    }
+
     fn provision(&self, role: ProvisionedRole) -> Result<DesktopSnapshot, String> {
         let mut inner = self
             .inner
@@ -405,6 +457,7 @@ impl DeviceState {
             .inner
             .lock()
             .map_err(|_| "state_unavailable".to_string())?;
+        let worker_role = inner.config.role == Some(ProvisionedRole::Worker);
         inner.supervisor.stop()?;
 
         let updated = DeviceConfig {
@@ -413,6 +466,11 @@ impl DeviceState {
         };
         updated.save(&self.config_path)?;
         inner.config = updated;
+        if worker_role {
+            inner
+                .supervisor
+                .clear_worker_provisioning_after_decommission();
+        }
         Ok(DesktopSnapshot::from(&*inner))
     }
 
@@ -569,6 +627,74 @@ impl DeviceState {
         }
         inner.supervisor.restart(role)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerQuitPlan {
+    GracefulDesktopStop,
+    LeaveLegacyOwnerRunning,
+}
+
+fn worker_quit_plan(
+    ownership: Option<worker_host::WorkerOwnership>,
+    runtime: supervisor::WorkerRuntimeObservation,
+) -> Result<WorkerQuitPlan, String> {
+    if runtime.startup_cleanup_pending {
+        return Err("worker_startup_cleanup_failed".to_string());
+    }
+    match ownership {
+        Some(worker_host::WorkerOwnership::Desktop)
+            if runtime.runtime_installed
+                && runtime.process_alive == Some(true)
+                && runtime.job_process_count.is_some_and(|count| count > 0) =>
+        {
+            Ok(WorkerQuitPlan::GracefulDesktopStop)
+        }
+        Some(worker_host::WorkerOwnership::Desktop) => {
+            Err("worker_cutover_rollback_required".to_string())
+        }
+        Some(
+            worker_host::WorkerOwnership::Legacy
+            | worker_host::WorkerOwnership::TakeoverRequired
+            | worker_host::WorkerOwnership::Blocked,
+        )
+        | None
+            if !runtime.runtime_installed =>
+        {
+            Ok(WorkerQuitPlan::LeaveLegacyOwnerRunning)
+        }
+        _ => Err("worker_cutover_rollback_required".to_string()),
+    }
+}
+
+fn worker_restart_is_desktop_owned(
+    ownership: Option<worker_host::WorkerOwnership>,
+    runtime: supervisor::WorkerRuntimeObservation,
+) -> Result<(), String> {
+    if ownership == Some(worker_host::WorkerOwnership::Desktop)
+        && runtime.runtime_installed
+        && !runtime.startup_cleanup_pending
+        && runtime.process_alive == Some(true)
+        && runtime.job_process_count.is_some_and(|count| count > 0)
+    {
+        Ok(())
+    } else {
+        Err("worker_cutover_rollback_required".to_string())
+    }
+}
+
+async fn worker_lifecycle_then_logout<T, Operation, Finalize, Logout>(
+    operation: Operation,
+    finalize: Finalize,
+) -> Result<T, String>
+where
+    Operation: Future<Output = Result<T, String>>,
+    Finalize: FnOnce() -> Logout,
+    Logout: Future<Output = ()>,
+{
+    let value = operation.await?;
+    finalize().await;
+    Ok(value)
 }
 
 struct DeviceWorkerCutover<'a> {
@@ -920,6 +1046,15 @@ async fn decommission_device(
     if confirmation != "RESET THIS DEVICE" {
         return Err("decommission_confirmation_required".to_string());
     }
+    if state.role()? == Some(ProvisionedRole::Worker) {
+        authorize_node_lifecycle(&state, &operator).await?;
+        let _operation = state.begin_worker_operation()?;
+        return worker_lifecycle_then_logout(
+            decommission_worker_provisioning(&state, &operator),
+            || operator.logout(),
+        )
+        .await;
+    }
     authorize_node_lifecycle(&state, &operator).await?;
     operator.logout().await;
     disable_autostart()?;
@@ -939,6 +1074,32 @@ async fn request_quit(
     operator: State<'_, OperatorAuthState>,
 ) -> Result<(), String> {
     authorize_node_lifecycle(&state, &operator).await?;
+    if state.role()? == Some(ProvisionedRole::Worker) {
+        let _operation = state.begin_worker_operation()?;
+        let (ownership, runtime) = state.worker_lifecycle_state()?;
+        let plan = worker_quit_plan(ownership, runtime).inspect_err(|error| {
+            state.mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(error));
+        })?;
+        if plan == WorkerQuitPlan::GracefulDesktopStop {
+            let context = state.worker_cutover_context(true).inspect_err(|error| {
+                state.mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(error));
+            })?;
+            let mut backend = DeviceWorkerCutover {
+                device: state.inner().clone(),
+                operator: operator.inner(),
+                helper: context.helper,
+                binding: context.binding,
+            };
+            worker_lifecycle_then_logout(worker_cutover::quit_desktop_worker(&mut backend), || {
+                operator.logout()
+            })
+            .await?;
+        } else {
+            worker_lifecycle_then_logout(async { Ok(()) }, || operator.logout()).await?;
+        }
+        app.exit(0);
+        return Ok(());
+    }
     operator.logout().await;
     state.stop()?;
     app.exit(0);
@@ -951,8 +1112,169 @@ async fn request_restart(
     operator: State<'_, OperatorAuthState>,
 ) -> Result<(), String> {
     authorize_node_lifecycle(&state, &operator).await?;
+    if state.role()? == Some(ProvisionedRole::Worker) {
+        let _operation = state.begin_worker_operation()?;
+        let (ownership, runtime) = state.worker_lifecycle_state()?;
+        if let Err(error) = worker_restart_is_desktop_owned(ownership, runtime) {
+            if ownership == Some(worker_host::WorkerOwnership::Desktop) {
+                state
+                    .mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(&error));
+            }
+            return Err(error);
+        }
+        let context = state.worker_cutover_context(true).inspect_err(|error| {
+            state.mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(error));
+        })?;
+        let mut backend = DeviceWorkerCutover {
+            device: state.inner().clone(),
+            operator: operator.inner(),
+            helper: context.helper,
+            binding: context.binding,
+        };
+        return worker_lifecycle_then_logout(
+            worker_cutover::restart_desktop_worker(&mut backend),
+            || operator.logout(),
+        )
+        .await;
+    }
     operator.logout().await;
     state.restart()
+}
+
+async fn decommission_worker_provisioning(
+    state: &DeviceState,
+    operator: &OperatorAuthState,
+) -> Result<DesktopSnapshot, String> {
+    let (ownership, runtime) = state.worker_lifecycle_state()?;
+    match ownership {
+        Some(worker_host::WorkerOwnership::Desktop) => {
+            if let Err(error) = worker_restart_is_desktop_owned(ownership, runtime) {
+                state
+                    .mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(&error));
+                return Err(error);
+            }
+            let context = state.worker_cutover_context(true).inspect_err(|error| {
+                state.mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(error));
+            })?;
+            let mut backend = DeviceWorkerCutover {
+                device: state.clone(),
+                operator,
+                helper: context.helper,
+                binding: context.binding,
+            };
+            if let Err(error) = worker_cutover::rollback_to_legacy(&mut backend).await {
+                backend.mark_intervention(worker_cutover::lifecycle_failure_diagnostic(&error));
+                return Err(error);
+            }
+        }
+        Some(
+            worker_host::WorkerOwnership::Legacy | worker_host::WorkerOwnership::TakeoverRequired,
+        ) => {
+            if runtime.runtime_installed || runtime.startup_cleanup_pending {
+                state.mark_worker_intervention("worker_cutover_rollback_required");
+                return Err("worker_cutover_rollback_required".to_string());
+            }
+            let context = state.worker_cutover_context(false).inspect_err(|error| {
+                state.mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(error));
+            })?;
+            let mut backend = DeviceWorkerCutover {
+                device: state.clone(),
+                operator,
+                helper: context.helper,
+                binding: context.binding,
+            };
+            worker_cutover::verify_legacy_owner_for_decommission(&mut backend).await?;
+        }
+        Some(worker_host::WorkerOwnership::Blocked) | None => {
+            state.mark_worker_intervention("worker_cutover_rollback_required");
+            return Err("worker_cutover_rollback_required".to_string());
+        }
+    }
+
+    disable_autostart()?;
+    match state.decommission() {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => {
+            let _ = enable_autostart();
+            Err(error)
+        }
+    }
+}
+
+fn force_stop_confirmation_matches(confirmation: &str) -> bool {
+    confirmation == FORCE_STOP_WORKER_CONFIRMATION
+}
+
+#[tauri::command]
+async fn force_stop_worker(
+    state: State<'_, DeviceState>,
+    operator: State<'_, OperatorAuthState>,
+    confirmation: String,
+) -> Result<DesktopSnapshot, String> {
+    if !force_stop_confirmation_matches(&confirmation) {
+        return Err("worker_force_confirmation_required".to_string());
+    }
+    operator.authorize_node_lifecycle(false).await?;
+    let _operation = state.begin_worker_operation()?;
+    let context = state.worker_force_context().inspect_err(|error| {
+        state.mark_worker_intervention(worker_cutover::lifecycle_failure_diagnostic(error));
+    })?;
+    let mut backend = DeviceWorkerCutover {
+        device: state.inner().clone(),
+        operator: operator.inner(),
+        helper: context.helper,
+        binding: context.binding.clone(),
+    };
+    let task_state = match backend.inspect_task().await {
+        Ok(task_state) => task_state,
+        Err(error) => {
+            backend.mark_intervention(worker_cutover::lifecycle_failure_diagnostic(&error));
+            return Err(error);
+        }
+    };
+    if task_state != worker_host::LegacyTaskState::Disabled {
+        backend.mark_intervention("worker_legacy_task_invalid");
+        return Err("worker_legacy_task_invalid".to_string());
+    }
+    let local = match backend.local_runtime().await {
+        Ok(local) => local,
+        Err(error) => {
+            backend.mark_intervention(worker_cutover::lifecycle_failure_diagnostic(&error));
+            return Err(error);
+        }
+    };
+    if !local.runtime_installed
+        || local.startup_cleanup_pending
+        || !local.job_process_count.is_some_and(|count| count > 0)
+    {
+        backend.mark_intervention("worker_cutover_rollback_required");
+        return Err("worker_cutover_rollback_required".to_string());
+    }
+    let snapshot = state.force_worker_process_tree(&context.binding)?;
+    let task_state = match backend.inspect_task().await {
+        Ok(task_state) => task_state,
+        Err(error) => {
+            backend.mark_intervention("worker_forced_interruption");
+            return Err(error);
+        }
+    };
+    let local = match backend.local_runtime().await {
+        Ok(local) => local,
+        Err(error) => {
+            backend.mark_intervention("worker_forced_interruption");
+            return Err(error);
+        }
+    };
+    if task_state != worker_host::LegacyTaskState::Disabled
+        || local.runtime_installed
+        || local.startup_cleanup_pending
+        || local.job_process_count != Some(0)
+        || backend.process_lock_observation() != worker_host::ProcessLockObservation::NotHeld
+    {
+        backend.mark_intervention("worker_forced_interruption");
+        return Err("worker_forced_interruption".to_string());
+    }
+    Ok(snapshot)
 }
 
 async fn authorize_node_lifecycle(
@@ -1207,6 +1529,7 @@ pub fn run() {
             operator_change_password,
             takeover_local_worker,
             rollback_local_worker_to_legacy,
+            force_stop_worker,
             local_worker_drain_status
         ])
         .setup(|app| {
@@ -1286,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_cutover_and_rollback_share_a_native_single_flight_guard() {
+    fn worker_lifecycle_mutations_share_a_native_single_flight_guard() {
         let directory = tempfile::tempdir().expect("temporary device directory");
         let device = DeviceState::load(
             directory.path().join("device-config.json"),
@@ -1304,6 +1627,174 @@ mod tests {
         ));
         drop(first);
         assert!(device.begin_worker_operation().is_ok());
+    }
+
+    #[test]
+    fn worker_decommission_clears_local_role_without_deleting_worker_identity_or_data() {
+        let directory = tempfile::tempdir().expect("temporary Worker decommission fixture");
+        let config_path = directory.path().join("device-config.json");
+        let data_root = directory.path().join("worker-data");
+        let worker_dir = data_root.join("worker");
+        fs::create_dir_all(&worker_dir).expect("create durable Worker identity directory");
+        let marker_path = worker_dir.join("worker_id");
+        let key_path = worker_dir.join("12345678-1234-4234-8234-123456789abc.device-key.dpapi");
+        let journal_path = data_root.join("journal/worker-state.sqlite3");
+        fs::create_dir_all(journal_path.parent().expect("journal parent"))
+            .expect("create journal directory");
+        fs::write(&marker_path, b"identity marker fixture").expect("write identity marker fixture");
+        fs::write(&key_path, b"protected key fixture").expect("write key fixture");
+        fs::write(&journal_path, b"journal fixture").expect("write journal fixture");
+        let before = [
+            fs::read(&marker_path).expect("snapshot marker"),
+            fs::read(&key_path).expect("snapshot key"),
+            fs::read(&journal_path).expect("snapshot journal"),
+        ];
+        let config = DeviceConfig {
+            role: Some(ProvisionedRole::Worker),
+            autostart_enabled: true,
+            ..DeviceConfig::default()
+        };
+        config.save(&config_path).expect("write Worker config");
+        let supervisor = Supervisor::default();
+        let device = DeviceState {
+            config_path,
+            inner: Arc::new(Mutex::new(DeviceStateInner { config, supervisor })),
+            worker_operation_active: Arc::new(AtomicBool::new(false)),
+        };
+
+        let snapshot = device.decommission().expect("clear Desktop Worker role");
+
+        assert_eq!(snapshot.role, None);
+        assert!(!snapshot.autostart_enabled);
+        assert_eq!(
+            fs::read(marker_path).expect("identity marker remains"),
+            before[0]
+        );
+        assert_eq!(
+            fs::read(key_path).expect("protected key remains"),
+            before[1]
+        );
+        assert_eq!(fs::read(journal_path).expect("journal remains"), before[2]);
+    }
+
+    #[test]
+    fn worker_quit_leaves_legacy_and_takeover_required_owners_running() {
+        let absent_runtime = supervisor::WorkerRuntimeObservation {
+            runtime_installed: false,
+            startup_cleanup_pending: false,
+            process_alive: None,
+            job_process_count: Some(0),
+            process_exit_proven: false,
+            server_online_verified: false,
+        };
+        for ownership in [
+            Some(worker_host::WorkerOwnership::Legacy),
+            Some(worker_host::WorkerOwnership::TakeoverRequired),
+            Some(worker_host::WorkerOwnership::Blocked),
+            None,
+        ] {
+            assert_eq!(
+                worker_quit_plan(ownership, absent_runtime),
+                Ok(WorkerQuitPlan::LeaveLegacyOwnerRunning)
+            );
+        }
+        let desktop_runtime = supervisor::WorkerRuntimeObservation {
+            runtime_installed: true,
+            startup_cleanup_pending: false,
+            process_alive: Some(true),
+            job_process_count: Some(1),
+            process_exit_proven: false,
+            server_online_verified: false,
+        };
+        assert_eq!(
+            worker_quit_plan(Some(worker_host::WorkerOwnership::Desktop), desktop_runtime),
+            Ok(WorkerQuitPlan::GracefulDesktopStop)
+        );
+        assert_eq!(
+            worker_quit_plan(Some(worker_host::WorkerOwnership::Legacy), desktop_runtime),
+            Err("worker_cutover_rollback_required".to_string())
+        );
+        assert_eq!(
+            worker_restart_is_desktop_owned(
+                Some(worker_host::WorkerOwnership::TakeoverRequired),
+                absent_runtime
+            ),
+            Err("worker_cutover_rollback_required".to_string())
+        );
+    }
+
+    #[test]
+    fn force_stop_requires_the_exact_confirmation_phrase() {
+        assert!(force_stop_confirmation_matches("FORCE STOP WORKER"));
+        for value in [
+            "force stop worker",
+            " FORCE STOP WORKER",
+            "FORCE STOP WORKER ",
+            "FORCE STOP",
+        ] {
+            assert!(!force_stop_confirmation_matches(value));
+        }
+    }
+
+    #[test]
+    fn worker_lifecycle_logs_out_only_after_successful_terminal_operation() {
+        use std::sync::Mutex as StdMutex;
+
+        tauri::async_runtime::block_on(async {
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let operation_events = Arc::clone(&events);
+            worker_lifecycle_then_logout(
+                async move {
+                    operation_events
+                        .lock()
+                        .expect("operation event lock")
+                        .push("offline-exit-online-proof");
+                    Ok(())
+                },
+                || {
+                    let logout_events = Arc::clone(&events);
+                    async move {
+                        logout_events
+                            .lock()
+                            .expect("logout event lock")
+                            .push("logout");
+                    }
+                },
+            )
+            .await
+            .expect("successful Worker lifecycle operation");
+            assert_eq!(
+                *events.lock().expect("read event sequence"),
+                ["offline-exit-online-proof", "logout"]
+            );
+
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let operation_events = Arc::clone(&events);
+            let result = worker_lifecycle_then_logout(
+                async move {
+                    operation_events
+                        .lock()
+                        .expect("failed operation event lock")
+                        .push("drain-failed");
+                    Err::<(), _>("worker_drain_unavailable".to_string())
+                },
+                || {
+                    let logout_events = Arc::clone(&events);
+                    async move {
+                        logout_events
+                            .lock()
+                            .expect("failed logout event lock")
+                            .push("logout");
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result, Err("worker_drain_unavailable".to_string()));
+            assert_eq!(
+                *events.lock().expect("read failed event sequence"),
+                ["drain-failed"]
+            );
+        });
     }
 
     #[test]

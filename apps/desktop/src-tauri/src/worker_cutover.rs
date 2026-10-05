@@ -11,6 +11,21 @@ const LOCAL_EXIT_POLL_LIMIT: usize = 120;
 
 pub(super) type CutoverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkerDrainReason {
+    Quit,
+    Restart,
+}
+
+impl WorkerDrainReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Quit => "DESKTOP_QUIT",
+            Self::Restart => "DESKTOP_RESTART",
+        }
+    }
+}
+
 pub(super) struct DurableDrainOfflineProof {
     worker_id: String,
     marker_sha256: String,
@@ -226,6 +241,162 @@ pub(super) async fn rollback_to_legacy<B: WorkerCutoverBackend>(
     }
 }
 
+pub(super) async fn quit_desktop_worker<B: WorkerCutoverBackend>(
+    backend: &mut B,
+) -> Result<(), String> {
+    match drain_and_reap_desktop_worker(backend, WorkerDrainReason::Quit).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            backend.mark_intervention(lifecycle_failure_diagnostic(&error));
+            Err(error)
+        }
+    }
+}
+
+pub(super) async fn restart_desktop_worker<B: WorkerCutoverBackend>(
+    backend: &mut B,
+) -> Result<(), String> {
+    if let Err(error) = drain_and_reap_desktop_worker(backend, WorkerDrainReason::Restart).await {
+        backend.mark_intervention(lifecycle_failure_diagnostic(&error));
+        return Err(error);
+    }
+
+    if let Err(error) = backend.start_desktop_worker().await {
+        backend.mark_intervention(startup_failure_diagnostic(&error));
+        return Err("worker_cutover_rollback_required".to_string());
+    }
+
+    match wait_for_desktop_online(backend).await {
+        Ok(()) => backend
+            .mark_desktop_online()
+            .map_err(|_| "worker_cutover_rollback_required".to_string()),
+        Err(diagnostic) => {
+            backend.mark_intervention(diagnostic);
+            Err("worker_cutover_rollback_required".to_string())
+        }
+    }
+}
+
+pub(super) async fn verify_legacy_owner_for_decommission<B: WorkerCutoverBackend>(
+    backend: &mut B,
+) -> Result<(), String> {
+    let result = async {
+        let task_state = backend.inspect_task().await?;
+        let local = backend.local_runtime().await?;
+        if local.runtime_installed
+            || local.startup_cleanup_pending
+            || local.job_process_count != Some(0)
+        {
+            return Err("worker_cutover_rollback_required".to_string());
+        }
+        let lock = backend.process_lock_observation();
+        match (task_state, lock) {
+            (LegacyTaskState::Running, ProcessLockObservation::Held) => {
+                backend.mark_legacy_active()
+            }
+            (LegacyTaskState::Ready, ProcessLockObservation::NotHeld) => {
+                backend.mark_legacy_ready("worker_legacy_task_ready")
+            }
+            (_, ProcessLockObservation::Unavailable) => {
+                Err("worker_process_lock_unavailable".to_string())
+            }
+            _ => Err("worker_cutover_rollback_required".to_string()),
+        }
+    }
+    .await;
+    if let Err(error) = &result {
+        backend.mark_intervention(lifecycle_failure_diagnostic(error));
+    }
+    result
+}
+
+async fn drain_and_reap_desktop_worker<B: WorkerCutoverBackend>(
+    backend: &mut B,
+    reason: WorkerDrainReason,
+) -> Result<(), String> {
+    if backend.inspect_task().await? != LegacyTaskState::Disabled {
+        return Err("worker_legacy_task_invalid".to_string());
+    }
+    validate_desktop_runtime(backend).await?;
+    let status = backend.worker_status().await?;
+    ensure_active_before_drain(status.status)?;
+    if backend.inspect_task().await? != LegacyTaskState::Disabled {
+        return Err("worker_legacy_task_invalid".to_string());
+    }
+    validate_desktop_runtime(backend).await?;
+
+    let post_request = backend.request_drain(reason.code()).await?;
+    wait_for_authoritative_offline(backend, post_request).await?;
+    wait_for_desktop_exit(backend).await?;
+    if backend.inspect_task().await? != LegacyTaskState::Disabled {
+        return Err("worker_legacy_task_invalid".to_string());
+    }
+    backend.reap_desktop_after_natural_exit().await?;
+    if backend.inspect_task().await? != LegacyTaskState::Disabled {
+        return Err("worker_legacy_task_invalid".to_string());
+    }
+    Ok(())
+}
+
+async fn validate_desktop_runtime<B: WorkerCutoverBackend>(backend: &mut B) -> Result<(), String> {
+    let local = backend.local_runtime().await?;
+    if local.startup_cleanup_pending {
+        return Err("worker_startup_cleanup_failed".to_string());
+    }
+    if !local.runtime_installed
+        || local.process_alive != Some(true)
+        || !local.job_process_count.is_some_and(|count| count > 0)
+    {
+        return Err("worker_process_exited".to_string());
+    }
+    match backend.process_lock_observation() {
+        ProcessLockObservation::Held => Ok(()),
+        ProcessLockObservation::NotHeld => Err("worker_process_lock_not_acquired".to_string()),
+        ProcessLockObservation::Unavailable => Err("worker_process_lock_unavailable".to_string()),
+    }
+}
+
+pub(super) fn lifecycle_failure_diagnostic(error: &str) -> &'static str {
+    match error {
+        "worker_host_configuration_required" => "worker_host_configuration_required",
+        "worker_identity_missing" => "worker_identity_missing",
+        "worker_identity_not_enrolled" => "worker_identity_not_enrolled",
+        "worker_device_key_unprotect_failed" => "worker_device_key_unprotect_failed",
+        "worker_package_invalid" => "worker_package_invalid",
+        "worker_host_config_invalid" => "worker_host_config_invalid",
+        "worker_drain_unavailable" => "worker_drain_unavailable",
+        "worker_drain_request_failed" => "worker_drain_request_failed",
+        "worker_drain_response_invalid" => "worker_drain_response_invalid",
+        "worker_drain_interrupted" => "worker_drain_interrupted",
+        "worker_drain_timeout" => "worker_drain_timeout",
+        "worker_process_exit_timeout" => "worker_process_exit_timeout",
+        "worker_process_exited" => "worker_process_exited",
+        "worker_process_lock_not_acquired" => "worker_process_lock_not_acquired",
+        "worker_process_lock_held" => "worker_process_lock_held",
+        "worker_process_lock_unavailable" => "worker_process_lock_unavailable",
+        "worker_process_job_create_failed" => "worker_process_job_create_failed",
+        "worker_process_job_assign_failed" => "worker_process_job_assign_failed",
+        "worker_process_start_failed" => "worker_process_start_failed",
+        "worker_legacy_task_invalid" => "worker_legacy_task_invalid",
+        "worker_legacy_task_not_registered" => "worker_legacy_task_not_registered",
+        "worker_legacy_task_enable_failed" => "worker_legacy_task_enable_failed",
+        "worker_legacy_task_start_failed" => "worker_legacy_task_start_failed",
+        "worker_legacy_task_disable_failed" => "worker_legacy_task_disable_failed",
+        "worker_legacy_task_running" => "worker_legacy_task_running",
+        "worker_startup_cleanup_failed" => "worker_startup_cleanup_failed",
+        "worker_startup_timeout" => "worker_startup_timeout",
+        "worker_identity_corrupt" => "worker_identity_corrupt",
+        "worker_rollback_failed" => "worker_rollback_failed",
+        "worker_forced_interruption" => "worker_forced_interruption",
+        "operator_session_revoked" => "operator_session_revoked",
+        "operator_forbidden" => "operator_forbidden",
+        "operator_password_change_required" => "operator_password_change_required",
+        "worker_protocol_incompatible" => "worker_protocol_incompatible",
+        "worker_cutover_drain_already_in_progress" => "worker_cutover_drain_already_in_progress",
+        _ => "worker_cutover_rollback_required",
+    }
+}
+
 async fn wait_for_legacy_active<B: WorkerCutoverBackend>(
     backend: &mut B,
 ) -> Result<WorkerDrainStatus, String> {
@@ -365,6 +536,14 @@ async fn wait_for_desktop_online<B: WorkerCutoverBackend>(
     backend: &mut B,
 ) -> Result<(), &'static str> {
     for attempt in 0..STATUS_POLL_LIMIT {
+        if backend
+            .inspect_task()
+            .await
+            .map_err(|_| "worker_legacy_task_invalid")?
+            != LegacyTaskState::Disabled
+        {
+            return Err("worker_legacy_task_invalid");
+        }
         let local = backend
             .local_runtime()
             .await
@@ -422,6 +601,9 @@ async fn wait_for_desktop_online<B: WorkerCutoverBackend>(
 
 async fn wait_for_desktop_exit<B: WorkerCutoverBackend>(backend: &mut B) -> Result<(), String> {
     for attempt in 0..LOCAL_EXIT_POLL_LIMIT {
+        if backend.inspect_task().await? != LegacyTaskState::Disabled {
+            return Err("worker_legacy_task_invalid".to_string());
+        }
         let local = backend.local_runtime().await?;
         if local.startup_cleanup_pending {
             return Err("worker_startup_cleanup_failed".to_string());
@@ -628,12 +810,29 @@ async fn handle_ready_startup_failure<B: WorkerCutoverBackend>(
 fn startup_failure_diagnostic(error: &str) -> &'static str {
     match error {
         "worker_startup_timeout" => "worker_startup_timeout",
+        "worker_startup_cleanup_failed" => "worker_startup_cleanup_failed",
+        "worker_identity_missing" => "worker_identity_missing",
+        "worker_identity_not_enrolled" => "worker_identity_not_enrolled",
+        "worker_device_key_unprotect_failed" => "worker_device_key_unprotect_failed",
+        "worker_host_configuration_required" => "worker_host_configuration_required",
+        "worker_host_config_invalid" => "worker_host_config_invalid",
+        "worker_process_lock_not_acquired" => "worker_process_lock_not_acquired",
+        "worker_process_lock_held" => "worker_process_lock_held",
         "worker_process_lock_unavailable" => "worker_process_lock_unavailable",
+        "worker_process_exited" => "worker_process_exited",
+        "worker_process_start_failed" => "worker_process_start_failed",
+        "worker_process_job_create_failed" => "worker_process_job_create_failed",
+        "worker_process_job_assign_failed" => "worker_process_job_assign_failed",
         "worker_legacy_task_start_failed" => "worker_legacy_task_start_failed",
+        "worker_legacy_task_invalid" => "worker_legacy_task_invalid",
+        "worker_legacy_task_not_registered" => "worker_legacy_task_not_registered",
         "worker_cutover_drain_already_in_progress" => "worker_cutover_drain_already_in_progress",
         "worker_protocol_incompatible" => "worker_protocol_incompatible",
         "worker_drain_unavailable" => "worker_drain_unavailable",
         "worker_drain_response_invalid" => "worker_drain_response_invalid",
+        "worker_drain_interrupted" => "worker_drain_interrupted",
+        "worker_identity_corrupt" => "worker_identity_corrupt",
+        "worker_package_invalid" => "worker_package_invalid",
         "operator_session_revoked" => "operator_session_revoked",
         "operator_forbidden" => "operator_forbidden",
         "operator_password_change_required" => "operator_password_change_required",
@@ -651,10 +850,12 @@ mod tests {
         Inspect(LegacyTaskState),
         Lock(ProcessLockObservation),
         Post(&'static str),
+        PostResponse(&'static str),
         Get(&'static str),
         Task(TaskOperation),
         StartDesktop,
         ReapDesktop,
+        Logout,
         MarkDesktopOnline,
         MarkLegacyActive,
         MarkLegacyReady,
@@ -673,6 +874,8 @@ mod tests {
         task_start_error: Option<(String, bool)>,
         drain_in_progress: bool,
         desktop_exits_after_offline: bool,
+        desktop_job_empty_after_offline: bool,
+        desktop_lock_released_after_offline: bool,
         operations: Vec<TaskOperation>,
     }
 
@@ -683,6 +886,20 @@ mod tests {
 
         fn ready(statuses: &[WorkerStatus]) -> Self {
             Self::new(LegacyTaskState::Ready, statuses)
+        }
+
+        fn desktop(statuses: &[WorkerStatus]) -> Self {
+            let mut backend = Self::new(LegacyTaskState::Disabled, statuses);
+            backend.lock = ProcessLockObservation::Held;
+            backend.runtime = WorkerRuntimeObservation {
+                runtime_installed: true,
+                startup_cleanup_pending: false,
+                process_alive: Some(true),
+                job_process_count: Some(1),
+                process_exit_proven: false,
+                server_online_verified: true,
+            };
+            backend
         }
 
         fn new(task_state: LegacyTaskState, statuses: &[WorkerStatus]) -> Self {
@@ -710,6 +927,8 @@ mod tests {
                 task_start_error: None,
                 drain_in_progress: false,
                 desktop_exits_after_offline: true,
+                desktop_job_empty_after_offline: true,
+                desktop_lock_released_after_offline: true,
                 operations: Vec::new(),
             }
         }
@@ -723,21 +942,36 @@ mod tests {
                 .pop_front()
                 .expect("planned status response")?;
             self.events.push(event(status_name(value.status)));
-            if value.status == WorkerStatus::Offline && self.drain_in_progress {
+            self.apply_status_effects(value.status);
+            Ok(value)
+        }
+
+        fn take_post_response(&mut self) -> Result<WorkerDrainStatus, String> {
+            let value = self.statuses.pop_front().expect("planned POST response")?;
+            self.events
+                .push(Event::PostResponse(status_name(value.status)));
+            self.apply_status_effects(value.status);
+            Ok(value)
+        }
+
+        fn apply_status_effects(&mut self, status: WorkerStatus) {
+            if status == WorkerStatus::Offline && self.drain_in_progress {
                 if self.task_state == LegacyTaskState::Running {
                     self.task_state = LegacyTaskState::Ready;
                     self.lock = ProcessLockObservation::NotHeld;
                 }
                 if self.runtime.runtime_installed && self.desktop_exits_after_offline {
-                    self.lock = ProcessLockObservation::NotHeld;
-                    self.runtime.runtime_installed = false;
                     self.runtime.process_alive = Some(false);
-                    self.runtime.job_process_count = Some(0);
+                    if self.desktop_job_empty_after_offline {
+                        self.runtime.job_process_count = Some(0);
+                    }
+                    if self.desktop_lock_released_after_offline {
+                        self.lock = ProcessLockObservation::NotHeld;
+                    }
                     self.runtime.process_exit_proven = true;
                 }
                 self.drain_in_progress = false;
             }
-            Ok(value)
         }
     }
 
@@ -809,7 +1043,7 @@ mod tests {
                 self.requested.push(reason_code);
                 self.events.push(Event::Post(reason_code));
                 self.drain_in_progress = true;
-                self.take_status(Event::Get)
+                self.take_post_response()
             })
         }
 
@@ -923,6 +1157,23 @@ mod tests {
             running_worker_jobs,
             quiescent,
         })
+    }
+
+    #[test]
+    fn startup_and_lifecycle_diagnostics_preserve_stable_worker_codes() {
+        for code in [
+            "worker_identity_missing",
+            "worker_identity_not_enrolled",
+            "worker_identity_corrupt",
+            "worker_device_key_unprotect_failed",
+            "worker_package_invalid",
+            "worker_host_config_invalid",
+            "worker_process_job_create_failed",
+            "worker_process_job_assign_failed",
+        ] {
+            assert_eq!(startup_failure_diagnostic(code), code);
+            assert_eq!(lifecycle_failure_diagnostic(code), code);
+        }
     }
 
     fn status_name(status: WorkerStatus) -> &'static str {
@@ -1485,5 +1736,221 @@ mod tests {
             validate_drain_status_shape(&inconsistent_draining).unwrap_err(),
             "worker_drain_response_invalid"
         );
+    }
+
+    #[test]
+    fn desktop_quit_drains_once_and_waits_offline_exit_and_reap_before_logout() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::desktop(&[
+                WorkerStatus::Online,
+                WorkerStatus::Draining,
+                WorkerStatus::Draining,
+                WorkerStatus::Offline,
+            ]);
+            quit_desktop_worker(&mut backend)
+                .await
+                .expect("Desktop Worker stops gracefully");
+            backend.events.push(Event::Logout);
+
+            assert_eq!(backend.requested, ["DESKTOP_QUIT"]);
+            assert!(backend.operations.is_empty());
+            assert!(!backend.runtime.runtime_installed);
+            assert_eq!(backend.runtime.job_process_count, Some(0));
+            assert_eq!(backend.lock, ProcessLockObservation::NotHeld);
+            let post = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::Post("DESKTOP_QUIT"))
+                .expect("one drain POST");
+            let offline = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::Get("OFFLINE"))
+                .expect("authoritative OFFLINE poll");
+            let reap = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::ReapDesktop)
+                .expect("natural runtime reap");
+            let logout = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::Logout)
+                .expect("logout after terminal proof");
+            assert!(post < offline && offline < reap && reap < logout);
+            assert_eq!(
+                backend
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Post(_)))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn quit_drain_failure_keeps_desktop_process_and_does_not_reap() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::desktop(&[WorkerStatus::Online, WorkerStatus::Draining]);
+            backend.statuses.extend(
+                std::iter::repeat_with(|| status(WorkerStatus::Draining)).take(STATUS_POLL_LIMIT),
+            );
+
+            assert_eq!(
+                quit_desktop_worker(&mut backend).await.unwrap_err(),
+                "worker_drain_timeout"
+            );
+            assert_eq!(backend.requested, ["DESKTOP_QUIT"]);
+            assert!(backend.runtime.runtime_installed);
+            assert_eq!(backend.runtime.job_process_count, Some(1));
+            assert!(!backend.events.contains(&Event::ReapDesktop));
+            assert!(backend
+                .events
+                .contains(&Event::Intervention("worker_drain_timeout")));
+        });
+    }
+
+    #[test]
+    fn offline_without_natural_process_tree_exit_is_not_graceful_quit() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::desktop(&[
+                WorkerStatus::Online,
+                WorkerStatus::Draining,
+                WorkerStatus::Offline,
+            ]);
+            backend.desktop_exits_after_offline = false;
+
+            assert_eq!(
+                quit_desktop_worker(&mut backend).await.unwrap_err(),
+                "worker_process_exit_timeout"
+            );
+            assert!(backend.runtime.runtime_installed);
+            assert_eq!(backend.runtime.job_process_count, Some(1));
+            assert_eq!(backend.lock, ProcessLockObservation::Held);
+            assert!(!backend.events.contains(&Event::ReapDesktop));
+        });
+    }
+
+    #[test]
+    fn offline_without_empty_job_or_released_lock_is_not_graceful_quit() {
+        for (job_empty, lock_released) in [(false, true), (true, false)] {
+            tauri::async_runtime::block_on(async {
+                let mut backend = FakeBackend::desktop(&[
+                    WorkerStatus::Online,
+                    WorkerStatus::Draining,
+                    WorkerStatus::Offline,
+                ]);
+                backend.desktop_job_empty_after_offline = job_empty;
+                backend.desktop_lock_released_after_offline = lock_released;
+
+                assert_eq!(
+                    quit_desktop_worker(&mut backend).await.unwrap_err(),
+                    "worker_process_exit_timeout"
+                );
+                assert!(backend.runtime.runtime_installed);
+                assert!(!backend.events.contains(&Event::ReapDesktop));
+            });
+        }
+    }
+
+    #[test]
+    fn restart_uses_fixed_reason_and_requires_same_binding_online_after_relaunch() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::desktop(&[
+                WorkerStatus::Online,
+                WorkerStatus::Draining,
+                WorkerStatus::Draining,
+                WorkerStatus::Offline,
+                WorkerStatus::Offline,
+                WorkerStatus::Registering,
+                WorkerStatus::Degraded,
+                WorkerStatus::Online,
+            ]);
+            let original_binding = backend.binding.clone();
+            restart_desktop_worker(&mut backend)
+                .await
+                .expect("Desktop Worker restarts online");
+
+            assert_eq!(backend.requested, ["DESKTOP_RESTART"]);
+            assert_eq!(backend.binding.worker_id, original_binding.worker_id);
+            assert_eq!(
+                backend.binding.identity_marker_sha256,
+                original_binding.identity_marker_sha256
+            );
+            assert_eq!(
+                backend.binding.protected_key_sha256,
+                original_binding.protected_key_sha256
+            );
+            assert_eq!(backend.task_state, LegacyTaskState::Disabled);
+            assert!(backend.operations.is_empty());
+            let reap = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::ReapDesktop)
+                .expect("old runtime was reaped naturally");
+            let start = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::StartDesktop)
+                .expect("same Desktop binding restarted");
+            let online = backend
+                .events
+                .iter()
+                .rposition(|event| *event == Event::Get("ONLINE"))
+                .expect("authoritative ONLINE after restart");
+            let marked = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::MarkDesktopOnline)
+                .expect("health marked only after ONLINE");
+            assert!(reap < start && start < online && online < marked);
+        });
+    }
+
+    #[test]
+    fn restart_timeout_keeps_legacy_task_disabled_and_reports_intervention() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::desktop(&[
+                WorkerStatus::Online,
+                WorkerStatus::Draining,
+                WorkerStatus::Offline,
+            ]);
+            backend.statuses.extend(
+                std::iter::repeat_with(|| status(WorkerStatus::Offline)).take(STATUS_POLL_LIMIT),
+            );
+
+            assert_eq!(
+                restart_desktop_worker(&mut backend).await.unwrap_err(),
+                "worker_cutover_rollback_required"
+            );
+            assert_eq!(backend.task_state, LegacyTaskState::Disabled);
+            assert!(backend.operations.is_empty());
+            assert_eq!(backend.requested, ["DESKTOP_RESTART"]);
+            assert!(backend
+                .events
+                .contains(&Event::Intervention("worker_startup_timeout")));
+        });
+    }
+
+    #[test]
+    fn decommission_preserves_legacy_running_or_ready_worker_without_drain() {
+        tauri::async_runtime::block_on(async {
+            let mut running = FakeBackend::running(&[]);
+            verify_legacy_owner_for_decommission(&mut running)
+                .await
+                .expect("active legacy owner remains untouched");
+            assert!(running.requested.is_empty());
+            assert!(running.operations.is_empty());
+            assert!(running.events.contains(&Event::MarkLegacyActive));
+
+            let mut ready = FakeBackend::ready(&[]);
+            verify_legacy_owner_for_decommission(&mut ready)
+                .await
+                .expect("enabled ready task remains untouched");
+            assert!(ready.requested.is_empty());
+            assert!(ready.operations.is_empty());
+            assert!(ready.events.contains(&Event::MarkLegacyReady));
+        });
     }
 }

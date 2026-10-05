@@ -27,6 +27,8 @@ const WORKER_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WORKER_STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_STARTUP_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const WORKER_FORCE_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_FORCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const POSTGRES_STDERR_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -668,6 +670,32 @@ impl Supervisor {
         Ok(WorkerCutoverContext { helper, binding })
     }
 
+    pub(super) fn worker_force_context(&mut self) -> Result<WorkerCutoverContext, String> {
+        let local = self.worker_runtime_observation();
+        if self.worker_ownership != Some(WorkerOwnership::Desktop)
+            || self.legacy_task_state != Some(LegacyTaskState::Disabled)
+            || !local.runtime_installed
+            || local.startup_cleanup_pending
+            || !local.job_process_count.is_some_and(|count| count > 0)
+        {
+            return Err("worker_cutover_rollback_required".to_string());
+        }
+        let helper = self
+            .worker_task_helper
+            .clone()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        let binding = self
+            .worker_binding
+            .clone()
+            .ok_or_else(|| "worker_host_configuration_required".to_string())?;
+        if worker_host::observe_process_lock(&binding.data_root)
+            == ProcessLockObservation::Unavailable
+        {
+            return Err("worker_process_lock_unavailable".to_string());
+        }
+        Ok(WorkerCutoverContext { helper, binding })
+    }
+
     pub(super) fn worker_runtime_observation(&mut self) -> WorkerRuntimeObservation {
         self.refresh_health();
         let (process_alive, job_process_count) = self
@@ -692,6 +720,22 @@ impl Supervisor {
 
     pub(super) fn set_legacy_task_state(&mut self, state: LegacyTaskState) {
         self.legacy_task_state = Some(state);
+    }
+
+    pub(super) fn worker_ownership(&self) -> Option<WorkerOwnership> {
+        self.worker_ownership
+    }
+
+    pub(super) fn clear_worker_provisioning_after_decommission(&mut self) {
+        debug_assert!(self.worker_runtime.is_none());
+        debug_assert!(self.worker_startup_cleanup.is_none());
+        self.worker_binding = None;
+        self.worker_ownership = None;
+        self.legacy_task_state = None;
+        self.worker_online_verified = false;
+        self.worker_process_exit_proven = false;
+        self.diagnostic_code = None;
+        self.lifecycle = Lifecycle::Stopped;
     }
 
     pub(super) fn mark_worker_server_online(&mut self, worker_id: &str) -> Result<(), String> {
@@ -819,6 +863,68 @@ impl Supervisor {
             return Err("worker_process_exit_timeout".to_string());
         }
         Ok(())
+    }
+
+    pub(super) fn force_stop_worker_process_tree(
+        &mut self,
+        expected_binding: &WorkerHostBinding,
+    ) -> Result<(), String> {
+        let valid = self.worker_ownership == Some(WorkerOwnership::Desktop)
+            && self.legacy_task_state == Some(LegacyTaskState::Disabled)
+            && self.worker_binding.as_ref().is_some_and(|binding| {
+                worker_host::binding_match_failure(expected_binding, binding).is_ok()
+            })
+            && self.worker_startup_cleanup.is_none();
+        if !valid {
+            return Err(self.fail_worker("worker_cutover_rollback_required"));
+        }
+        let Some(runtime) = self.worker_runtime.as_mut() else {
+            return Err(self.fail_worker("worker_cutover_rollback_required"));
+        };
+        if !runtime._job.active_processes().is_ok_and(|count| count > 0) {
+            return Err(self.fail_worker("worker_cutover_rollback_required"));
+        }
+        if runtime._job.terminate().is_err() {
+            self.lifecycle = Lifecycle::Degraded;
+            self.diagnostic_code = Some("worker_forced_interruption");
+            return Err("worker_forced_interruption".to_string());
+        }
+
+        let deadline = Instant::now() + WORKER_FORCE_TIMEOUT;
+        loop {
+            let process_count = runtime._job.active_processes();
+            let process_exited = runtime
+                .child
+                .try_wait()
+                .map(|status| status.is_some())
+                .unwrap_or(false);
+            let lock = worker_host::observe_process_lock(&expected_binding.data_root);
+            if lock == ProcessLockObservation::Unavailable {
+                self.lifecycle = Lifecycle::Degraded;
+                self.diagnostic_code = Some("worker_forced_interruption");
+                return Err("worker_forced_interruption".to_string());
+            }
+            if process_count == Ok(0) && process_exited && lock == ProcessLockObservation::NotHeld {
+                if runtime.child.wait().is_err() || runtime._job.close_when_empty().is_err() {
+                    self.lifecycle = Lifecycle::Degraded;
+                    self.diagnostic_code = Some("worker_forced_interruption");
+                    return Err("worker_forced_interruption".to_string());
+                }
+                self.worker_runtime = None;
+                self.worker_online_verified = false;
+                self.worker_process_exit_proven = false;
+                self.worker_ownership = Some(WorkerOwnership::Blocked);
+                self.lifecycle = Lifecycle::Degraded;
+                self.diagnostic_code = Some("worker_forced_interruption");
+                return Ok(());
+            }
+            if Instant::now() >= deadline || process_count.is_err() {
+                self.lifecycle = Lifecycle::Degraded;
+                self.diagnostic_code = Some("worker_forced_interruption");
+                return Err("worker_forced_interruption".to_string());
+            }
+            thread::sleep(WORKER_FORCE_POLL_INTERVAL);
+        }
     }
 
     fn fail(&mut self, code: &'static str) -> String {
@@ -1845,6 +1951,16 @@ impl ProcessJob {
         }
     }
 
+    fn terminate(&self) -> Result<(), ()> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if self.0.is_null() || unsafe { TerminateJobObject(self.0, 1) } == 0 {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
     fn close(&mut self) -> Result<(), ()> {
         use windows_sys::Win32::Foundation::CloseHandle;
 
@@ -1981,6 +2097,10 @@ impl ProcessJob {
     }
 
     fn assign(&self, _child: &Child) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn terminate(&self) -> Result<(), ()> {
         Err(())
     }
 
@@ -2237,6 +2357,35 @@ mod tests {
         assert_eq!(snapshot.state, "starting");
         assert_eq!(snapshot.worker_ownership, Some("DESKTOP"));
         assert_ne!(snapshot.state, "running");
+    }
+
+    #[test]
+    fn decommission_clears_in_memory_worker_provisioning() {
+        let mut supervisor = Supervisor {
+            worker_binding: Some(WorkerHostBinding {
+                executable: PathBuf::from("threads-worker.exe"),
+                host_config: PathBuf::from("worker-host.json"),
+                data_root: PathBuf::from("worker-data"),
+                worker_id: "12345678-1234-4234-8234-123456789abc".to_string(),
+                identity_marker_sha256: "a".repeat(64),
+                protected_key_sha256: "b".repeat(64),
+                host_config_sha256: "c".repeat(64),
+            }),
+            worker_ownership: Some(WorkerOwnership::Legacy),
+            legacy_task_state: Some(LegacyTaskState::Running),
+            ..Supervisor::default()
+        };
+
+        supervisor.clear_worker_provisioning_after_decommission();
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.worker_id, None);
+        assert_eq!(snapshot.worker_ownership, None);
+        assert_eq!(snapshot.legacy_task_state, None);
+        assert_eq!(
+            supervisor.local_worker_id(),
+            Err("worker_host_configuration_required".to_string())
+        );
     }
 
     #[test]
@@ -2736,6 +2885,89 @@ mod tests {
             "closing Desktop Job Object must stop Worker"
         );
         let _ = child.wait();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_worker_job_termination_is_diagnostic_and_preserves_identity_files() {
+        let child = spawn_test_worker_process();
+        let process_observer = WorkerProcessExitObserver::open(child.id());
+        let job = ProcessJob::new_worker().expect("create Worker Job Object");
+        let mut child = child;
+        assign_and_resume_worker(&job, &mut child).expect("assign and resume Worker");
+        let (identity_directory, binding, identity_guard) = worker_test_identity_guard();
+        let worker_dir = identity_directory.path().join("worker");
+        let marker_path = worker_dir.join("worker_id");
+        let key_path = worker_dir.join(format!("{}.device-key.dpapi", binding.worker_id));
+        let marker_before = std::fs::read(&marker_path).expect("read identity marker");
+        let key_before = std::fs::read(&key_path).expect("read protected key");
+        let journal_path = identity_directory
+            .path()
+            .join("journal/worker-state.sqlite3");
+        let profile_path = identity_directory
+            .path()
+            .join("browser-profiles/profile-state");
+        std::fs::create_dir_all(journal_path.parent().expect("journal parent"))
+            .expect("create journal fixture directory");
+        std::fs::create_dir_all(profile_path.parent().expect("profile parent"))
+            .expect("create profile fixture directory");
+        std::fs::write(&journal_path, b"journal fixture").expect("write journal fixture");
+        std::fs::write(&profile_path, b"profile fixture").expect("write profile fixture");
+        let journal_before = std::fs::read(&journal_path).expect("snapshot journal");
+        let profile_before = std::fs::read(&profile_path).expect("snapshot profile");
+        let helper = identity_directory
+            .path()
+            .join(worker_host::TASK_HELPER_NAME);
+        std::fs::write(&helper, b"fixture helper").expect("write task helper fixture");
+        let mut supervisor = Supervisor {
+            worker_ownership: Some(WorkerOwnership::Desktop),
+            legacy_task_state: Some(LegacyTaskState::Disabled),
+            worker_binding: Some(binding.clone()),
+            worker_task_helper: Some(helper),
+            worker_runtime: Some(WorkerRuntime {
+                child,
+                _job: job,
+                _identity_guard: identity_guard,
+            }),
+            ..Supervisor::default()
+        };
+
+        supervisor
+            .worker_force_context()
+            .expect("only a Desktop-owned disabled-task process tree is force eligible");
+        supervisor
+            .force_stop_worker_process_tree(&binding)
+            .expect("explicit force terminates the Worker Job Object");
+
+        process_observer.wait_for_exit();
+        assert!(supervisor.worker_runtime.is_none());
+        assert!(!supervisor.worker_process_exit_proven);
+        assert!(!supervisor.worker_online_verified);
+        assert_eq!(supervisor.worker_ownership, Some(WorkerOwnership::Blocked));
+        assert_eq!(
+            supervisor.legacy_task_state,
+            Some(LegacyTaskState::Disabled)
+        );
+        assert_eq!(
+            supervisor.diagnostic_code,
+            Some("worker_forced_interruption")
+        );
+        assert_eq!(
+            std::fs::read(marker_path).expect("identity marker remains"),
+            marker_before
+        );
+        assert_eq!(
+            std::fs::read(key_path).expect("protected key remains"),
+            key_before
+        );
+        assert_eq!(
+            std::fs::read(journal_path).expect("journal remains"),
+            journal_before
+        );
+        assert_eq!(
+            std::fs::read(profile_path).expect("browser profile remains"),
+            profile_before
+        );
     }
 
     #[cfg(windows)]
