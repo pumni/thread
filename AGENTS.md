@@ -36,7 +36,7 @@ This file is the repository-wide constitution and router for coding agents. Deta
 - Workers do not invent business actions; Control Plane/Scheduler creates them.
 - API-first means preferred executor where suitable, not API-only architecture; `HYBRID` fallback is bounded by capability policy and never inferred automatically from arbitrary API failures.
 - Browser automation is allowed only in the approved Worker/browser boundary and only from C3 onward.
-- Login/session challenges require human intervention; do not bypass them.
+- Browser/UI recognition mismatch or ambiguity must fail closed; login/session challenges require human intervention, never bypass.
 - No anti-detect, fingerprint spoofing, or human-emulation-for-evasion subsystem.
 - Domain code must not import FastAPI, httpx, SQLAlchemy, WebSocket/browser libraries, Windows APIs, or Meta DTOs.
 - External side effects require explicit idempotency/recovery behavior; timeout is not proof of failure.
