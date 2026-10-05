@@ -28,40 +28,80 @@ def _read_evidence(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _scenario_attempt(name: str, prefix: str) -> tuple[str, int] | None:
+    if not name.startswith(prefix):
+        return None
+
+    scenario, separator, attempt_text = name[len(prefix) :].rpartition("-attempt-")
+    if not separator or scenario not in REQUIRED_SCENARIOS:
+        return None
+    if not attempt_text.isdecimal():
+        return None
+
+    attempt = int(attempt_text)
+    if attempt < 1 or str(attempt) != attempt_text:
+        return None
+    return scenario, attempt
+
+
 def aggregate_scenarios(artifact_root: Path, source_sha: str, output_root: Path) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=True)
     scenario_output = output_root / "controller-scenarios"
     scenario_output.mkdir(parents=True, exist_ok=True)
 
-    discovered: list[tuple[str, Path]] = []
+    candidates: dict[str, list[tuple[int, Path]]] = {
+        scenario: [] for scenario in REQUIRED_SCENARIOS
+    }
+    invalid_artifacts: list[str] = []
+    prefix = f"dx04-evidence-{source_sha}-"
     if artifact_root.exists():
         for artifact in sorted(path for path in artifact_root.iterdir() if path.is_dir()):
-            prefix = f"dx04-evidence-{source_sha}-"
             if artifact.name.startswith(prefix):
-                discovered.append((artifact.name[len(prefix) :], artifact))
+                parsed = _scenario_attempt(artifact.name, prefix)
+                if parsed is None:
+                    invalid_artifacts.append(artifact.name)
+                else:
+                    scenario, attempt = parsed
+                    candidates[scenario].append((attempt, artifact))
 
-    observed = [scenario for scenario, _ in discovered]
-    counts = {scenario: observed.count(scenario) for scenario in set(observed)}
+    observed = [scenario for scenario in REQUIRED_SCENARIOS if candidates[scenario]]
     rows: list[dict[str, Any]] = []
-    all_valid = len(observed) == len(REQUIRED_SCENARIOS) and set(observed) == set(
-        REQUIRED_SCENARIOS
-    )
+    all_valid = not invalid_artifacts and len(observed) == len(REQUIRED_SCENARIOS)
 
     for required in REQUIRED_SCENARIOS:
-        matching = [(scenario, path) for scenario, path in discovered if scenario == required]
-        if len(matching) != 1:
+        available = candidates[required]
+        if not available:
             rows.append(
                 {
                     "scenario": required,
-                    "artifact_count": len(matching),
-                    "result": "MISSING" if not matching else "DUPLICATE",
+                    "artifact_count": 0,
+                    "available_attempts": [],
+                    "selected_attempt": None,
+                    "result": "MISSING",
                     "primary_failure_code": "controller_scenario_artifact_set_invalid",
                 }
             )
             all_valid = False
             continue
 
-        _scenario, artifact_path = matching[0]
+        selected_attempt = max(attempt for attempt, _path in available)
+        selected = [path for attempt, path in available if attempt == selected_attempt]
+        available_attempts = sorted(attempt for attempt, _path in available)
+        if len(selected) != 1:
+            rows.append(
+                {
+                    "scenario": required,
+                    "artifact_count": len(selected),
+                    "available_attempts": available_attempts,
+                    "selected_attempt": selected_attempt,
+                    "result": "DUPLICATE",
+                    "primary_failure_code": "controller_scenario_artifact_set_invalid",
+                }
+            )
+            all_valid = False
+            continue
+
+        artifact_path = selected[0]
         evidence_path = artifact_path / "controller-lifecycle.json"
         evidence = _read_evidence(evidence_path)
         failure_code = None
@@ -93,7 +133,9 @@ def aggregate_scenarios(artifact_root: Path, source_sha: str, output_root: Path)
         rows.append(
             {
                 "scenario": required,
-                "artifact_count": 1,
+                "artifact_count": len(available),
+                "available_attempts": available_attempts,
+                "selected_attempt": selected_attempt,
                 "result": result,
                 "primary_failure_code": failure_code,
             }
@@ -105,16 +147,12 @@ def aggregate_scenarios(artifact_root: Path, source_sha: str, output_root: Path)
         if result != "PASS":
             all_valid = False
 
-    if any(count != 1 for count in counts.values()):
-        all_valid = False
-    if set(observed) != set(REQUIRED_SCENARIOS):
-        all_valid = False
-
     manifest = {
         "schema_version": 1,
         "source_revision": source_sha,
         "required_scenarios": list(REQUIRED_SCENARIOS),
         "observed_scenarios": observed,
+        "invalid_artifacts": invalid_artifacts,
         "scenarios": rows,
         "result": "PASS" if all_valid else "BLOCKER",
     }
