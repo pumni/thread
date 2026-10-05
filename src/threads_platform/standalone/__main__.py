@@ -7,6 +7,8 @@ import asyncio
 import re
 import sys
 from collections.abc import Sequence
+from pathlib import Path
+from uuid import UUID
 
 from threads_platform.application.ports.threads import (
     ThreadsAPIError,
@@ -27,6 +29,11 @@ from threads_platform.standalone.api import (
     StandaloneApiError,
     bind_env_credential,
     build_threads_http_client,
+)
+from threads_platform.standalone.mutations import (
+    LocalOperationStore,
+    LocalThreadsMutationRuntime,
+    StandaloneMutationError,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
@@ -88,6 +95,27 @@ async def _run_api_command(args: argparse.Namespace, store: LocalAccountStore) -
         return "".join(lines)
 
 
+async def _run_post_command(
+    args: argparse.Namespace,
+    root: Path,
+    store: LocalAccountStore,
+) -> str:
+    settings = Settings()
+    async with build_threads_http_client(settings) as client:
+        api = HttpThreadsAPI(client)
+        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
+        operations = LocalOperationStore(root)
+        runtime = LocalThreadsMutationRuntime(
+            root,
+            store,
+            api,
+            secret_resolver,
+            operations,
+        )
+        result = await runtime.publish_text(args.alias, args.text)
+        return f"published operation={result.operation_id} media={result.media_id}\n"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="threads-local")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -116,6 +144,15 @@ def _build_parser() -> argparse.ArgumentParser:
         page_parser.add_argument("alias")
         page_parser.add_argument("thread_id")
         page_parser.add_argument("--after")
+
+    post_parser = commands.add_parser("post")
+    post_parser.add_argument("alias")
+    post_parser.add_argument("text")
+
+    operation_parser = commands.add_parser("operation")
+    operation_commands = operation_parser.add_subparsers(dest="operation_command", required=True)
+    show_parser = operation_commands.add_parser("show")
+    show_parser.add_argument("operation_id")
     return parser
 
 
@@ -142,16 +179,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sys.stdout.write(f"{account.alias} {account.id}\n")
             return 0
 
+        if args.command == "operation":
+            try:
+                operation_id = UUID(args.operation_id)
+            except ValueError, AttributeError:
+                raise StandaloneMutationError("OPERATION_NOT_FOUND") from None
+            operation = LocalOperationStore(root).get(operation_id)
+            sys.stdout.write(
+                f"operation {operation.id} kind={operation.kind} phase={operation.phase} "
+                f"container={operation.container_id or '-'} "
+                f"media={operation.media_id or '-'} "
+                f"outcome={operation.outcome_code or '-'}\n"
+            )
+            return 0
+
+        if args.command == "post":
+            output = asyncio.run(_run_post_command(args, root, store))
+            sys.stdout.write(output)
+            return 0
+
         sys.stdout.write(asyncio.run(_run_api_command(args, store)))
         return 0
     except (
         StandaloneAccountError,
         StandaloneRuntimeError,
         StandaloneApiError,
+        StandaloneMutationError,
         ThreadsCredentialError,
         ThreadsAPIError,
     ) as error:
-        sys.stderr.write(f"ERROR {error.code}\n")
+        operation_id = getattr(error, "operation_id", None)
+        suffix = f" operation={operation_id}" if operation_id is not None else ""
+        sys.stderr.write(f"ERROR {error.code}{suffix}\n")
         return 1
     except KeyboardInterrupt:
         sys.stderr.write("ERROR INTERRUPTED\n")

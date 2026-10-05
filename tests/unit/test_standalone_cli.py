@@ -12,6 +12,8 @@ from pydantic import SecretStr
 import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.accounts as account_module
 from threads_platform.application.ports.threads import (
+    MediaContainer,
+    MediaContainerRequest,
     PublishingQuota,
     RemoteMedia,
     RemoteReply,
@@ -24,6 +26,10 @@ from threads_platform.config.settings import Settings
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.standalone.__main__ import main
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
+from threads_platform.standalone.mutations import (
+    LocalOperationStore,
+    PublishedTextResult,
+)
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
 
@@ -452,3 +458,149 @@ def test_cli_never_prints_resolved_token_on_api_failure(
     assert token_sentinel not in captured.out + captured.err
     assert context.enter_count == 1
     assert context.exit_count == 1
+
+
+def test_cli_post_success_has_exact_output_and_closes_http_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    calls: list[tuple[str, str]] = []
+
+    async def fake_publish(runtime: object, alias: str, text: str) -> PublishedTextResult:
+        calls.append((alias, text))
+        return PublishedTextResult(operation_id, "media-123")
+
+    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "publish_text", fake_publish)
+
+    result = main(["post", "alice", "chosen text"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("alice", "chosen text")]
+    assert captured.out == f"published operation={operation_id} media=media-123\n"
+    assert captured.err == ""
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+@pytest.mark.parametrize("text", ["  \t", "x" * 501])
+def test_cli_post_validation_is_bounded_and_does_not_echo_text(
+    text: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+
+    result = main(["post", "alice", text])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_POST_TEXT\n"
+    assert text not in captured.out + captured.err
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+def test_cli_post_ambiguous_error_includes_operation_and_redacts_token_and_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    token_sentinel = "token-sentinel-never-output"
+    text_sentinel = "post-text-sentinel-never-output"
+    token_env_name = "THREADS_PLATFORM_THREADS_TOKEN_LOCAL07_TEST"
+    monkeypatch.setenv(token_env_name, token_sentinel)
+    store = account_module.LocalAccountStore(tmp_path / "local")
+    store.add("alice")
+    store.set_credential_ref("alice", f"env://{token_env_name}")
+    api_calls: list[str] = []
+
+    class _FailingPublishApi:
+        async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
+            assert token.get_secret_value() == token_sentinel
+            api_calls.append("quota")
+            return PublishingQuota(usage=1, total=100)
+
+        async def create_container(
+            self, token: SecretStr, request: MediaContainerRequest
+        ) -> MediaContainer:
+            assert token.get_secret_value() == token_sentinel
+            assert request == MediaContainerRequest(media_type="TEXT", text=text_sentinel)
+            api_calls.append("create")
+            return MediaContainer(container_id="container-123")
+
+        async def publish_container(self, token: SecretStr, container_id: str) -> str:
+            assert token.get_secret_value() == token_sentinel
+            assert container_id == "container-123"
+            api_calls.append("publish")
+            raise ThreadsAPIError("THREADS_RATE_LIMITED")
+
+    def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
+        return cast(HttpThreadsAPI, _FailingPublishApi())
+
+    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+
+    result = main(["post", "alice", text_sentinel])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    match = re.fullmatch(
+        r"ERROR PUBLISH_OUTCOME_AMBIGUOUS operation=([0-9a-f-]{36})\n", captured.err
+    )
+    assert match is not None
+    operation_id = UUID(match.group(1))
+    assert api_calls == ["quota", "create", "publish"]
+    assert LocalOperationStore(tmp_path / "local").get(operation_id).phase == "AMBIGUOUS"
+    assert token_sentinel not in captured.out + captured.err
+    assert text_sentinel not in captured.out + captured.err
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+def test_cli_operation_show_is_local_only_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    root.mkdir(parents=True)
+    operation = LocalOperationStore(root).create_received(
+        UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    )
+
+    def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
+        raise AssertionError("operation show must not build an HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+
+    result = main(["operation", "show", str(operation.id)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        f"operation {operation.id} kind=POST_TEXT phase=RECEIVED container=- media=- outcome=-\n"
+    )
+    assert captured.err == ""
+
+
+def test_cli_operation_show_invalid_id_has_safe_error_without_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+
+    def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
+        raise AssertionError("operation show must not build an HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+
+    result = main(["operation", "show", "not-an-operation-id"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR OPERATION_NOT_FOUND\n"
