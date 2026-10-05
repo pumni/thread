@@ -133,7 +133,8 @@ adapter; business/domain concept; accidental cross-topology dependency.
 | `WorkerProcessLock` Protocol | `application.ports.worker_agent` — accidental cross-topology dependency on a Worker-owned port | A filesystem lock is a shared local execution primitive, not Worker Agent contract state | `ProcessLock` in `application.ports.process_lock` | #178 |
 | `WorkerProcessLock` implementation | `infrastructure.worker_agent.process_lock` — accidental cross-topology dependency | Generic OS/file lock implementation is owned by Worker Agent package, then Standalone imports it | `FilesystemProcessLock` in `infrastructure.local.process_lock` | #178 |
 | `WorkerProcessAlreadyRunning` | `infrastructure.worker_agent.process_lock` — accidental cross-topology dependency | Shared consumer outcome has Worker-specific ownership/name | `ProcessAlreadyRunning` in `application.ports.process_lock`; concrete adapter raises it | #178 |
-| `BrowserEngine`, `BrowserEngineSession`, feed/profile/thread/media session Protocols | `workers.browser` — accidental cross-topology dependency when imported by Standalone/Playwright adapter | These are adapter ports without lease or Worker orchestration semantics | `application.ports.browser` — genuinely shared execution primitive/port | #179 |
+| `BrowserEngine`, `BrowserEngineSession`, feed/profile/thread/media session Protocols | `workers.browser` — accidental cross-topology dependency when imported by Standalone/Playwright adapter | Adapter base/session contracts are not Worker orchestration | `application.ports.browser` — shared engine/session Protocols; base `BrowserEngineSession` contains only `navigate(...)` and `close()` | #179 |
+| `BrowserEngineSession.inspect_surface()` | Current shared base Protocol in `workers.browser` | It exposes Worker synthetic-session inspection to every engine consumer | Remove from shared base; define `workers.browser.WorkerSurfaceEngineSession` with `inspect_surface() -> BrowserSurface` | #179 |
 | Generic browser errors (`BrowserAdapterError`, contract/locator/session/challenge/navigation/runtime/network errors) | `workers.browser` — accidental cross-topology dependency for standalone and generic adapter | Adapter failures should not be defined by Worker orchestration | `application.ports.browser` — shared browser-port outcomes | #179 |
 | `BrowserAccountAffinityMismatch`, `ActionOutcomeAmbiguous`, `WorkerJobLeaseLost`, `WorkerJobRetrySafetyViolation` | `workers.browser` — Worker/distributed orchestration | They carry Worker account/session/job/intervention semantics | Remain in `workers.browser` | None |
 | `BrowserSurface`, `FeedAncestorObservation`, `FeedCandidateObservation`, `PreparedMediaComposer` | `workers.browser` — accidental cross-topology dependency for the adapter | Playwright produces these port observations/handles; their types carry no Worker identity | `application.ports.browser` | #179 |
@@ -168,12 +169,12 @@ adapter; business/domain concept; accidental cross-topology dependency.
 |---|---|
 | `application/ports/process_lock.py` | `ProcessLock` Protocol (`held`, `acquire()`, `release()`); `ProcessAlreadyRunning` shared outcome exception |
 | `infrastructure/local/process_lock.py` | `FilesystemProcessLock`, the OS-specific file-lock implementation of `ProcessLock`; no Worker-specific imports or names |
-| `application/ports/browser.py` | `BrowserEngine`, `BrowserEngineSession`, `BrowserFeedEngineSession`, `BrowserThreadOpenEngineSession`, `BrowserProfileOpenEngineSession`, `BrowserMediaEngineSession`; `BrowserLaunchRequest`; `BrowserSurface`, `FeedAncestorObservation`, `FeedCandidateObservation`, `PreparedMediaComposer`; generic browser adapter errors listed in ADR-0009; `BrowserNetworkProtocol`, `BrowserNetworkRoute`, `BrowserProxyCredentials`; shared `BROWSER_FEED_ORIGIN` and `BROWSER_FEED_CANDIDATE_BOUND` contract constants |
-| `workers/browser.py` | `WorkerJobExecution`, `WorkerJobReconnectRecovery`, `WorkerBrowserSession`, `PlaywrightBrowserAdapter`, managed Worker profile resolver; `BrowserNavigationPolicy`, `BrowserSurfaceState`, synthetic contract classifier; `BrowserAccountAffinityMismatch`, `ActionOutcomeAmbiguous`, `WorkerJobLeaseLost`, `WorkerJobRetrySafetyViolation`; imports generic contracts from `application.ports.browser` |
+| `application/ports/browser.py` | `BrowserEngine`; base `BrowserEngineSession` Protocol with only `navigate(...)` and `close()`; feed/profile/thread/media engine-session Protocols; `BrowserLaunchRequest`; raw `BrowserSurface`, `FeedAncestorObservation`, `FeedCandidateObservation`, `PreparedMediaComposer`; generic browser adapter errors listed in ADR-0009; `BrowserNetworkProtocol`, `BrowserNetworkRoute`, `BrowserProxyCredentials`; shared `BROWSER_FEED_ORIGIN` and `BROWSER_FEED_CANDIDATE_BOUND` contract constants |
+| `workers/browser.py` | `WorkerSurfaceEngineSession` Protocol with `inspect_surface() -> BrowserSurface`; `WorkerJobExecution`, `WorkerJobReconnectRecovery`, `WorkerBrowserSession`, `PlaywrightBrowserAdapter`, managed Worker profile resolver; `BrowserNavigationPolicy`, `BrowserSurfaceState`, `classify_browser_surface`, `SUPPORTED_UI_CONTRACT_ID`, `SUPPORTED_UI_CONTRACT_VERSION`; `BrowserAccountAffinityMismatch`, `ActionOutcomeAmbiguous`, `WorkerJobLeaseLost`, `WorkerJobRetrySafetyViolation`; imports generic contracts from `application.ports.browser` |
 | `workers/sessions.py` | `InvalidSessionTransition`, Worker session state/manager Protocols and implementation, `NetworkProfileApplication`, `ProxyCredentialProvider`, `BrowserSessionOpenResult`; `WorkerNetworkRoute(account_id, browser_route, credential_ref)` holds Worker-only network affinity metadata and a shared `BrowserNetworkRoute` |
 | `infrastructure/browser/playwright_engine.py` | `PlaywrightBrowserEngine`, Playwright session, selectors/recognition, existing guard/error mapping, and proxy-settings conversion; imports only `application.ports.browser`, stdlib, and Playwright |
-| `infrastructure/threads_api/environment_credentials.py` | `THREADS_TOKEN_ENV_PREFIX`, ref validator/normalizer, secret-value validator, `EnvironmentThreadsCredentialSecretResolver`; imports the resolver/error port but no persistence/UoW/domain account lifecycle |
-| `infrastructure/threads_api/credentials.py` | `PersistentThreadsAccessTokenProvider` and private persistence lifecycle helpers; imports `UnitOfWork`, domain account metadata, `Clock`, Threads resolver port, and environment validators |
+| `infrastructure/threads_api/environment_credentials.py` | `THREADS_TOKEN_ENV_PREFIX`, ref validator/normalizer, exact helper `infrastructure.threads_api.environment_credentials._valid_secret_value`, `EnvironmentThreadsCredentialSecretResolver`; imports the resolver/error port but no persistence/UoW/domain account lifecycle |
+| `infrastructure/threads_api/credentials.py` | `PersistentThreadsAccessTokenProvider` and private persistence lifecycle helpers; imports `UnitOfWork`, domain account metadata, `Clock`, Threads resolver port, `validate_threads_credential_ref`, and `_valid_secret_value` from `environment_credentials` |
 | `infrastructure/threads_api/composition.py` | Control Plane composition imports environment resolver and persistent provider from their separate modules |
 
 `BrowserNetworkRoute` fields are exactly `protocol: BrowserNetworkProtocol`,
@@ -207,6 +208,33 @@ Standalone derives the local profile directory and per-account lock path from
 `BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None)`, with no proxy
 credentials. Neither account UUID nor a substituted Worker UUID enters the
 generic browser request.
+
+### Synthetic surface inspection ownership and marker freeze
+
+The shared `application.ports.browser.BrowserEngineSession` is a topology-neutral
+base Protocol containing exactly `navigate(url, *, allowed_origins)` and
+`close()`. It does not declare `inspect_surface()`.
+`BrowserSurface` remains the shared raw observation DTO. The Worker-owned
+structural Protocol is exact:
+
+```python
+class WorkerSurfaceEngineSession(Protocol):
+    async def inspect_surface(self) -> BrowserSurface: ...
+```
+
+`BrowserSurfaceState`, `classify_browser_surface`,
+`SUPPORTED_UI_CONTRACT_ID`, and `SUPPORTED_UI_CONTRACT_VERSION` remain in
+`workers.browser`. `BrowserEngine.open()` returns the shared base Protocol;
+Worker code casts/uses the returned concrete engine session as
+`WorkerSurfaceEngineSession`, and `WorkerBrowserSession` consumes that Worker
+Protocol. Standalone uses only `BrowserEngineSession` and never depends on
+synthetic surface inspection.
+
+The concrete `_PlaywrightBrowserSession` may retain `inspect_surface()` as an
+extra concrete capability. ARCH-03 keeps these existing marker names and root
+locator unchanged: `worker-ui-contract`, `worker-ui-version`,
+`worker-session-state`, `[data-worker-ui-root]`. Do not rename, widen, or change
+their semantics; this extraction changes interface ownership only.
 
 ### Before/after import examples
 
@@ -291,6 +319,27 @@ request = BrowserLaunchRequest(
 )
 ```
 
+Worker capability modules also change imports in ARCH-03 because they currently
+import generic browser symbols from `workers.browser`. The exact source family
+is:
+
+```text
+src/threads_platform/workers/feed_browse.py
+src/threads_platform/workers/profile_open.py
+src/threads_platform/workers/thread_open.py
+src/threads_platform/workers/media_local_upload.py
+```
+
+Split their imports by ownership: generic/shared symbols such as
+`BROWSER_FEED_ORIGIN`, `BROWSER_FEED_CANDIDATE_BOUND`, `BrowserAdapterError`,
+`BrowserContractError`, `FeedCandidateObservation`, `PreparedMediaComposer`,
+`SessionExpired`, `ChallengeDetected`, and `RemoteSessionStateUncertain` come
+from `application.ports.browser`; Worker policy/orchestration symbols such as
+`BrowserNavigationPolicy`, `WorkerBrowserSession`, `WorkerJobExecution`,
+`WorkerJobLeaseLost`, and `ActionOutcomeAmbiguous` remain imported from
+`workers.browser`. Do not retain or add an implicit or explicit compatibility
+re-export from `workers.browser` to avoid these four import updates.
+
 ## Expected changed file families by checkpoint
 
 These are planned ownership surfaces, not additional authorization for ARCH-01.
@@ -298,7 +347,7 @@ These are planned ownership surfaces, not additional authorization for ARCH-01.
 | Checkpoint | Expected source/test families |
 |---|---|
 | #178 ARCH-02 | Add `application/ports/process_lock.py` and `infrastructure/local/process_lock.py`; remove `WorkerProcessLock` Protocol from `application/ports/worker_agent.py` and Worker-owned implementation module; rewire `workers/runtime.py`, `workers/__main__.py`, `standalone/runtime.py`; update `tests/unit/test_worker_agent_foundation.py` and `tests/unit/test_standalone_runtime.py` lock imports/assertions. |
-| #179 ARCH-03 | Add `application/ports/browser.py`; update `workers/browser.py`, `workers/sessions.py`, `infrastructure/browser/playwright_engine.py`, `standalone/runtime.py`; update browser adapter, standalone runtime, Worker feed/profile/thread/media unit tests and test doubles. No selectors, redirect rules, timeouts, feature allowlists, proxy capabilities, or WorkerJob behavior change. |
+| #179 ARCH-03 | Add `application/ports/browser.py`; update `workers/browser.py`, `workers/sessions.py`, `workers/feed_browse.py`, `workers/profile_open.py`, `workers/thread_open.py`, `workers/media_local_upload.py`, `infrastructure/browser/playwright_engine.py`, and `standalone/runtime.py`; update browser adapter, standalone runtime, Worker feed/profile/thread/media unit tests and test doubles. Split generic imports to the shared port and Worker policy/orchestration imports to `workers.browser`; do not use compatibility re-exports. Preserve `worker-ui-contract`, `worker-ui-version`, `worker-session-state`, and `[data-worker-ui-root]` exactly, with no selector or semantics change. No redirect rules, timeouts, feature allowlists, proxy capabilities, or WorkerJob behavior change. |
 | #180 ARCH-04 | Add `infrastructure/threads_api/environment_credentials.py`; split `infrastructure/threads_api/credentials.py`; update `standalone/__main__.py`, `standalone/api.py`, `tools/credential_admin.py`, `infrastructure/threads_api/composition.py`; update unit and PostgreSQL credential/composition tests. |
 | #181 ARCH-05 | Add focused AST/import architecture fitness tests under `tests/unit/` (one test module is sufficient); no runtime implementation or dependency change. Enforce the exact rules below. |
 
@@ -381,30 +430,33 @@ importing runtime modules. It must implement these exact rules:
 3. For `application/ports/browser.py` and `application/ports/process_lock.py`,
    reject targets under `domain`, `workers`, `standalone`, `infrastructure`,
    `transport`, or persistence implementation modules.
-4. Inspect the `BrowserLaunchRequest` dataclass. Its ordered annotated field
+4. Inspect the shared `BrowserEngineSession` Protocol and assert its ordered
+   operation set is exactly `navigate`, `close`; it must not expose
+   `inspect_surface()` or Worker synthetic/session-surface inspection.
+5. Inspect the `BrowserLaunchRequest` dataclass. Its ordered annotated field
    names must equal exactly `("profile_directory", "network_route",
    "proxy_credentials", "headless")`; its annotations must resolve to `Path`,
    `BrowserNetworkRoute`, `BrowserProxyCredentials | None`, and `bool` with the
    stated defaults. Reject `worker_id`, `worker_job_id`, account/profile IDs,
    lease/checkpoint/control-client/session-state fields, or extra fields.
-5. Inspect `BrowserNetworkRoute` and `BrowserProxyCredentials` dataclasses.
+6. Inspect `BrowserNetworkRoute` and `BrowserProxyCredentials` dataclasses.
    Their ordered fields must equal exactly `("protocol", "host", "port")` and
    `("username", "password")`; no ownership IDs or credential references may
    be added.
-6. Reject `domain.workers.NetworkProtocol` imports from Standalone and
+7. Reject `domain.workers.NetworkProtocol` imports from Standalone and
    `infrastructure.browser`. Permit its use only in Worker domain/assignment
    code; `workers.sessions` is the explicit mapping owner to
    `BrowserNetworkProtocol`.
-7. In `infrastructure/threads_api/environment_credentials.py`, reject imports
+8. In `infrastructure/threads_api/environment_credentials.py`, reject imports
    from `application.ports.repositories`, `domain.accounts`,
    `infrastructure.persistence`, and names `UnitOfWork`, `UnitOfWorkFactory`, or
    `PersistentThreadsAccessTokenProvider`.
-8. Reject duplicate definitions, compatibility aliases, wildcard imports, and
+9. Reject duplicate definitions, compatibility aliases, wildcard imports, and
    explicit `__all__` re-exports of moved symbols from
    `infrastructure.worker_agent.process_lock`, `workers.browser`, and
    `workers.sessions`. Permit ordinary imports from the new port used internally
    by Worker code. Moved symbols must be defined only at their target modules.
-9. Inspect `Import`, `ImportFrom`, package-relative imports, and literal calls
+10. Inspect `Import`, `ImportFrom`, package-relative imports, and literal calls
    to `__import__` or `importlib.import_module`; report the source file and
    resolved offending module.
 

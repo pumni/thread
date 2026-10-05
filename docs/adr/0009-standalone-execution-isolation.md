@@ -75,10 +75,20 @@ or account/profile/network ownership.
 The topology-neutral browser engine port and its errors/DTOs live in
 `threads_platform.application.ports.browser`. It contains:
 
-- `BrowserEngine`, `BrowserEngineSession`, and the feed, profile, thread, and
-  media engine-session Protocols;
+- `BrowserEngine` and `BrowserEngineSession`, plus the feed, profile, thread,
+  and media engine-session Protocols. The shared base `BrowserEngineSession`
+  declares only these operations:
+
+  ```python
+  async def navigate(self, url: str, *, allowed_origins: frozenset[str]) -> None: ...
+  async def close(self) -> None: ...
+  ```
+
+  It does not declare `inspect_surface()` or any Worker synthetic/session
+  inspection operation;
 - `BrowserSurface`, `FeedAncestorObservation`, `FeedCandidateObservation`, and
-  `PreparedMediaComposer`;
+  `PreparedMediaComposer`. `BrowserSurface` remains a shared raw observation
+  DTO and does not carry the Worker classifier or policy;
 - `BrowserAdapterError` and engine/contract outcomes used by the adapter:
   `BrowserContractError`, `LocatorNotFound`, `SessionExpired`,
   `ChallengeDetected`, `RemoteSessionStateUncertain`, `NavigationTimeout`,
@@ -89,9 +99,33 @@ The topology-neutral browser engine port and its errors/DTOs live in
 The following remain in `workers.browser` because they encode WorkerJob or
 Worker capability orchestration: `WorkerJobExecution`, reconnect recovery,
 `WorkerBrowserSession`, `PlaywrightBrowserAdapter`, managed Worker profile
-resolution, `BrowserAccountAffinityMismatch`, `ActionOutcomeAmbiguous`,
-`WorkerJobLeaseLost`, `WorkerJobRetrySafetyViolation`, the synthetic
-`worker.synthetic` surface classifier/state, and `BrowserNavigationPolicy`.
+resolution, `WorkerSurfaceEngineSession`, `BrowserAccountAffinityMismatch`,
+`ActionOutcomeAmbiguous`, `WorkerJobLeaseLost`,
+`WorkerJobRetrySafetyViolation`, `BrowserSurfaceState`,
+`classify_browser_surface`, `SUPPORTED_UI_CONTRACT_ID`,
+`SUPPORTED_UI_CONTRACT_VERSION`, and `BrowserNavigationPolicy`.
+
+`workers.browser.WorkerSurfaceEngineSession` is the Worker-owned structural
+Protocol for interpreting the shared raw observation:
+
+```python
+class WorkerSurfaceEngineSession(Protocol):
+    async def inspect_surface(self) -> BrowserSurface: ...
+```
+
+`BrowserEngine.open()` continues returning the shared base Protocol. At the
+Worker adapter boundary, Worker code casts/uses the returned concrete session
+as `WorkerSurfaceEngineSession`; `WorkerBrowserSession` consumes that
+Worker-owned Protocol. Standalone uses only `BrowserEngineSession` and never
+depends on or calls synthetic surface inspection.
+
+The concrete `_PlaywrightBrowserSession` in
+`infrastructure.browser.playwright_engine` may retain `inspect_surface()` as
+an extra concrete capability. ARCH-03 preserves its exact existing markers and
+locator—`worker-ui-contract`, `worker-ui-version`,
+`worker-session-state`, and `[data-worker-ui-root]`—without renaming, widening,
+or changing their semantics. This interface extraction does not change browser
+behavior.
 
 `BrowserNavigationPolicy` chooses the allowlist for a specific Worker
 capability. The shared Playwright adapter continues enforcing the supplied
@@ -199,14 +233,19 @@ credential value type.
   resolver Protocol, with its existing sanitized credential errors.
 - `infrastructure.threads_api.environment_credentials` owns
   `THREADS_TOKEN_ENV_PREFIX`, `validate_threads_credential_ref`,
-  `normalize_threads_credential_ref`, secret-value validation, and
-  `EnvironmentThreadsCredentialSecretResolver`. Importing this module does not
-  import UnitOfWork/repository contracts, persisted account lifecycle, or
+  `normalize_threads_credential_ref`,
+  `infrastructure.threads_api.environment_credentials._valid_secret_value`,
+  and `EnvironmentThreadsCredentialSecretResolver`. Importing this module does
+  not import UnitOfWork/repository contracts, persisted account lifecycle, or
   persistence adapters.
 - `infrastructure.threads_api.credentials` owns
   `PersistentThreadsAccessTokenProvider` and its UnitOfWork/account lifecycle
-  behavior. It may import the environment reference validator and secret-value
-  validator; the environment module never imports the persistent provider.
+  behavior. It may import `validate_threads_credential_ref` and
+  `_valid_secret_value` from `environment_credentials`; the provider uses
+  `_valid_secret_value` after resolver return for the existing defensive token
+  validation. This dependency is one-way. The environment module never imports
+  UnitOfWork, repositories, persistent provider, persistence adapters, or domain
+  account lifecycle types.
 - `infrastructure.threads_api.composition` composes the environment resolver
   and persistent provider for Control Plane processes. Standalone imports only
   the environment credential module and existing Threads API adapter/port.
@@ -274,26 +313,30 @@ The checks will:
    fields are exactly `profile_directory`, `network_route`,
    `proxy_credentials`, and `headless`; reject Worker/account/profile identity,
    WorkerJob/lease/checkpoint, control-client, or Worker-session fields.
-5. Inspect `BrowserNetworkRoute` and `BrowserProxyCredentials` dataclass
+5. Inspect the shared `BrowserEngineSession` Protocol and assert its ordered
+   operation set is exactly `navigate`, `close`; reject `inspect_surface()` and
+   Worker synthetic/session-surface inspection from the shared base Protocol.
+6. Inspect `BrowserNetworkRoute` and `BrowserProxyCredentials` dataclass
    annotations and assert their ordered fields are exactly `protocol`, `host`,
    `port`, and `username`, `password`, respectively.
-6. Reject imports of `domain.workers.NetworkProtocol` from Standalone and
+7. Reject imports of `domain.workers.NetworkProtocol` from Standalone and
    `infrastructure.browser`; permit the explicit Worker mapping in
    `workers.sessions` only.
-7. Parse `infrastructure.threads_api.environment_credentials` and reject
+8. Parse `infrastructure.threads_api.environment_credentials` and reject
    imports from `application.ports.repositories`, `domain.accounts`,
    `infrastructure.persistence`, or symbols named `UnitOfWork`,
    `UnitOfWorkFactory`, or `PersistentThreadsAccessTokenProvider`.
-8. Reject duplicate definitions, compatibility aliases, wildcard imports, and
+9. Reject duplicate definitions, compatibility aliases, wildcard imports, and
    explicit `__all__` re-exports of moved symbols from
    `infrastructure.worker_agent`, `workers.browser`, and `workers.sessions`.
    Permit normal imports from the new shared port when Worker implementation
    needs those types internally.
 
-The AST walker will resolve `Import`, `ImportFrom`, package-relative imports,
-and literal `__import__` / `importlib.import_module` calls. It will report the
-offending source path and import target. It will not blanket-ban the existing
-Worker Agent ports or redesign unrelated `application.ports` dependencies.
+10. The AST walker will resolve `Import`, `ImportFrom`, package-relative
+    imports, and literal `__import__` / `importlib.import_module` calls. It will
+    report the offending source path and import target. It will not blanket-ban
+    the existing Worker Agent ports or redesign unrelated `application.ports`
+    dependencies.
 
 ## Migration sequence
 
@@ -304,9 +347,14 @@ Worker Agent ports or redesign unrelated `application.ports` dependencies.
 2. **ARCH-03 / #179:** add `application.ports.browser`; move generic browser
    contracts, errors, DTOs, network configuration, and shared origin/bound
    constants; split Worker-only affinity metadata into `WorkerNetworkRoute`;
-   rewire the Playwright adapter, Worker orchestration, and Standalone; remove
-   all Worker/domain imports from `infrastructure.browser` and all Worker
-   imports from Standalone.
+   rewire the Playwright adapter, Worker orchestration, Standalone, and the
+   `workers.feed_browse`, `workers.profile_open`, `workers.thread_open`, and
+   `workers.media_local_upload` capability modules. Those four modules split
+   imports so generic/shared browser symbols come from `application.ports.browser`
+   while Worker orchestration/policy symbols remain from `workers.browser`;
+   no compatibility re-export is used. Keep the existing synthetic inspection
+   markers/selectors exactly unchanged. Remove all Worker/domain imports from
+   `infrastructure.browser` and all Worker imports from Standalone.
 3. **ARCH-04 / #180:** move environment credential primitives/resolution to
    `infrastructure.threads_api.environment_credentials`; leave the persistent
    provider in `credentials`; update Standalone, admin tooling, composition,
