@@ -1,132 +1,24 @@
-# Codex Execution Guide v2
+# Codex Execution Guide (Deprecated / Compatibility Router)
 
-## 1. Context loading for a fresh Codex session
+> [!NOTE]
+> **DEPRECATED — USE CANONICAL PROCESS & CONTEXT MAP**
+> This standalone guide has been deprecated to eliminate duplicated policies and maintain single canonical homes for all engineering standards.
+> Coding agents must follow the live progressive disclosure context layer instead of relying on static guide copies.
 
-Codex should use the repository context layer rather than preload every document.
+## Canonical Homes for Engineering Standards
 
-Before coding:
-
-1. follow root `AGENTS.md` (and nearest nested `AGENTS.md` if working within a subtree);
-2. read the authorized GitHub issue/batch and coordinator comments as task authority;
-3. use `docs/CONTEXT_MAP.md` to select matching skills and relevant ADR/protocol/runbook docs;
-4. inspect current code and tests before proposing new abstractions.
-
-Read broader project documentation only when the task genuinely crosses those boundaries.
-
-Do not use the deleted legacy Facebook report as implementation architecture.
-
-## 2. Authorization boundary
-
-The roadmap is not authorization.
-
-Implement only the issue/batch explicitly handed off by the coordinator.
-
-Do not start the next C-stage because earlier work appears complete.
-
-## 3. Batch discipline
-
-For an authorized batch:
-- use the requested branch;
-- implement in dependency order;
-- keep issue-level commits/commit groups;
-- run verification at boundaries;
-- continue without intermediate review only inside the authorized batch;
-- stop at the designated checkpoint PR.
-
-Do not self-merge.
-
-## 4. Architecture rules
-
-Always preserve:
-- transport -> application -> domain;
-- infrastructure/worker adapters implement ports;
-- PostgreSQL source of truth;
-- Command = business intent;
-- WorkerJob = remote execution assignment;
-- leases/fencing for distributed ownership;
-- typed bounded failures/retries;
-- no secrets in logs/Git.
-
-Domain must not import FastAPI, httpx, SQLAlchemy, WebSocket libs, browser libs, Windows APIs, or Meta DTOs.
-
-## 5. Distributed-worker rules
-
-For C1+:
-- WebSocket is notification/presence only;
-- durable state mutation uses the agreed Worker protocol;
-- wrong worker/account assignment must fail;
-- stale lease must fail;
-- worker OFFLINE/DRAINING/UPGRADE_REQUIRED cannot claim;
-- hostname is not worker identity;
-- no automatic profile migration;
-- strict-online behavior applies;
-- worker local journal is recovery metadata only.
-
-## 6. Browser rules
-
-Browser implementation is not allowed before C3.
-
-When authorized:
-- browser is an infrastructure/worker adapter;
-- every action corresponds to an explicit capability;
-- UI contract mismatch fails closed;
-- no random selector fallback;
-- no anti-detect/fingerprint spoofing;
-- no automated challenge/2FA bypass;
-- no plaintext account-password model by default;
-- mutation requires checkpoint/recovery design;
-- lease loss prevents new irreversible actions.
-
-## 7. External Threads API rules
-
-- verify current official Meta docs/changelog before changing external contract code;
-- documentation fixtures are labeled documentation-contract;
-- live fixtures require scrubbed live evidence;
-- issue #3 remains the live production gate;
-- do not invent undocumented response behavior.
-
-## 8. Dependencies
-
-A new runtime dependency needs written justification in PR.
-
-Requires coordinator decision:
-- Redis/message broker;
-- microservices;
-- primary DB change;
-- new browser execution architecture;
-- automatic profile migration;
-- OAuth/security-model change;
-- fleet-wide secret scheme;
-- breaking CRM/Worker protocol change.
-
-## 9. Standard verification
-
-~~~bash
-uv sync --locked
-uv run ruff check .
-uv run ruff format --check .
-uv run pyright
-uv run alembic check
-uv run pytest
-~~~
-
-DB changes also require migration/integration verification.
-Distributed changes require concurrent-claim, stale-lease, reconnect/restart, wrong-worker/affinity and protocol-version tests.
-Browser changes require adapter-contract, UI-mismatch, session/intervention and safe-boundary/lease-loss tests.
-
-## 10. PR format
-
-Include Summary, Issue/commit map, Architecture, Data/migrations, Protocol, Failure/recovery, Verification, Security, External evidence, Risks/follow-ups.
-
-## 11. Stop conditions
-
-Stop the affected work and report when:
-- requirements conflict with ADR/source-of-truth;
-- safe recovery cannot be proven;
-- production credential/data is required;
-- browser is required before C3;
-- platform UI/API behavior materially differs from contract;
-- implementation would need evasion/bypass behavior;
-- quality gates cannot pass without weakening standards.
-
-Partial completion of the authorized batch is preferable to architecture improvisation.
+| Topic / Requirement | Canonical Home | Purpose |
+|---|---|---|
+| **Live Task Authorization** | Authorized GitHub issue / user prompt / coordinator instruction | Sole authority defining current task scope and requirements. |
+| **Implementation Truth** | Code and passing tests on active checkout branch | Ground truth defining how the system currently behaves. |
+| **Global Architectural & Security Invariants** | Root [`AGENTS.md`](../AGENTS.md) | Universal laws, domain boundaries, stop conditions. |
+| **Component / Subtree Instructions** | Nearest nested `AGENTS.md` (e.g. [`apps/desktop/AGENTS.md`](../apps/desktop/AGENTS.md)) | Local subsystem guidelines and build constraints. |
+| **Task & Capability Documentation Routing** | [`docs/CONTEXT_MAP.md`](CONTEXT_MAP.md) | JIT capability-based document and skill router. |
+| **Specialized Workflows** | Project Skills ([`.agents/skills/`](../.agents/skills/)) | Specialized playbooks for DB migrations, browser capabilities, triage, etc. |
+| **Worker Wire & Protocol Contract** | [`docs/protocols/WORKER_PROTOCOL_V1.md`](protocols/WORKER_PROTOCOL_V1.md) & protocol docs | Additive framing, schemas, and versioning rules. |
+| **Hosted CI Failure Triage & Diagnostics** | [`docs/CI_AGENT_WORKFLOW.md`](CI_AGENT_WORKFLOW.md) & `ci-failure-triage` | Merge-authoritative CI gate, exact-SHA reporting, two-strike stop rule. |
+| **Review Severity & Acceptance Gates** | [`docs/ACCEPTANCE_AND_REVIEW.md`](ACCEPTANCE_AND_REVIEW.md) | Gate criteria (Architecture, Data, Reliability, Security, Browser). |
+| **Durable Architectural Decisions** | Accepted ADRs ([`docs/adr/`](adr/)) | Binding architectural contracts. |
+| **Task Contract & Deliverables Format** | [`.github/ISSUE_TEMPLATE/codex-task.md`](../.github/ISSUE_TEMPLATE/codex-task.md) | Task specification and acceptance checklist. |
+| **PR Evidence & Verification Structure** | [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md) | Mandatory evidence-capture format for pull requests. |
+| **Historical Milestone Archive** | [`docs/handoffs/PROJECT_STATE_HISTORY_2026-10.md`](handoffs/PROJECT_STATE_HISTORY_2026-10.md) | Milestone chronology for Batches A/B, TP-004A, C1–C6. |

@@ -15,6 +15,7 @@ Describe what changed and why.
 ## Architecture / ADRs
 
 Which modules, ports, state machines and ADRs changed?
+- [ ] Any new runtime dependency is documented with written justification
 
 ## Data / migrations
 
