@@ -25,6 +25,7 @@ Reject/request changes when:
 - worker owns authoritative business state;
 - profile affinity can be bypassed;
 - new broker/DB/microservice architecture appears without ADR;
+- new runtime dependencies appear without written justification;
 - browser code appears before/without approved scope.
 
 ## 3. Data gate

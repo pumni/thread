@@ -37,6 +37,7 @@ Inspect these sources before modifying protocol contracts:
 3. **Fencing & Leases:** All WorkerJob state updates and completions require a valid fencing token and active lease. Stale lease attempts must fail closed.
 4. **Additive Protocol Evolution:** New protocol capabilities must negotiate version cleanly. Unknown message types or fields from newer/older peers must fail closed without crashing the server.
 5. **High-Entropy Credentials:** Enrollment uses 256-bit single-use tokens; never replace high-entropy credentials with short unauthenticated tokens without an approved security review.
+6. **Identity & Affinity:** Worker identity is cryptographically derived via enrollment token and node UUID, never inferred from transient hostnames or network IP addresses. Account affinity is persistent and cannot be bypassed.
 
 ## Step-by-Step Procedure
 1. **Inspect active wire contracts:** Review message dataclasses and schemas in `src/threads_platform/application/worker_protocol.py`.
