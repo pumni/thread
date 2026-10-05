@@ -14,7 +14,7 @@ from threads_platform.application.ports.threads import (
 )
 from threads_platform.config.settings import Settings
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
-from threads_platform.infrastructure.threads_api.credentials import (
+from threads_platform.infrastructure.threads_api.environment_credentials import (
     EnvironmentThreadsCredentialSecretResolver,
 )
 from threads_platform.standalone.accounts import (

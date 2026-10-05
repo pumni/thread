@@ -24,7 +24,7 @@ from threads_platform.infrastructure.persistence.database import (
     create_session_factory,
 )
 from threads_platform.infrastructure.persistence.uow import SQLAlchemyUnitOfWorkFactory
-from threads_platform.infrastructure.threads_api.credentials import (
+from threads_platform.infrastructure.threads_api.environment_credentials import (
     EnvironmentThreadsCredentialSecretResolver,
     normalize_threads_credential_ref,
 )

@@ -42,8 +42,10 @@ from threads_platform.infrastructure.threads_api.composition import (
     compose_process_command_runtime,
 )
 from threads_platform.infrastructure.threads_api.credentials import (
-    EnvironmentThreadsCredentialSecretResolver,
     PersistentThreadsAccessTokenProvider,
+)
+from threads_platform.infrastructure.threads_api.environment_credentials import (
+    EnvironmentThreadsCredentialSecretResolver,
 )
 from threads_platform.tools.credential_admin import (
     bind_credential_metadata,

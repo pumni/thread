@@ -18,8 +18,10 @@ from threads_platform.application.worker_jobs import WorkerJobService
 from threads_platform.config.settings import Settings
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.infrastructure.threads_api.credentials import (
-    EnvironmentThreadsCredentialSecretResolver,
     PersistentThreadsAccessTokenProvider,
+)
+from threads_platform.infrastructure.threads_api.environment_credentials import (
+    EnvironmentThreadsCredentialSecretResolver,
 )
 
 
