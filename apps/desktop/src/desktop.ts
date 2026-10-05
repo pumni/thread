@@ -41,12 +41,6 @@ export interface DesktopSnapshot {
   };
 }
 
-export type WorkerDrainReason =
-  | "DESKTOP_QUIT"
-  | "DESKTOP_RESTART"
-  | "DESKTOP_LEGACY_CUTOVER"
-  | "DESKTOP_ROLLBACK";
-
 export type WorkerStatus =
   | "REGISTERING"
   | "ONLINE"
@@ -57,6 +51,7 @@ export type WorkerStatus =
   | "UPGRADE_REQUIRED";
 
 export interface WorkerDrainStatus {
+  workerId: string;
   status: WorkerStatus;
   activeBrowserSessions: number;
   runningWorkerJobs: number;
@@ -128,7 +123,6 @@ export const DESKTOP_COMMANDS = [
   "operator_change_password",
   "takeover_local_worker",
   "rollback_local_worker_to_legacy",
-  "request_local_worker_drain",
   "local_worker_drain_status",
   "controller_https_configure",
   "controller_https_reconfigure",
@@ -218,10 +212,6 @@ export function takeoverLocalWorker(): Promise<void> {
 
 export function rollbackLocalWorkerToLegacy(): Promise<void> {
   return invoke<void>("rollback_local_worker_to_legacy");
-}
-
-export function requestLocalWorkerDrain(reasonCode: WorkerDrainReason): Promise<WorkerDrainStatus> {
-  return invoke<WorkerDrainStatus>("request_local_worker_drain", { reasonCode });
 }
 
 export function localWorkerDrainStatus(): Promise<WorkerDrainStatus> {

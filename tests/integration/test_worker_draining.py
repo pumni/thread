@@ -190,6 +190,11 @@ async def test_running_job_remains_valid_through_drain_and_blocks_completion(
     job_before_drain_completion = await jobs.get(queued.id)
     attempts_before_drain_completion = await jobs.attempts(queued.id)
     await control.complete_drain(worker_id)
+    offline_status = await control.drain_status(worker_id)
+    assert offline_status.status is WorkerStatus.OFFLINE
+    assert offline_status.active_browser_sessions == 0
+    assert offline_status.running_worker_jobs == 0
+    assert not offline_status.quiescent
     with pytest.raises(WorkerControlError, match="WORKER_NOT_DRAINING"):
         await control.complete_drain(worker_id)
 

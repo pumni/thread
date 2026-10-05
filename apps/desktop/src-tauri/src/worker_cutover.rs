@@ -108,7 +108,7 @@ pub(super) async fn takeover<B: WorkerCutoverBackend>(backend: &mut B) -> Result
     let initial_status = match wait_for_legacy_active(backend).await {
         Ok(status) => status,
         Err(primary_error) if original_state == LegacyTaskState::Ready => {
-            return restore_ready_after_failed_start(backend, &primary_error).await;
+            return handle_ready_startup_failure(backend, &primary_error).await;
         }
         Err(error) => return Err(error),
     };
@@ -211,9 +211,15 @@ pub(super) async fn rollback_to_legacy<B: WorkerCutoverBackend>(
         .await
         .map_err(|_| "worker_rollback_failed".to_string())?;
 
-    match wait_for_legacy_online(backend).await {
-        Ok(()) => backend.mark_legacy_active(),
+    match wait_for_legacy_active(backend).await {
+        Ok(status) if matches!(status.status, WorkerStatus::Online | WorkerStatus::Degraded) => {
+            backend.mark_legacy_active()
+        }
         Err(_) => {
+            backend.mark_intervention("worker_rollback_failed");
+            Err("worker_rollback_failed".to_string())
+        }
+        Ok(_) => {
             backend.mark_intervention("worker_rollback_failed");
             Err("worker_rollback_failed".to_string())
         }
@@ -238,11 +244,14 @@ async fn wait_for_legacy_active<B: WorkerCutoverBackend>(
             {
                 return Ok(status);
             }
-            WorkerStatus::Online | WorkerStatus::Degraded | WorkerStatus::Registering => {}
+            WorkerStatus::Online
+            | WorkerStatus::Degraded
+            | WorkerStatus::Registering
+            | WorkerStatus::Offline => {}
             WorkerStatus::Draining => {
                 return Err("worker_cutover_drain_already_in_progress".to_string());
             }
-            WorkerStatus::Offline | WorkerStatus::Disabled | WorkerStatus::UpgradeRequired => {
+            WorkerStatus::Disabled | WorkerStatus::UpgradeRequired => {
                 return Err("worker_protocol_incompatible".to_string());
             }
         }
@@ -250,34 +259,7 @@ async fn wait_for_legacy_active<B: WorkerCutoverBackend>(
             backend.pause().await;
         }
     }
-    Err("worker_drain_timeout".to_string())
-}
-
-async fn wait_for_legacy_online<B: WorkerCutoverBackend>(backend: &mut B) -> Result<(), String> {
-    for attempt in 0..STATUS_POLL_LIMIT {
-        if backend.inspect_task().await? != LegacyTaskState::Running {
-            return Err("worker_legacy_task_start_failed".to_string());
-        }
-        let lock = backend.process_lock_observation();
-        if lock == ProcessLockObservation::Unavailable {
-            return Err("worker_process_lock_unavailable".to_string());
-        }
-        let status = backend.worker_status().await?;
-        match status.status {
-            WorkerStatus::Online if lock == ProcessLockObservation::Held => return Ok(()),
-            WorkerStatus::Online | WorkerStatus::Degraded | WorkerStatus::Registering => {}
-            WorkerStatus::Draining => {
-                return Err("worker_cutover_drain_already_in_progress".to_string());
-            }
-            WorkerStatus::Offline | WorkerStatus::Disabled | WorkerStatus::UpgradeRequired => {
-                return Err("worker_protocol_incompatible".to_string());
-            }
-        }
-        if attempt + 1 < STATUS_POLL_LIMIT {
-            backend.pause().await;
-        }
-    }
-    Err("worker_drain_timeout".to_string())
+    Err("worker_startup_timeout".to_string())
 }
 
 fn ensure_active_before_drain(status: WorkerStatus) -> Result<(), String> {
@@ -295,6 +277,7 @@ async fn wait_for_authoritative_offline<B: WorkerCutoverBackend>(
     backend: &mut B,
     post_request: WorkerDrainStatus,
 ) -> Result<(), String> {
+    validate_drain_status_shape(&post_request)?;
     match post_request.status {
         WorkerStatus::Offline => return validate_offline_status(&post_request),
         WorkerStatus::Draining => {}
@@ -308,6 +291,7 @@ async fn wait_for_authoritative_offline<B: WorkerCutoverBackend>(
 
     for attempt in 0..STATUS_POLL_LIMIT {
         let status = backend.worker_status().await?;
+        validate_drain_status_shape(&status)?;
         match status.status {
             WorkerStatus::Offline => return validate_offline_status(&status),
             WorkerStatus::Draining => {}
@@ -326,10 +310,30 @@ async fn wait_for_authoritative_offline<B: WorkerCutoverBackend>(
 }
 
 fn validate_offline_status(status: &WorkerDrainStatus) -> Result<(), String> {
-    if status.active_browser_sessions == 0 && status.running_worker_jobs == 0 && status.quiescent {
+    if status.status == WorkerStatus::Offline
+        && status.active_browser_sessions == 0
+        && status.running_worker_jobs == 0
+        && !status.quiescent
+    {
         Ok(())
     } else {
         Err("worker_drain_response_invalid".to_string())
+    }
+}
+
+fn validate_drain_status_shape(status: &WorkerDrainStatus) -> Result<(), String> {
+    match status.status {
+        WorkerStatus::Draining => {
+            let no_work_remains =
+                status.active_browser_sessions == 0 && status.running_worker_jobs == 0;
+            if status.quiescent == no_work_remains {
+                Ok(())
+            } else {
+                Err("worker_drain_response_invalid".to_string())
+            }
+        }
+        WorkerStatus::Offline => validate_offline_status(status),
+        _ => Ok(()),
     }
 }
 
@@ -404,18 +408,16 @@ async fn wait_for_desktop_online<B: WorkerCutoverBackend>(
                 }
                 return Ok(());
             }
-            WorkerStatus::Registering => {}
-            WorkerStatus::Degraded
-            | WorkerStatus::Draining
-            | WorkerStatus::Offline
-            | WorkerStatus::Disabled
-            | WorkerStatus::UpgradeRequired => return Err("worker_protocol_incompatible"),
+            WorkerStatus::Registering | WorkerStatus::Offline | WorkerStatus::Degraded => {}
+            WorkerStatus::Draining | WorkerStatus::Disabled | WorkerStatus::UpgradeRequired => {
+                return Err("worker_protocol_incompatible");
+            }
         }
         if attempt + 1 < STATUS_POLL_LIMIT {
             backend.pause().await;
         }
     }
-    Err("worker_drain_timeout")
+    Err("worker_startup_timeout")
 }
 
 async fn wait_for_desktop_exit<B: WorkerCutoverBackend>(backend: &mut B) -> Result<(), String> {
@@ -575,19 +577,18 @@ async fn restore_ready_after_failed_start<B: WorkerCutoverBackend>(
         return Err("worker_cutover_rollback_required".to_string());
     }
 
-    let status = match backend.worker_status().await {
+    let status = match wait_for_legacy_active(backend).await {
         Ok(status) => status,
-        Err(_) => {
-            backend.mark_intervention("worker_cutover_rollback_required");
+        Err(error) => {
+            backend.mark_intervention(startup_failure_diagnostic(&error));
+            if error == "worker_startup_timeout" {
+                return Err(error);
+            }
             return Err("worker_cutover_rollback_required".to_string());
         }
     };
     if !matches!(status.status, WorkerStatus::Online | WorkerStatus::Degraded) {
-        backend.mark_intervention(if status.status == WorkerStatus::Draining {
-            "worker_cutover_drain_already_in_progress"
-        } else {
-            "worker_protocol_incompatible"
-        });
+        backend.mark_intervention("worker_cutover_rollback_required");
         return Err("worker_cutover_rollback_required".to_string());
     }
     backend.mark_legacy_active()?;
@@ -598,6 +599,46 @@ async fn restore_ready_after_failed_start<B: WorkerCutoverBackend>(
         .mark_legacy_ready("worker_legacy_task_ready")
         .map_err(|_| "worker_cutover_rollback_required".to_string())?;
     Err(primary_error.to_string())
+}
+
+async fn handle_ready_startup_failure<B: WorkerCutoverBackend>(
+    backend: &mut B,
+    primary_error: &str,
+) -> Result<(), String> {
+    let task_state = backend.inspect_task().await;
+    let lock = backend.process_lock_observation();
+    match (task_state, lock) {
+        (Ok(LegacyTaskState::Ready), ProcessLockObservation::NotHeld) => {
+            backend
+                .mark_legacy_ready("worker_legacy_task_ready")
+                .map_err(|_| "worker_cutover_rollback_required".to_string())?;
+            Err(primary_error.to_string())
+        }
+        (Ok(LegacyTaskState::Running), ProcessLockObservation::Held) => {
+            backend.mark_intervention(startup_failure_diagnostic(primary_error));
+            Err(primary_error.to_string())
+        }
+        _ => {
+            backend.mark_intervention("worker_cutover_rollback_required");
+            Err("worker_cutover_rollback_required".to_string())
+        }
+    }
+}
+
+fn startup_failure_diagnostic(error: &str) -> &'static str {
+    match error {
+        "worker_startup_timeout" => "worker_startup_timeout",
+        "worker_process_lock_unavailable" => "worker_process_lock_unavailable",
+        "worker_legacy_task_start_failed" => "worker_legacy_task_start_failed",
+        "worker_cutover_drain_already_in_progress" => "worker_cutover_drain_already_in_progress",
+        "worker_protocol_incompatible" => "worker_protocol_incompatible",
+        "worker_drain_unavailable" => "worker_drain_unavailable",
+        "worker_drain_response_invalid" => "worker_drain_response_invalid",
+        "operator_session_revoked" => "operator_session_revoked",
+        "operator_forbidden" => "operator_forbidden",
+        "operator_password_change_required" => "operator_password_change_required",
+        _ => "worker_cutover_rollback_required",
+    }
 }
 
 #[cfg(test)]
@@ -630,6 +671,7 @@ mod tests {
         runtime: WorkerRuntimeObservation,
         desktop_start_error: Option<String>,
         task_start_error: Option<(String, bool)>,
+        drain_in_progress: bool,
         desktop_exits_after_offline: bool,
         operations: Vec<TaskOperation>,
     }
@@ -666,6 +708,7 @@ mod tests {
                 },
                 desktop_start_error: None,
                 task_start_error: None,
+                drain_in_progress: false,
                 desktop_exits_after_offline: true,
                 operations: Vec::new(),
             }
@@ -680,7 +723,7 @@ mod tests {
                 .pop_front()
                 .expect("planned status response")?;
             self.events.push(event(status_name(value.status)));
-            if value.status == WorkerStatus::Offline {
+            if value.status == WorkerStatus::Offline && self.drain_in_progress {
                 if self.task_state == LegacyTaskState::Running {
                     self.task_state = LegacyTaskState::Ready;
                     self.lock = ProcessLockObservation::NotHeld;
@@ -692,6 +735,7 @@ mod tests {
                     self.runtime.job_process_count = Some(0);
                     self.runtime.process_exit_proven = true;
                 }
+                self.drain_in_progress = false;
             }
             Ok(value)
         }
@@ -764,6 +808,7 @@ mod tests {
             Box::pin(async move {
                 self.requested.push(reason_code);
                 self.events.push(Event::Post(reason_code));
+                self.drain_in_progress = true;
                 self.take_status(Event::Get)
             })
         }
@@ -857,19 +902,26 @@ mod tests {
     }
 
     fn status(status: WorkerStatus) -> Result<WorkerDrainStatus, String> {
+        let (active_browser_sessions, running_worker_jobs) = if status == WorkerStatus::Offline {
+            (0, 0)
+        } else {
+            (1, 1)
+        };
+        status_with(status, active_browser_sessions, running_worker_jobs, false)
+    }
+
+    fn status_with(
+        status: WorkerStatus,
+        active_browser_sessions: u32,
+        running_worker_jobs: u32,
+        quiescent: bool,
+    ) -> Result<WorkerDrainStatus, String> {
         Ok(WorkerDrainStatus {
+            worker_id: binding().worker_id,
             status,
-            active_browser_sessions: if status == WorkerStatus::Offline {
-                0
-            } else {
-                1
-            },
-            running_worker_jobs: if status == WorkerStatus::Offline {
-                0
-            } else {
-                1
-            },
-            quiescent: status == WorkerStatus::Offline,
+            active_browser_sessions,
+            running_worker_jobs,
+            quiescent,
         })
     }
 
@@ -893,7 +945,9 @@ mod tests {
                 WorkerStatus::Online,
                 WorkerStatus::Draining,
                 WorkerStatus::Offline,
+                WorkerStatus::Offline,
                 WorkerStatus::Registering,
+                WorkerStatus::Degraded,
                 WorkerStatus::Online,
             ]);
             takeover(&mut backend).await.expect("cutover succeeds");
@@ -920,12 +974,24 @@ mod tests {
                 .iter()
                 .rposition(|event| *event == Event::Get("ONLINE"))
                 .expect("authoritative ONLINE observed");
+            let desktop_offline = backend
+                .events
+                .iter()
+                .rposition(|event| *event == Event::Get("OFFLINE"))
+                .expect("post-start OFFLINE is transitional");
+            let desktop_degraded = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::Get("DEGRADED"))
+                .expect("post-start DEGRADED is transitional");
             let mark_online = backend
                 .events
                 .iter()
                 .position(|event| *event == Event::MarkDesktopOnline)
                 .expect("health commit");
             assert!(offline < disable && disable < start_desktop && start_desktop < online);
+            assert!(start_desktop < desktop_offline && desktop_offline < desktop_degraded);
+            assert!(desktop_degraded < online);
             assert!(online < mark_online);
         });
     }
@@ -934,10 +1000,15 @@ mod tests {
     fn ready_cutover_starts_and_observes_legacy_before_drain() {
         tauri::async_runtime::block_on(async {
             let mut backend = FakeBackend::ready(&[
+                WorkerStatus::Offline,
+                WorkerStatus::Registering,
                 WorkerStatus::Online,
                 WorkerStatus::Online,
                 WorkerStatus::Draining,
                 WorkerStatus::Offline,
+                WorkerStatus::Offline,
+                WorkerStatus::Registering,
+                WorkerStatus::Degraded,
                 WorkerStatus::Online,
             ]);
             takeover(&mut backend)
@@ -963,6 +1034,59 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_desktop_startup_offline_windows_have_bounded_timeouts() {
+        tauri::async_runtime::block_on(async {
+            let mut legacy = FakeBackend::running(&[]);
+            legacy.statuses = std::iter::repeat_with(|| status(WorkerStatus::Offline))
+                .take(STATUS_POLL_LIMIT)
+                .collect();
+            assert_eq!(
+                wait_for_legacy_active(&mut legacy).await.unwrap_err(),
+                "worker_startup_timeout"
+            );
+
+            let mut desktop = FakeBackend::new(LegacyTaskState::Disabled, &[]);
+            desktop.runtime = WorkerRuntimeObservation {
+                runtime_installed: true,
+                startup_cleanup_pending: false,
+                process_alive: Some(true),
+                job_process_count: Some(1),
+                process_exit_proven: false,
+                server_online_verified: false,
+            };
+            desktop.lock = ProcessLockObservation::Held;
+            desktop.statuses = std::iter::repeat_with(|| status(WorkerStatus::Offline))
+                .take(STATUS_POLL_LIMIT)
+                .collect();
+            assert_eq!(
+                wait_for_desktop_online(&mut desktop).await,
+                Err("worker_startup_timeout")
+            );
+        });
+    }
+
+    #[test]
+    fn ready_startup_timeout_is_bounded_once_and_keeps_legacy_as_owner() {
+        tauri::async_runtime::block_on(async {
+            let mut backend = FakeBackend::ready(&[]);
+            backend.statuses = std::iter::repeat_with(|| status(WorkerStatus::Offline))
+                .take(STATUS_POLL_LIMIT)
+                .collect();
+            assert_eq!(
+                takeover(&mut backend).await.unwrap_err(),
+                "worker_startup_timeout"
+            );
+            assert_eq!(backend.task_state, LegacyTaskState::Running);
+            assert_eq!(backend.lock, ProcessLockObservation::Held);
+            assert_eq!(backend.operations, [TaskOperation::Start]);
+            assert_eq!(backend.statuses.len(), 0);
+            assert!(backend
+                .events
+                .contains(&Event::Intervention("worker_startup_timeout")));
+        });
+    }
+
+    #[test]
     fn draining_does_not_disable_until_authoritative_offline_and_exit_proof() {
         tauri::async_runtime::block_on(async {
             let mut backend = FakeBackend::running(&[
@@ -970,9 +1094,11 @@ mod tests {
                 WorkerStatus::Online,
                 WorkerStatus::Draining,
                 WorkerStatus::Draining,
+                WorkerStatus::Draining,
                 WorkerStatus::Offline,
                 WorkerStatus::Online,
             ]);
+            backend.statuses[4] = status_with(WorkerStatus::Draining, 0, 0, true);
             takeover(&mut backend)
                 .await
                 .expect("busy drain eventually completes");
@@ -981,12 +1107,18 @@ mod tests {
                 .iter()
                 .position(|event| *event == Event::Get("OFFLINE"))
                 .unwrap();
+            let quiescent_draining = backend
+                .events
+                .iter()
+                .rposition(|event| *event == Event::Get("DRAINING"))
+                .unwrap();
             let disable = backend
                 .events
                 .iter()
                 .position(|event| *event == Event::Task(TaskOperation::Disable))
                 .unwrap();
             assert!(get_offline < disable);
+            assert!(quiescent_draining < get_offline);
         });
     }
 
@@ -1046,6 +1178,8 @@ mod tests {
     fn ready_start_that_ran_but_reported_failure_is_drained_back_to_ready() {
         tauri::async_runtime::block_on(async {
             let mut backend = FakeBackend::ready(&[
+                WorkerStatus::Offline,
+                WorkerStatus::Registering,
                 WorkerStatus::Online,
                 WorkerStatus::Draining,
                 WorkerStatus::Offline,
@@ -1196,8 +1330,9 @@ mod tests {
                     WorkerStatus::Online,
                     WorkerStatus::Draining,
                     WorkerStatus::Offline,
+                    WorkerStatus::Offline,
+                    WorkerStatus::Registering,
                     WorkerStatus::Degraded,
-                    WorkerStatus::Online,
                 ],
             );
             backend.runtime = WorkerRuntimeObservation {
@@ -1232,23 +1367,28 @@ mod tests {
                 .iter()
                 .position(|event| *event == Event::Task(TaskOperation::Enable))
                 .unwrap();
-            let legacy_online = backend
+            let legacy_offline = backend
                 .events
                 .iter()
-                .rposition(|event| *event == Event::Get("ONLINE"))
+                .rposition(|event| *event == Event::Get("OFFLINE"))
                 .unwrap();
             let legacy_degraded = backend
                 .events
                 .iter()
                 .position(|event| *event == Event::Get("DEGRADED"))
                 .unwrap();
-            assert!(offline < reap && reap < enable && enable < legacy_online);
-            assert!(legacy_degraded < legacy_online);
+            let legacy_registering = backend
+                .events
+                .iter()
+                .position(|event| *event == Event::Get("REGISTERING"))
+                .unwrap();
+            assert!(offline < reap && reap < enable && enable < legacy_offline);
+            assert!(legacy_offline < legacy_registering && legacy_registering < legacy_degraded);
         });
     }
 
     #[test]
-    fn manual_rollback_waits_for_authoritative_online_before_success() {
+    fn manual_rollback_keeps_legacy_owner_when_status_becomes_unavailable_after_start() {
         tauri::async_runtime::block_on(async {
             let mut backend = FakeBackend::new(
                 LegacyTaskState::Disabled,
@@ -1256,7 +1396,7 @@ mod tests {
                     WorkerStatus::Online,
                     WorkerStatus::Draining,
                     WorkerStatus::Offline,
-                    WorkerStatus::Degraded,
+                    WorkerStatus::Offline,
                 ],
             );
             backend
@@ -1318,15 +1458,31 @@ mod tests {
     }
 
     #[test]
-    fn worker_offline_is_not_accepted_with_non_quiescent_evidence() {
-        let invalid = WorkerDrainStatus {
-            status: WorkerStatus::Offline,
-            active_browser_sessions: 0,
-            running_worker_jobs: 1,
-            quiescent: false,
-        };
+    fn worker_drain_wire_quiescence_matches_the_server_transition_contract() {
+        let busy_draining = status_with(WorkerStatus::Draining, 1, 2, false).unwrap();
+        assert!(validate_drain_status_shape(&busy_draining).is_ok());
+
+        let quiescent_draining = status_with(WorkerStatus::Draining, 0, 0, true).unwrap();
+        assert!(validate_drain_status_shape(&quiescent_draining).is_ok());
+
+        let offline = status_with(WorkerStatus::Offline, 0, 0, false).unwrap();
+        assert!(validate_drain_status_shape(&offline).is_ok());
+
+        let invalid_offline = status_with(WorkerStatus::Offline, 0, 1, false).unwrap();
         assert_eq!(
-            validate_offline_status(&invalid).unwrap_err(),
+            validate_drain_status_shape(&invalid_offline).unwrap_err(),
+            "worker_drain_response_invalid"
+        );
+
+        let impossible_offline = status_with(WorkerStatus::Offline, 0, 0, true).unwrap();
+        assert_eq!(
+            validate_drain_status_shape(&impossible_offline).unwrap_err(),
+            "worker_drain_response_invalid"
+        );
+
+        let inconsistent_draining = status_with(WorkerStatus::Draining, 0, 0, false).unwrap();
+        assert_eq!(
+            validate_drain_status_shape(&inconsistent_draining).unwrap_err(),
             "worker_drain_response_invalid"
         );
     }

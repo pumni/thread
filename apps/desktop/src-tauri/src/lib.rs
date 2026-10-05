@@ -1094,18 +1094,6 @@ async fn rollback_local_worker_to_legacy(
 }
 
 #[tauri::command]
-async fn request_local_worker_drain(
-    device: State<'_, DeviceState>,
-    operator: State<'_, OperatorAuthState>,
-    reason_code: String,
-) -> Result<WorkerDrainStatus, String> {
-    let worker_id = device.local_worker_id()?;
-    operator
-        .request_local_worker_drain(&worker_id, &reason_code)
-        .await
-}
-
-#[tauri::command]
 async fn local_worker_drain_status(
     device: State<'_, DeviceState>,
     operator: State<'_, OperatorAuthState>,
@@ -1219,7 +1207,6 @@ pub fn run() {
             operator_change_password,
             takeover_local_worker,
             rollback_local_worker_to_legacy,
-            request_local_worker_drain,
             local_worker_drain_status
         ])
         .setup(|app| {

@@ -94,10 +94,25 @@ pub(crate) enum WorkerStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "snake_case"))]
 pub(crate) struct WorkerDrainStatus {
+    pub worker_id: String,
     pub status: WorkerStatus,
     pub active_browser_sessions: u32,
     pub running_worker_jobs: u32,
     pub quiescent: bool,
+}
+
+async fn decode_worker_drain_status(
+    response: reqwest::Response,
+    requested_worker_id: &str,
+) -> Result<WorkerDrainStatus, String> {
+    let status = response
+        .json::<WorkerDrainStatus>()
+        .await
+        .map_err(|_| "worker_drain_response_invalid".to_string())?;
+    if status.worker_id != requested_worker_id {
+        return Err("worker_drain_response_invalid".to_string());
+    }
+    Ok(status)
 }
 
 struct Session {
@@ -382,10 +397,7 @@ impl OperatorAuthState {
         if !response.status().is_success() {
             return Err("worker_drain_request_failed".to_string());
         }
-        response
-            .json()
-            .await
-            .map_err(|_| "worker_drain_response_invalid".to_string())
+        decode_worker_drain_status(response, worker_id).await
     }
 
     pub(crate) async fn local_worker_drain_status(
@@ -416,10 +428,7 @@ impl OperatorAuthState {
         if !response.status().is_success() {
             return Err("worker_drain_unavailable".to_string());
         }
-        response
-            .json()
-            .await
-            .map_err(|_| "worker_drain_response_invalid".to_string())
+        decode_worker_drain_status(response, worker_id).await
     }
 
     async fn require_worker_lifecycle_snapshot(&self) -> Result<SessionSnapshot, String> {
@@ -759,6 +768,7 @@ mod tests {
         Status(u16),
         Disconnect,
         UnknownStatus,
+        MismatchedWorkerId,
     }
 
     fn logout_server() -> (
@@ -951,7 +961,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut drain_status_reads = 0;
-            let request_limit = if endpoint_failure.is_some() { 2 } else { 6 };
+            let request_limit = if endpoint_failure.is_some() { 2 } else { 8 };
             for _ in 0..request_limit {
                 let accept_deadline = Instant::now() + Duration::from_secs(10);
                 let (socket, _) = loop {
@@ -1047,25 +1057,36 @@ mod tests {
                 } else if matches!(endpoint_failure, Some(WorkerEndpointFailure::UnknownStatus)) {
                     (
                         "200 OK",
-                        r#"{"status":"UNKNOWN","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string(),
+                        r#"{"worker_id":"12345678-1234-4234-8234-123456789abc","status":"UNKNOWN","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string(),
+                    )
+                } else if matches!(
+                    endpoint_failure,
+                    Some(WorkerEndpointFailure::MismatchedWorkerId)
+                ) {
+                    (
+                        "200 OK",
+                        r#"{"worker_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","status":"ONLINE","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":false}"#.to_string(),
                     )
                 } else if request_line.starts_with("POST /v1/workers/") {
                     (
                         "200 OK",
-                        r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string(),
+                        r#"{"worker_id":"12345678-1234-4234-8234-123456789abc","status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string(),
                     )
                 } else if request_line.starts_with("GET /v1/workers/") {
                     drain_status_reads += 1;
-                    if drain_status_reads == 1 {
-                        (
+                    match drain_status_reads {
+                        1 => (
                             "200 OK",
-                            r#"{"status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string(),
-                        )
-                    } else {
-                        (
+                            r#"{"worker_id":"12345678-1234-4234-8234-123456789abc","status":"DRAINING","active_browser_sessions":1,"running_worker_jobs":2,"quiescent":false}"#.to_string(),
+                        ),
+                        2 => (
                             "200 OK",
-                            r#"{"status":"OFFLINE","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string(),
-                        )
+                            r#"{"worker_id":"12345678-1234-4234-8234-123456789abc","status":"DRAINING","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":true}"#.to_string(),
+                        ),
+                        _ => (
+                            "200 OK",
+                            r#"{"worker_id":"12345678-1234-4234-8234-123456789abc","status":"OFFLINE","active_browser_sessions":0,"running_worker_jobs":0,"quiescent":false}"#.to_string(),
+                        ),
                     }
                 } else {
                     panic!("unexpected test Worker API request: {request_line}");
@@ -1224,21 +1245,31 @@ mod tests {
             state.request_local_worker_drain(worker_id, "DESKTOP_LEGACY_CUTOVER"),
         )
         .expect("Operator-authorized drain request");
+        assert_eq!(requested.worker_id, "12345678-1234-4234-8234-123456789abc");
         assert_eq!(requested.status, WorkerStatus::Draining);
         assert_eq!(requested.running_worker_jobs, 2);
         assert!(!requested.quiescent);
 
         let draining = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
             .expect("first drain status poll");
+        assert_eq!(draining.worker_id, worker_id);
         assert_eq!(draining.status, WorkerStatus::Draining);
+        assert!(!draining.quiescent);
+        let quiescent = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
+            .expect("quiescent drain status poll");
+        assert_eq!(quiescent.status, WorkerStatus::Draining);
+        assert_eq!(quiescent.active_browser_sessions, 0);
+        assert_eq!(quiescent.running_worker_jobs, 0);
+        assert!(quiescent.quiescent);
         let offline = tauri::async_runtime::block_on(state.local_worker_drain_status(worker_id))
-            .expect("second drain status poll");
+            .expect("offline drain status poll");
+        assert_eq!(offline.worker_id, worker_id);
         assert_eq!(offline.status, WorkerStatus::Offline);
         assert_eq!(offline.active_browser_sessions, 0);
         assert_eq!(offline.running_worker_jobs, 0);
-        assert!(offline.quiescent);
+        assert!(!offline.quiescent);
 
-        let evidence = (0..6)
+        let evidence = (0..8)
             .map(|_| {
                 request_receiver
                     .recv_timeout(Duration::from_secs(5))
@@ -1255,13 +1286,13 @@ mod tests {
             .filter(|request| request.target.starts_with("GET /v1/workers/"))
             .collect::<Vec<_>>();
         assert_eq!(drain_posts.len(), 1);
-        assert_eq!(drain_polls.len(), 2);
+        assert_eq!(drain_polls.len(), 3);
         assert_eq!(
             evidence
                 .iter()
                 .filter(|request| request.target.starts_with("GET /v1/operator/me "))
                 .count(),
-            3
+            4
         );
         assert!(evidence.iter().all(|request| {
             request.authorization == "authorization: Bearer synthetic-operator-bearer"
@@ -1348,6 +1379,12 @@ mod tests {
                 "worker_drain_response_invalid",
                 false,
             );
+            assert_worker_endpoint_failure(
+                method,
+                WorkerEndpointFailure::MismatchedWorkerId,
+                "worker_drain_response_invalid",
+                false,
+            );
         }
     }
 
@@ -1363,6 +1400,7 @@ mod tests {
             ("UPGRADE_REQUIRED", WorkerStatus::UpgradeRequired),
         ] {
             let value: WorkerDrainStatus = serde_json::from_value(serde_json::json!({
+                "worker_id": "12345678-1234-4234-8234-123456789abc",
                 "status": wire,
                 "active_browser_sessions": 0,
                 "running_worker_jobs": 0,
@@ -1374,12 +1412,27 @@ mod tests {
         }
 
         let unknown = serde_json::from_value::<WorkerDrainStatus>(serde_json::json!({
+            "worker_id": "12345678-1234-4234-8234-123456789abc",
             "status": "UNKNOWN",
             "active_browser_sessions": 0,
             "running_worker_jobs": 0,
             "quiescent": true
         }));
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn worker_drain_status_tauri_dto_uses_camel_case_worker_id() {
+        let status = WorkerDrainStatus {
+            worker_id: "12345678-1234-4234-8234-123456789abc".to_string(),
+            status: WorkerStatus::Offline,
+            active_browser_sessions: 0,
+            running_worker_jobs: 0,
+            quiescent: false,
+        };
+        let value = serde_json::to_value(status).expect("serialize Tauri drain status");
+        assert_eq!(value["workerId"], "12345678-1234-4234-8234-123456789abc");
+        assert!(value.get("worker_id").is_none());
     }
 
     #[test]

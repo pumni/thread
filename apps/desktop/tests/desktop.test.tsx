@@ -95,7 +95,6 @@ describe("desktop provisioning", () => {
       "operator_change_password",
       "takeover_local_worker",
       "rollback_local_worker_to_legacy",
-      "request_local_worker_drain",
       "local_worker_drain_status",
       "controller_https_configure",
       "controller_https_reconfigure",
@@ -104,6 +103,7 @@ describe("desktop provisioning", () => {
       "controller_trust_confirm",
       "controller_trust_summary",
     ]);
+    expect(DESKTOP_COMMANDS).not.toContain("request_local_worker_drain");
   });
 
   it("shows explicit initial HTTPS configuration when no identity is provisioned", async () => {
