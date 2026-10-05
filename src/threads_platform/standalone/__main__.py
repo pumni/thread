@@ -11,6 +11,9 @@ from pathlib import Path
 from uuid import UUID
 
 from threads_platform.application.ports.threads import (
+    PublishingQuota,
+    RemoteMedia,
+    ReplyPage,
     ThreadsAPIError,
     ThreadsCredentialError,
 )
@@ -36,6 +39,13 @@ from threads_platform.standalone.mutations import (
     StandaloneMutationError,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+from threads_platform.standalone.workflows import (
+    LocalWorkflowRuntime,
+    StandaloneWorkflowError,
+    WorkflowPlan,
+    WorkflowStepResult,
+    load_workflow,
+)
 
 
 def _format_scalar(value: int | str | None) -> str:
@@ -116,6 +126,70 @@ async def _run_post_command(
         return f"published operation={result.operation_id} media={result.media_id}\n"
 
 
+async def _run_workflow_command(
+    plan: WorkflowPlan,
+    root: Path,
+    store: LocalAccountStore,
+) -> str:
+    settings = Settings()
+    async with build_threads_http_client(settings) as client:
+        api = HttpThreadsAPI(client)
+        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
+        api_runtime = LocalThreadsApiRuntime(store, api, secret_resolver)
+        mutation_runtime = LocalThreadsMutationRuntime(
+            root,
+            store,
+            api,
+            secret_resolver,
+            LocalOperationStore(root),
+        )
+        runtime = LocalWorkflowRuntime(api_runtime, mutation_runtime)
+        results = await runtime.run(plan)
+    return _format_workflow_results(results)
+
+
+def _format_workflow_results(results: tuple[WorkflowStepResult, ...]) -> str:
+    lines: list[str] = []
+    for result in results:
+        value = result.value
+        if isinstance(value, PublishingQuota):
+            lines.append(
+                f"workflow step={result.index} action=quota "
+                f"usage={_format_scalar(value.usage)} total={_format_scalar(value.total)} "
+                f"reply_usage={_format_scalar(value.reply_usage)} "
+                f"reply_total={_format_scalar(value.reply_total)}\n"
+            )
+        elif isinstance(value, RemoteMedia):
+            lines.append(
+                f"workflow step={result.index} action=media id={value.media_id} "
+                f"timestamp={_format_scalar(value.published_at)} "
+                f"permalink={_format_scalar(value.permalink)} "
+                f"text={_format_text(value.text)}\n"
+            )
+        elif isinstance(value, ReplyPage):
+            lines.append(
+                f"workflow step={result.index} action={result.action} "
+                f"count={len(value.replies)} has_more={str(value.has_more).lower()} "
+                f"next_cursor={_format_scalar(value.next_cursor)}\n"
+            )
+            for reply in value.replies:
+                lines.append(
+                    f"workflow step={result.index} reply {reply.reply_id} "
+                    f"timestamp={_format_scalar(reply.timestamp)} "
+                    f"root={_format_scalar(reply.root_post_id)} "
+                    f"parent={_format_scalar(reply.replied_to_id)} "
+                    f"text={_format_text(reply.text)}\n"
+                )
+        else:
+            assert result.action == "post_text"
+            lines.append(
+                f"workflow step={result.index} action=post_text published "
+                f"operation={value.operation_id} media={value.media_id}\n"
+            )
+    lines.append(f"workflow completed steps={len(results)}\n")
+    return "".join(lines)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="threads-local")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -149,6 +223,11 @@ def _build_parser() -> argparse.ArgumentParser:
     post_parser.add_argument("alias")
     post_parser.add_argument("text")
 
+    workflow_parser = commands.add_parser("workflow")
+    workflow_commands = workflow_parser.add_subparsers(dest="workflow_command", required=True)
+    run_workflow_parser = workflow_commands.add_parser("run")
+    run_workflow_parser.add_argument("file")
+
     operation_parser = commands.add_parser("operation")
     operation_commands = operation_parser.add_subparsers(dest="operation_command", required=True)
     show_parser = operation_commands.add_parser("show")
@@ -159,6 +238,15 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "workflow":
+            plan = load_workflow(Path(args.file))
+            root = resolve_standalone_data_root()
+            store = LocalAccountStore(root)
+            store.get(plan.account)
+            output = asyncio.run(_run_workflow_command(plan, root, store))
+            sys.stdout.write(output)
+            return 0
+
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
         if args.command == "account":
@@ -200,6 +288,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         sys.stdout.write(asyncio.run(_run_api_command(args, store)))
         return 0
+    except StandaloneWorkflowError as error:
+        suffix = f" step={error.step_index}" if error.step_index is not None else ""
+        if error.operation_id is not None:
+            suffix += f" operation={error.operation_id}"
+        sys.stderr.write(f"ERROR {error.code}{suffix}\n")
+        return 1
     except (
         StandaloneAccountError,
         StandaloneRuntimeError,
