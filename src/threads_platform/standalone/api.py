@@ -17,7 +17,9 @@ from threads_platform.application.ports.threads import (
     ThreadsCredentialSecretResolver,
 )
 from threads_platform.config.settings import Settings
-from threads_platform.infrastructure.threads_api.credentials import normalize_threads_credential_ref
+from threads_platform.infrastructure.threads_api.environment_credentials import (
+    normalize_threads_credential_ref,
+)
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
 
 _SAFE_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")

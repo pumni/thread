@@ -1,6 +1,10 @@
+import ast
 import re
+import subprocess
+import sys
 from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
@@ -10,7 +14,7 @@ from threads_platform.application.ports.threads import (
     ThreadsCredentialErrorCode,
 )
 from threads_platform.config.settings import Settings
-from threads_platform.infrastructure.threads_api.credentials import (
+from threads_platform.infrastructure.threads_api.environment_credentials import (
     EnvironmentThreadsCredentialSecretResolver,
     normalize_threads_credential_ref,
 )
@@ -190,3 +194,60 @@ def test_admin_parser_uses_metadata_only_inputs(capsys: pytest.CaptureFixture[st
     assert "--secret" not in help_output
     assert "--refresh-token" not in help_output
     assert Settings().threads_token_provider_mode == "disabled"
+
+
+def test_environment_credentials_import_isolated_from_persistent_lifecycle() -> None:
+    forbidden = (
+        "threads_platform.application.ports.repositories",
+        "threads_platform.domain.accounts",
+        "threads_platform.infrastructure.persistence",
+        "threads_platform.infrastructure.threads_api.credentials",
+    )
+    source_path = Path(__file__).resolve().parents[2] / (
+        "src/threads_platform/infrastructure/threads_api/environment_credentials.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported_modules.update(
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    )
+    forbidden_direct_imports = sorted(
+        imported
+        for imported in imported_modules
+        if any(imported == blocked or imported.startswith(blocked + ".") for blocked in forbidden)
+    )
+    assert not forbidden_direct_imports
+
+    import_script = "\n".join(
+        (
+            "import importlib, sys",
+            "importlib.import_module(",
+            "    'threads_platform.infrastructure.threads_api.environment_credentials'",
+            ")",
+            f"forbidden = {forbidden!r}",
+            "loaded = sorted(",
+            "    module",
+            "    for module in sys.modules",
+            "    if any(",
+            "        module == prefix or module.startswith(prefix + '.')",
+            "        for prefix in forbidden",
+            "    )",
+            ")",
+            "assert not loaded, loaded",
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", import_script],
+        cwd=source_path.parents[4],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
