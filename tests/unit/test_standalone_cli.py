@@ -1704,7 +1704,11 @@ def test_cli_workflow_invalid_plan_is_rejected_before_settings_or_http_client(
     _set_data_root(monkeypatch, tmp_path / "local")
     workflow_path = _write_workflow(
         tmp_path / "private-workflow.json",
-        [{"action": "quota"}, {"action": "unknown"}],
+        [
+            {"action": "quota"},
+            {"action": "feed", "limit": 3},
+            {"action": "thread", "thread_ref": "INVALID"},
+        ],
     )
     calls: list[str] = []
 
@@ -1823,7 +1827,8 @@ def test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context(
         "workflow step=2 action=media id=media-1 timestamp=then "
         "permalink=https://www.threads.com/t/1 text=public media text\n"
         "workflow step=3 action=replies count=1 has_more=true next_cursor=cursor-out\n"
-        "workflow step=3 reply reply-1 timestamp=- root=root-1 parent=- text=reply text\n"
+        "workflow step=3 action=replies reply reply-1 timestamp=- root=root-1 "
+        "parent=- text=reply text\n"
         "workflow step=4 action=conversation count=0 has_more=false next_cursor=-\n"
         "workflow completed steps=4\n"
     )
@@ -1836,6 +1841,166 @@ def test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context(
     ]
     assert context.enter_count == 1
     assert context.exit_count == 1
+
+
+def test_cli_workflow_formats_mixed_api_and_browser_reads_with_step_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    account_module.LocalAccountStore(root).add("local-alice")
+    workflow_path = _write_workflow(
+        tmp_path / "workflow.json",
+        [
+            {"action": "public_profile", "username": "alice"},
+            {
+                "action": "search",
+                "query": "private query sentinel",
+                "mode": "KEYWORD",
+                "type": "TOP",
+                "limit": 25,
+            },
+            {"action": "feed", "limit": 3},
+            {"action": "profile", "username": "alice"},
+            {"action": "thread", "thread_ref": "/@alice/post/post-1"},
+            {"action": "profile_posts", "username": "alice", "limit": 10},
+            {"action": "mentions", "limit": 5},
+        ],
+        account="local-alice",
+    )
+    context = _install_fake_api_client(monkeypatch)
+    events: list[tuple[object, ...]] = []
+
+    async def fake_public_profile(
+        runtime: LocalThreadsApiRuntime, alias: str, username: str
+    ) -> RemotePublicProfile:
+        events.append(("public_profile", alias, username))
+        return RemotePublicProfile("author-1", username, "Alice", None, None)
+
+    async def fake_search(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> DiscoveryPage:
+        events.append(("search", alias, query, search_mode, search_type, after, limit))
+        return DiscoveryPage(
+            (
+                RemoteDiscoveryThread(
+                    "search-thread",
+                    "author-1",
+                    "alice",
+                    "bounded search text",
+                    "https://www.threads.com/@alice/post/search-thread",
+                    "TEXT",
+                    None,
+                    False,
+                    True,
+                ),
+            ),
+            None,
+            False,
+        )
+
+    async def fake_profile_posts(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        username: str,
+        *,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> DiscoveryPage:
+        events.append(("profile_posts", alias, username, after, limit))
+        return DiscoveryPage((), None, False)
+
+    async def fake_mentions(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        *,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> DiscoveryPage:
+        events.append(("mentions", alias, after, limit))
+        return DiscoveryPage((), None, False)
+
+    class FakeLocalRuntime:
+        def __init__(self, _root: Path, _store: LocalAccountStore) -> None:
+            pass
+
+        async def browse_feed(self, alias: str, limit: int) -> BrowserFeedResultV1:
+            events.append(("feed", alias, limit))
+            return BrowserFeedResultV1(
+                observations=(
+                    BrowserFeedItemResultV1(
+                        thread_ref="https://www.threads.com/@alice/post/feed-thread",
+                        author_username="alice",
+                        position=0,
+                    ),
+                ),
+                truncated=False,
+            )
+
+        async def open_profile(self, alias: str, username: str) -> BrowserTargetOpenResultV1:
+            events.append(("profile", alias, username))
+            return BrowserTargetOpenResultV1(target_kind="PROFILE", target_ref=f"/@{username}")
+
+        async def open_thread(self, alias: str, thread_ref: str) -> BrowserTargetOpenResultV1:
+            events.append(("thread", alias, thread_ref))
+            return BrowserTargetOpenResultV1(target_kind="THREAD", target_ref=thread_ref)
+
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "public_profile", fake_public_profile)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "search", fake_search)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "profile_posts", fake_profile_posts)
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "mentions", fake_mentions)
+    monkeypatch.setattr(cli_module, "LocalRuntime", FakeLocalRuntime)
+
+    result = main(["workflow", "run", str(workflow_path)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.err == ""
+    assert captured.out == (
+        "workflow step=1 action=public_profile profile id=author-1 username=alice "
+        "name=Alice bio=- picture=-\n"
+        "workflow step=2 action=search count=1 has_more=false next_cursor=-\n"
+        "workflow step=2 action=search thread search-thread username=alice timestamp=- "
+        "media_type=TEXT quote=false has_replies=true "
+        "permalink=https://www.threads.com/@alice/post/search-thread "
+        "text=bounded search text\n"
+        "workflow step=3 action=feed count=1 truncated=false\n"
+        "workflow step=3 action=feed item position=0 "
+        "thread_ref=https://www.threads.com/@alice/post/feed-thread author=alice text=-\n"
+        "workflow step=4 action=profile recognized target=/@alice\n"
+        "workflow step=5 action=thread recognized target=/@alice/post/post-1\n"
+        "workflow step=6 action=profile_posts count=0 has_more=false next_cursor=-\n"
+        "workflow step=7 action=mentions count=0 has_more=false next_cursor=-\n"
+        "workflow completed steps=7\n"
+    )
+    assert "private query sentinel" not in captured.out
+    assert events == [
+        ("public_profile", "local-alice", "alice"),
+        (
+            "search",
+            "local-alice",
+            "private query sentinel",
+            DiscoverySearchMode.KEYWORD,
+            DiscoverySearchType.TOP,
+            None,
+            25,
+        ),
+        ("feed", "local-alice", 3),
+        ("profile", "local-alice", "alice"),
+        ("thread", "local-alice", "/@alice/post/post-1"),
+        ("profile_posts", "local-alice", "alice", None, 10),
+        ("mentions", "local-alice", None, 5),
+    ]
+    assert context.enter_count == context.exit_count == 1
 
 
 def test_cli_workflow_post_success_is_exact_and_never_echoes_text(

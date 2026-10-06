@@ -25,6 +25,11 @@ STANDALONE_FORBIDDEN_IMPORTS = (
     "threads_platform.application.worker_jobs",
     "threads_platform.infrastructure.threads_api.composition",
     "threads_platform.transport",
+    "threads_platform.domain.account_activities",
+    "threads_platform.application.account_activity_materialization",
+    "threads_platform.application.account_activity_recurrence",
+    "threads_platform.application.scheduler",
+    "threads_platform.scheduler",
 )
 STANDALONE_FORBIDDEN_SYMBOLS = frozenset(
     {
@@ -32,6 +37,12 @@ STANDALONE_FORBIDDEN_SYMBOLS = frozenset(
         "CommandRuntimeComposition",
         "WorkerJob",
         "WorkerJobService",
+        "WorkerJobExecution",
+        "AccountActivityPlan",
+        "AccountActivityTemplate",
+        "ScheduledActivity",
+        "Scheduler",
+        "Command",
         "UnitOfWork",
         "UnitOfWorkFactory",
         "SQLAlchemyUnitOfWorkFactory",

@@ -12,7 +12,10 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from threads_platform.application.browser_capabilities import BrowserFeedResultV1
+from threads_platform.application.browser_capabilities import (
+    BrowserFeedResultV1,
+    BrowserTargetOpenResultV1,
+)
 from threads_platform.application.ports.threads import (
     DiscoveryPage,
     PublishingQuota,
@@ -125,10 +128,24 @@ def _format_public_profile(profile: RemotePublicProfile) -> str:
     )
 
 
-def _format_discovery_page(kind: str, page: DiscoveryPage, limit: int) -> str:
+def _format_discovery_page(
+    kind: str,
+    page: DiscoveryPage,
+    limit: int,
+    *,
+    workflow_step: int | None = None,
+) -> str:
     threads = page.threads[: min(max(limit, 0), 50)]
+    header = (
+        f"{kind} " if workflow_step is None else f"workflow step={workflow_step} action={kind} "
+    )
+    thread_prefix = (
+        "thread "
+        if workflow_step is None
+        else f"workflow step={workflow_step} action={kind} thread "
+    )
     lines = [
-        f"{kind} count={len(threads)} "
+        f"{header}count={len(threads)} "
         f"has_more={str(page.has_more).lower()} "
         f"next_cursor={_format_discovery_cursor(page.next_cursor)}\n"
     ]
@@ -137,7 +154,7 @@ def _format_discovery_page(kind: str, page: DiscoveryPage, limit: int) -> str:
         quote = "-" if thread.is_quote_post is None else str(thread.is_quote_post).lower()
         has_replies = "-" if thread.has_replies is None else str(thread.has_replies).lower()
         lines.append(
-            f"thread {_format_bounded_text(thread.remote_thread_id, 255)} "
+            f"{thread_prefix}{_format_bounded_text(thread.remote_thread_id, 255)} "
             f"username={_format_bounded_text(thread.username, 255)} "
             f"timestamp={_format_bounded_text(timestamp, 64)} "
             f"media_type={_format_bounded_text(thread.media_type, 80)} "
@@ -365,7 +382,8 @@ async def _run_workflow_command(
             secret_resolver,
             LocalOperationStore(root),
         )
-        runtime = LocalWorkflowRuntime(api_runtime, mutation_runtime)
+        browser_runtime = LocalRuntime(root, store)
+        runtime = LocalWorkflowRuntime(api_runtime, mutation_runtime, browser_runtime)
         results = await runtime.run(plan)
     return _format_workflow_results(results)
 
@@ -396,12 +414,41 @@ def _format_workflow_results(results: tuple[WorkflowStepResult, ...]) -> str:
             )
             for reply in value.replies:
                 lines.append(
-                    f"workflow step={result.index} reply {reply.reply_id} "
+                    f"workflow step={result.index} action={result.action} reply {reply.reply_id} "
                     f"timestamp={_format_scalar(reply.timestamp)} "
                     f"root={_format_scalar(reply.root_post_id)} "
                     f"parent={_format_scalar(reply.replied_to_id)} "
                     f"text={_format_text(reply.text)}\n"
                 )
+        elif isinstance(value, BrowserTargetOpenResultV1):
+            lines.append(
+                f"workflow step={result.index} action={result.action} recognized "
+                f"target={_format_bounded_text(value.target_ref, 255)}\n"
+            )
+        elif isinstance(value, BrowserFeedResultV1):
+            lines.append(
+                f"workflow step={result.index} action=feed count={len(value.observations)} "
+                f"truncated={str(value.truncated).lower()}\n"
+            )
+            for item in value.observations:
+                lines.append(
+                    f"workflow step={result.index} action=feed item position={item.position} "
+                    f"thread_ref={_format_bounded_text(item.thread_ref, 255)} "
+                    f"author={_format_bounded_text(item.author_username, 30)} "
+                    f"text={_format_bounded_text(item.text_excerpt, 500)}\n"
+                )
+        elif isinstance(value, RemotePublicProfile):
+            profile = _format_public_profile(value)
+            lines.append(f"workflow step={result.index} action=public_profile {profile}")
+        elif isinstance(value, DiscoveryPage):
+            lines.append(
+                _format_discovery_page(
+                    result.action,
+                    value,
+                    50,
+                    workflow_step=result.index,
+                )
+            )
         else:
             assert result.action == "post_text"
             lines.append(
