@@ -94,7 +94,7 @@ class LocalThreadsApiRuntime:
     ) -> ReplyPage:
         if _OPAQUE_ID.fullmatch(thread_id) is None:
             raise StandaloneApiError("INVALID_THREAD_ID")
-        self._validate_cursor(after)
+        self.validate_cursor(after)
         token = await self._resolve_token(alias)
         return await self._api.get_replies(token, thread_id, after)
 
@@ -107,12 +107,12 @@ class LocalThreadsApiRuntime:
     ) -> ReplyPage:
         if _OPAQUE_ID.fullmatch(thread_id) is None:
             raise StandaloneApiError("INVALID_THREAD_ID")
-        self._validate_cursor(after)
+        self.validate_cursor(after)
         token = await self._resolve_token(alias)
         return await self._api.get_conversation(token, thread_id, after)
 
     async def public_profile(self, alias: str, username: str) -> RemotePublicProfile:
-        normalized_username = self._validate_lookup_text(username, "INVALID_USERNAME")
+        normalized_username = self.validate_lookup_text(username, "INVALID_USERNAME")
         token = await self._resolve_token(alias)
         return await self._api.get_public_profile(token, normalized_username)
 
@@ -124,9 +124,9 @@ class LocalThreadsApiRuntime:
         after: str | None = None,
         limit: int = _DEFAULT_PAGE_LIMIT,
     ) -> DiscoveryPage:
-        normalized_username = self._validate_lookup_text(username, "INVALID_USERNAME")
-        self._validate_cursor(after)
-        self._validate_limit(limit)
+        normalized_username = self.validate_lookup_text(username, "INVALID_USERNAME")
+        self.validate_cursor(after)
+        self.validate_limit(limit)
         token = await self._resolve_token(alias)
         return await self._api.get_profile_posts(
             token, normalized_username, after=after, limit=limit
@@ -142,9 +142,9 @@ class LocalThreadsApiRuntime:
         after: str | None = None,
         limit: int = _DEFAULT_PAGE_LIMIT,
     ) -> DiscoveryPage:
-        normalized_query = self._validate_lookup_text(query, "INVALID_QUERY")
-        self._validate_cursor(after)
-        self._validate_limit(limit)
+        normalized_query = self.validate_lookup_text(query, "INVALID_QUERY")
+        self.validate_cursor(after)
+        self.validate_limit(limit)
         search_mode = self._validate_search_mode(search_mode)
         search_type = self._validate_search_type(search_type)
         token = await self._resolve_token(alias)
@@ -166,8 +166,8 @@ class LocalThreadsApiRuntime:
         after: str | None = None,
         limit: int = _DEFAULT_PAGE_LIMIT,
     ) -> DiscoveryPage:
-        self._validate_cursor(after)
-        self._validate_limit(limit)
+        self.validate_cursor(after)
+        self.validate_limit(limit)
         token = await self._resolve_token(alias)
         return await self._api.get_mentions(
             token,
@@ -184,7 +184,7 @@ class LocalThreadsApiRuntime:
         return await self._secret_resolver.resolve(account.credential_ref)
 
     @staticmethod
-    def _validate_cursor(after: object) -> None:
+    def validate_cursor(after: object) -> None:
         if after is not None and (
             not isinstance(after, str)
             or not after.strip()
@@ -195,7 +195,7 @@ class LocalThreadsApiRuntime:
             raise StandaloneApiError("INVALID_CURSOR")
 
     @staticmethod
-    def _validate_lookup_text(value: object, code: str) -> str:
+    def validate_lookup_text(value: object, code: str) -> str:
         if not isinstance(value, str) or "\r" in value or "\n" in value:
             raise StandaloneApiError(code)
         normalized = value.strip()
@@ -204,7 +204,7 @@ class LocalThreadsApiRuntime:
         return normalized
 
     @staticmethod
-    def _validate_limit(limit: object) -> None:
+    def validate_limit(limit: object) -> None:
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
