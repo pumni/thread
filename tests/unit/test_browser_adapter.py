@@ -638,7 +638,7 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
     asyncio.run(scenario())
 
 
-def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
+def test_playwright_profile_open_uses_unique_bounded_header_association(
     tmp_path: Path,
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -649,6 +649,7 @@ def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
         *,
         error: type[Exception] | None = None,
         ancestor_bound: int = 8,
+        expected_origin: str | None = None,
     ) -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
         profile_directory = tmp_path / f"profile-open-{uuid4()}"
@@ -664,6 +665,8 @@ def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
             await session.navigate(
                 f"{synthetic_origin}{path}", allowed_origins=frozenset({synthetic_origin})
             )
+            if expected_origin is not None:
+                monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", expected_origin)
             engine_session = cast(BrowserProfileOpenEngineSession, session)
             if error is None:
                 assert (
@@ -685,11 +688,9 @@ def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
     async def scenario() -> None:
         target = "/@alice"
         await verify(target, target)
-        await verify(
-            "/@duph1",
-            "/@duph1",
-            error=BrowserContractError,
-        )
+        await verify("/@duph1", "/@duph1")
+        await verify("/@ambiguousheaders", "/@ambiguousheaders", error=BrowserContractError)
+        await verify("/@headingoverflow", "/@headingoverflow", error=BrowserContractError)
         await verify(
             "/@missingh1",
             "/@missingh1",
@@ -719,6 +720,12 @@ def test_playwright_profile_open_uses_exact_path_h1_and_bounded_header(
             "/@queryhref",
             "/@queryhref",
             error=RemoteSessionStateUncertain,
+        )
+        await verify(
+            "/@alice",
+            "/@alice",
+            error=RemoteSessionStateUncertain,
+            expected_origin="https://www.threads.com",
         )
         await verify(
             "/@overbound",
@@ -1491,6 +1498,17 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
         b"<header><div><h1>First profile</h1><h1>Second profile</h1>"
         b'<a href="/@duph1">profile identity</a></div></header>'
     ),
+    "/@ambiguousheaders": _profile_document(
+        b"<section><div><h1>First profile</h1>"
+        b'<a href="/@ambiguousheaders">profile identity</a></div>'
+        b"<div><h1>Second profile</h1>"
+        b'<a href="/@ambiguousheaders">profile identity</a></div></section>'
+    ),
+    "/@headingoverflow": _profile_document(
+        b"<header><div>"
+        + b"".join(b"<h1>Profile heading</h1>" for _ in range(9))
+        + b'<a href="/@headingoverflow">profile identity</a></div></header>'
+    ),
     "/@missingh1": _profile_document(
         b'<header><div><a href="/@missingh1">profile identity</a></div></header>'
     ),
@@ -1515,11 +1533,11 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
         b'<a href="/@queryhref?source=profile">profile identity</a></header>'
     ),
     "/@overbound": _profile_document(
-        b'<section><a href="/@overbound">profile identity</a>'
-        + b"<div>" * 8
+        b'<div><a href="/@overbound">profile identity</a>'
+        + b"<span>" * 8
         + b"<h1>Public profile</h1>"
-        + b"</div>" * 8
-        + b"</section>"
+        + b"</span>" * 8
+        + b"</div>"
     ),
     "/media-composer": _media_composer_document(
         b"fetch('/rupload_igphoto/fb_uploader_123', {method: 'POST'})"

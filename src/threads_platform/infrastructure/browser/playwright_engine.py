@@ -208,33 +208,37 @@ _PROFILE_OPEN_SCRIPT = r"""
 
   const anchors = Array.from(document.querySelectorAll('a[href]'));
   if (anchors.length > 1000) return {outcome: 'invalid'};
-  const headings = Array.from(document.querySelectorAll('h1'));
-  if (headings.length !== 1 || !(headings[0].textContent || '').replace(/\s+/g, ' ').trim()) {
-    return {outcome: 'invalid'};
-  }
+  const headings = document.querySelectorAll('h1');
+  const headingBound = 8;
+  if (headings.length === 0 || headings.length > headingBound) return {outcome: 'invalid'};
   const exactTargetAnchors = anchors.filter(
     (anchor) => anchorPath(anchor.getAttribute('href')) === targetRef
   );
   if (exactTargetAnchors.length === 0) return {outcome: 'uncertain'};
 
-  let node = headings[0].parentElement;
-  let profileHeader = null;
-  for (let depth = 1; node && depth <= ancestorBound; depth += 1) {
-    if (node.tagName === 'DIV') {
-      profileHeader = node;
-      break;
-    }
-    node = node.parentElement;
-  }
-  if (profileHeader === null) return {outcome: 'invalid'};
+  const qualifyingHeaders = new Set();
+  for (let headingIndex = 0; headingIndex < headings.length; headingIndex += 1) {
+    const heading = headings[headingIndex];
+    if (!heading || !(heading.textContent || '').replace(/\s+/g, ' ').trim()) continue;
 
-  const headerLinks = Array.from(profileHeader.querySelectorAll('a[href]'));
-  if (headerLinks.some((link) => isPostPermalink(link.getAttribute('href')))) {
-    return {outcome: 'invalid'};
+    let node = heading.parentElement;
+    let profileHeader = null;
+    for (let depth = 1; node && depth <= ancestorBound; depth += 1) {
+      if (node.tagName === 'DIV') {
+        profileHeader = node;
+        break;
+      }
+      node = node.parentElement;
+    }
+    if (profileHeader === null) continue;
+
+    const headerLinks = anchors.filter((link) => profileHeader.contains(link));
+    if (headerLinks.some((link) => isPostPermalink(link.getAttribute('href')))) continue;
+    if (headerLinks.some((link) => anchorPath(link.getAttribute('href')) === targetRef)) {
+      qualifyingHeaders.add(profileHeader);
+    }
   }
-  if (!headerLinks.some((link) => anchorPath(link.getAttribute('href')) === targetRef)) {
-    return {outcome: 'invalid'};
-  }
+  if (qualifyingHeaders.size !== 1) return {outcome: 'invalid'};
   return {outcome: 'recognized'};
 }
 """
