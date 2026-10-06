@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -33,9 +34,12 @@ from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.standalone.__main__ import main
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
 from threads_platform.standalone.mutations import (
+    CarouselItem,
+    CarouselManifest,
     CreatedReplyResult,
     LocalOperationStore,
     LocalThreadsMutationRuntime,
+    PublishedCarouselResult,
     PublishedMediaResult,
     PublishedTextResult,
     StandaloneMutationError,
@@ -973,6 +977,186 @@ def test_cli_media_inputs_fail_before_settings_or_http(
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "invalid_file",
+    ["missing", "directory", "oversized", "non-utf8", "invalid-json", "duplicate", "extra"],
+)
+def test_cli_carousel_manifest_errors_precede_settings_account_and_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    invalid_file: str,
+) -> None:
+    path = tmp_path / "private-manifest.json"
+    if invalid_file == "directory":
+        path.mkdir()
+    elif invalid_file == "oversized":
+        path.write_bytes(b" " * 65_537)
+    elif invalid_file == "non-utf8":
+        path.write_bytes(b"\xff")
+    elif invalid_file == "invalid-json":
+        path.write_text("{", encoding="utf-8")
+    elif invalid_file == "duplicate":
+        path.write_text('{"items":[],"items":[]}', encoding="utf-8")
+    elif invalid_file == "extra":
+        path.write_text(
+            '{"items":[{"media_type":"IMAGE","url":"https://media.example/a.jpg"},'
+            '{"media_type":"VIDEO","url":"https://media.example/b.mp4"}],'
+            '"private":"sentinel"}',
+            encoding="utf-8",
+        )
+
+    calls: list[str] = []
+
+    def fail_settings() -> Settings:
+        calls.append("settings")
+        raise AssertionError("invalid manifest must fail before Settings")
+
+    def fail_data_root() -> Path:
+        calls.append("data-root")
+        raise AssertionError("invalid manifest must fail before account state")
+
+    def fail_client(_settings: Settings) -> httpx2.AsyncClient:
+        calls.append("http")
+        raise AssertionError("invalid manifest must fail before HTTP client")
+
+    monkeypatch.setattr(cli_module, "Settings", fail_settings)
+    monkeypatch.setattr(cli_module, "resolve_standalone_data_root", fail_data_root)
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+
+    result = main(["post-carousel", "alice", str(path)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_CAROUSEL_MANIFEST\n"
+    assert str(path) not in captured.out + captured.err
+    assert "sentinel" not in captured.out + captured.err
+    assert calls == []
+
+
+def test_cli_carousel_success_has_exact_safe_output_and_closes_http_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    path = tmp_path / "private-manifest-path.json"
+    manifest_data = {
+        "text": "private carousel caption",
+        "items": [
+            {
+                "media_type": "IMAGE",
+                "url": "https://media.example/private-image.jpg",
+                "alt_text": "private image alt",
+            },
+            {
+                "media_type": "VIDEO",
+                "url": "https://media.example/private-video.mp4",
+                "alt_text": "private video alt",
+            },
+        ],
+    }
+    path.write_text(json.dumps(manifest_data), encoding="utf-8")
+    calls: list[tuple[str, CarouselManifest]] = []
+
+    async def fake_publish(
+        _runtime: LocalThreadsMutationRuntime,
+        alias: str,
+        manifest: CarouselManifest,
+    ) -> PublishedCarouselResult:
+        calls.append((alias, manifest))
+        return PublishedCarouselResult(operation_id, "published-media-42")
+
+    monkeypatch.setattr(LocalThreadsMutationRuntime, "publish_carousel", fake_publish)
+
+    result = main(["post-carousel", "alice", str(path)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [
+        (
+            "alice",
+            CarouselManifest(
+                items=(
+                    CarouselItem(
+                        "IMAGE",
+                        "https://media.example/private-image.jpg",
+                        "private image alt",
+                    ),
+                    CarouselItem(
+                        "VIDEO",
+                        "https://media.example/private-video.mp4",
+                        "private video alt",
+                    ),
+                ),
+                text="private carousel caption",
+            ),
+        )
+    ]
+    assert captured.out == (
+        f"published-carousel operation={operation_id} media=published-media-42\n"
+    )
+    assert captured.err == ""
+    for forbidden in (
+        str(path),
+        "private carousel caption",
+        "https://media.example/private-image.jpg",
+        "https://media.example/private-video.mp4",
+        "private image alt",
+        "private video alt",
+        "child-container-id",
+    ):
+        assert forbidden not in captured.out + captured.err
+    assert context.enter_count == context.exit_count == 1
+
+
+def test_cli_carousel_errors_do_not_echo_manifest_path_or_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    path = tmp_path / "private-manifest.json"
+    manifest_text = "private carousel text secret"
+    manifest_url = "https://media.example/private.jpg"
+    path.write_text(
+        json.dumps(
+            {
+                "text": manifest_text,
+                "items": [
+                    {"media_type": "IMAGE", "url": manifest_url},
+                    {"media_type": "VIDEO", "url": "https://media.example/private.mp4"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_publish(
+        _runtime: LocalThreadsMutationRuntime,
+        _alias: str,
+        _manifest: CarouselManifest,
+    ) -> PublishedCarouselResult:
+        raise StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation_id)
+
+    monkeypatch.setattr(LocalThreadsMutationRuntime, "publish_carousel", fail_publish)
+
+    result = main(["post-carousel", "alice", str(path)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == f"ERROR PUBLISH_OUTCOME_AMBIGUOUS operation={operation_id}\n"
+    for forbidden in (str(path), manifest_text, manifest_url, "private.mp4", "Authorization"):
+        assert forbidden not in captured.out + captured.err
+    assert context.enter_count == context.exit_count == 1
+
+
 @pytest.mark.parametrize("text", ["  \t", "x" * 501])
 def test_cli_post_validation_is_bounded_and_does_not_echo_text(
     text: str,
@@ -1214,6 +1398,43 @@ def test_cli_operation_show_renders_media_journal_without_http(
     assert captured.out == (
         f"operation {operation.id} kind={kind} phase=RECEIVED container=- media=- outcome=-\n"
     )
+    assert captured.err == ""
+
+
+def test_cli_operation_show_reports_carousel_child_count_without_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    root.mkdir(parents=True)
+    store = LocalOperationStore(root)
+    operation = store.create_received(
+        UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+        kind="POST_CAROUSEL",
+    )
+    creating = store.update(replace(operation, phase="CHILDREN_CREATING"))
+    first = store.update(replace(creating, child_container_ids=("child-private-one",)))
+    operation = store.update(
+        replace(first, child_container_ids=("child-private-one", "child-private-two"))
+    )
+
+    def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
+        raise AssertionError("operation show must not build an HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+
+    result = main(["operation", "show", str(operation.id)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        f"operation {operation.id} kind=POST_CAROUSEL phase=CHILDREN_CREATING "
+        "container=- media=- outcome=- children=2\n"
+    )
+    assert "child-private-one" not in captured.out
+    assert "child-private-two" not in captured.out
     assert captured.err == ""
 
 

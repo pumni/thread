@@ -10,9 +10,9 @@ import re
 import stat
 import tempfile
 import unicodedata
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import NoReturn, TypeGuard, cast
+from typing import Literal, NoReturn, TypeGuard, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
@@ -34,13 +34,21 @@ _REMOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _NUMERIC_HOST = re.compile(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|[0-9]+))*\Z")
 _JOURNAL_VERSION = 1
 _JOURNAL_KIND = "POST_TEXT"
-_JOURNAL_KINDS = frozenset({_JOURNAL_KIND, "CREATE_REPLY", "POST_IMAGE", "POST_VIDEO"})
+_CAROUSEL_KIND = "POST_CAROUSEL"
+_JOURNAL_KINDS = frozenset(
+    {_JOURNAL_KIND, "CREATE_REPLY", "POST_IMAGE", "POST_VIDEO", _CAROUSEL_KIND}
+)
+_MAX_CAROUSEL_MANIFEST_BYTES = 65_536
+_MAX_CAROUSEL_JSON_DEPTH = 3
+_MIN_CAROUSEL_ITEMS = 2
+_MAX_CAROUSEL_ITEMS = 20
 _CONTAINER_PROCESSING_TIMEOUT_SECONDS = 30.0
 _CONTAINER_PROCESSING_MAX_CHECKS = 10
 _CONTAINER_PROCESSING_POLL_INTERVAL_SECONDS = 3.0
 _JOURNAL_PHASES = frozenset(
     {
         "RECEIVED",
+        "CHILDREN_CREATING",
         "CONTAINER_CREATED",
         "PUBLISH_REQUESTED",
         "PUBLISHED",
@@ -49,12 +57,24 @@ _JOURNAL_PHASES = frozenset(
     }
 )
 _JOURNAL_KEYS = frozenset(
-    {"version", "id", "account_id", "kind", "phase", "container_id", "media_id", "outcome_code"}
+    {
+        "version",
+        "id",
+        "account_id",
+        "kind",
+        "phase",
+        "container_id",
+        "media_id",
+        "outcome_code",
+        "child_container_ids",
+    }
 )
 _REQUIRED_JOURNAL_KEYS = frozenset({"version", "id", "account_id", "kind", "phase"})
-_MAX_JOURNAL_BYTES = 4096
+# Required for 20 bounded child IDs plus the parent and published media IDs in one v1 record.
+_MAX_JOURNAL_BYTES = 8192
 _TRANSITIONS = {
-    "RECEIVED": frozenset({"CONTAINER_CREATED", "FAILED_FINAL"}),
+    "RECEIVED": frozenset({"CHILDREN_CREATING", "CONTAINER_CREATED", "FAILED_FINAL"}),
+    "CHILDREN_CREATING": frozenset({"CHILDREN_CREATING", "CONTAINER_CREATED", "FAILED_FINAL"}),
     "CONTAINER_CREATED": frozenset({"PUBLISH_REQUESTED", "FAILED_FINAL"}),
     "PUBLISH_REQUESTED": frozenset({"PUBLISHED", "AMBIGUOUS"}),
 }
@@ -84,6 +104,7 @@ class LocalOperation:
     container_id: str | None = None
     media_id: str | None = None
     outcome_code: str | None = None
+    child_container_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +123,161 @@ class CreatedReplyResult:
 class PublishedMediaResult:
     operation_id: UUID
     media_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class CarouselItem:
+    media_type: Literal["IMAGE", "VIDEO"]
+    url: str = field(repr=False)
+    alt_text: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CarouselManifest:
+    items: tuple[CarouselItem, ...]
+    text: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedCarouselResult:
+    operation_id: UUID
+    media_id: str
+
+
+def load_carousel_manifest(path: Path) -> CarouselManifest:
+    """Read and fully validate one bounded local carousel manifest."""
+
+    try:
+        path_metadata = path.stat()
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_size > _MAX_CAROUSEL_MANIFEST_BYTES
+        ):
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        with path.open("rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_CAROUSEL_MANIFEST_BYTES
+            ):
+                raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+            contents = stream.read(_MAX_CAROUSEL_MANIFEST_BYTES + 1)
+    except OSError, RuntimeError, ValueError:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST") from None
+
+    if len(contents) > _MAX_CAROUSEL_MANIFEST_BYTES:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+    try:
+        document = contents.decode("utf-8")
+        _validate_carousel_json_depth(document)
+        raw_manifest: object = json.loads(
+            document,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_non_json_constant,
+        )
+    except UnicodeDecodeError, ValueError, RecursionError:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST") from None
+    return _parse_carousel_manifest(raw_manifest)
+
+
+def _validate_carousel_json_depth(document: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in document:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_CAROUSEL_JSON_DEPTH:
+                raise ValueError
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                raise ValueError
+    if depth != 0 or in_string or escaped:
+        raise ValueError
+
+
+def _parse_carousel_manifest(value: object) -> CarouselManifest:
+    if not isinstance(value, dict):
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+    document = cast(dict[str, object], value)
+    keys = set(document)
+    if "items" not in keys or not keys <= {"text", "items"}:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+
+    text: str | None = None
+    if "text" in document:
+        raw_text = document["text"]
+        if type(raw_text) is not str:
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        _validate_optional_post_text(raw_text)
+        text = raw_text
+
+    raw_items = document["items"]
+    if not isinstance(raw_items, list):
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+    item_values = cast(list[object], raw_items)
+    if not _MIN_CAROUSEL_ITEMS <= len(item_values) <= _MAX_CAROUSEL_ITEMS:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+
+    items: list[CarouselItem] = []
+    for raw_item in item_values:
+        if not isinstance(raw_item, dict):
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        item = cast(dict[str, object], raw_item)
+        item_keys = set(item)
+        if item_keys not in (
+            {"media_type", "url"},
+            {"media_type", "url", "alt_text"},
+        ):
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        media_type = item["media_type"]
+        url = item["url"]
+        if type(media_type) is not str or media_type not in {"IMAGE", "VIDEO"}:
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        if type(url) is not str:
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        alt_text: str | None = None
+        if "alt_text" in item:
+            raw_alt_text = item["alt_text"]
+            if type(raw_alt_text) is not str:
+                raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+            alt_text = raw_alt_text
+        validate_media_post_inputs(url, None, alt_text)
+        items.append(CarouselItem(cast(Literal["IMAGE", "VIDEO"], media_type), url, alt_text))
+    return CarouselManifest(items=tuple(items), text=text)
+
+
+def _validate_carousel_manifest(value: object) -> CarouselManifest:
+    if not isinstance(value, CarouselManifest) or type(value.items) is not tuple:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+    if not _MIN_CAROUSEL_ITEMS <= len(value.items) <= _MAX_CAROUSEL_ITEMS:
+        raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+    if value.text is not None:
+        if type(value.text) is not str:
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        _validate_optional_post_text(value.text)
+
+    items: list[CarouselItem] = []
+    for raw_item in cast(tuple[object, ...], value.items):
+        if not isinstance(raw_item, CarouselItem) or raw_item.media_type not in {
+            "IMAGE",
+            "VIDEO",
+        }:
+            raise StandaloneMutationError("INVALID_CAROUSEL_MANIFEST")
+        item = raw_item
+        validate_media_post_inputs(item.url, None, item.alt_text)
+        items.append(item)
+    return CarouselManifest(items=tuple(items), text=value.text)
 
 
 class LocalOperationStore:
@@ -146,6 +322,10 @@ class LocalOperationStore:
             current.account_id != operation.account_id
             or current.kind != operation.kind
             or operation.phase not in _TRANSITIONS.get(current.phase, frozenset())
+            or (
+                current.kind == _CAROUSEL_KIND
+                and not _valid_carousel_child_transition(current, operation)
+            )
         ):
             raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
         operations = self._operations_directory(create=False)
@@ -385,6 +565,15 @@ class LocalThreadsMutationRuntime:
         )
         return PublishedMediaResult(operation_id=operation_id, media_id=media_id)
 
+    async def publish_carousel(
+        self,
+        alias: str,
+        manifest: CarouselManifest,
+    ) -> PublishedCarouselResult:
+        validated_manifest = _validate_carousel_manifest(manifest)
+        operation_id, media_id = await self._publish_carousel(alias, validated_manifest)
+        return PublishedCarouselResult(operation_id=operation_id, media_id=media_id)
+
     async def create_reply(
         self,
         alias: str,
@@ -477,28 +666,7 @@ class LocalThreadsMutationRuntime:
                     self._best_effort_failed_final(operation, code)
                     raise StandaloneMutationError(code, operation.id) from None
 
-            publish_requested = self._persist_required(
-                replace(operation, phase="PUBLISH_REQUESTED")
-            )
-            try:
-                media_id = await self._api.publish_container(token, container_id)
-            except asyncio.CancelledError:
-                self._raise_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
-            except Exception as error:
-                self._raise_ambiguous(publish_requested, _safe_exception_code(error))
-            except BaseException:
-                self._best_effort_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
-                raise
-            if not _valid_remote_id(media_id):
-                self._raise_ambiguous(publish_requested, "THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
-
-            try:
-                published = self._operations.update(
-                    replace(publish_requested, phase="PUBLISHED", media_id=media_id)
-                )
-            except StandaloneMutationError:
-                self._raise_ambiguous(publish_requested, "OPERATION_STATE_INVALID")
-            return published.id, media_id
+            return await self._publish_ready_container(token, operation)
         finally:
             try:
                 lock.release()
@@ -506,6 +674,160 @@ class LocalThreadsMutationRuntime:
                 # The lock implementation closes its stream even when unlock fails.
                 # Cleanup must not replace the primary publish outcome.
                 pass
+
+    async def _publish_carousel(
+        self,
+        alias: str,
+        manifest: CarouselManifest,
+    ) -> tuple[UUID, str]:
+        account = self._accounts.get(alias)
+        lock = FilesystemProcessLock(_account_lock_path(self._root, account.id))
+        try:
+            lock.acquire()
+        except ProcessAlreadyRunning:
+            raise StandaloneMutationError("ACCOUNT_BUSY") from None
+        except OSError:
+            raise StandaloneMutationError("LOCAL_OPERATION_UNAVAILABLE") from None
+
+        try:
+            if account.credential_ref is None:
+                raise ThreadsCredentialError(ThreadsCredentialErrorCode.NOT_CONFIGURED)
+            token = await self._secret_resolver.resolve(account.credential_ref)
+            quota = await self._api.get_publishing_quota(token)
+            if quota.usage is not None and quota.total is not None and quota.usage >= quota.total:
+                raise StandaloneMutationError("THREADS_PUBLISHING_QUOTA_REACHED")
+
+            operation = self._operations.create_received(account.id, kind=_CAROUSEL_KIND)
+            try:
+                operation = self._persist_required(replace(operation, phase="CHILDREN_CREATING"))
+            except StandaloneMutationError as error:
+                self._best_effort_failed_final(operation, error.code)
+                raise StandaloneMutationError(error.code, operation.id) from None
+
+            for item in manifest.items:
+                request = MediaContainerRequest(
+                    media_type=item.media_type,
+                    image_url=item.url if item.media_type == "IMAGE" else None,
+                    video_url=item.url if item.media_type == "VIDEO" else None,
+                    alt_text=item.alt_text,
+                    is_carousel_item=True,
+                )
+                try:
+                    child = await self._api.create_container(token, request)
+                except asyncio.CancelledError:
+                    self._best_effort_failed_final(operation, "OPERATION_CANCELLED")
+                    raise StandaloneMutationError("OPERATION_CANCELLED", operation.id) from None
+                except Exception as error:
+                    code = _safe_exception_code(error)
+                    self._best_effort_failed_final(operation, code)
+                    raise StandaloneMutationError(code, operation.id) from None
+
+                child_id = getattr(child, "container_id", None)
+                if not _valid_remote_id(child_id) or child_id in operation.child_container_ids:
+                    code = "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+                    self._best_effort_failed_final(operation, code)
+                    raise StandaloneMutationError(code, operation.id)
+
+                try:
+                    operation = self._persist_required(
+                        replace(
+                            operation,
+                            child_container_ids=(*operation.child_container_ids, child_id),
+                        )
+                    )
+                except StandaloneMutationError as error:
+                    self._best_effort_failed_final(operation, error.code)
+                    raise StandaloneMutationError(error.code, operation.id) from None
+
+                try:
+                    await self._wait_for_container_ready(token, child_id)
+                except asyncio.CancelledError:
+                    self._best_effort_failed_final(operation, "OPERATION_CANCELLED")
+                    raise StandaloneMutationError("OPERATION_CANCELLED", operation.id) from None
+                except StandaloneMutationError as error:
+                    self._best_effort_failed_final(operation, error.code)
+                    raise StandaloneMutationError(error.code, operation.id) from None
+                except Exception as error:
+                    code = _safe_exception_code(error)
+                    self._best_effort_failed_final(operation, code)
+                    raise StandaloneMutationError(code, operation.id) from None
+
+            parent_request = MediaContainerRequest(
+                media_type="CAROUSEL",
+                text=manifest.text,
+                children=operation.child_container_ids,
+            )
+            try:
+                parent = await self._api.create_container(token, parent_request)
+            except asyncio.CancelledError:
+                self._best_effort_failed_final(operation, "OPERATION_CANCELLED")
+                raise StandaloneMutationError("OPERATION_CANCELLED", operation.id) from None
+            except Exception as error:
+                code = _safe_exception_code(error)
+                self._best_effort_failed_final(operation, code)
+                raise StandaloneMutationError(code, operation.id) from None
+
+            parent_id = getattr(parent, "container_id", None)
+            if not _valid_remote_id(parent_id) or parent_id in operation.child_container_ids:
+                code = "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+                self._best_effort_failed_final(operation, code)
+                raise StandaloneMutationError(code, operation.id)
+            try:
+                operation = self._persist_required(
+                    replace(operation, phase="CONTAINER_CREATED", container_id=parent_id)
+                )
+            except StandaloneMutationError as error:
+                self._best_effort_failed_final(operation, error.code)
+                raise StandaloneMutationError(error.code, operation.id) from None
+
+            try:
+                await self._wait_for_container_ready(token, parent_id)
+            except asyncio.CancelledError:
+                self._best_effort_failed_final(operation, "OPERATION_CANCELLED")
+                raise StandaloneMutationError("OPERATION_CANCELLED", operation.id) from None
+            except StandaloneMutationError as error:
+                self._best_effort_failed_final(operation, error.code)
+                raise StandaloneMutationError(error.code, operation.id) from None
+            except Exception as error:
+                code = _safe_exception_code(error)
+                self._best_effort_failed_final(operation, code)
+                raise StandaloneMutationError(code, operation.id) from None
+
+            return await self._publish_ready_container(token, operation)
+        finally:
+            try:
+                lock.release()
+            except OSError:
+                pass
+
+    async def _publish_ready_container(
+        self,
+        token: SecretStr,
+        operation: LocalOperation,
+    ) -> tuple[UUID, str]:
+        container_id = operation.container_id
+        if container_id is None:
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        publish_requested = self._persist_required(replace(operation, phase="PUBLISH_REQUESTED"))
+        try:
+            media_id = await self._api.publish_container(token, container_id)
+        except asyncio.CancelledError:
+            self._raise_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
+        except Exception as error:
+            self._raise_ambiguous(publish_requested, _safe_exception_code(error))
+        except BaseException:
+            self._best_effort_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
+            raise
+        if not _valid_remote_id(media_id):
+            self._raise_ambiguous(publish_requested, "THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+
+        try:
+            published = self._operations.update(
+                replace(publish_requested, phase="PUBLISHED", media_id=media_id)
+            )
+        except BaseException:
+            self._raise_ambiguous(publish_requested, "OPERATION_STATE_INVALID")
+        return published.id, media_id
 
     async def _wait_for_container_ready(self, token: SecretStr, container_id: str) -> None:
         try:
@@ -709,6 +1031,10 @@ def _validate_operation(operation: LocalOperation) -> None:
         or operation.version != _JOURNAL_VERSION
         or operation.kind not in _JOURNAL_KINDS
         or operation.phase not in _JOURNAL_PHASES
+        or type(operation.child_container_ids) is not tuple
+        or len(operation.child_container_ids) > _MAX_CAROUSEL_ITEMS
+        or any(not _valid_remote_id(child_id) for child_id in operation.child_container_ids)
+        or len(set(operation.child_container_ids)) != len(operation.child_container_ids)
     ):
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
     if operation.container_id is not None and not _valid_remote_id(operation.container_id):
@@ -717,26 +1043,88 @@ def _validate_operation(operation: LocalOperation) -> None:
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
     if operation.outcome_code is not None and _SAFE_CODE.fullmatch(operation.outcome_code) is None:
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
-    valid_shape = {
-        "RECEIVED": operation.container_id is None
-        and operation.media_id is None
-        and operation.outcome_code is None,
-        "CONTAINER_CREATED": operation.container_id is not None
-        and operation.media_id is None
-        and operation.outcome_code is None,
-        "PUBLISH_REQUESTED": operation.container_id is not None
-        and operation.media_id is None
-        and operation.outcome_code is None,
-        "PUBLISHED": operation.container_id is not None
-        and operation.media_id is not None
-        and operation.outcome_code is None,
-        "AMBIGUOUS": operation.container_id is not None
-        and operation.media_id is None
-        and operation.outcome_code is not None,
-        "FAILED_FINAL": operation.media_id is None and operation.outcome_code is not None,
-    }
+    if operation.kind == _CAROUSEL_KIND:
+        has_ready_children = _MIN_CAROUSEL_ITEMS <= len(operation.child_container_ids)
+        parent_is_distinct = (
+            operation.container_id is None
+            or operation.container_id not in operation.child_container_ids
+        )
+        valid_shape = {
+            "RECEIVED": operation.container_id is None
+            and operation.media_id is None
+            and operation.outcome_code is None
+            and not operation.child_container_ids,
+            "CHILDREN_CREATING": operation.container_id is None
+            and operation.media_id is None
+            and operation.outcome_code is None,
+            "CONTAINER_CREATED": operation.container_id is not None
+            and operation.media_id is None
+            and operation.outcome_code is None
+            and has_ready_children
+            and parent_is_distinct,
+            "PUBLISH_REQUESTED": operation.container_id is not None
+            and operation.media_id is None
+            and operation.outcome_code is None
+            and has_ready_children
+            and parent_is_distinct,
+            "PUBLISHED": operation.container_id is not None
+            and operation.media_id is not None
+            and operation.outcome_code is None
+            and has_ready_children
+            and parent_is_distinct,
+            "AMBIGUOUS": operation.container_id is not None
+            and operation.media_id is None
+            and operation.outcome_code is not None
+            and has_ready_children
+            and parent_is_distinct,
+            "FAILED_FINAL": operation.media_id is None
+            and operation.outcome_code is not None
+            and parent_is_distinct,
+        }
+    else:
+        if operation.child_container_ids or operation.phase == "CHILDREN_CREATING":
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        valid_shape = {
+            "RECEIVED": operation.container_id is None
+            and operation.media_id is None
+            and operation.outcome_code is None,
+            "CONTAINER_CREATED": operation.container_id is not None
+            and operation.media_id is None
+            and operation.outcome_code is None,
+            "PUBLISH_REQUESTED": operation.container_id is not None
+            and operation.media_id is None
+            and operation.outcome_code is None,
+            "PUBLISHED": operation.container_id is not None
+            and operation.media_id is not None
+            and operation.outcome_code is None,
+            "AMBIGUOUS": operation.container_id is not None
+            and operation.media_id is None
+            and operation.outcome_code is not None,
+            "FAILED_FINAL": operation.media_id is None and operation.outcome_code is not None,
+        }
     if not valid_shape[operation.phase]:
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+
+
+def _valid_carousel_child_transition(
+    current: LocalOperation,
+    operation: LocalOperation,
+) -> bool:
+    current_children = current.child_container_ids
+    next_children = operation.child_container_ids
+    if len(next_children) < len(current_children) or next_children[: len(current_children)] != (
+        current_children
+    ):
+        return False
+    if current.phase == "RECEIVED":
+        return (
+            operation.phase in {"CHILDREN_CREATING", "FAILED_FINAL"}
+            and not current_children
+            and not next_children
+        )
+    if current.phase == "CHILDREN_CREATING" and operation.phase == "CHILDREN_CREATING":
+        return len(next_children) == len(current_children) + 1
+    return next_children == current_children
 
 
 def _encode_operation(operation: LocalOperation) -> str:
@@ -754,6 +1142,8 @@ def _encode_operation(operation: LocalOperation) -> str:
         data["media_id"] = operation.media_id
     if operation.outcome_code is not None:
         data["outcome_code"] = operation.outcome_code
+    if operation.child_container_ids:
+        data["child_container_ids"] = list(operation.child_container_ids)
     return json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n"
 
 
@@ -764,6 +1154,10 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError
         result[key] = value
     return result
+
+
+def _reject_non_json_constant(value: str) -> NoReturn:
+    raise ValueError(value)
 
 
 def _decode_operation(data: object, requested_id: UUID) -> LocalOperation:
@@ -800,10 +1194,14 @@ def _decode_operation(data: object, requested_id: UUID) -> LocalOperation:
     container_id = journal_data.get("container_id")
     media_id = journal_data.get("media_id")
     outcome_code = journal_data.get("outcome_code")
+    raw_child_ids = journal_data.get("child_container_ids", [])
     if (
         (container_id is not None and not isinstance(container_id, str))
         or (media_id is not None and not isinstance(media_id, str))
         or (outcome_code is not None and not isinstance(outcome_code, str))
+        or not isinstance(raw_child_ids, list)
+        or any(type(child_id) is not str for child_id in cast(list[object], raw_child_ids))
+        or (kind != _CAROUSEL_KIND and "child_container_ids" in journal_data)
     ):
         raise StandaloneMutationError("OPERATION_STATE_INVALID", requested_id)
     operation = LocalOperation(
@@ -815,6 +1213,7 @@ def _decode_operation(data: object, requested_id: UUID) -> LocalOperation:
         container_id=container_id,
         media_id=media_id,
         outcome_code=outcome_code,
+        child_container_ids=tuple(cast(list[str], raw_child_ids)),
     )
     try:
         _validate_operation(operation)
