@@ -127,8 +127,10 @@ class LocalOperationStore:
             current = self.get(operation.id)
         except StandaloneMutationError:
             raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id) from None
-        if current.account_id != operation.account_id or operation.phase not in _TRANSITIONS.get(
-            current.phase, frozenset()
+        if (
+            current.account_id != operation.account_id
+            or current.kind != operation.kind
+            or operation.phase not in _TRANSITIONS.get(current.phase, frozenset())
         ):
             raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
         operations = self._operations_directory(create=False)

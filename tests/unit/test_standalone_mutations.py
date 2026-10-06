@@ -972,6 +972,70 @@ def test_operation_get_is_local_bounded_and_rejects_missing_id(tmp_path: Path) -
     assert caught.value.code == "OPERATION_NOT_FOUND"
 
 
+@pytest.mark.parametrize(
+    ("current_kind", "replacement_kind"),
+    [("POST_TEXT", "CREATE_REPLY"), ("CREATE_REPLY", "POST_TEXT")],
+)
+def test_operation_update_rejects_kind_changes(
+    tmp_path: Path, current_kind: str, replacement_kind: str
+) -> None:
+    store = LocalOperationStore(tmp_path)
+    operation = store.create_received(
+        UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        kind=current_kind,
+    )
+    replacement = LocalOperation(
+        version=operation.version,
+        id=operation.id,
+        account_id=operation.account_id,
+        kind=replacement_kind,
+        phase="FAILED_FINAL",
+        outcome_code="TEST_FINAL_FAILURE",
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        store.update(replacement)
+
+    assert caught.value.code == "OPERATION_STATE_INVALID"
+    assert store.get(operation.id) == operation
+
+
+@pytest.mark.parametrize("kind", ["POST_TEXT", "CREATE_REPLY"])
+def test_operation_update_allows_normal_same_kind_transitions(tmp_path: Path, kind: str) -> None:
+    store = LocalOperationStore(tmp_path)
+    operation = store.create_received(UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), kind=kind)
+    container_created = LocalOperation(
+        version=operation.version,
+        id=operation.id,
+        account_id=operation.account_id,
+        kind=kind,
+        phase="CONTAINER_CREATED",
+        container_id="container-123",
+    )
+    publish_requested = LocalOperation(
+        version=operation.version,
+        id=operation.id,
+        account_id=operation.account_id,
+        kind=kind,
+        phase="PUBLISH_REQUESTED",
+        container_id="container-123",
+    )
+    published = LocalOperation(
+        version=operation.version,
+        id=operation.id,
+        account_id=operation.account_id,
+        kind=kind,
+        phase="PUBLISHED",
+        container_id="container-123",
+        media_id="media-123",
+    )
+
+    assert store.update(container_created) == container_created
+    assert store.update(publish_requested) == publish_requested
+    assert store.update(published) == published
+    assert store.get(operation.id) == published
+
+
 def test_post_text_journal_remains_readable_with_shared_reply_journal(tmp_path: Path) -> None:
     store = LocalOperationStore(tmp_path)
     operation_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
