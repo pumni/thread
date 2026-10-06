@@ -8,16 +8,20 @@ import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from threads_platform.application.ports.threads import (
+    DiscoveryPage,
     PublishingQuota,
     RemoteMedia,
+    RemotePublicProfile,
     ReplyPage,
     ThreadsAPIError,
     ThreadsCredentialError,
 )
 from threads_platform.config.settings import Settings
+from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.infrastructure.threads_api.environment_credentials import (
     EnvironmentThreadsCredentialSecretResolver,
@@ -59,6 +63,72 @@ def _format_text(value: str | None) -> str:
     return normalized[:500] if normalized else "-"
 
 
+def _format_bounded_text(value: str | None, limit: int) -> str:
+    if value is None:
+        return "-"
+    safe_value = re.sub(r"[\x00-\x1f\x7f]", " ", value)
+    normalized = re.sub(r"\s+", " ", safe_value).strip()
+    return normalized[:limit] if normalized else "-"
+
+
+def _format_https_url(value: str | None) -> str:
+    if value is None or len(value) > 2048 or re.search(r"[\s\x00-\x1f\x7f]", value):
+        return "-"
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError:
+        return "-"
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return "-"
+    return value
+
+
+def _format_discovery_cursor(value: str | None) -> str:
+    if value is None or not value.strip() or len(value) > 4096 or not value.isprintable():
+        return "-"
+    return value
+
+
+def _format_public_profile(profile: RemotePublicProfile) -> str:
+    return (
+        f"profile id={_format_bounded_text(profile.remote_author_id, 255)} "
+        f"username={_format_bounded_text(profile.username, 255)} "
+        f"name={_format_bounded_text(profile.display_name, 255)} "
+        f"bio={_format_bounded_text(profile.biography, 500)} "
+        f"picture={_format_https_url(profile.profile_picture_url)}\n"
+    )
+
+
+def _format_discovery_page(kind: str, page: DiscoveryPage, limit: int) -> str:
+    threads = page.threads[: min(max(limit, 0), 50)]
+    lines = [
+        f"{kind} count={len(threads)} "
+        f"has_more={str(page.has_more).lower()} "
+        f"next_cursor={_format_discovery_cursor(page.next_cursor)}\n"
+    ]
+    for thread in threads:
+        timestamp = thread.timestamp.isoformat() if thread.timestamp is not None else None
+        quote = "-" if thread.is_quote_post is None else str(thread.is_quote_post).lower()
+        has_replies = "-" if thread.has_replies is None else str(thread.has_replies).lower()
+        lines.append(
+            f"thread {_format_bounded_text(thread.remote_thread_id, 255)} "
+            f"username={_format_bounded_text(thread.username, 255)} "
+            f"timestamp={_format_bounded_text(timestamp, 64)} "
+            f"media_type={_format_bounded_text(thread.media_type, 80)} "
+            f"quote={quote} has_replies={has_replies} "
+            f"permalink={_format_https_url(thread.permalink)} "
+            f"text={_format_bounded_text(thread.text, 500)}\n"
+        )
+    return "".join(lines)
+
+
 async def _run_api_command(args: argparse.Namespace, store: LocalAccountStore) -> str:
     settings = Settings()
     async with build_threads_http_client(settings) as client:
@@ -82,6 +152,31 @@ async def _run_api_command(args: argparse.Namespace, store: LocalAccountStore) -
                 f"permalink {_format_scalar(media.permalink)}\n"
                 f"text {_format_text(media.text)}\n"
             )
+
+        if args.api_command == "public-profile":
+            profile = await runtime.public_profile(args.alias, args.username)
+            return _format_public_profile(profile)
+        if args.api_command == "profile-posts":
+            page = await runtime.profile_posts(
+                args.alias,
+                args.username,
+                after=args.after,
+                limit=args.limit,
+            )
+            return _format_discovery_page("profile-posts", page, args.limit)
+        if args.api_command == "search":
+            page = await runtime.search(
+                args.alias,
+                args.query,
+                search_mode=DiscoverySearchMode(args.mode.upper()),
+                search_type=DiscoverySearchType(args.type.upper()),
+                after=args.after,
+                limit=args.limit,
+            )
+            return _format_discovery_page("search", page, args.limit)
+        if args.api_command == "mentions":
+            page = await runtime.mentions(args.alias, after=args.after, limit=args.limit)
+            return _format_discovery_page("mentions", page, args.limit)
 
         if args.api_command == "replies":
             page = await runtime.replies(args.alias, args.thread_id, after=args.after)
@@ -213,6 +308,20 @@ def _build_parser() -> argparse.ArgumentParser:
     media_parser = api_commands.add_parser("media")
     media_parser.add_argument("alias")
     media_parser.add_argument("media_id")
+    public_profile_parser = api_commands.add_parser("public-profile")
+    public_profile_parser.add_argument("alias")
+    public_profile_parser.add_argument("username")
+    for name in ("profile-posts", "search", "mentions"):
+        page_parser = api_commands.add_parser(name)
+        page_parser.add_argument("alias")
+        if name == "profile-posts":
+            page_parser.add_argument("username")
+        elif name == "search":
+            page_parser.add_argument("query")
+            page_parser.add_argument("--mode", choices=("keyword", "tag"), required=True)
+            page_parser.add_argument("--type", choices=("top", "recent"), required=True)
+        page_parser.add_argument("--after")
+        page_parser.add_argument("--limit", type=int, default=25)
     for name in ("replies", "conversation"):
         page_parser = api_commands.add_parser(name)
         page_parser.add_argument("alias")

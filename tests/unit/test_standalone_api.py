@@ -10,14 +10,17 @@ from pydantic import AnyHttpUrl, SecretStr
 
 import threads_platform.standalone.api as api_module
 from threads_platform.application.ports.threads import (
+    DiscoveryPage,
     PublishingQuota,
     RemoteMedia,
+    RemotePublicProfile,
     ReplyPage,
     ThreadsAPI,
     ThreadsCredentialError,
     ThreadsCredentialErrorCode,
 )
 from threads_platform.config.settings import Settings
+from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 from threads_platform.infrastructure.threads_api.environment_credentials import (
     EnvironmentThreadsCredentialSecretResolver,
 )
@@ -50,9 +53,26 @@ class _FakeApi:
         self.media_calls: list[tuple[SecretStr, str]] = []
         self.replies_calls: list[tuple[SecretStr, str, str | None]] = []
         self.conversation_calls: list[tuple[SecretStr, str, str | None]] = []
+        self.public_profile_calls: list[tuple[SecretStr, str]] = []
+        self.profile_posts_calls: list[tuple[SecretStr, str, str | None, int]] = []
+        self.search_calls: list[
+            tuple[
+                SecretStr,
+                str,
+                DiscoverySearchMode,
+                DiscoverySearchType,
+                str | None,
+                object,
+                object,
+                int,
+            ]
+        ] = []
+        self.mentions_calls: list[tuple[SecretStr, str | None, object, object, int]] = []
         self.quota_result = PublishingQuota(usage=3, total=250, reply_usage=1, reply_total=100)
         self.media_result = RemoteMedia("media-1", "text", "https://example.test/p/1", "now")
         self.page_result = ReplyPage((), "next", True)
+        self.discovery_page_result = DiscoveryPage((), "next", True)
+        self.public_profile_result = RemotePublicProfile("author-1", "alice", None, None, None)
         self.failure: Exception | None = None
 
     async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
@@ -80,6 +100,53 @@ class _FakeApi:
         if self.failure is not None:
             raise self.failure
         return self.page_result
+
+    async def get_public_profile(self, token: SecretStr, username: str) -> RemotePublicProfile:
+        self.public_profile_calls.append((token, username))
+        if self.failure is not None:
+            raise self.failure
+        return self.public_profile_result
+
+    async def get_profile_posts(
+        self, token: SecretStr, username: str, *, after: str | None, limit: int
+    ) -> DiscoveryPage:
+        self.profile_posts_calls.append((token, username, after, limit))
+        if self.failure is not None:
+            raise self.failure
+        return self.discovery_page_result
+
+    async def search_threads(
+        self,
+        token: SecretStr,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None,
+        since: object,
+        until: object,
+        limit: int,
+    ) -> DiscoveryPage:
+        self.search_calls.append(
+            (token, query, search_mode, search_type, after, since, until, limit)
+        )
+        if self.failure is not None:
+            raise self.failure
+        return self.discovery_page_result
+
+    async def get_mentions(
+        self,
+        token: SecretStr,
+        *,
+        after: str | None,
+        since: object,
+        until: object,
+        limit: int,
+    ) -> DiscoveryPage:
+        self.mentions_calls.append((token, after, since, until, limit))
+        if self.failure is not None:
+            raise self.failure
+        return self.discovery_page_result
 
 
 def _configured_runtime(
@@ -204,6 +271,142 @@ async def test_invalid_ids_and_cursors_are_rejected_before_account_lookup() -> N
     assert api.media_calls == []
     assert api.replies_calls == []
     assert api.conversation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_discovery_inputs_are_rejected_before_account_lookup() -> None:
+    class _ForbiddenAccountLookup:
+        def get(self, alias: str) -> object:
+            raise AssertionError("account lookup must not occur for invalid input")
+
+    api = _FakeApi()
+    resolver = _FakeResolver()
+    runtime = LocalThreadsApiRuntime(
+        cast(LocalAccountStore, _ForbiddenAccountLookup()),
+        cast(ThreadsAPI, api),
+        resolver,
+    )
+    operations: tuple[tuple[Callable[[], object], str], ...] = (
+        (lambda: runtime.public_profile("alice", ""), "INVALID_USERNAME"),
+        (lambda: runtime.public_profile("alice", "   "), "INVALID_USERNAME"),
+        (lambda: runtime.public_profile("alice", "x" * 256), "INVALID_USERNAME"),
+        (lambda: runtime.public_profile("alice", "user\nname"), "INVALID_USERNAME"),
+        (
+            lambda: runtime.public_profile("alice", "https://example.test/profile"),
+            "INVALID_USERNAME",
+        ),
+        (lambda: runtime.profile_posts("alice", "alice", after=""), "INVALID_CURSOR"),
+        (lambda: runtime.profile_posts("alice", "alice", limit=0), "INVALID_LIMIT"),
+        (lambda: runtime.profile_posts("alice", "alice", limit=51), "INVALID_LIMIT"),
+        (lambda: runtime.profile_posts("alice", "alice", limit=True), "INVALID_LIMIT"),
+        (
+            lambda: runtime.search(
+                "alice",
+                "",
+                search_mode=DiscoverySearchMode.KEYWORD,
+                search_type=DiscoverySearchType.TOP,
+            ),
+            "INVALID_QUERY",
+        ),
+        (
+            lambda: runtime.search(
+                "alice",
+                "https://example.test/search",
+                search_mode=DiscoverySearchMode.KEYWORD,
+                search_type=DiscoverySearchType.TOP,
+            ),
+            "INVALID_QUERY",
+        ),
+        (
+            lambda: runtime.search(
+                "alice",
+                "query",
+                search_mode=cast(DiscoverySearchMode, "KEYWORD"),
+                search_type=DiscoverySearchType.TOP,
+            ),
+            "INVALID_SEARCH_MODE",
+        ),
+        (
+            lambda: runtime.search(
+                "alice",
+                "query",
+                search_mode=DiscoverySearchMode.KEYWORD,
+                search_type=cast(DiscoverySearchType, "top"),
+            ),
+            "INVALID_SEARCH_TYPE",
+        ),
+        (
+            lambda: runtime.search(
+                "alice",
+                "query",
+                search_mode=DiscoverySearchMode.KEYWORD,
+                search_type=DiscoverySearchType.TOP,
+                after="x\ry",
+            ),
+            "INVALID_CURSOR",
+        ),
+        (
+            lambda: runtime.search(
+                "alice",
+                "query",
+                search_mode=DiscoverySearchMode.KEYWORD,
+                search_type=DiscoverySearchType.TOP,
+                limit=cast(int, 1.5),
+            ),
+            "INVALID_LIMIT",
+        ),
+        (lambda: runtime.mentions("alice", after="x" * 4097), "INVALID_CURSOR"),
+        (lambda: runtime.mentions("alice", limit=False), "INVALID_LIMIT"),
+    )
+
+    for operation, expected_code in operations:
+        with pytest.raises(StandaloneApiError) as error:
+            await operation()  # type: ignore[misc]
+        assert error.value.code == expected_code
+
+    assert resolver.calls == []
+    assert api.public_profile_calls == []
+    assert api.profile_posts_calls == []
+    assert api.search_calls == []
+    assert api.mentions_calls == []
+
+
+@pytest.mark.asyncio
+async def test_discovery_methods_resolve_and_delegate_once_with_bounded_inputs(
+    tmp_path: Path,
+) -> None:
+    _, api, resolver, runtime = _configured_runtime(tmp_path)
+
+    profile = await runtime.public_profile("alice", "public_user")
+    posts = await runtime.profile_posts("alice", "post_user", after="posts-cursor", limit=12)
+    search = await runtime.search(
+        "alice",
+        "topic",
+        search_mode=DiscoverySearchMode.TAG,
+        search_type=DiscoverySearchType.RECENT,
+        after="search-cursor",
+        limit=8,
+    )
+    mentions = await runtime.mentions("alice", after="mentions-cursor", limit=3)
+
+    assert profile == api.public_profile_result
+    assert posts == search == mentions == api.discovery_page_result
+    assert api.public_profile_calls == [(resolver.token, "public_user")]
+    assert api.profile_posts_calls == [(resolver.token, "post_user", "posts-cursor", 12)]
+    assert api.search_calls == [
+        (
+            resolver.token,
+            "topic",
+            DiscoverySearchMode.TAG,
+            DiscoverySearchType.RECENT,
+            "search-cursor",
+            None,
+            None,
+            8,
+        )
+    ]
+    assert api.mentions_calls == [(resolver.token, "mentions-cursor", None, None, 3)]
+    assert resolver.calls == [_CREDENTIAL_REF] * 4
 
 
 @pytest.mark.asyncio

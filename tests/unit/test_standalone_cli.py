@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -13,10 +14,13 @@ from pydantic import SecretStr
 import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.accounts as account_module
 from threads_platform.application.ports.threads import (
+    DiscoveryPage,
     MediaContainer,
     MediaContainerRequest,
     PublishingQuota,
+    RemoteDiscoveryThread,
     RemoteMedia,
+    RemotePublicProfile,
     RemoteReply,
     ReplyPage,
     ThreadsAPIError,
@@ -24,6 +28,7 @@ from threads_platform.application.ports.threads import (
     ThreadsCredentialErrorCode,
 )
 from threads_platform.config.settings import Settings
+from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.standalone.__main__ import main
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
@@ -387,6 +392,196 @@ def test_cli_api_conversation_formats_one_page(
     assert captured.err == ""
 
 
+def test_cli_api_public_profile_normalizes_and_bounds_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    biography = " biography\n" + "b" * 510
+
+    async def fake_profile(
+        runtime: LocalThreadsApiRuntime, alias: str, username: str
+    ) -> RemotePublicProfile:
+        assert (alias, username) == ("alice", "public_user")
+        return RemotePublicProfile(
+            "profile\nid",
+            "public_user",
+            " Example\n User\x1bEND ",
+            biography,
+            "http://example.test/profile.jpg",
+        )
+
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "public_profile", fake_profile)
+
+    result = main(["api", "public-profile", "alice", "public_user"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        f"profile id=profile id username=public_user name=Example User END "
+        f"bio={('biography ' + 'b' * 510)[:500]} picture=-\n"
+    )
+    assert captured.err == ""
+    assert context.enter_count == context.exit_count == 1
+
+
+def test_cli_api_profile_posts_forwards_pagination_and_formats_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    calls: list[tuple[str, str, str | None, int]] = []
+
+    async def fake_profile_posts(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        username: str,
+        *,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> DiscoveryPage:
+        calls.append((alias, username, after, limit))
+        thread = RemoteDiscoveryThread(
+            "thread-1",
+            "author-1",
+            None,
+            "post text",
+            "https://example.test/thread/1",
+            "TEXT",
+            None,
+            None,
+            None,
+        )
+        return DiscoveryPage((thread,), "next-posts", True)
+
+    monkeypatch.setattr(
+        cli_module.LocalThreadsApiRuntime,
+        "profile_posts",
+        fake_profile_posts,
+    )
+
+    result = main(
+        ["api", "profile-posts", "alice", "public_user", "--after", "cursor-1", "--limit", "7"]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("alice", "public_user", "cursor-1", 7)]
+    assert captured.out == (
+        "profile-posts count=1 has_more=true next_cursor=next-posts\n"
+        "thread thread-1 username=- timestamp=- media_type=TEXT quote=- has_replies=- "
+        "permalink=https://example.test/thread/1 text=post text\n"
+    )
+    assert captured.err == ""
+    assert context.enter_count == context.exit_count == 1
+
+
+def test_cli_api_search_maps_choices_and_bounds_page_output_without_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    query_sentinel = "private-query-sentinel"
+    thread_text = " first\n\tsecond " + "x" * 510
+    calls: list[tuple[str, str, DiscoverySearchMode, DiscoverySearchType, str | None, int]] = []
+
+    async def fake_search(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        query: str,
+        *,
+        search_mode: DiscoverySearchMode,
+        search_type: DiscoverySearchType,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> DiscoveryPage:
+        calls.append((alias, query, search_mode, search_type, after, limit))
+        first = RemoteDiscoveryThread(
+            "thread-1",
+            "author-1",
+            "alice",
+            thread_text,
+            "https://example.test/thread/1",
+            "TEXT",
+            datetime(2026, 10, 5, tzinfo=UTC),
+            True,
+            False,
+        )
+        second = RemoteDiscoveryThread("thread-2", None, None, None, None, None, None, None, None)
+        return DiscoveryPage((first, second), "next-search", True)
+
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "search", fake_search)
+
+    result = main(
+        [
+            "api",
+            "search",
+            "alice",
+            query_sentinel,
+            "--mode",
+            "tag",
+            "--type",
+            "recent",
+            "--after",
+            "search-cursor",
+            "--limit",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    bounded_text = ("first second " + "x" * 510)[:500]
+    assert result == 0
+    assert calls == [
+        (
+            "alice",
+            query_sentinel,
+            DiscoverySearchMode.TAG,
+            DiscoverySearchType.RECENT,
+            "search-cursor",
+            1,
+        )
+    ]
+    assert captured.out == (
+        "search count=1 has_more=true next_cursor=next-search\n"
+        "thread thread-1 username=alice timestamp=2026-10-05T00:00:00+00:00 "
+        f"media_type=TEXT quote=true has_replies=false permalink=https://example.test/thread/1 "
+        f"text={bounded_text}\n"
+    )
+    assert query_sentinel not in captured.out + captured.err
+    assert captured.err == ""
+    assert context.enter_count == context.exit_count == 1
+
+
+def test_cli_api_mentions_formats_cursor_and_accepts_canonical_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    calls: list[tuple[str, str | None, int]] = []
+
+    async def fake_mentions(
+        runtime: LocalThreadsApiRuntime,
+        alias: str,
+        *,
+        after: str | None = None,
+        limit: int = 25,
+    ) -> DiscoveryPage:
+        calls.append((alias, after, limit))
+        return DiscoveryPage((), "next-mentions", True)
+
+    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "mentions", fake_mentions)
+
+    result = main(["api", "mentions", "alice", "--after", "mentions-cursor", "--limit", "4"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("alice", "mentions-cursor", 4)]
+    assert captured.out == "mentions count=0 has_more=true next_cursor=next-mentions\n"
+    assert captured.err == ""
+    assert context.enter_count == context.exit_count == 1
+
+
 @pytest.mark.parametrize(
     ("argv", "method_name", "failure", "expected_code"),
     [
@@ -407,6 +602,30 @@ def test_cli_api_conversation_formats_one_page(
             "media",
             StandaloneApiError("INVALID_MEDIA_ID"),
             "INVALID_MEDIA_ID",
+        ),
+        (
+            ["api", "public-profile", "alice", "username"],
+            "public_profile",
+            ThreadsAPIError("THREADS_TRANSPORT_FAILURE"),
+            "THREADS_TRANSPORT_FAILURE",
+        ),
+        (
+            ["api", "profile-posts", "alice", "username"],
+            "profile_posts",
+            ThreadsCredentialError(ThreadsCredentialErrorCode.SECRET_UNAVAILABLE),
+            "THREADS_CREDENTIAL_SECRET_UNAVAILABLE",
+        ),
+        (
+            ["api", "search", "alice", "query", "--mode", "keyword", "--type", "top"],
+            "search",
+            ThreadsAPIError("THREADS_TRANSPORT_FAILURE"),
+            "THREADS_TRANSPORT_FAILURE",
+        ),
+        (
+            ["api", "mentions", "alice"],
+            "mentions",
+            ThreadsAPIError("THREADS_TRANSPORT_FAILURE"),
+            "THREADS_TRANSPORT_FAILURE",
         ),
     ],
 )
