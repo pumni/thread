@@ -33,6 +33,7 @@ from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.standalone.__main__ import main
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
 from threads_platform.standalone.mutations import (
+    CreatedReplyResult,
     LocalOperationStore,
     LocalThreadsMutationRuntime,
     PublishedTextResult,
@@ -715,6 +716,49 @@ def test_cli_post_success_has_exact_output_and_closes_http_context(
     assert context.exit_count == 1
 
 
+def test_cli_reply_success_has_exact_output_and_closes_http_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    calls: list[tuple[str, str, str, str | None]] = []
+
+    async def fake_reply(
+        runtime: LocalThreadsMutationRuntime,
+        alias: str,
+        thread_id: str,
+        text: str,
+        *,
+        parent_reply_id: str | None = None,
+    ) -> CreatedReplyResult:
+        calls.append((alias, thread_id, text, parent_reply_id))
+        return CreatedReplyResult(operation_id, "reply-123")
+
+    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "create_reply", fake_reply)
+
+    result = main(
+        [
+            "reply",
+            "alice",
+            "thread-456",
+            "chosen reply text",
+            "--parent-reply-id",
+            "reply-789",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("alice", "thread-456", "chosen reply text", "reply-789")]
+    assert captured.out == f"replied operation={operation_id} reply=reply-123\n"
+    assert "chosen reply text" not in captured.out + captured.err
+    assert captured.err == ""
+    assert context.enter_count == context.exit_count == 1
+
+
 @pytest.mark.parametrize("text", ["  \t", "x" * 501])
 def test_cli_post_validation_is_bounded_and_does_not_echo_text(
     text: str,
@@ -793,6 +837,89 @@ def test_cli_post_ambiguous_error_includes_operation_and_redacts_token_and_text(
     assert context.exit_count == 1
 
 
+def test_cli_reply_ambiguous_error_redacts_token_text_and_target_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    token_sentinel = "reply-token-sentinel-never-output"
+    text_sentinel = "reply-text-sentinel-never-output"
+    credential_ref = "THREADS_PLATFORM_THREADS_TOKEN_REPLY_TEST"
+    monkeypatch.setenv(credential_ref, token_sentinel)
+    store = account_module.LocalAccountStore(tmp_path / "local")
+    store.add("alice")
+    store.set_credential_ref("alice", f"env://{credential_ref}")
+    api_calls: list[str] = []
+
+    class _FailingReplyApi:
+        async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
+            assert token.get_secret_value() == token_sentinel
+            api_calls.append("quota")
+            return PublishingQuota(reply_usage=1, reply_total=100)
+
+        async def create_container(
+            self,
+            token: SecretStr,
+            request: MediaContainerRequest,
+        ) -> MediaContainer:
+            assert token.get_secret_value() == token_sentinel
+            assert request == MediaContainerRequest(
+                media_type="TEXT",
+                text=text_sentinel,
+                reply_to_id="reply-parent-2",
+            )
+            api_calls.append("create")
+            return MediaContainer(container_id="container-123")
+
+        async def publish_container(self, token: SecretStr, container_id: str) -> str:
+            assert token.get_secret_value() == token_sentinel
+            assert container_id == "container-123"
+            api_calls.append("publish")
+            raise ThreadsAPIError("THREADS_RATE_LIMITED")
+
+    def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
+        return cast(HttpThreadsAPI, _FailingReplyApi())
+
+    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+
+    result = main(
+        [
+            "reply",
+            "alice",
+            "thread-root-1",
+            text_sentinel,
+            "--parent-reply-id",
+            "reply-parent-2",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    match = re.fullmatch(
+        r"ERROR PUBLISH_OUTCOME_AMBIGUOUS operation=([0-9a-f-]{36})\n", captured.err
+    )
+    assert match is not None
+    operation_id = UUID(match.group(1))
+    assert api_calls == ["quota", "create", "publish"]
+    operation = LocalOperationStore(tmp_path / "local").get(operation_id)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "AMBIGUOUS"
+    journal = (tmp_path / "local" / "operations" / f"{operation_id}.json").read_text()
+    for forbidden in (
+        text_sentinel,
+        token_sentinel,
+        credential_ref,
+        "thread-root-1",
+        "reply-parent-2",
+        "Authorization",
+    ):
+        assert forbidden not in captured.out + captured.err + journal
+    assert context.enter_count == context.exit_count == 1
+
+
 def test_cli_operation_show_is_local_only_and_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -814,6 +941,34 @@ def test_cli_operation_show_is_local_only_and_bounded(
     assert result == 0
     assert captured.out == (
         f"operation {operation.id} kind=POST_TEXT phase=RECEIVED container=- media=- outcome=-\n"
+    )
+    assert captured.err == ""
+
+
+def test_cli_operation_show_renders_create_reply_journal_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    root.mkdir(parents=True)
+    operation = LocalOperationStore(root).create_received(
+        UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        kind="CREATE_REPLY",
+    )
+
+    def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
+        raise AssertionError("operation show must not build an HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+
+    result = main(["operation", "show", str(operation.id)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        f"operation {operation.id} kind=CREATE_REPLY phase=RECEIVED container=- media=- outcome=-\n"
     )
     assert captured.err == ""
 

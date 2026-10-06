@@ -57,7 +57,7 @@ class _FakeAPI:
         operations: LocalOperationStore,
         *,
         quota: PublishingQuota | None = None,
-        create_error: Exception | None = None,
+        create_error: BaseException | None = None,
         publish_error: BaseException | None = None,
         container_id: str = "container-123",
         media_id: str = "media-123",
@@ -127,7 +127,7 @@ def _setup(
     *,
     quota: PublishingQuota | None = None,
     resolver: _FakeResolver | None = None,
-    create_error: Exception | None = None,
+    create_error: BaseException | None = None,
     publish_error: BaseException | None = None,
     container_id: str = "container-123",
     media_id: str = "media-123",
@@ -197,6 +197,55 @@ async def test_invalid_text_is_rejected_before_account_lock_secret_or_api(
     assert not (tmp_path / "operations").exists()
 
 
+@pytest.mark.parametrize(
+    ("thread_id", "text", "parent_reply_id", "expected_code"),
+    [
+        ("bad/id", _TEXT, None, "INVALID_THREAD_ID"),
+        ("https://example.test/thread", _TEXT, None, "INVALID_THREAD_ID"),
+        ("thread-1", "", None, "INVALID_REPLY_TEXT"),
+        ("thread-1", " \t ", None, "INVALID_REPLY_TEXT"),
+        ("thread-1", "x" * 501, None, "INVALID_REPLY_TEXT"),
+        ("thread-1", _TEXT, "", "INVALID_REPLY_ID"),
+        ("thread-1", _TEXT, "bad/reply", "INVALID_REPLY_ID"),
+        ("thread-1", _TEXT, "https://example.test/reply", "INVALID_REPLY_ID"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_reply_inputs_are_rejected_before_account_lock_secret_or_api(
+    tmp_path: Path,
+    thread_id: str,
+    text: str,
+    parent_reply_id: str | None,
+    expected_code: str,
+) -> None:
+    accounts = _CountingAccounts(tmp_path)
+    operations = LocalOperationStore(tmp_path)
+    resolver = _FakeResolver()
+    api = _FakeAPI(tmp_path, operations)
+    runtime = LocalThreadsMutationRuntime(
+        tmp_path,
+        accounts,
+        cast(ThreadsAPI, api),
+        cast(ThreadsCredentialSecretResolver, resolver),
+        operations,
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply(
+            "missing",
+            thread_id,
+            text,
+            parent_reply_id=parent_reply_id,
+        )
+
+    assert caught.value.code == expected_code
+    assert accounts.get_calls == 0
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "locks").exists()
+    assert not (tmp_path / "operations").exists()
+
+
 @pytest.mark.asyncio
 async def test_missing_credential_and_missing_environment_secret_are_safe(
     tmp_path: Path,
@@ -215,6 +264,9 @@ async def test_missing_credential_and_missing_environment_secret_are_safe(
     with pytest.raises(ThreadsCredentialError) as missing:
         await runtime.publish_text("alice", _TEXT)
     assert missing.value.code == "THREADS_CREDENTIAL_NOT_CONFIGURED"
+    with pytest.raises(ThreadsCredentialError) as missing_reply:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+    assert missing_reply.value.code == "THREADS_CREDENTIAL_NOT_CONFIGURED"
     assert api.calls == []
 
     accounts.set_credential_ref("alice", _CREDENTIAL_REF)
@@ -229,6 +281,9 @@ async def test_missing_credential_and_missing_environment_secret_are_safe(
     with pytest.raises(ThreadsCredentialError) as unavailable:
         await runtime.publish_text("alice", _TEXT)
     assert unavailable.value.code == "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
+    with pytest.raises(ThreadsCredentialError) as unavailable_reply:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+    assert unavailable_reply.value.code == "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
     assert _TOKEN not in str(unavailable.value)
     assert _CREDENTIAL_REF not in str(unavailable.value)
     assert api.calls == []
@@ -249,6 +304,141 @@ async def test_quota_is_called_once_before_journal_and_quota_limit_has_no_mutati
     assert api.events == [("quota", None)]
     assert resolver.calls == [_CREDENTIAL_REF]
     assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_reply_quota_is_checked_once_and_exhaustion_creates_no_journal_or_container(
+    tmp_path: Path,
+) -> None:
+    _, _, api, resolver, runtime, _ = _setup(
+        tmp_path,
+        quota=PublishingQuota(
+            usage=1,
+            total=100,
+            reply_usage=25,
+            reply_total=25,
+        ),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "THREADS_REPLY_QUOTA_REACHED"
+    assert api.calls == ["quota"]
+    assert api.events == [("quota", None)]
+    assert resolver.calls == [_CREDENTIAL_REF]
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_unknown_reply_quota_fields_do_not_invent_exhaustion(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        quota=PublishingQuota(
+            usage=100,
+            total=100,
+            reply_usage=None,
+            reply_total=25,
+        ),
+    )
+
+    result = await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert api.calls == ["quota", "create", "publish"]
+    assert result.reply_id == "media-123"
+    assert operations.get(result.operation_id).phase == "PUBLISHED"
+
+
+@pytest.mark.parametrize(
+    ("parent_reply_id", "expected_reply_to"),
+    [(None, "thread-123"), ("reply-456", "reply-456")],
+)
+@pytest.mark.asyncio
+async def test_create_reply_uses_exact_text_request_and_journals_safe_phase_order(
+    tmp_path: Path,
+    parent_reply_id: str | None,
+    expected_reply_to: str,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path)
+
+    result = await runtime.create_reply(
+        "alice",
+        "thread-123",
+        _TEXT,
+        parent_reply_id=parent_reply_id,
+    )
+
+    assert api.calls == ["quota", "create", "publish"]
+    assert api.events == [
+        ("quota", None),
+        ("create", "RECEIVED"),
+        ("publish", "PUBLISH_REQUESTED"),
+    ]
+    assert api.create_request == MediaContainerRequest(
+        media_type="TEXT",
+        text=_TEXT,
+        reply_to_id=expected_reply_to,
+    )
+    assert result.reply_id == "media-123"
+    operation = operations.get(result.operation_id)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "PUBLISHED"
+    assert operation.container_id == "container-123"
+    assert operation.media_id == "media-123"
+    assert operation.outcome_code is None
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    for forbidden in (_TEXT, _TOKEN, _CREDENTIAL_REF, "thread-123", "reply-456", "Authorization"):
+        assert forbidden not in journal
+    assert set(json.loads(journal)) == {
+        "version",
+        "id",
+        "account_id",
+        "kind",
+        "phase",
+        "container_id",
+        "media_id",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reply_container_failure_is_final_and_never_publishes(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        create_error=ThreadsContractError(),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+    assert api.calls == ["quota", "create"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_reply_container_cancellation_is_final_before_publish_boundary(
+    tmp_path: Path,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        create_error=asyncio.CancelledError("pre-publish cancel sentinel"),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "OPERATION_CANCELLED"
+    assert api.calls == ["quota", "create"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "OPERATION_CANCELLED"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    assert "pre-publish cancel sentinel" not in journal
 
 
 @pytest.mark.asyncio
@@ -356,6 +546,36 @@ async def test_publish_failure_is_ambiguous_without_retry_or_reconciliation(
     )
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        ThreadsAPIError("THREADS_RATE_LIMITED"),
+        ThreadsTransportError(),
+        ThreadsContractError(),
+        RuntimeError("reply response sentinel"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reply_publish_failure_is_ambiguous_without_retry_or_reconciliation(
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, publish_error=error)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT, parent_reply_id="reply-2")
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "publish"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == getattr(error, "code", "THREADS_TRANSPORT_FAILURE")
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    assert "reply response sentinel" not in journal
+
+
 @pytest.mark.asyncio
 async def test_publish_cancellation_is_ambiguous_without_retry_or_reconciliation(
     tmp_path: Path,
@@ -381,6 +601,28 @@ async def test_publish_cancellation_is_ambiguous_without_retry_or_reconciliation
     assert operation.outcome_code == "PUBLISH_OUTCOME_AMBIGUOUS"
     journal = (tmp_path / "operations" / f"{operation_id}.json").read_text(encoding="utf-8")
     assert "cancel sentinel" not in journal
+
+
+@pytest.mark.asyncio
+async def test_reply_publish_cancellation_is_ambiguous_without_retry(
+    tmp_path: Path,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=asyncio.CancelledError("reply cancel sentinel"),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "publish"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "AMBIGUOUS"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    assert "reply cancel sentinel" not in journal
 
 
 @pytest.mark.asyncio
@@ -447,6 +689,23 @@ async def test_invalid_media_id_after_publish_is_ambiguous(tmp_path: Path) -> No
     assert operation.outcome_code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
 
 
+@pytest.mark.asyncio
+async def test_invalid_published_reply_id_is_ambiguous(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, media_id="../unsafe")
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "publish"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.media_id is None
+    assert operation.outcome_code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+
+
 def test_required_journal_write_before_publish_prevents_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -472,6 +731,31 @@ def test_required_journal_write_before_publish_prevents_publish(
 
 
 @pytest.mark.asyncio
+async def test_reply_requires_durable_publish_requested_before_remote_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path)
+    original_update = operations.update
+
+    def fail_publish_requested(operation: LocalOperation) -> LocalOperation:
+        if operation.phase == "PUBLISH_REQUESTED":
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_publish_requested)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "OPERATION_STATE_INVALID"
+    assert api.calls == ["quota", "create"]
+    operation = _only_operation(operations, tmp_path)
+    assert operation.kind == "CREATE_REPLY"
+    assert operation.phase == "CONTAINER_CREATED"
+
+
+@pytest.mark.asyncio
 async def test_final_journal_failure_is_ambiguous_and_keeps_last_durable_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -493,6 +777,33 @@ async def test_final_journal_failure_is_ambiguous_and_keeps_last_durable_state(
     operation_id = caught.value.operation_id
     assert operation_id is not None
     durable = operations.get(operation_id)
+    assert durable.phase == "PUBLISH_REQUESTED"
+    assert durable.media_id is None
+
+
+@pytest.mark.asyncio
+async def test_final_reply_journal_failure_is_ambiguous_and_keeps_requested_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path)
+    original_update = operations.update
+
+    def fail_terminal_updates(operation: LocalOperation) -> LocalOperation:
+        if operation.phase in {"PUBLISHED", "AMBIGUOUS"}:
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_terminal_updates)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "publish"]
+    assert caught.value.operation_id is not None
+    durable = operations.get(caught.value.operation_id)
+    assert durable.kind == "CREATE_REPLY"
     assert durable.phase == "PUBLISH_REQUESTED"
     assert durable.media_id is None
 
@@ -621,6 +932,9 @@ async def test_same_account_lock_conflict_is_bounded_and_lock_releases_after_suc
     with pytest.raises(StandaloneMutationError) as caught:
         await runtime.publish_text("alice", _TEXT)
     assert caught.value.code == "ACCOUNT_BUSY"
+    with pytest.raises(StandaloneMutationError) as reply_caught:
+        await runtime.create_reply("alice", "thread-1", _TEXT)
+    assert reply_caught.value.code == "ACCOUNT_BUSY"
     assert api.calls == []
     held.release()
 
@@ -656,3 +970,43 @@ def test_operation_get_is_local_bounded_and_rejects_missing_id(tmp_path: Path) -
     with pytest.raises(StandaloneMutationError) as caught:
         store.get(UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"))
     assert caught.value.code == "OPERATION_NOT_FOUND"
+
+
+def test_post_text_journal_remains_readable_with_shared_reply_journal(tmp_path: Path) -> None:
+    store = LocalOperationStore(tmp_path)
+    operation_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    account_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+    operations_path = tmp_path / "operations"
+    operations_path.mkdir()
+    legacy_path = operations_path / f"{operation_id}.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "id": str(operation_id),
+                "account_id": str(account_id),
+                "kind": "POST_TEXT",
+                "phase": "PUBLISHED",
+                "container_id": "container-legacy",
+                "media_id": "media-legacy",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    legacy = store.get(operation_id)
+    reply = store.create_received(account_id, kind="CREATE_REPLY")
+
+    assert legacy.kind == "POST_TEXT"
+    assert legacy.phase == "PUBLISHED"
+    assert legacy.media_id == "media-legacy"
+    assert reply.version == 1
+    assert reply.kind == "CREATE_REPLY"
+    assert reply.phase == "RECEIVED"
+    assert set(json.loads((operations_path / f"{reply.id}.json").read_text())) == {
+        "version",
+        "id",
+        "account_id",
+        "kind",
+        "phase",
+    }

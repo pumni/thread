@@ -28,6 +28,7 @@ _SAFE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _REMOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _JOURNAL_VERSION = 1
 _JOURNAL_KIND = "POST_TEXT"
+_JOURNAL_KINDS = frozenset({_JOURNAL_KIND, "CREATE_REPLY"})
 _JOURNAL_PHASES = frozenset(
     {
         "RECEIVED",
@@ -82,8 +83,14 @@ class PublishedTextResult:
     media_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class CreatedReplyResult:
+    operation_id: UUID
+    reply_id: str
+
+
 class LocalOperationStore:
-    """Strict, atomic JSON journal for standalone post operations."""
+    """Strict, atomic JSON journal for standalone API mutations."""
 
     def __init__(self, data_root: Path) -> None:
         self._configured_root = Path(data_root).absolute()
@@ -92,12 +99,19 @@ class LocalOperationStore:
         except OSError, RuntimeError:
             raise StandaloneMutationError("OPERATION_STATE_INVALID") from None
 
-    def create_received(self, account_id: UUID) -> LocalOperation:
+    def create_received(
+        self,
+        account_id: UUID,
+        *,
+        kind: str = _JOURNAL_KIND,
+    ) -> LocalOperation:
+        if kind not in _JOURNAL_KINDS:
+            raise StandaloneMutationError("OPERATION_STATE_INVALID")
         operation = LocalOperation(
             version=_JOURNAL_VERSION,
             id=uuid4(),
             account_id=account_id,
-            kind=_JOURNAL_KIND,
+            kind=kind,
             phase="RECEIVED",
         )
         operations = self._operations_directory(create=True)
@@ -300,6 +314,44 @@ class LocalThreadsMutationRuntime:
 
     async def publish_text(self, alias: str, text: str) -> PublishedTextResult:
         _validate_post_text(text)
+        operation_id, media_id = await self._publish_text_container(
+            alias,
+            MediaContainerRequest(media_type="TEXT", text=text),
+            kind="POST_TEXT",
+            reply_quota=False,
+        )
+        return PublishedTextResult(operation_id=operation_id, media_id=media_id)
+
+    async def create_reply(
+        self,
+        alias: str,
+        thread_id: str,
+        text: str,
+        *,
+        parent_reply_id: str | None = None,
+    ) -> CreatedReplyResult:
+        if not _valid_remote_id(thread_id):
+            raise StandaloneMutationError("INVALID_THREAD_ID")
+        if parent_reply_id is not None and not _valid_remote_id(parent_reply_id):
+            raise StandaloneMutationError("INVALID_REPLY_ID")
+        _validate_mutation_text(text, "INVALID_REPLY_TEXT")
+        reply_to_id = parent_reply_id if parent_reply_id is not None else thread_id
+        operation_id, reply_id = await self._publish_text_container(
+            alias,
+            MediaContainerRequest(media_type="TEXT", text=text, reply_to_id=reply_to_id),
+            kind="CREATE_REPLY",
+            reply_quota=True,
+        )
+        return CreatedReplyResult(operation_id=operation_id, reply_id=reply_id)
+
+    async def _publish_text_container(
+        self,
+        alias: str,
+        request: MediaContainerRequest,
+        *,
+        kind: str,
+        reply_quota: bool,
+    ) -> tuple[UUID, str]:
         account = self._accounts.get(alias)
         lock = FilesystemProcessLock(_account_lock_path(self._root, account.id))
         try:
@@ -314,15 +366,25 @@ class LocalThreadsMutationRuntime:
                 raise ThreadsCredentialError(ThreadsCredentialErrorCode.NOT_CONFIGURED)
             token = await self._secret_resolver.resolve(account.credential_ref)
             quota = await self._api.get_publishing_quota(token)
-            if quota.usage is not None and quota.total is not None and quota.usage >= quota.total:
-                raise StandaloneMutationError("THREADS_PUBLISHING_QUOTA_REACHED")
-
-            operation = self._operations.create_received(account.id)
-            try:
-                container = await self._api.create_container(
-                    token,
-                    MediaContainerRequest(media_type="TEXT", text=text),
+            usage, total = (
+                (quota.reply_usage, quota.reply_total)
+                if reply_quota
+                else (quota.usage, quota.total)
+            )
+            if usage is not None and total is not None and usage >= total:
+                quota_code = (
+                    "THREADS_REPLY_QUOTA_REACHED"
+                    if reply_quota
+                    else "THREADS_PUBLISHING_QUOTA_REACHED"
                 )
+                raise StandaloneMutationError(quota_code)
+
+            operation = self._operations.create_received(account.id, kind=kind)
+            try:
+                container = await self._api.create_container(token, request)
+            except asyncio.CancelledError:
+                self._best_effort_failed_final(operation, "OPERATION_CANCELLED")
+                raise StandaloneMutationError("OPERATION_CANCELLED", operation.id) from None
             except Exception as error:
                 code = _safe_exception_code(error)
                 self._best_effort_failed_final(operation, code)
@@ -355,7 +417,7 @@ class LocalThreadsMutationRuntime:
                 )
             except StandaloneMutationError:
                 self._raise_ambiguous(publish_requested, "OPERATION_STATE_INVALID")
-            return PublishedTextResult(operation_id=published.id, media_id=media_id)
+            return published.id, media_id
         finally:
             try:
                 lock.release()
@@ -429,8 +491,12 @@ def _account_lock_path(root: Path, account_id: UUID) -> Path:
 
 
 def _validate_post_text(text: object) -> None:
+    _validate_mutation_text(text, "INVALID_POST_TEXT")
+
+
+def _validate_mutation_text(text: object, code: str) -> None:
     if not isinstance(text, str) or not 1 <= len(text) <= 500 or not text.strip():
-        raise StandaloneMutationError("INVALID_POST_TEXT")
+        raise StandaloneMutationError(code)
 
 
 def _valid_remote_id(value: object) -> TypeGuard[str]:
@@ -448,7 +514,7 @@ def _validate_operation(operation: LocalOperation) -> None:
     if (
         type(operation.version) is not int
         or operation.version != _JOURNAL_VERSION
-        or operation.kind != _JOURNAL_KIND
+        or operation.kind not in _JOURNAL_KINDS
         or operation.phase not in _JOURNAL_PHASES
     ):
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
