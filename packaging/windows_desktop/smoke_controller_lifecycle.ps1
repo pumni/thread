@@ -795,7 +795,8 @@ function Invoke-ResolvedInputMutation {
         [string]$FieldId,
         [string]$Value,
         [scriptblock]$ResolveControl,
-        [int]$ExpectedPort
+        [int]$ExpectedPort,
+        [switch]$KeyboardOnly
     )
 
     $isPassword = $FieldId -eq "password"
@@ -832,7 +833,7 @@ function Invoke-ResolvedInputMutation {
 
     try { $record.control_type = [string]$control.Current.ControlType.ProgrammaticName } catch { }
     $isEdit = $record.control_type -eq "ControlType.Edit"
-    if (-not $isPassword -and $isEdit) {
+    if (-not $KeyboardOnly -and -not $isPassword -and $isEdit) {
         $valuePattern = $null
         try {
             $valuePattern = $control.GetCurrentPattern(
@@ -971,7 +972,8 @@ function Set-LoginInput {
         [string]$AutomationId,
         [System.Windows.Automation.ControlType[]]$AllowedControlTypes = @(
             [System.Windows.Automation.ControlType]::Edit
-        )
+        ),
+        [switch]$KeyboardOnly
     )
 
     $fieldId = [regex]::Replace($Name.Trim().ToLowerInvariant(), "[^a-z0-9]+", "_").Trim("_")
@@ -1019,7 +1021,8 @@ function Set-LoginInput {
         -FieldId $fieldId `
         -Value $Value `
         -ResolveControl $resolveCurrentInput `
-        -ExpectedPort $expectedPort
+        -ExpectedPort $expectedPort `
+        -KeyboardOnly:$KeyboardOnly
 }
 
 function Get-ActiveOwnerSessionCount([object]$Config) {
@@ -1089,7 +1092,9 @@ function Get-OperatorLoginDatabaseState([object]$Config) {
         "SELECT COALESCE(string_agg(event_type, ',' ORDER BY created_at DESC), '') FROM (SELECT event_type, created_at FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type LIKE 'operator.login_%' ORDER BY created_at DESC LIMIT 8) recent;"
     $loginSuccessAuditCount = Invoke-Psql $Config `
         "SELECT COUNT(*) FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type = 'operator.login_succeeded';"
-    if ($loginSuccessAuditCount -notmatch '^\d+$') {
+    $logoutAuditCount = Invoke-Psql $Config `
+        "SELECT COUNT(*) FROM public.workspace_audit_events WHERE actor_username = '$username' AND event_type = 'operator.logout';"
+    if ($loginSuccessAuditCount -notmatch '^\d+$' -or $logoutAuditCount -notmatch '^\d+$') {
         throw "controller_operator_login_audit_count_invalid"
     }
     return [ordered]@{
@@ -1102,6 +1107,7 @@ function Get-OperatorLoginDatabaseState([object]$Config) {
         login_failed_attempts = if ($throttleFields.Count -eq 3) { [int]$throttleFields[1] } else { 0 }
         login_lock_active = $throttleFields.Count -eq 3 -and $throttleFields[2] -eq "true"
         login_success_audit_count = [int]$loginSuccessAuditCount
+        logout_audit_count = [int]$logoutAuditCount
         recent_owner_audit_event_types = if ([string]::IsNullOrWhiteSpace($eventRows)) {
             @()
         } else { @($eventRows.Split(',') | Where-Object { $_ -match '^operator\.login_[a-z_]+$' }) }
@@ -1261,6 +1267,7 @@ function Get-OperatorLoginSnapshot(
         login_failed_attempts = [int]$database.login_failed_attempts
         login_lock_active = [bool]$database.login_lock_active
         login_success_audit_count = [int]$database.login_success_audit_count
+        logout_audit_count = [int]$database.logout_audit_count
         recent_owner_audit_event_types = @($database.recent_owner_audit_event_types)
         postgres_count = @($runtime.postgres).Count
         http_count = @($runtime.http).Count
@@ -1297,11 +1304,13 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
     $beforeState.login_failed_attempts_before = [int]$beforeState.login_failed_attempts
     $beforeState.login_lock_active_before = [bool]$beforeState.login_lock_active
     $beforeState.login_success_audit_count_before = [int]$beforeState.login_success_audit_count
+    $beforeState.logout_audit_count_before = [int]$beforeState.logout_audit_count
     $before = [ordered]@{
         active_owner_session_count_before = [int]$beforeState.active_owner_session_count
         login_failed_attempts = [int]$beforeState.login_failed_attempts
         login_lock_active = [bool]$beforeState.login_lock_active
         login_success_audit_count_before = [int]$beforeState.login_success_audit_count
+        logout_audit_count_before = [int]$beforeState.logout_audit_count
         health_probe_outcome_before = [string]$beforeState.health_probe_outcome
         ready_probe_outcome_before = [string]$beforeState.ready_probe_outcome
     }
@@ -1324,6 +1333,7 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
         login_failed_attempts = [int]$afterState.login_failed_attempts
         login_lock_active = [bool]$afterState.login_lock_active
         login_success_audit_count_after = [int]$afterState.login_success_audit_count
+        logout_audit_count_after = [int]$afterState.logout_audit_count
         recent_owner_audit_event_types_after = @($afterState.recent_owner_audit_event_types)
         health_probe_outcome = [string]$afterState.health_probe_outcome
         ready_probe_outcome = [string]$afterState.ready_probe_outcome
@@ -1333,6 +1343,7 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
     $afterState.login_throttle_present_after = [bool]$afterState.login_throttle_present
     $afterState.login_failed_attempts_after = [int]$afterState.login_failed_attempts
     $afterState.login_lock_active_after = [bool]$afterState.login_lock_active
+    $afterState.logout_audit_count_after = [int]$afterState.logout_audit_count
     $outcome = Get-OperatorLoginOutcome `
         $before $after $uiReady $inputMutationSucceeded $invokeCompleted $uiErrorCategory
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -1346,6 +1357,7 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
             login_failed_attempts = [int]$afterState.login_failed_attempts
             login_lock_active = [bool]$afterState.login_lock_active
             login_success_audit_count_after = [int]$afterState.login_success_audit_count
+            logout_audit_count_after = [int]$afterState.logout_audit_count
             recent_owner_audit_event_types_after = @($afterState.recent_owner_audit_event_types)
             health_probe_outcome = [string]$afterState.health_probe_outcome
             ready_probe_outcome = [string]$afterState.ready_probe_outcome
@@ -1355,6 +1367,7 @@ function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]
         $afterState.login_throttle_present_after = [bool]$afterState.login_throttle_present
         $afterState.login_failed_attempts_after = [int]$afterState.login_failed_attempts
         $afterState.login_lock_active_after = [bool]$afterState.login_lock_active
+        $afterState.logout_audit_count_after = [int]$afterState.logout_audit_count
         $outcome = Get-OperatorLoginOutcome `
             $before $after $uiReady $inputMutationSucceeded $invokeCompleted $uiErrorCategory
     }
@@ -1467,7 +1480,8 @@ function Ensure-ControllerOwner(
     [int]$ProcessId,
     [string]$LoginStage,
     [switch]$ForceReauthentication,
-    [switch]$AfterEndpointReconfiguration
+    [switch]$AfterEndpointReconfiguration,
+    [switch]$AllowOneRelockRecovery
 ) {
     $config = Get-ControllerConfig
     if ($ForceReauthentication) {
@@ -1493,9 +1507,32 @@ function Ensure-ControllerOwner(
             throw "controller_active_owner_session_count_not_one"
         }
     }
-    Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage
+    $sessionVerificationStage = $LoginStage
+    try {
+        Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage
+    } catch {
+        if (-not $AllowOneRelockRecovery -or
+            $_.Exception.Message -cne "controller_owner_login_relocked_after_success") {
+            throw
+        }
+        $relockUiState = Get-OperatorLoginUiState $ProcessId
+        $relockSnapshot = Get-OperatorLoginSnapshot $ProcessId $config $relockUiState
+        if ($relockSnapshot.health_probe_outcome -ne "PASS" -or
+            $relockSnapshot.ready_probe_outcome -ne "PASS") {
+            throw "controller_owner_login_relock_recovery_runtime_not_ready"
+        }
+        if ($relockSnapshot.active_owner_session_count -ne 0) {
+            throw "controller_owner_login_relock_recovery_session_count_invalid"
+        }
+        if (-not [bool]$relockUiState.Ready) {
+            throw "controller_owner_login_relock_recovery_ui_not_actionable"
+        }
+        $relockRecoveryStage = "${LoginStage}_after_relock"
+        Invoke-ObservedOperatorLogin $ProcessId $config $relockRecoveryStage
+        $sessionVerificationStage = $relockRecoveryStage
+    }
     $null = Wait-ForOperatorSessionCount `
-        $config $LoginStage 1 3 "controller_owner_login_session_not_observed"
+        $config $sessionVerificationStage 1 3 "controller_owner_login_session_not_observed"
     if ($AfterEndpointReconfiguration) {
         $checks.endpoint_running_transition_reauthenticates_one_owner_session = $true
     }
@@ -1934,7 +1971,8 @@ function Set-ControllerEndpointFields([int]$ProcessId, [string]$Address, [int]$P
         -Name "Stable LAN IPv4 address" `
         -Value $Address `
         -AutomationId "controller-lan-address" `
-        -AllowedControlTypes @([System.Windows.Automation.ControlType]::Edit)
+        -AllowedControlTypes @([System.Windows.Automation.ControlType]::Edit) `
+        -KeyboardOnly
     Set-LoginInput `
         -ProcessId $ProcessId `
         -Name "HTTPS port" `
@@ -2713,7 +2751,8 @@ try {
     $null = Set-OperatorSessionMode $desktop.Id (Get-ControllerConfig) "signed_out" `
         "reopen_before_login" "controller_reopen_owner_session_not_locked"
     $checks.reopen_requires_operator_sign_in = $true
-    Ensure-ControllerOwner $desktop.Id "reopen_after_login" -ForceReauthentication
+    Ensure-ControllerOwner $desktop.Id "reopen_after_login" `
+        -ForceReauthentication -AllowOneRelockRecovery
     $checks.owner_reauthenticated_after_reopen = $true
     $owned = Assert-ControllerProcesses
     $trayReopenRuntimeIdentity = Add-ControllerRuntimeIdentitySnapshot `

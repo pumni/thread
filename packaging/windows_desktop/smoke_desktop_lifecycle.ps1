@@ -339,7 +339,7 @@ function Find-FirstByControlType(
     return $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
 
-function Invoke-Button([string]$Name) {
+function Invoke-Button([string]$Name, [int]$TimeoutSeconds = 20) {
     Wait-Until {
         $window = Get-PrimaryWindow
         $button = Find-ElementByName $window $Name ([System.Windows.Automation.ControlType]::Button)
@@ -352,7 +352,7 @@ function Invoke-Button([string]$Name) {
             # Reacquire the semantic button on the next bounded poll.
             return $false
         }
-    } 20 "lifecycle_button_unavailable_$($Name -replace '\W+', '_')"
+    } $TimeoutSeconds "lifecycle_button_unavailable_$($Name -replace '\W+', '_')"
 }
 
 try {
@@ -414,7 +414,7 @@ try {
     } 25 "desktop_initial_window_not_visible"
     Set-LifecycleCheck "concurrent_launch_keeps_one_primary" ((Get-PrimaryProcesses).Count -eq 1) "single_instance_primary_count_invalid"
 
-    Invoke-Button "Provision as Worker"
+    Invoke-Button "Provision as Worker" -TimeoutSeconds 60
     Wait-Until { (Get-HelperProcesses $primaryId).Count -eq 1 } 10 "worker_mock_helper_did_not_start"
     $helperId = [int](Get-HelperProcesses $primaryId | Select-Object -First 1).ProcessId
     $helperProcessIds.Add($helperId)

@@ -12,6 +12,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from threads_platform.application.browser_capabilities import BrowserFeedResultV1
 from threads_platform.application.ports.threads import (
     DiscoveryPage,
     PublishingQuota,
@@ -75,6 +76,18 @@ def _format_bounded_text(value: str | None, limit: int) -> str:
     safe_value = re.sub(r"[\x00-\x1f\x7f]", " ", value)
     normalized = re.sub(r"\s+", " ", safe_value).strip()
     return normalized[:limit] if normalized else "-"
+
+
+def _format_feed_result(result: BrowserFeedResultV1) -> str:
+    lines = [f"feed count={len(result.observations)} truncated={str(result.truncated).lower()}\n"]
+    for item in result.observations:
+        lines.append(
+            f"item position={item.position} "
+            f"thread_ref={_format_bounded_text(item.thread_ref, 255)} "
+            f"author={_format_bounded_text(item.author_username, 30)} "
+            f"text={_format_bounded_text(item.text_excerpt, 500)}\n"
+        )
+    return "".join(lines)
 
 
 def _format_https_url(value: str | None) -> str:
@@ -415,6 +428,16 @@ def _build_parser() -> argparse.ArgumentParser:
     set_env_parser.add_argument("alias")
     set_env_parser.add_argument("variable_name")
 
+    profile_parser = commands.add_parser("profile")
+    profile_parser.add_argument("alias")
+    profile_parser.add_argument("username")
+    thread_parser = commands.add_parser("thread")
+    thread_parser.add_argument("alias")
+    thread_parser.add_argument("thread_ref")
+    feed_parser = commands.add_parser("feed")
+    feed_parser.add_argument("alias")
+    feed_parser.add_argument("--limit", type=int, default=10)
+
     api_parser = commands.add_parser("api")
     api_commands = api_parser.add_subparsers(dest="api_command", required=True)
     quota_parser = api_commands.add_parser("quota")
@@ -529,6 +552,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             for account in store.list():
                 sys.stdout.write(f"{account.alias} {account.id}\n")
+            return 0
+
+        if args.command == "profile":
+            result = asyncio.run(LocalRuntime(root, store).open_profile(args.alias, args.username))
+            sys.stdout.write(f"profile recognized target={result.target_ref}\n")
+            return 0
+
+        if args.command == "thread":
+            result = asyncio.run(LocalRuntime(root, store).open_thread(args.alias, args.thread_ref))
+            sys.stdout.write(f"thread recognized target={result.target_ref}\n")
+            return 0
+
+        if args.command == "feed":
+            result = asyncio.run(LocalRuntime(root, store).browse_feed(args.alias, args.limit))
+            sys.stdout.write(_format_feed_result(result))
             return 0
 
         if args.command == "operation":

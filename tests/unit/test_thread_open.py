@@ -33,7 +33,6 @@ from threads_platform.workers.browser_capability_dispatch import BrowserCapabili
 from threads_platform.workers.sessions import BrowserSessionOpenResult, WorkerNetworkRoute
 from threads_platform.workers.thread_open import (
     THREAD_OPEN_ALLOWED_FAILURE_CODES,
-    THREAD_OPEN_ANCESTOR_BOUND,
     THREAD_OPEN_CAPABILITY_NAME,
     THREAD_OPEN_CAPABILITY_VERSION,
     BrowserThreadOpenWorker,
@@ -76,9 +75,7 @@ async def test_thread_worker_completes_with_only_normalized_recognition_result()
 
     assert client.snapshot.status is WorkerJobStatus.SUCCEEDED
     assert manager.engine.navigation == [f"{BROWSER_FEED_ORIGIN}/@alice/post/post-1"]
-    assert manager.engine.verifications == [
-        ("/@alice/post/post-1", "alice", THREAD_OPEN_ANCESTOR_BOUND)
-    ]
+    assert manager.engine.verifications == [("/@alice/post/post-1", "alice")]
     assert client.completed == {
         "result_version": 1,
         "target_kind": "THREAD",
@@ -511,7 +508,7 @@ class _MemorySessionManager:
 class _MemoryEngineSession:
     def __init__(self) -> None:
         self.navigation: list[str] = []
-        self.verifications: list[tuple[str, str, int]] = []
+        self.verifications: list[tuple[str, str]] = []
         self.navigation_error: BrowserAdapterError | None = None
         self.verify_error: BrowserAdapterError | None = None
 
@@ -524,12 +521,10 @@ class _MemoryEngineSession:
     async def inspect_surface(self) -> BrowserSurface:
         return BrowserSurface("worker.synthetic", "1", "AUTHENTICATED", True)
 
-    async def verify_thread_target(
-        self, *, target_ref: str, author_username: str, ancestor_bound: int
-    ) -> None:
+    async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
         if self.verify_error is not None:
             raise self.verify_error
-        self.verifications.append((target_ref, author_username, ancestor_bound))
+        self.verifications.append((target_ref, author_username))
 
     async def close(self) -> None:
         return None

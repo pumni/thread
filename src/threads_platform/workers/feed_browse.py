@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Protocol
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from threads_platform.application.browser_capabilities import (
@@ -13,12 +11,16 @@ from threads_platform.application.browser_capabilities import (
     BrowserFeedItemResultV1,
     BrowserFeedResultV1,
 )
-from threads_platform.application.ports.browser import (
+from threads_platform.application.browser_read_semantics import (
     BROWSER_FEED_CANDIDATE_BOUND,
+    BROWSER_FEED_ITERATION_BOUND,
+    BROWSER_FEED_URL,
+    normalize_feed_permalinks,
+)
+from threads_platform.application.ports.browser import (
     BROWSER_FEED_ORIGIN,
     BrowserAdapterError,
     BrowserContractError,
-    FeedCandidateObservation,
 )
 from threads_platform.application.ports.worker_agent import (
     LocalSessionState,
@@ -38,11 +40,10 @@ from threads_platform.workers.browser import (
 from threads_platform.workers.sessions import BrowserSessionOpenResult
 
 THREADS_WEB_ORIGIN = BROWSER_FEED_ORIGIN
-THREADS_FEED_URL = f"{THREADS_WEB_ORIGIN}/"
+THREADS_FEED_URL = BROWSER_FEED_URL
 FEED_CAPABILITY_NAME = "threads.browser.feed.browse"
 FEED_CAPABILITY_VERSION = 1
-FEED_ANCESTOR_BOUND = 8
-FEED_ITERATION_BOUND = 5
+FEED_ITERATION_BOUND = BROWSER_FEED_ITERATION_BOUND
 FEED_CANDIDATE_BOUND = BROWSER_FEED_CANDIDATE_BOUND
 FEED_NAVIGATION_POLICY = BrowserNavigationPolicy(frozenset({THREADS_WEB_ORIGIN}))
 FEED_ALLOWED_FAILURE_CODES = next(
@@ -50,9 +51,6 @@ FEED_ALLOWED_FAILURE_CODES = next(
     for contract in BROWSER_CAPABILITY_CONTRACTS
     if contract.name == FEED_CAPABILITY_NAME
 )
-
-_THREAD_PATH = re.compile(r"^/@([A-Za-z0-9._]{1,30})/post/([A-Za-z0-9_-]{1,120})/?$")
-_PROFILE_PATH = re.compile(r"^/@([A-Za-z0-9._]{1,30})/?$")
 
 
 class FeedBrowserSessionManager(Protocol):
@@ -65,87 +63,6 @@ class FeedBrowserSessionManager(Protocol):
 
 class FeedWorkerControlClient(WorkerControlClient, WorkerJobControlClient, Protocol):
     """Control Plane calls required by an account-affine feed WorkerJob."""
-
-
-def normalize_feed_candidates(
-    candidates: Sequence[FeedCandidateObservation],
-    *,
-    max_items: int,
-    ancestor_bound: int = FEED_ANCESTOR_BOUND,
-    existing_refs: frozenset[str] = frozenset(),
-    position_start: int = 0,
-) -> tuple[BrowserFeedItemResultV1, ...]:
-    if not 1 <= max_items <= 20 or ancestor_bound < 1:
-        raise ValueError("feed observation bounds are invalid")
-    if len(candidates) > FEED_CANDIDATE_BOUND:
-        raise BrowserContractError()
-
-    seen_refs = set(existing_refs)
-    normalized: list[BrowserFeedItemResultV1] = []
-    for candidate in candidates:
-        pivot = _thread_reference(candidate.permalink_href)
-        if pivot is None:
-            raise BrowserContractError()
-        thread_ref, pivot_username = pivot
-        if thread_ref in seen_refs:
-            continue
-
-        matched: tuple[str, str] | None = None
-        for ancestor in candidate.ancestors[:ancestor_bound]:
-            if ancestor.links_truncated or ancestor.text_regions_truncated:
-                raise BrowserContractError()
-
-            thread_refs_list: list[str] = []
-            for href in ancestor.hrefs:
-                reference = _thread_reference(href)
-                if reference is not None:
-                    thread_refs_list.append(reference[0])
-            thread_refs = tuple(thread_refs_list)
-            matching_pivots = sum(ref == thread_ref for ref in thread_refs)
-            if any(ref != thread_ref for ref in thread_refs):
-                raise BrowserContractError()
-            if matching_pivots > 1:
-                raise BrowserContractError()
-            if matching_pivots != 1:
-                continue
-
-            compatible_authors = tuple(
-                username
-                for href in ancestor.hrefs
-                if (username := _profile_username(href)) is not None
-                and username.casefold() == pivot_username.casefold()
-            )
-            if len(compatible_authors) > 1:
-                raise BrowserContractError()
-            if not compatible_authors:
-                continue
-
-            excerpts = tuple(
-                " ".join(region.split())
-                for region in ancestor.text_regions
-                if " ".join(region.split())
-            )
-            if not excerpts:
-                continue
-            excerpt = max(excerpts, key=len)[:500]
-            matched = (compatible_authors[0].casefold(), excerpt)
-            break
-
-        if matched is None:
-            raise BrowserContractError()
-
-        normalized.append(
-            BrowserFeedItemResultV1(
-                thread_ref=thread_ref,
-                author_username=matched[0],
-                text_excerpt=matched[1],
-                position=position_start + len(normalized),
-            )
-        )
-        seen_refs.add(thread_ref)
-        if len(normalized) >= max_items:
-            break
-    return tuple(normalized)
 
 
 class BrowserFeedBrowseWorker:
@@ -273,16 +190,13 @@ class BrowserFeedBrowseWorker:
             self._check_deadline(deadline)
             if iteration:
                 await browser_session.scroll_feed()
-            candidates = await browser_session.collect_feed_candidates(
-                ancestor_bound=FEED_ANCESTOR_BOUND
+            permalinks = await browser_session.collect_feed_permalinks(
+                candidate_bound=FEED_CANDIDATE_BOUND
             )
-            if not candidates and not observations:
-                raise BrowserContractError()
             remaining_items = max_items - len(observations)
-            batch = normalize_feed_candidates(
-                candidates,
+            batch = normalize_feed_permalinks(
+                permalinks,
                 max_items=remaining_items,
-                ancestor_bound=FEED_ANCESTOR_BOUND,
                 existing_refs=frozenset(seen_refs),
                 position_start=len(observations),
             )
@@ -299,9 +213,16 @@ class BrowserFeedBrowseWorker:
             if len(observations) >= max_items:
                 truncated = True
                 break
-            if iteration and not batch:
-                truncated = True
-                break
+            if not batch:
+                if observations:
+                    truncated = True
+                    break
+                if iteration == FEED_ITERATION_BOUND - 1:
+                    await execution.request_intervention(
+                        "REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN"
+                    )
+                    return
+                continue
             if iteration == FEED_ITERATION_BOUND - 1:
                 truncated = True
 
@@ -360,35 +281,3 @@ def _max_items(input_data: dict[str, object]) -> int | None:
     if type(value) is not int or not 1 <= value <= 20:
         return None
     return value
-
-
-def _thread_reference(href: str) -> tuple[str, str] | None:
-    parsed = urlsplit(href)
-    if parsed.scheme:
-        origin = f"{parsed.scheme}://{parsed.netloc}".lower()
-        if origin != THREADS_WEB_ORIGIN:
-            return None
-    elif parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
-        return None
-    if parsed.query or parsed.fragment:
-        return None
-    match = _THREAD_PATH.fullmatch(parsed.path)
-    if match is None:
-        return None
-    username = match.group(1).casefold()
-    post_id = match.group(2)
-    return f"{THREADS_WEB_ORIGIN}/@{username}/post/{post_id}", username
-
-
-def _profile_username(href: str) -> str | None:
-    parsed = urlsplit(href)
-    if parsed.scheme:
-        origin = f"{parsed.scheme}://{parsed.netloc}".lower()
-        if origin != THREADS_WEB_ORIGIN:
-            return None
-    elif parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
-        return None
-    if parsed.query or parsed.fragment:
-        return None
-    match = _PROFILE_PATH.fullmatch(parsed.path)
-    return match.group(1) if match is not None else None

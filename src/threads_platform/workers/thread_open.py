@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections.abc import Callable
 from typing import Protocol
@@ -10,6 +9,9 @@ from uuid import UUID
 from threads_platform.application.browser_capabilities import (
     BROWSER_CAPABILITY_CONTRACTS,
     BrowserTargetOpenResultV1,
+)
+from threads_platform.application.browser_read_semantics import (
+    parse_thread_ref as parse_shared_thread_ref,
 )
 from threads_platform.application.ports.browser import (
     BROWSER_FEED_ORIGIN,
@@ -34,15 +36,12 @@ from threads_platform.workers.sessions import BrowserSessionOpenResult
 
 THREAD_OPEN_CAPABILITY_NAME = "threads.browser.thread.open"
 THREAD_OPEN_CAPABILITY_VERSION = 1
-THREAD_OPEN_ANCESTOR_BOUND = 8
 THREAD_OPEN_NAVIGATION_POLICY = BrowserNavigationPolicy(frozenset({BROWSER_FEED_ORIGIN}))
 THREAD_OPEN_ALLOWED_FAILURE_CODES = next(
     contract.allowed_failure_codes
     for contract in BROWSER_CAPABILITY_CONTRACTS
     if contract.name == THREAD_OPEN_CAPABILITY_NAME
 )
-
-_THREAD_REF = re.compile(r"^/@([A-Za-z0-9._]{1,30})/post/([A-Za-z0-9_-]{1,120})/?$")
 
 
 class ThreadOpenBrowserSessionManager(Protocol):
@@ -182,7 +181,6 @@ class BrowserThreadOpenWorker:
         await browser_session.verify_thread_target(
             target_ref=target_ref,
             author_username=author_username,
-            ancestor_bound=THREAD_OPEN_ANCESTOR_BOUND,
         )
         await execution.checkpoint({"phase": "THREAD_READY"})
         if await execution.acknowledge_cancellation_if_pending():
@@ -234,10 +232,4 @@ class BrowserThreadOpenWorker:
 def parse_thread_ref(input_data: dict[str, object]) -> tuple[str, str] | None:
     if set(input_data) != {"thread_ref"}:
         return None
-    value = input_data.get("thread_ref")
-    if not isinstance(value, str):
-        return None
-    match = _THREAD_REF.fullmatch(value)
-    if match is None:
-        return None
-    return value[:-1] if value.endswith("/") else value, match.group(1)
+    return parse_shared_thread_ref(input_data.get("thread_ref"))

@@ -86,9 +86,10 @@ The topology-neutral browser engine port and its errors/DTOs live in
 
   It does not declare `inspect_surface()` or any Worker synthetic/session
   inspection operation;
-- `BrowserSurface`, `FeedAncestorObservation`, `FeedCandidateObservation`, and
-  `PreparedMediaComposer`. `BrowserSurface` remains a shared raw observation
-  DTO and does not carry the Worker classifier or policy;
+- `BrowserSurface` and `PreparedMediaComposer`. `BrowserSurface` remains a
+  shared raw observation DTO and does not carry the Worker classifier or policy.
+  The feed engine Protocol returns bounded permalink strings; normalized feed
+  results are built by topology-neutral application semantics;
 - `BrowserAdapterError` and engine/contract outcomes used by the adapter:
   `BrowserContractError`, `LocatorNotFound`, `SessionExpired`,
   `ChallengeDetected`, `RemoteSessionStateUncertain`, `NavigationTimeout`,
@@ -128,10 +129,12 @@ or changing their semantics. This interface extraction does not change browser
 behavior.
 
 `BrowserNavigationPolicy` chooses the allowlist for a specific Worker
-capability. The shared Playwright adapter continues enforcing the supplied
-allowlist, rejecting origin changes and redirects, and reporting its existing
-typed outcomes. This assignment changes ownership only; it does not widen the
-allowlist or alter navigation, timeout, redirect, or fail-closed behavior.
+capability. The shared Playwright adapter enforces the supplied origin
+allowlist for initial and direct top-level navigation requests. Chromium
+handles redirects normally; the adapter checks the final page origin after
+navigation and rechecks it before each semantic operation. A final off-origin
+page is rejected with the existing typed outcome. This keeps the allowlist
+unchanged while avoiding manual redirect fetching in the adapter.
 
 ### Exact browser launch and network contracts
 
@@ -377,10 +380,10 @@ defined by epic #176.
 - Standalone no longer needs to construct or carry a fake Worker identity.
 - Environment credential use no longer loads persistent UnitOfWork/account
   lifecycle contracts at import time.
-- The shared browser port includes capability-shaped observation DTOs and
-  Threads Web origin/bound constants because the existing Playwright adapter
-  produces those observations; this is a topology-neutral adapter contract,
-  not authorization for Standalone to use Worker capabilities.
+- The shared browser port includes engine-shaped read Protocols and the Threads
+  Web origin/permalink bound because both hosts use the same bounded primitives.
+  This is a topology-neutral adapter contract, not authorization for Standalone
+  to use Worker capabilities.
 - A future topology needing new browser identity, routing, credential, or
   session fields must update this ADR rather than extending the engine request
   with host-specific state.

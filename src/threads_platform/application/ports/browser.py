@@ -83,24 +83,6 @@ class BrowserSurface:
     required_root_present: bool
 
 
-@dataclass(frozen=True, slots=True)
-class FeedAncestorObservation:
-    """Bounded semantic evidence extracted from one permalink ancestor."""
-
-    hrefs: tuple[str, ...]
-    text_regions: tuple[str, ...]
-    links_truncated: bool = False
-    text_regions_truncated: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class FeedCandidateObservation:
-    """A post permalink and its nearest-first bounded ancestor evidence."""
-
-    permalink_href: str
-    ancestors: tuple[FeedAncestorObservation, ...]
-
-
 class BrowserNetworkProtocol(StrEnum):
     DIRECT = "DIRECT"
     HTTP = "HTTP"
@@ -136,17 +118,13 @@ class BrowserEngineSession(Protocol):
 
 
 class BrowserFeedEngineSession(BrowserEngineSession, Protocol):
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]: ...
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]: ...
 
     async def scroll_feed(self) -> None: ...
 
 
 class BrowserThreadOpenEngineSession(BrowserEngineSession, Protocol):
-    async def verify_thread_target(
-        self, *, target_ref: str, author_username: str, ancestor_bound: int
-    ) -> None: ...
+    async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None: ...
 
 
 class BrowserProfileOpenEngineSession(BrowserEngineSession, Protocol):
