@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from collections.abc import Callable
 from typing import Protocol
@@ -10,6 +9,10 @@ from uuid import UUID
 from threads_platform.application.browser_capabilities import (
     BROWSER_CAPABILITY_CONTRACTS,
     BrowserTargetOpenResultV1,
+)
+from threads_platform.application.browser_read_semantics import (
+    BROWSER_READ_TARGET_ANCESTOR_BOUND,
+    normalize_profile_ref,
 )
 from threads_platform.application.ports.browser import (
     BROWSER_FEED_ORIGIN,
@@ -34,15 +37,13 @@ from threads_platform.workers.sessions import BrowserSessionOpenResult
 
 PROFILE_OPEN_CAPABILITY_NAME = "threads.browser.profile.open"
 PROFILE_OPEN_CAPABILITY_VERSION = 1
-PROFILE_OPEN_ANCESTOR_BOUND = 8
+PROFILE_OPEN_ANCESTOR_BOUND = BROWSER_READ_TARGET_ANCESTOR_BOUND
 PROFILE_OPEN_NAVIGATION_POLICY = BrowserNavigationPolicy(frozenset({BROWSER_FEED_ORIGIN}))
 PROFILE_OPEN_ALLOWED_FAILURE_CODES = next(
     contract.allowed_failure_codes
     for contract in BROWSER_CAPABILITY_CONTRACTS
     if contract.name == PROFILE_OPEN_CAPABILITY_NAME
 )
-
-_PROFILE_REF = re.compile(r"^/@([A-Za-z0-9._]{1,30})/?$")
 
 
 class ProfileOpenBrowserSessionManager(Protocol):
@@ -235,7 +236,4 @@ class BrowserProfileOpenWorker:
 def parse_profile_ref(input_data: dict[str, object]) -> str | None:
     if set(input_data) != {"profile_ref"}:
         return None
-    value = input_data.get("profile_ref")
-    if not isinstance(value, str) or _PROFILE_REF.fullmatch(value) is None:
-        return None
-    return value[:-1] if value.endswith("/") else value
+    return normalize_profile_ref(input_data.get("profile_ref"))

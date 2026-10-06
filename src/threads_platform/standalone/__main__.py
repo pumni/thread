@@ -415,6 +415,13 @@ def _build_parser() -> argparse.ArgumentParser:
     set_env_parser.add_argument("alias")
     set_env_parser.add_argument("variable_name")
 
+    profile_parser = commands.add_parser("profile")
+    profile_parser.add_argument("alias")
+    profile_parser.add_argument("username")
+    thread_parser = commands.add_parser("thread")
+    thread_parser.add_argument("alias")
+    thread_parser.add_argument("thread_ref")
+
     api_parser = commands.add_parser("api")
     api_commands = api_parser.add_subparsers(dest="api_command", required=True)
     quota_parser = api_commands.add_parser("quota")
@@ -529,6 +536,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             for account in store.list():
                 sys.stdout.write(f"{account.alias} {account.id}\n")
+            return 0
+
+        if args.command == "profile":
+            result = asyncio.run(LocalRuntime(root, store).open_profile(args.alias, args.username))
+            sys.stdout.write(f"profile recognized target={result.target_ref}\n")
+            return 0
+
+        if args.command == "thread":
+            result = asyncio.run(LocalRuntime(root, store).open_thread(args.alias, args.thread_ref))
+            sys.stdout.write(f"thread recognized target={result.target_ref}\n")
             return 0
 
         if args.command == "operation":

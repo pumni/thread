@@ -14,6 +14,7 @@ from pydantic import SecretStr
 
 import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.accounts as account_module
+from threads_platform.application.browser_capabilities import BrowserTargetOpenResultV1
 from threads_platform.application.ports.threads import (
     DiscoveryPage,
     MediaContainer,
@@ -329,6 +330,86 @@ def test_cli_login_keyboard_interrupt_returns_130(
     assert result == 130
     assert captured.out == ""
     assert captured.err == "ERROR INTERRUPTED\n"
+    assert "Traceback" not in captured.err
+
+
+def test_cli_profile_success_has_bounded_canonical_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    calls: list[tuple[str, str]] = []
+
+    async def fake_open_profile(
+        runtime: LocalRuntime, alias: str, username: str
+    ) -> BrowserTargetOpenResultV1:
+        calls.append((alias, username))
+        return BrowserTargetOpenResultV1(
+            target_kind="PROFILE", target_ref="/@alice", recognized=True
+        )
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "open_profile", fake_open_profile)
+
+    result = main(["profile", "devtest1", "alice"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("devtest1", "alice")]
+    assert captured.out == "profile recognized target=/@alice\n"
+    assert captured.err == ""
+
+
+def test_cli_thread_success_has_bounded_canonical_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    calls: list[tuple[str, str]] = []
+
+    async def fake_open_thread(
+        runtime: LocalRuntime, alias: str, thread_ref: str
+    ) -> BrowserTargetOpenResultV1:
+        calls.append((alias, thread_ref))
+        return BrowserTargetOpenResultV1(
+            target_kind="THREAD",
+            target_ref="/@alice/post/post-1",
+            recognized=True,
+        )
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "open_thread", fake_open_thread)
+
+    result = main(["thread", "devtest1", "/@alice/post/post-1/"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("devtest1", "/@alice/post/post-1/")]
+    assert captured.out == "thread recognized target=/@alice/post/post-1\n"
+    assert captured.err == ""
+
+
+def test_cli_browser_read_error_does_not_echo_path_or_page_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "private-profile-path"
+    _set_data_root(monkeypatch, root)
+
+    async def fail_open_profile(runtime: LocalRuntime, alias: str, username: str) -> None:
+        raise StandaloneRuntimeError("BROWSER_CONTRACT_MISMATCH")
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "open_profile", fail_open_profile)
+
+    result = main(["profile", "devtest1", "alice"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR BROWSER_CONTRACT_MISMATCH\n"
+    assert str(root) not in captured.out + captured.err
+    assert "DOM" not in captured.out + captured.err
     assert "Traceback" not in captured.err
 
 
