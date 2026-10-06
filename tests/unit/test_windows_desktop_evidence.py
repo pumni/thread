@@ -28,6 +28,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / "packaging" / "windows_desktop" / "verify_runtime_evidence.py"
 CONTROLLER_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "smoke_controller_lifecycle.ps1"
+LIFECYCLE_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "smoke_desktop_lifecycle.ps1"
 CONTROLLER_HTTPS_PROBE = REPO_ROOT / "packaging" / "windows_desktop" / "controller_https_probe.ps1"
 HOSTED_SMOKE = REPO_ROOT / "packaging" / "windows_desktop" / "run_hosted_smoke.ps1"
 SCENARIO_AGGREGATOR = (
@@ -91,6 +92,64 @@ FROZEN_CONTROLLER_CHECKS = (
     "unwritable_root_is_rejected",
     "corrupt_cluster_is_preserved_and_rejected",
 )
+
+
+def test_desktop_lifecycle_button_readiness_is_bounded_and_semantic() -> None:
+    source = LIFECYCLE_SMOKE.read_text(encoding="utf-8")
+    button_start = source.index("function Invoke-Button(")
+    button_end = source.index("\n}", button_start) + 2
+    button = source[button_start:button_end]
+    wait_start = source.index("function Wait-Until")
+    wait_end = source.index("\n}", wait_start) + 2
+    wait = source[wait_start:wait_end]
+
+    assert re.search(
+        r"function Invoke-Button\(\[string\]\$Name,\s*\[int\]\$TimeoutSeconds\s*=\s*20\)",
+        button,
+    )
+    assert re.search(r"\}\s*\$TimeoutSeconds\s+\"lifecycle_button_unavailable_", button)
+    assert (
+        "Find-ElementByName $window $Name ([System.Windows.Automation.ControlType]::Button)"
+        in button
+    )
+    assert (
+        "GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()" in button
+    )
+    assert "catch [System.Management.Automation.MethodInvocationException]" in button
+    assert "return $false" in button
+    assert button.index("Wait-Until {") < button.index("Find-ElementByName $window $Name")
+    assert "Start-Sleep" not in button
+    assert "$deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)" in wait
+    assert "while ([DateTime]::UtcNow -lt $deadline)" in wait
+    assert "if (& $Condition) { return }" in wait
+
+    button_calls = [
+        line.strip() for line in source.splitlines() if re.match(r"^\s*Invoke-Button\s+", line)
+    ]
+    assert button_calls == ['Invoke-Button "Provision as Worker" -TimeoutSeconds 60']
+
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell parser is only available on Windows test hosts")
+    smoke_path = str(LIFECYCLE_SMOKE).replace("'", "''")
+    assertion = rf"""
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    '{smoke_path}', [ref]$tokens, [ref]$parseErrors
+) | Out-Null
+if ($parseErrors.Count -gt 0) {{ throw "Desktop lifecycle smoke script did not parse" }}
+"lifecycle smoke parse PASS"
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "lifecycle smoke parse PASS" in completed.stdout
 
 
 def test_controller_quit_wait_is_process_authoritative() -> None:
