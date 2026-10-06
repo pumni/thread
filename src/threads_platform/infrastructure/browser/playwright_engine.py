@@ -128,8 +128,8 @@ _THREAD_OPEN_SCRIPT = r"""
 }
 """
 
-_PROFILE_READINESS_TIMEOUT_SECONDS = 2.0
-_PROFILE_READINESS_POLL_SECONDS = 0.05
+_BROWSER_READ_READINESS_TIMEOUT_SECONDS = 2.0
+_BROWSER_READ_READINESS_POLL_SECONDS = 0.05
 
 _PROFILE_OPEN_SCRIPT = r"""
 ({allowedOrigin, targetRef, ancestorBound}) => {
@@ -359,18 +359,35 @@ class _PlaywrightBrowserSession:
             or not 1 <= candidate_bound <= BROWSER_FEED_CANDIDATE_BOUND
         ):
             raise BrowserContractError()
-        try:
-            payload = await self._page.evaluate(
-                _FEED_SCAN_SCRIPT,
-                {
-                    "allowedOrigin": BROWSER_FEED_ORIGIN,
-                    "candidateBound": candidate_bound,
-                },
-            )
-        except PlaywrightError:
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        script_args = {
+            "allowedOrigin": BROWSER_FEED_ORIGIN,
+            "candidateBound": candidate_bound,
+        }
+        while True:
             self._ensure_alive()
-            raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
-        return _feed_permalinks(payload)
+            await self._raise_navigation_policy_error()
+            try:
+                payload = await self._page.evaluate(_FEED_SCAN_SCRIPT, script_args)
+            except PlaywrightError:
+                self._ensure_alive()
+                await self._raise_navigation_policy_error()
+                raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
+            await self._raise_navigation_policy_error()
+            permalinks = _feed_permalinks(payload)
+            if permalinks:
+                return permalinks
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return ()
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                return ()
 
     async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
         self._ensure_alive()
@@ -382,7 +399,7 @@ class _PlaywrightBrowserSession:
             raise BrowserContractError()
         loop = asyncio.get_running_loop()
         readiness_timeout_seconds = min(
-            _PROFILE_READINESS_TIMEOUT_SECONDS,
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
             self._navigation_timeout_ms / 1000,
         )
         deadline = loop.time() + readiness_timeout_seconds
@@ -404,7 +421,7 @@ class _PlaywrightBrowserSession:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(_PROFILE_READINESS_POLL_SECONDS, remaining))
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
             if loop.time() >= deadline:
                 break
             try:
@@ -427,7 +444,7 @@ class _PlaywrightBrowserSession:
             raise BrowserContractError()
         loop = asyncio.get_running_loop()
         readiness_timeout_seconds = min(
-            _PROFILE_READINESS_TIMEOUT_SECONDS,
+            _BROWSER_READ_READINESS_TIMEOUT_SECONDS,
             self._navigation_timeout_ms / 1000,
         )
         deadline = loop.time() + readiness_timeout_seconds
@@ -446,7 +463,7 @@ class _PlaywrightBrowserSession:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            await asyncio.sleep(min(_PROFILE_READINESS_POLL_SECONDS, remaining))
+            await asyncio.sleep(min(_BROWSER_READ_READINESS_POLL_SECONDS, remaining))
             if loop.time() >= deadline:
                 break
             try:

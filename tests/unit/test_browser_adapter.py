@@ -397,6 +397,9 @@ def test_off_origin_redirect_fails_closed_and_navigation_state_resets(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_POLL_SECONDS", 0.005)
+
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
         profile_directory = tmp_path / "redirect-profile"
@@ -420,6 +423,10 @@ def test_off_origin_redirect_fails_closed_and_navigation_state_resets(
                 await cast(BrowserThreadOpenEngineSession, session).verify_thread_target(
                     target_ref="/@alice/post/post-1",
                     author_username="alice",
+                )
+            with pytest.raises(RemoteSessionStateUncertain):
+                await cast(BrowserFeedEngineSession, session).collect_feed_permalinks(
+                    candidate_bound=100
                 )
 
             await session.navigate(
@@ -652,11 +659,14 @@ def test_page_initiated_off_origin_navigation_blocks_thread_inspection_after_loa
     asyncio.run(scenario())
 
 
-def test_playwright_feed_scan_returns_no_permalink_for_empty_or_unrelated_page(
+def test_playwright_feed_scan_returns_empty_after_safe_readiness_window_expires(
     tmp_path: Path,
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_TIMEOUT_SECONDS", 0.03)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_POLL_SECONDS", 0.005)
+
     async def scenario() -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
         profile_directory = tmp_path / "session-transition-profile"
@@ -677,6 +687,51 @@ def test_playwright_feed_scan_returns_no_permalink_for_empty_or_unrelated_page(
                 candidate_bound=100
             )
             assert permalinks == ()
+        finally:
+            await session.close()
+
+    asyncio.run(scenario())
+
+
+def test_playwright_feed_scan_waits_for_delayed_client_rendered_permalink(
+    tmp_path: Path,
+    synthetic_origin: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_TIMEOUT_SECONDS", 0.25)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_POLL_SECONDS", 0.005)
+
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        profile_directory = tmp_path / "feed-delayed-profile"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine().open(
+            BrowserLaunchRequest(
+                profile_directory=profile_directory,
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            await session.navigate(
+                f"{synthetic_origin}/login",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            page = cast(Any, session)._page
+            assert await page.locator("a[href]").count() == 0
+            await page.evaluate(
+                """() => window.setTimeout(() => {
+                    const anchor = document.createElement('a');
+                    anchor.href = '/@alice/post/post-delayed';
+                    document.body.appendChild(anchor);
+                }, 30)"""
+            )
+
+            permalinks = await cast(BrowserFeedEngineSession, session).collect_feed_permalinks(
+                candidate_bound=100
+            )
+
+            assert permalinks == ("/@alice/post/post-delayed",)
         finally:
             await session.close()
 
@@ -737,8 +792,8 @@ def test_playwright_thread_open_uses_bounded_permalink_and_author_evidence(
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_TIMEOUT_SECONDS", 0.25)
-    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_TIMEOUT_SECONDS", 0.25)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_POLL_SECONDS", 0.01)
 
     async def verify(
         path: str,
@@ -837,8 +892,8 @@ def test_playwright_profile_open_uses_unique_bounded_header_association(
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_TIMEOUT_SECONDS", 0.08)
-    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_POLL_SECONDS", 0.005)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(playwright_engine, "_BROWSER_READ_READINESS_POLL_SECONDS", 0.005)
 
     async def verify(
         path: str,
@@ -853,7 +908,7 @@ def test_playwright_profile_open_uses_unique_bounded_header_association(
         if readiness_timeout_seconds is not None:
             monkeypatch.setattr(
                 playwright_engine,
-                "_PROFILE_READINESS_TIMEOUT_SECONDS",
+                "_BROWSER_READ_READINESS_TIMEOUT_SECONDS",
                 readiness_timeout_seconds,
             )
         profile_directory = tmp_path / f"profile-open-{uuid4()}"
