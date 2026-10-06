@@ -39,10 +39,12 @@ from threads_platform.standalone.api import (
     build_threads_http_client,
 )
 from threads_platform.standalone.mutations import (
+    CarouselManifest,
     CreatedReplyResult,
     LocalOperationStore,
     LocalThreadsMutationRuntime,
     StandaloneMutationError,
+    load_carousel_manifest,
     validate_media_post_inputs,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
@@ -289,6 +291,27 @@ async def _run_media_post_command(
         )
 
 
+async def _run_carousel_post_command(
+    alias: str,
+    manifest: CarouselManifest,
+    root: Path,
+    store: LocalAccountStore,
+) -> str:
+    settings = Settings()
+    async with build_threads_http_client(settings) as client:
+        api = HttpThreadsAPI(client)
+        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
+        runtime = LocalThreadsMutationRuntime(
+            root,
+            store,
+            api,
+            secret_resolver,
+            LocalOperationStore(root),
+        )
+        result = await runtime.publish_carousel(alias, manifest)
+    return f"published-carousel operation={result.operation_id} media={result.media_id}\n"
+
+
 async def _run_workflow_command(
     plan: WorkflowPlan,
     root: Path,
@@ -414,6 +437,9 @@ def _build_parser() -> argparse.ArgumentParser:
     video_parser.add_argument("video_url")
     video_parser.add_argument("text", nargs="?")
     video_parser.add_argument("--alt-text")
+    carousel_parser = commands.add_parser("post-carousel")
+    carousel_parser.add_argument("alias")
+    carousel_parser.add_argument("manifest")
 
     workflow_parser = commands.add_parser("workflow")
     workflow_commands = workflow_parser.add_subparsers(dest="workflow_command", required=True)
@@ -436,6 +462,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             store = LocalAccountStore(root)
             store.get(plan.account)
             output = asyncio.run(_run_workflow_command(plan, root, store))
+            sys.stdout.write(output)
+            return 0
+
+        if args.command == "post-carousel":
+            manifest = load_carousel_manifest(Path(args.manifest))
+            root = resolve_standalone_data_root()
+            store = LocalAccountStore(root)
+            output = asyncio.run(_run_carousel_post_command(args.alias, manifest, root, store))
             sys.stdout.write(output)
             return 0
 
@@ -465,11 +499,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             except ValueError, AttributeError:
                 raise StandaloneMutationError("OPERATION_NOT_FOUND") from None
             operation = LocalOperationStore(root).get(operation_id)
+            child_summary = (
+                f" children={len(operation.child_container_ids)}"
+                if operation.kind == "POST_CAROUSEL"
+                else ""
+            )
             sys.stdout.write(
                 f"operation {operation.id} kind={operation.kind} phase={operation.phase} "
                 f"container={operation.container_id or '-'} "
                 f"media={operation.media_id or '-'} "
-                f"outcome={operation.outcome_code or '-'}\n"
+                f"outcome={operation.outcome_code or '-'}{child_summary}\n"
             )
             return 0
 
