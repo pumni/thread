@@ -1354,9 +1354,14 @@ def test_controller_session_timeline_is_separate_and_scenario_scoped() -> None:
     normalized_ensure = re.sub(r"`\s*\r?\n\s*", " ", ensure_owner)
     assert "$config $revocationStage 0 15 $revocationFailure" in normalized_ensure
     assert "Invoke-ObservedOperatorLogin $ProcessId $config $LoginStage" in normalized_ensure
-    assert "$config $LoginStage 1 3" in normalized_ensure
+    assert "$config $sessionVerificationStage 1 3" in normalized_ensure
     assert 'Ensure-ControllerOwner $desktop.Id "cutover_relogin"' in normalized
-    assert 'Ensure-ControllerOwner $desktop.Id "reopen_after_login"' in normalized
+    assert (
+        'Ensure-ControllerOwner $desktop.Id "reopen_after_login" `\n'
+        "        -ForceReauthentication -AllowOneRelockRecovery"
+    ) in source
+    assert "-ForceReauthentication -AfterEndpointReconfiguration" in normalized
+    assert "-AfterEndpointReconfiguration -AllowOneRelockRecovery" not in normalized
     assert "function Quit-Desktop([int]$ProcessId, [string]$LoginStage)" in source
     assert "Ensure-ControllerOwner $ProcessId $LoginStage" in source
     assert 'Wait-ForOperatorSessionCount `\n        $Config "before_privileged_quit" 1' in source
@@ -2309,17 +2314,19 @@ $before = [ordered]@{{
     login_failed_attempts = 0
     login_lock_active = $false
     login_success_audit_count_before = 7
+    logout_audit_count_before = 3
     health_probe_outcome_before = 'PASS'
     ready_probe_outcome_before = 'PASS'
 }}
 function New-After([int]$Sessions, [int]$Failures = 0, [bool]$Locked = $false,
     [string[]]$Events = @(), [string]$Health = 'PASS', [string]$Ready = 'PASS',
-    [int]$SuccessAuditCount = 7) {{
+    [int]$SuccessAuditCount = 7, [int]$LogoutAuditCount = 3) {{
     return [ordered]@{{
         active_owner_session_count_after = $Sessions
         login_failed_attempts = $Failures
         login_lock_active = $Locked
         login_success_audit_count_after = $SuccessAuditCount
+        logout_audit_count_after = $LogoutAuditCount
         recent_owner_audit_event_types_after = $Events
         health_probe_outcome = $Health
         ready_probe_outcome = $Ready
@@ -2327,6 +2334,7 @@ function New-After([int]$Sessions, [int]$Failures = 0, [bool]$Locked = $false,
 }}
 $historicalAuditSuccess = New-After 0 -Events @('operator.login_succeeded') -SuccessAuditCount 7
 $newAuditSuccess = New-After 0 -Events @('operator.login_succeeded') -SuccessAuditCount 8
+$provenRelock = New-After 0 -SuccessAuditCount 8 -LogoutAuditCount 4
 $outcomes = @(
     (Get-OperatorLoginOutcome $before (New-After 0) $false $false $false 'NONE'),
     (Get-OperatorLoginOutcome $before (New-After 0) $true $false $false 'NONE'),
@@ -2335,11 +2343,25 @@ $outcomes = @(
     (Get-OperatorLoginOutcome $before (New-After 0 -Failures 1) $true $true $true 'NONE'),
     (Get-OperatorLoginOutcome $before $historicalAuditSuccess $true $true $true 'NONE'),
     (Get-OperatorLoginOutcome $before $newAuditSuccess $true $true $true 'NONE'),
+    (Get-OperatorLoginOutcome $before $provenRelock $true $true $true 'NONE'),
     (Get-OperatorLoginOutcome $before (New-After 0) $true $true $true 'OPERATOR_API_UNAVAILABLE'),
     (Get-OperatorLoginOutcome $before (New-After 0 -Health 'FAIL') $true $true $true 'NONE'),
     (Get-OperatorLoginOutcome $before (New-After 0) $true $true $true 'NONE')
 )
-[Console]::WriteLine(($outcomes | ConvertTo-Json -Compress))
+$failureCodes = @(
+    (Get-OperatorLoginFailureCode 'LOGIN_UI_NOT_READY'),
+    (Get-OperatorLoginFailureCode 'LOGIN_UI_INPUT_FAILED'),
+    (Get-OperatorLoginFailureCode 'LOGIN_UI_INVOKE_FAILED'),
+    (Get-OperatorLoginFailureCode 'LOGIN_RUNTIME_BECAME_UNREADY'),
+    (Get-OperatorLoginFailureCode 'LOGIN_TRANSPORT_UNAVAILABLE'),
+    (Get-OperatorLoginFailureCode 'LOGIN_SERVER_REJECTED'),
+    (Get-OperatorLoginFailureCode 'LOGIN_SESSION_NOT_PERSISTED'),
+    (Get-OperatorLoginFailureCode 'LOGIN_RELOCKED_AFTER_SUCCESS')
+)
+[Console]::WriteLine((ConvertTo-Json -InputObject @{{
+    outcomes = $outcomes
+    failure_codes = $failureCodes
+}} -Compress))
 """
     completed = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
@@ -2350,7 +2372,8 @@ $outcomes = @(
     )
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
-    assert json.loads(completed.stdout.strip()) == [
+    result = json.loads(completed.stdout.strip())
+    assert result["outcomes"] == [
         "LOGIN_UI_NOT_READY",
         "LOGIN_UI_INPUT_FAILED",
         "LOGIN_UI_INVOKE_FAILED",
@@ -2358,10 +2381,251 @@ $outcomes = @(
         "LOGIN_SERVER_REJECTED",
         "LOGIN_FAILURE_UNCLASSIFIED",
         "LOGIN_SESSION_NOT_PERSISTED",
+        "LOGIN_RELOCKED_AFTER_SUCCESS",
         "LOGIN_TRANSPORT_UNAVAILABLE",
         "LOGIN_RUNTIME_BECAME_UNREADY",
         "LOGIN_FAILURE_UNCLASSIFIED",
     ]
+    assert result["failure_codes"] == [
+        "controller_owner_login_ui_not_ready",
+        "controller_owner_login_input_failed",
+        "controller_owner_login_invoke_failed",
+        "controller_owner_login_runtime_became_unready",
+        "controller_owner_login_transport_unavailable",
+        "controller_owner_login_server_rejected",
+        "controller_owner_login_session_not_persisted",
+        "controller_owner_login_relocked_after_success",
+    ]
+
+
+def test_controller_login_relock_recovery_is_opt_in_and_bounded_to_one_retry() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell recovery test is only available on Windows test hosts")
+
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    ensure_owner = source[
+        source.index("function Ensure-ControllerOwner") : source.index("function Start-Desktop")
+    ]
+    assertion = (
+        r"""
+$script:mockOutcomes = @()
+$script:attemptIndex = 0
+$script:attemptStages = [System.Collections.Generic.List[string]]::new()
+$script:waitedCounts = [System.Collections.Generic.List[int]]::new()
+$script:waitedStages = [System.Collections.Generic.List[string]]::new()
+$script:waitedObservedCounts = [System.Collections.Generic.List[int]]::new()
+$script:mockHealth = 'PASS'
+$script:mockReady = 'PASS'
+$script:mockUiReady = $true
+$script:mockSnapshotSessions = 0
+$script:mockWaitSessionCount = 0
+function Reset-TestState([string[]]$Outcomes, [string]$Health = 'PASS',
+    [string]$Ready = 'PASS', [bool]$UiReady = $true, [int]$SnapshotSessions = 0) {
+    $script:mockOutcomes = $Outcomes
+    $script:attemptIndex = 0
+    $script:attemptStages = [System.Collections.Generic.List[string]]::new()
+    $script:waitedCounts = [System.Collections.Generic.List[int]]::new()
+    $script:waitedStages = [System.Collections.Generic.List[string]]::new()
+    $script:waitedObservedCounts = [System.Collections.Generic.List[int]]::new()
+    $script:mockHealth = $Health
+    $script:mockReady = $Ready
+    $script:mockUiReady = $UiReady
+    $script:mockSnapshotSessions = $SnapshotSessions
+    $script:mockWaitSessionCount = 0
+}
+function Get-ControllerConfig { return [pscustomobject]@{ endpointPort = 443 } }
+function Wait-ForOperatorSessionCount([object]$Config, [string]$Stage,
+    [int]$ExpectedCount, [int]$TimeoutSeconds, [string]$FailureCode) {
+    $script:waitedObservedCounts.Add($script:mockWaitSessionCount) | Out-Null
+    $script:waitedCounts.Add($ExpectedCount) | Out-Null
+    $script:waitedStages.Add($Stage) | Out-Null
+    if ($script:mockWaitSessionCount -ne $ExpectedCount) { throw $FailureCode }
+}
+function Get-OperatorLoginUiState([int]$ProcessId) {
+    return [pscustomobject]@{ Ready = $script:mockUiReady }
+}
+function Get-OperatorLoginSnapshot([int]$ProcessId, [object]$Config, [object]$UiState) {
+    return [pscustomobject]@{
+        health_probe_outcome = $script:mockHealth
+        ready_probe_outcome = $script:mockReady
+        active_owner_session_count = $script:mockSnapshotSessions
+    }
+}
+function Invoke-ObservedOperatorLogin([int]$ProcessId, [object]$Config, [string]$Stage) {
+    $script:attemptStages.Add($Stage) | Out-Null
+    $outcome = [string]$script:mockOutcomes[$script:attemptIndex]
+    $script:attemptIndex++
+    if ($outcome -ne 'SUCCESS') { throw $outcome }
+    $script:mockWaitSessionCount = 1
+}
+"""
+        + ensure_owner
+        + r"""
+Reset-TestState @('controller_owner_login_relocked_after_success', 'SUCCESS')
+$successError = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $successError = $_.Exception.Message }
+$success = @{
+    error = $successError
+    attempts = $script:attemptIndex
+    stages = @($script:attemptStages.ToArray())
+    waited_counts = @($script:waitedCounts.ToArray())
+    waited_stages = @($script:waitedStages.ToArray())
+    waited_observed_counts = @($script:waitedObservedCounts.ToArray())
+}
+
+Reset-TestState @('SUCCESS')
+$normalError = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $normalError = $_.Exception.Message }
+$normalSuccess = @{ error = $normalError; attempts = $script:attemptIndex }
+
+Reset-TestState @('controller_owner_login_relocked_after_success',
+    'controller_owner_login_server_rejected')
+$secondFailure = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $secondFailure = $_.Exception.Message }
+$secondFailureResult = @{ error = $secondFailure; attempts = $script:attemptIndex }
+
+Reset-TestState @('controller_owner_login_relocked_after_success')
+$unoptedFailure = $null
+try { Ensure-ControllerOwner 42 'cutover_relogin' -ForceReauthentication }
+catch { $unoptedFailure = $_.Exception.Message }
+$unopted = @{ error = $unoptedFailure; attempts = $script:attemptIndex }
+
+Reset-TestState @('controller_owner_login_session_not_persisted')
+$persistenceFailure = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $persistenceFailure = $_.Exception.Message }
+$persistence = @{ error = $persistenceFailure; attempts = $script:attemptIndex }
+
+Reset-TestState @('controller_owner_login_relocked_after_success', 'SUCCESS') 'FAIL'
+$unreadyFailure = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $unreadyFailure = $_.Exception.Message }
+$unready = @{ error = $unreadyFailure; attempts = $script:attemptIndex }
+
+Reset-TestState @('controller_owner_login_relocked_after_success', 'SUCCESS') 'PASS' 'PASS' $false
+$uiFailure = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $uiFailure = $_.Exception.Message }
+$uiBlocked = @{ error = $uiFailure; attempts = $script:attemptIndex }
+
+Reset-TestState @('controller_owner_login_relocked_after_success', 'SUCCESS') 'PASS' 'PASS' $true 1
+$sessionFailure = $null
+try {
+    Ensure-ControllerOwner 42 'reopen_after_login' -ForceReauthentication -AllowOneRelockRecovery
+} catch { $sessionFailure = $_.Exception.Message }
+$sessionBlocked = @{ error = $sessionFailure; attempts = $script:attemptIndex }
+
+[Console]::WriteLine((ConvertTo-Json -InputObject @{
+    success = $success
+    normal_success = $normalSuccess
+    second_failure = $secondFailureResult
+    unopted = $unopted
+    persistence = $persistence
+    unready = $unready
+    ui_blocked = $uiBlocked
+    session_blocked = $sessionBlocked
+} -Depth 6 -Compress))
+"""
+    )
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", assertion],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result["success"] == {
+        "error": None,
+        "attempts": 2,
+        "stages": ["reopen_after_login", "reopen_after_login_after_relock"],
+        "waited_counts": [0, 1],
+        "waited_stages": ["reopen_before_login", "reopen_after_login_after_relock"],
+        "waited_observed_counts": [0, 1],
+    }
+    assert result["normal_success"] == {"error": None, "attempts": 1}
+    assert result["second_failure"] == {
+        "error": "controller_owner_login_server_rejected",
+        "attempts": 2,
+    }
+    assert result["unopted"] == {
+        "error": "controller_owner_login_relocked_after_success",
+        "attempts": 1,
+    }
+    assert result["persistence"] == {
+        "error": "controller_owner_login_session_not_persisted",
+        "attempts": 1,
+    }
+    assert result["unready"] == {
+        "error": "controller_owner_login_relock_recovery_runtime_not_ready",
+        "attempts": 1,
+    }
+    assert result["ui_blocked"] == {
+        "error": "controller_owner_login_relock_recovery_ui_not_actionable",
+        "attempts": 1,
+    }
+    assert result["session_blocked"] == {
+        "error": "controller_owner_login_relock_recovery_session_count_invalid",
+        "attempts": 1,
+    }
+
+    normalized = re.sub(r"`\s*\r?\n\s*", " ", source)
+    assert normalized.count("-AllowOneRelockRecovery") == 1
+    assert (
+        'Ensure-ControllerOwner $desktop.Id "reopen_after_login" `\n'
+        "        -ForceReauthentication -AllowOneRelockRecovery"
+    ) in source
+    cutover_call_start = normalized.index('Ensure-ControllerOwner $desktop.Id "cutover_relogin"')
+    cutover_call = normalized[cutover_call_start : normalized.index("\n", cutover_call_start)]
+    assert "-ForceReauthentication -AfterEndpointReconfiguration" in cutover_call
+    assert "-AllowOneRelockRecovery" not in cutover_call
+    assert ensure_owner.count("Invoke-ObservedOperatorLogin") == 2
+    assert '"${LoginStage}_after_relock"' in ensure_owner
+    assert "while (" not in ensure_owner
+
+
+def test_controller_login_snapshots_include_only_sanitized_logout_counts() -> None:
+    source = CONTROLLER_SMOKE.read_text(encoding="utf-8")
+    database = source[
+        source.index("function Get-OperatorLoginDatabaseState") : source.index(
+            "function Get-PostCrashOperatorAuthState"
+        )
+    ]
+    snapshot = source[
+        source.index("function Get-OperatorLoginSnapshot") : source.index(
+            "function Invoke-ObservedOperatorLogin"
+        )
+    ]
+    observed = source[
+        source.index("function Invoke-ObservedOperatorLogin") : source.index(
+            "function Add-OperatorSessionTransition"
+        )
+    ]
+    assert "event_type = 'operator.logout'" in database
+    assert "actor_username = '$username'" in database
+    assert "logout_audit_count = [int]$logoutAuditCount" in database
+    assert "logout_audit_count = [int]$database.logout_audit_count" in snapshot
+    assert "logout_audit_count_before = [int]$beforeState.logout_audit_count" in observed
+    assert "logout_audit_count_after = [int]$afterState.logout_audit_count" in observed
+    timeline = observed[
+        observed.index("$script:operatorLoginAttemptTimeline.Add(") : observed.index(
+            ") | Out-Null", observed.index("$script:operatorLoginAttemptTimeline.Add(")
+        )
+    ]
+    for forbidden in ("smokeOwnerPassword", "smokeOwnerUsername", "bearer", "authorization"):
+        assert forbidden.lower() not in timeline.lower()
 
 
 def test_controller_login_readiness_is_actionable_and_submits_once_without_secret_readback() -> (
@@ -2432,7 +2696,10 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
     assert "authorization" not in timeline_record.lower()
     assert "$_" not in timeline_record
     assert "operator_login_attempt_timeline = @($operatorLoginAttemptTimeline)" in source
-    assert 'Ensure-ControllerOwner $desktop.Id "reopen_after_login"' in source
+    assert (
+        'Ensure-ControllerOwner $desktop.Id "reopen_after_login" `\n'
+        "        -ForceReauthentication -AllowOneRelockRecovery" in source
+    )
     for stage in (
         "cutover_relogin",
         "reopen_after_login",
@@ -2457,6 +2724,7 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
         "LOGIN_TRANSPORT_UNAVAILABLE",
         "LOGIN_SERVER_REJECTED",
         "LOGIN_SESSION_NOT_PERSISTED",
+        "LOGIN_RELOCKED_AFTER_SUCCESS",
         "LOGIN_FAILURE_UNCLASSIFIED",
     ):
         assert safe_category in source or safe_category in (
@@ -2468,6 +2736,8 @@ def test_controller_login_readiness_is_actionable_and_submits_once_without_secre
     ).read_text(encoding="utf-8")
     assert "login_success_audit_count_after" in classifier
     assert "login_success_audit_count_before" in classifier
+    assert "logout_audit_count_after" in classifier
+    assert "logout_audit_count_before" in classifier
     assert (
         'recent_owner_audit_event_types_after) -contains "operator.login_succeeded"'
         not in classifier

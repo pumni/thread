@@ -15,15 +15,27 @@ function Get-OperatorLoginOutcome(
         return "SUCCESS"
     }
 
+    $loginSuccessAuditAdvanced = [int]$After.login_success_audit_count_after -gt
+        [int]$Before.login_success_audit_count_before
+    $logoutAuditAdvanced = [int]$After.logout_audit_count_after -gt
+        [int]$Before.logout_audit_count_before
+    if ($loginSuccessAuditAdvanced -and
+        $After.active_owner_session_count_after -eq 0 -and
+        $logoutAuditAdvanced -and
+        $After.health_probe_outcome -eq "PASS" -and
+        $After.ready_probe_outcome -eq "PASS") {
+        return "LOGIN_RELOCKED_AFTER_SUCCESS"
+    }
+
+    if ($loginSuccessAuditAdvanced -and
+        $After.active_owner_session_count_after -ne 1 -and
+        [int]$After.logout_audit_count_after -eq [int]$Before.logout_audit_count_before) {
+        return "LOGIN_SESSION_NOT_PERSISTED"
+    }
+
     if ([int]$After.login_failed_attempts -gt [int]$Before.login_failed_attempts -or
         (-not [bool]$Before.login_lock_active -and [bool]$After.login_lock_active)) {
         return "LOGIN_SERVER_REJECTED"
-    }
-
-    if ([int]$After.login_success_audit_count_after -gt
-        [int]$Before.login_success_audit_count_before -and
-        $After.active_owner_session_count_after -ne 1) {
-        return "LOGIN_SESSION_NOT_PERSISTED"
     }
 
     if ($UiErrorCategory -eq "OPERATOR_API_UNAVAILABLE") {
@@ -49,6 +61,7 @@ function Get-OperatorLoginFailureCode([string]$Outcome) {
         "LOGIN_TRANSPORT_UNAVAILABLE" { return "controller_owner_login_transport_unavailable" }
         "LOGIN_SERVER_REJECTED" { return "controller_owner_login_server_rejected" }
         "LOGIN_SESSION_NOT_PERSISTED" { return "controller_owner_login_session_not_persisted" }
+        "LOGIN_RELOCKED_AFTER_SUCCESS" { return "controller_owner_login_relocked_after_success" }
         default { return "controller_owner_login_failure_unclassified" }
     }
 }
