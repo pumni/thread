@@ -1,17 +1,22 @@
-"""Local, journaled text publishing for the standalone command line."""
+"""Local, journaled Threads API mutations for the standalone command line."""
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
 import stat
 import tempfile
+import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import NoReturn, TypeGuard, cast
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
+
+from pydantic import SecretStr
 
 from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
 from threads_platform.application.ports.threads import (
@@ -26,9 +31,13 @@ from threads_platform.standalone.accounts import LocalAccountStore
 
 _SAFE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _REMOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
+_NUMERIC_HOST = re.compile(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|[0-9]+))*\Z")
 _JOURNAL_VERSION = 1
 _JOURNAL_KIND = "POST_TEXT"
-_JOURNAL_KINDS = frozenset({_JOURNAL_KIND, "CREATE_REPLY"})
+_JOURNAL_KINDS = frozenset({_JOURNAL_KIND, "CREATE_REPLY", "POST_IMAGE", "POST_VIDEO"})
+_CONTAINER_PROCESSING_TIMEOUT_SECONDS = 30.0
+_CONTAINER_PROCESSING_MAX_CHECKS = 10
+_CONTAINER_PROCESSING_POLL_INTERVAL_SECONDS = 3.0
 _JOURNAL_PHASES = frozenset(
     {
         "RECEIVED",
@@ -87,6 +96,12 @@ class PublishedTextResult:
 class CreatedReplyResult:
     operation_id: UUID
     reply_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedMediaResult:
+    operation_id: UUID
+    media_id: str
 
 
 class LocalOperationStore:
@@ -316,13 +331,59 @@ class LocalThreadsMutationRuntime:
 
     async def publish_text(self, alias: str, text: str) -> PublishedTextResult:
         _validate_post_text(text)
-        operation_id, media_id = await self._publish_text_container(
+        operation_id, media_id = await self._publish_container(
             alias,
             MediaContainerRequest(media_type="TEXT", text=text),
             kind="POST_TEXT",
             reply_quota=False,
         )
         return PublishedTextResult(operation_id=operation_id, media_id=media_id)
+
+    async def publish_image(
+        self,
+        alias: str,
+        image_url: str,
+        text: str | None = None,
+        *,
+        alt_text: str | None = None,
+    ) -> PublishedMediaResult:
+        validate_media_post_inputs(image_url, text, alt_text)
+        operation_id, media_id = await self._publish_container(
+            alias,
+            MediaContainerRequest(
+                media_type="IMAGE",
+                image_url=image_url,
+                text=text,
+                alt_text=alt_text,
+            ),
+            kind="POST_IMAGE",
+            reply_quota=False,
+            wait_for_processing=True,
+        )
+        return PublishedMediaResult(operation_id=operation_id, media_id=media_id)
+
+    async def publish_video(
+        self,
+        alias: str,
+        video_url: str,
+        text: str | None = None,
+        *,
+        alt_text: str | None = None,
+    ) -> PublishedMediaResult:
+        validate_media_post_inputs(video_url, text, alt_text)
+        operation_id, media_id = await self._publish_container(
+            alias,
+            MediaContainerRequest(
+                media_type="VIDEO",
+                video_url=video_url,
+                text=text,
+                alt_text=alt_text,
+            ),
+            kind="POST_VIDEO",
+            reply_quota=False,
+            wait_for_processing=True,
+        )
+        return PublishedMediaResult(operation_id=operation_id, media_id=media_id)
 
     async def create_reply(
         self,
@@ -338,7 +399,7 @@ class LocalThreadsMutationRuntime:
             raise StandaloneMutationError("INVALID_REPLY_ID")
         _validate_mutation_text(text, "INVALID_REPLY_TEXT")
         reply_to_id = parent_reply_id if parent_reply_id is not None else thread_id
-        operation_id, reply_id = await self._publish_text_container(
+        operation_id, reply_id = await self._publish_container(
             alias,
             MediaContainerRequest(media_type="TEXT", text=text, reply_to_id=reply_to_id),
             kind="CREATE_REPLY",
@@ -346,13 +407,14 @@ class LocalThreadsMutationRuntime:
         )
         return CreatedReplyResult(operation_id=operation_id, reply_id=reply_id)
 
-    async def _publish_text_container(
+    async def _publish_container(
         self,
         alias: str,
         request: MediaContainerRequest,
         *,
         kind: str,
         reply_quota: bool,
+        wait_for_processing: bool = False,
     ) -> tuple[UUID, str]:
         account = self._accounts.get(alias)
         lock = FilesystemProcessLock(_account_lock_path(self._root, account.id))
@@ -401,6 +463,20 @@ class LocalThreadsMutationRuntime:
             operation = self._persist_required(
                 replace(operation, phase="CONTAINER_CREATED", container_id=container_id)
             )
+            if wait_for_processing:
+                try:
+                    await self._wait_for_container_ready(token, container_id)
+                except asyncio.CancelledError:
+                    self._best_effort_failed_final(operation, "OPERATION_CANCELLED")
+                    raise StandaloneMutationError("OPERATION_CANCELLED", operation.id) from None
+                except StandaloneMutationError as error:
+                    self._best_effort_failed_final(operation, error.code)
+                    raise StandaloneMutationError(error.code, operation.id) from None
+                except Exception as error:
+                    code = _safe_exception_code(error)
+                    self._best_effort_failed_final(operation, code)
+                    raise StandaloneMutationError(code, operation.id) from None
+
             publish_requested = self._persist_required(
                 replace(operation, phase="PUBLISH_REQUESTED")
             )
@@ -410,6 +486,9 @@ class LocalThreadsMutationRuntime:
                 self._raise_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
             except Exception as error:
                 self._raise_ambiguous(publish_requested, _safe_exception_code(error))
+            except BaseException:
+                self._best_effort_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
+                raise
             if not _valid_remote_id(media_id):
                 self._raise_ambiguous(publish_requested, "THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
 
@@ -428,6 +507,28 @@ class LocalThreadsMutationRuntime:
                 # Cleanup must not replace the primary publish outcome.
                 pass
 
+    async def _wait_for_container_ready(self, token: SecretStr, container_id: str) -> None:
+        try:
+            async with asyncio.timeout(_CONTAINER_PROCESSING_TIMEOUT_SECONDS):
+                for check_index in range(_CONTAINER_PROCESSING_MAX_CHECKS):
+                    container = await self._api.get_container(token, container_id)
+                    if getattr(container, "container_id", None) != container_id:
+                        raise StandaloneMutationError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+                    status = getattr(container, "status", None)
+                    if status == "FINISHED":
+                        return
+                    if status == "ERROR":
+                        raise StandaloneMutationError("THREADS_CONTAINER_ERROR")
+                    if status == "EXPIRED":
+                        raise StandaloneMutationError("THREADS_CONTAINER_EXPIRED")
+                    if status != "IN_PROGRESS":
+                        raise StandaloneMutationError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+                    if check_index == _CONTAINER_PROCESSING_MAX_CHECKS - 1:
+                        raise StandaloneMutationError("THREADS_CONTAINER_PROCESSING_TIMEOUT")
+                    await asyncio.sleep(_CONTAINER_PROCESSING_POLL_INTERVAL_SECONDS)
+        except TimeoutError:
+            raise StandaloneMutationError("THREADS_CONTAINER_PROCESSING_TIMEOUT") from None
+
     def _persist_required(self, operation: LocalOperation) -> LocalOperation:
         try:
             return self._operations.update(operation)
@@ -441,11 +542,14 @@ class LocalThreadsMutationRuntime:
             pass
 
     def _raise_ambiguous(self, operation: LocalOperation, code: str) -> NoReturn:
+        self._best_effort_ambiguous(operation, code)
+        raise StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation.id) from None
+
+    def _best_effort_ambiguous(self, operation: LocalOperation, code: str) -> None:
         try:
             self._operations.update(replace(operation, phase="AMBIGUOUS", outcome_code=code))
         except StandaloneMutationError:
             pass
-        raise StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation.id) from None
 
 
 def _account_lock_path(root: Path, account_id: UUID) -> Path:
@@ -496,9 +600,96 @@ def _validate_post_text(text: object) -> None:
     _validate_mutation_text(text, "INVALID_POST_TEXT")
 
 
+def _validate_optional_post_text(text: object) -> None:
+    if text is not None:
+        _validate_mutation_text(text, "INVALID_POST_TEXT")
+
+
+def validate_media_post_inputs(media_url: object, text: object, alt_text: object) -> None:
+    if not _valid_media_url(media_url):
+        raise StandaloneMutationError("INVALID_MEDIA_URL")
+    _validate_optional_post_text(text)
+    _validate_alt_text(alt_text)
+
+
 def _validate_mutation_text(text: object, code: str) -> None:
     if not isinstance(text, str) or not 1 <= len(text) <= 500 or not text.strip():
         raise StandaloneMutationError(code)
+
+
+def _validate_alt_text(alt_text: object) -> None:
+    if alt_text is not None and (not isinstance(alt_text, str) or len(alt_text) > 1000):
+        raise StandaloneMutationError("INVALID_ALT_TEXT")
+
+
+def _valid_media_url(value: object) -> TypeGuard[str]:
+    if not isinstance(value, str) or not 1 <= len(value) <= 2048:
+        return False
+    if (
+        "\\" in value
+        or re.search(r"%(?![0-9a-fA-F]{2})", value) is not None
+        or any(
+            character.isspace() or unicodedata.category(character) == "Cc" for character in value
+        )
+    ):
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "%" in hostname
+    ):
+        return False
+    if port is not None and not 0 <= port <= 65535:
+        return False
+
+    normalized_host = hostname[:-1] if hostname.endswith(".") else hostname
+    if not normalized_host or normalized_host.endswith("."):
+        return False
+    try:
+        address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        if _NUMERIC_HOST.fullmatch(normalized_host) is not None:
+            return False
+        try:
+            ascii_host = normalized_host.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return False
+        if (
+            ascii_host == "localhost"
+            or ascii_host.endswith(".localhost")
+            or ascii_host == "localhost.localdomain"
+            or ascii_host.endswith(".local")
+        ):
+            return False
+        labels = ascii_host.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or re.fullmatch(r"[a-z0-9-]+", label) is None
+            for label in labels
+        ):
+            return False
+    else:
+        if address.is_loopback or address.is_unspecified:
+            return False
+        if isinstance(address, ipaddress.IPv6Address):
+            mapped_address = address.ipv4_mapped
+            if mapped_address is not None and (
+                mapped_address.is_loopback or mapped_address.is_unspecified
+            ):
+                return False
+    return True
 
 
 def _valid_remote_id(value: object) -> TypeGuard[str]:

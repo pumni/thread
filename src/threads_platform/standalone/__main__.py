@@ -8,6 +8,7 @@ import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -42,6 +43,7 @@ from threads_platform.standalone.mutations import (
     LocalOperationStore,
     LocalThreadsMutationRuntime,
     StandaloneMutationError,
+    validate_media_post_inputs,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 from threads_platform.standalone.workflows import (
@@ -247,6 +249,46 @@ async def _run_reply_command(
         return f"replied operation={result.operation_id} reply={result.reply_id}\n"
 
 
+async def _run_media_post_command(
+    args: argparse.Namespace,
+    root: Path,
+    store: LocalAccountStore,
+    *,
+    media_type: Literal["IMAGE", "VIDEO"],
+) -> str:
+    media_url = args.image_url if media_type == "IMAGE" else args.video_url
+    validate_media_post_inputs(media_url, args.text, args.alt_text)
+    settings = Settings()
+    async with build_threads_http_client(settings) as client:
+        api = HttpThreadsAPI(client)
+        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
+        runtime = LocalThreadsMutationRuntime(
+            root,
+            store,
+            api,
+            secret_resolver,
+            LocalOperationStore(root),
+        )
+        if media_type == "IMAGE":
+            result = await runtime.publish_image(
+                args.alias,
+                args.image_url,
+                args.text,
+                alt_text=args.alt_text,
+            )
+        else:
+            result = await runtime.publish_video(
+                args.alias,
+                args.video_url,
+                args.text,
+                alt_text=args.alt_text,
+            )
+        return (
+            f"published-{media_type.lower()} operation={result.operation_id} "
+            f"media={result.media_id}\n"
+        )
+
+
 async def _run_workflow_command(
     plan: WorkflowPlan,
     root: Path,
@@ -362,6 +404,16 @@ def _build_parser() -> argparse.ArgumentParser:
     reply_parser.add_argument("thread_id")
     reply_parser.add_argument("text")
     reply_parser.add_argument("--parent-reply-id")
+    image_parser = commands.add_parser("post-image")
+    image_parser.add_argument("alias")
+    image_parser.add_argument("image_url")
+    image_parser.add_argument("text", nargs="?")
+    image_parser.add_argument("--alt-text")
+    video_parser = commands.add_parser("post-video")
+    video_parser.add_argument("alias")
+    video_parser.add_argument("video_url")
+    video_parser.add_argument("text", nargs="?")
+    video_parser.add_argument("--alt-text")
 
     workflow_parser = commands.add_parser("workflow")
     workflow_commands = workflow_parser.add_subparsers(dest="workflow_command", required=True)
@@ -428,6 +480,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "reply":
             output = asyncio.run(_run_reply_command(args, root, store))
+            sys.stdout.write(output)
+            return 0
+
+        if args.command == "post-image":
+            output = asyncio.run(_run_media_post_command(args, root, store, media_type="IMAGE"))
+            sys.stdout.write(output)
+            return 0
+
+        if args.command == "post-video":
+            output = asyncio.run(_run_media_post_command(args, root, store, media_type="VIDEO"))
             sys.stdout.write(output)
             return 0
 

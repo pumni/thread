@@ -36,6 +36,7 @@ from threads_platform.standalone.mutations import (
     CreatedReplyResult,
     LocalOperationStore,
     LocalThreadsMutationRuntime,
+    PublishedMediaResult,
     PublishedTextResult,
     StandaloneMutationError,
 )
@@ -759,6 +760,219 @@ def test_cli_reply_success_has_exact_output_and_closes_http_context(
     assert context.enter_count == context.exit_count == 1
 
 
+@pytest.mark.parametrize(
+    ("media_type", "command", "expected_label"),
+    [
+        ("IMAGE", "post-image", "published-image"),
+        ("VIDEO", "post-video", "published-video"),
+    ],
+)
+def test_cli_media_post_success_has_exact_safe_output_and_closes_http_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    media_type: str,
+    command: str,
+    expected_label: str,
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    context = _install_fake_api_client(monkeypatch)
+    operation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    media_url = f"https://{media_type.lower()}-url-secret.media.example/object"
+    text = "media-post-text-secret"
+    alt_text = "media-alt-text-secret"
+    calls: list[tuple[str, str, str, str | None, str | None]] = []
+
+    async def fake_image(
+        _runtime: LocalThreadsMutationRuntime,
+        alias: str,
+        image_url: str,
+        post_text: str | None = None,
+        *,
+        alt_text: str | None = None,
+    ) -> PublishedMediaResult:
+        calls.append(("IMAGE", alias, image_url, post_text, alt_text))
+        return PublishedMediaResult(operation_id, "media-123")
+
+    async def fake_video(
+        _runtime: LocalThreadsMutationRuntime,
+        alias: str,
+        video_url: str,
+        post_text: str | None = None,
+        *,
+        alt_text: str | None = None,
+    ) -> PublishedMediaResult:
+        calls.append(("VIDEO", alias, video_url, post_text, alt_text))
+        return PublishedMediaResult(operation_id, "media-123")
+
+    method = "publish_image" if media_type == "IMAGE" else "publish_video"
+    replacement = fake_image if media_type == "IMAGE" else fake_video
+    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, method, replacement)
+
+    result = main([command, "alice", media_url, text, "--alt-text", alt_text])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [(media_type, "alice", media_url, text, alt_text)]
+    assert captured.out == f"{expected_label} operation={operation_id} media=media-123\n"
+    assert captured.err == ""
+    for forbidden in (media_url, text, alt_text):
+        assert forbidden not in captured.out + captured.err
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+@pytest.mark.parametrize(
+    ("media_type", "command"),
+    [("IMAGE", "post-image"), ("VIDEO", "post-video")],
+)
+def test_cli_media_publish_ambiguous_error_redacts_all_mutation_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    media_type: str,
+    command: str,
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    context = _install_fake_api_client(monkeypatch)
+    token_sentinel = "media-token-secret-never-output"
+    credential_name = "THREADS_PLATFORM_THREADS_TOKEN_MEDIA_TEST"
+    credential_ref = f"env://{credential_name}"
+    media_url = f"https://{media_type.lower()}-url-secret.media.example/object"
+    text = "media-post-text-secret-never-output"
+    alt_text = "media-alt-text-secret-never-output"
+    monkeypatch.setenv(credential_name, token_sentinel)
+    store = account_module.LocalAccountStore(root)
+    store.add("alice")
+    store.set_credential_ref("alice", credential_ref)
+    api_calls: list[str] = []
+
+    class _FailingMediaApi:
+        async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
+            assert token.get_secret_value() == token_sentinel
+            api_calls.append("quota")
+            return PublishingQuota(usage=1, total=100)
+
+        async def create_container(
+            self, token: SecretStr, request: MediaContainerRequest
+        ) -> MediaContainer:
+            assert token.get_secret_value() == token_sentinel
+            if media_type == "IMAGE":
+                expected = MediaContainerRequest(
+                    media_type="IMAGE",
+                    image_url=media_url,
+                    text=text,
+                    alt_text=alt_text,
+                )
+            else:
+                expected = MediaContainerRequest(
+                    media_type="VIDEO",
+                    video_url=media_url,
+                    text=text,
+                    alt_text=alt_text,
+                )
+            assert request == expected
+            api_calls.append("create")
+            return MediaContainer(container_id="container-123")
+
+        async def get_container(self, token: SecretStr, container_id: str) -> MediaContainer:
+            assert token.get_secret_value() == token_sentinel
+            assert container_id == "container-123"
+            api_calls.append("status")
+            return MediaContainer(container_id, status="FINISHED")
+
+        async def publish_container(self, token: SecretStr, container_id: str) -> str:
+            assert token.get_secret_value() == token_sentinel
+            assert container_id == "container-123"
+            api_calls.append("publish")
+            raise ThreadsAPIError("THREADS_RATE_LIMITED")
+
+    def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
+        return cast(HttpThreadsAPI, _FailingMediaApi())
+
+    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+
+    result = main([command, "alice", media_url, text, "--alt-text", alt_text])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    match = re.fullmatch(
+        r"ERROR PUBLISH_OUTCOME_AMBIGUOUS operation=([0-9a-f-]{36})\n", captured.err
+    )
+    assert match is not None
+    operation_id = UUID(match.group(1))
+    assert api_calls == ["quota", "create", "status", "publish"]
+    assert api_calls.count("publish") == 1
+    operation = LocalOperationStore(root).get(operation_id)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "AMBIGUOUS"
+    journal = (root / "operations" / f"{operation_id}.json").read_text(encoding="utf-8")
+    for forbidden in (
+        media_url,
+        text,
+        alt_text,
+        token_sentinel,
+        credential_ref,
+        "Authorization",
+    ):
+        assert forbidden not in captured.out + captured.err + journal
+    assert context.enter_count == 1
+    assert context.exit_count == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "url", "text", "alt_text", "expected_code"),
+    [
+        ("post-image", "file:///private/image.jpg", "private text", None, "INVALID_MEDIA_URL"),
+        ("post-video", "https://media.example/video.mp4", " \t ", None, "INVALID_POST_TEXT"),
+        ("post-image", "https://media.example/image.jpg", None, "x" * 1001, "INVALID_ALT_TEXT"),
+    ],
+)
+def test_cli_media_inputs_fail_before_settings_or_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    url: str,
+    text: str | None,
+    alt_text: str | None,
+    expected_code: str,
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "local")
+    calls: list[str] = []
+
+    def fail_settings() -> Settings:
+        calls.append("settings")
+        raise AssertionError("invalid media input must be rejected before Settings")
+
+    def fail_client(_settings: Settings) -> httpx2.AsyncClient:
+        calls.append("http")
+        raise AssertionError("invalid media input must be rejected before HTTP client")
+
+    monkeypatch.setattr(cli_module, "Settings", fail_settings)
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+    argv = [command, "alice", url]
+    if text is not None:
+        argv.append(text)
+    if alt_text is not None:
+        argv.extend(["--alt-text", alt_text])
+
+    result = main(argv)
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == f"ERROR {expected_code}\n"
+    assert url not in captured.out + captured.err
+    if text is not None:
+        assert text not in captured.out + captured.err
+    if alt_text is not None:
+        assert alt_text not in captured.out + captured.err
+    assert calls == []
+
+
 @pytest.mark.parametrize("text", ["  \t", "x" * 501])
 def test_cli_post_validation_is_bounded_and_does_not_echo_text(
     text: str,
@@ -969,6 +1183,36 @@ def test_cli_operation_show_renders_create_reply_journal_without_http(
     assert result == 0
     assert captured.out == (
         f"operation {operation.id} kind=CREATE_REPLY phase=RECEIVED container=- media=- outcome=-\n"
+    )
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("kind", ["POST_IMAGE", "POST_VIDEO"])
+def test_cli_operation_show_renders_media_journal_without_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    kind: str,
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    root.mkdir(parents=True)
+    operation = LocalOperationStore(root).create_received(
+        UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        kind=kind,
+    )
+
+    def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
+        raise AssertionError("operation show must not build an HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+
+    result = main(["operation", "show", str(operation.id)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        f"operation {operation.id} kind={kind} phase=RECEIVED container=- media=- outcome=-\n"
     )
     assert captured.err == ""
 
