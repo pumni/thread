@@ -35,7 +35,7 @@ from threads_platform.standalone.mutations import (
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 
-_MAX_WORKFLOW_BYTES = 65_536
+MAX_WORKFLOW_BYTES = 65_536
 _MAX_WORKFLOW_STEPS = 32
 _ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}")
@@ -182,6 +182,25 @@ class WorkflowPlan:
     steps: tuple[WorkflowStep, ...]
 
 
+def is_read_only_workflow(plan: WorkflowPlan) -> bool:
+    """Return whether every parsed workflow step is an approved READ capability."""
+
+    read_only_steps = (
+        QuotaStep,
+        MediaStep,
+        RepliesStep,
+        ConversationStep,
+        FeedStep,
+        ProfileStep,
+        ThreadStep,
+        PublicProfileStep,
+        ProfilePostsStep,
+        SearchStep,
+        MentionsStep,
+    )
+    return all(isinstance(step, read_only_steps) for step in plan.steps)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkflowStepResult:
     index: int
@@ -196,11 +215,11 @@ def load_workflow(path: Path) -> WorkflowPlan:
         if not path.is_file():
             raise StandaloneWorkflowError("WORKFLOW_UNAVAILABLE")
         with path.open("rb") as stream:
-            contents = stream.read(_MAX_WORKFLOW_BYTES + 1)
+            contents = stream.read(MAX_WORKFLOW_BYTES + 1)
     except OSError:
         raise StandaloneWorkflowError("WORKFLOW_UNAVAILABLE") from None
 
-    if len(contents) > _MAX_WORKFLOW_BYTES:
+    if len(contents) > MAX_WORKFLOW_BYTES:
         raise StandaloneWorkflowError("INVALID_WORKFLOW") from None
     try:
         document = contents.decode("utf-8")

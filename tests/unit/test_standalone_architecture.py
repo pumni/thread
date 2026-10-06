@@ -24,6 +24,7 @@ STANDALONE_FORBIDDEN_IMPORTS = (
     "threads_platform.application.commands",
     "threads_platform.application.worker_jobs",
     "threads_platform.infrastructure.threads_api.composition",
+    "threads_platform.infrastructure.control_plane",
     "threads_platform.transport",
     "threads_platform.domain.account_activities",
     "threads_platform.application.account_activity_materialization",
@@ -46,6 +47,8 @@ STANDALONE_FORBIDDEN_SYMBOLS = frozenset(
         "UnitOfWork",
         "UnitOfWorkFactory",
         "SQLAlchemyUnitOfWorkFactory",
+        "ControlClient",
+        "ControlPlaneClient",
     }
 )
 BROWSER_INFRASTRUCTURE_FORBIDDEN_IMPORTS = (

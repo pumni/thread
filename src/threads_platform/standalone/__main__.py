@@ -7,6 +7,7 @@ import asyncio
 import re
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -51,6 +52,12 @@ from threads_platform.standalone.mutations import (
     load_carousel_manifest,
     validate_media_post_inputs,
     validate_reply_moderation_inputs,
+)
+from threads_platform.standalone.recurrences import (
+    LocalRecurrenceRunner,
+    LocalRecurrenceStore,
+    RecurrenceRecord,
+    StandaloneRecurrenceError,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 from threads_platform.standalone.workflows import (
@@ -370,6 +377,15 @@ async def _run_workflow_command(
     root: Path,
     store: LocalAccountStore,
 ) -> str:
+    results = await _execute_workflow_plan(plan, root, store)
+    return _format_workflow_results(results)
+
+
+async def _execute_workflow_plan(
+    plan: WorkflowPlan,
+    root: Path,
+    store: LocalAccountStore,
+) -> tuple[WorkflowStepResult, ...]:
     settings = Settings()
     async with build_threads_http_client(settings) as client:
         api = HttpThreadsAPI(client)
@@ -385,7 +401,36 @@ async def _run_workflow_command(
         browser_runtime = LocalRuntime(root, store)
         runtime = LocalWorkflowRuntime(api_runtime, mutation_runtime, browser_runtime)
         results = await runtime.run(plan)
-    return _format_workflow_results(results)
+    return results
+
+
+async def _run_recurrence_command(
+    recurrence_id: str,
+    root: Path,
+    accounts: LocalAccountStore,
+    recurrences: LocalRecurrenceStore,
+) -> None:
+    async def execute_once(plan: WorkflowPlan) -> object:
+        return await _execute_workflow_plan(plan, root, accounts)
+
+    await LocalRecurrenceRunner(recurrences).run(recurrence_id, execute_once)
+
+
+def _format_recurrence_record(record: RecurrenceRecord) -> str:
+    last_outcome = record.last_outcome or "-"
+    last_error = record.last_error_code or "-"
+    last_step = _format_scalar(record.last_step_index)
+    return (
+        f"recurrence id={record.id} status={record.status} account={record.account} "
+        f"every_seconds={record.interval_seconds} "
+        f"next_due_at={_format_recurrence_timestamp(record.next_due_at)} "
+        f"last_outcome={last_outcome} last_error_code={last_error} "
+        f"last_step_index={last_step}\n"
+    )
+
+
+def _format_recurrence_timestamp(value: datetime) -> str:
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _format_workflow_results(results: tuple[WorkflowStepResult, ...]) -> str:
@@ -543,6 +588,19 @@ def _build_parser() -> argparse.ArgumentParser:
     run_workflow_parser = workflow_commands.add_parser("run")
     run_workflow_parser.add_argument("file")
 
+    recurrence_parser = commands.add_parser("recurrence")
+    recurrence_commands = recurrence_parser.add_subparsers(dest="recurrence_command", required=True)
+    create_recurrence_parser = recurrence_commands.add_parser("create")
+    create_recurrence_parser.add_argument("file")
+    create_recurrence_parser.add_argument("--every-seconds", type=int, required=True)
+    recurrence_commands.add_parser("list")
+    show_recurrence_parser = recurrence_commands.add_parser("show")
+    show_recurrence_parser.add_argument("id")
+    run_recurrence_parser = recurrence_commands.add_parser("run")
+    run_recurrence_parser.add_argument("id")
+    disable_recurrence_parser = recurrence_commands.add_parser("disable")
+    disable_recurrence_parser.add_argument("id")
+
     operation_parser = commands.add_parser("operation")
     operation_commands = operation_parser.add_subparsers(dest="operation_command", required=True)
     show_parser = operation_commands.add_parser("show")
@@ -560,6 +618,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             store.get(plan.account)
             output = asyncio.run(_run_workflow_command(plan, root, store))
             sys.stdout.write(output)
+            return 0
+
+        if args.command == "recurrence":
+            root = resolve_standalone_data_root()
+            accounts = LocalAccountStore(root)
+            recurrences = LocalRecurrenceStore(root, accounts)
+            if args.recurrence_command == "create":
+                record = recurrences.create(Path(args.file), args.every_seconds)
+                sys.stdout.write(
+                    f"recurrence created id={record.id} account={record.account} "
+                    f"every_seconds={record.interval_seconds} "
+                    f"next_due_at={_format_recurrence_timestamp(record.next_due_at)}\n"
+                )
+                return 0
+            if args.recurrence_command == "list":
+                records = recurrences.list()
+                for record in records:
+                    sys.stdout.write(_format_recurrence_record(record))
+                return 0
+            if args.recurrence_command == "show":
+                sys.stdout.write(_format_recurrence_record(recurrences.get(args.id)))
+                return 0
+            if args.recurrence_command == "disable":
+                record = recurrences.disable(args.id)
+                sys.stdout.write(f"recurrence disabled id={record.id}\n")
+                return 0
+            record = recurrences.get(args.id)
+            if record.status != "ENABLED":
+                raise StandaloneRecurrenceError("RECURRENCE_DISABLED")
+            sys.stdout.write(f"recurrence starting id={record.id}\n")
+            sys.stdout.flush()
+            asyncio.run(_run_recurrence_command(args.id, root, accounts, recurrences))
             return 0
 
         if args.command == "post-carousel":
@@ -666,6 +756,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if error.operation_id is not None:
             suffix += f" operation={error.operation_id}"
         sys.stderr.write(f"ERROR {error.code}{suffix}\n")
+        return 1
+    except StandaloneRecurrenceError as error:
+        sys.stderr.write(f"ERROR {error.code}\n")
         return 1
     except (
         StandaloneAccountError,
