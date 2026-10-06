@@ -24,9 +24,9 @@ NurtureOutcome = Literal["RUNNING", "SUCCESS", "FAILED", "INTERRUPTED", "AMBIGUO
 NurtureActionState = Literal["NONE", "PENDING", "CONFIRMED", "AMBIGUOUS"]
 
 MAX_NURTURE_TARGETS = 2_000
-MAX_NURTURE_RUN_RECEIPTS = 2_000
 MAX_NURTURE_RUN_BYTES = 8_192
 MAX_NURTURE_TARGET_STATE_BYTES = 2_097_152
+_MAX_ACTIVE_RUNS_TO_REPAIR = 32
 _MAX_COUNTER = 1_000_000
 _MAX_DECISION_CODES = 32
 _MAX_OPERATION_IDS = 6
@@ -198,9 +198,9 @@ class NurtureStore:
             finished_at=None,
             outcome="RUNNING",
         )
-        directory = self._run_directory(run.account_id, create=True)
+        directory = self._run_directory(run.account_id, "active", create=True)
         assert directory is not None
-        if len(self._run_receipt_paths(directory)) >= MAX_NURTURE_RUN_RECEIPTS:
+        if self._run_receipt_paths(directory):
             raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
         self._write_new_run(directory / f"{run.id}.json", run)
         return run
@@ -210,10 +210,7 @@ class NurtureStore:
         account_id = owner.account_id
         _validate_uuid(account_id, version=4)
         _validate_uuid(run_id, version=4)
-        directory = self._run_directory(account_id, create=False)
-        if directory is None:
-            raise NurtureStateError("NURTURE_RUN_NOT_FOUND")
-        path = self._run_path(directory, run_id, must_exist=False)
+        path = self._find_run_path(account_id, run_id)
         if path is None:
             raise NurtureStateError("NURTURE_RUN_NOT_FOUND")
         run = self._read_run(path, run_id)
@@ -242,11 +239,14 @@ class NurtureStore:
             or (updated.outcome != "RUNNING" and updated.finished_at is None)
         ):
             raise NurtureStateError("NURTURE_STATE_INVALID")
-        directory = self._run_directory(owner.account_id, create=False)
-        assert directory is not None
+        directory = self._run_directory(owner.account_id, "active", create=False)
+        if directory is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
         path = self._run_path(directory, updated.id, must_exist=True)
         assert path is not None
         self._write_replace(path, _encode_run(updated), MAX_NURTURE_RUN_BYTES)
+        if updated.outcome != "RUNNING":
+            self._move_run_to_completed(directory, updated)
         return updated
 
     def load_target_state(
@@ -302,27 +302,30 @@ class NurtureStore:
 
     def repair_stale_runs(self, owner: NurtureAccountLock) -> None:
         owner.require_held(self)
-        directory = self._run_directory(owner.account_id, create=False)
+        directory = self._run_directory(owner.account_id, "active", create=False)
         if directory is None:
             return
         json_paths = self._run_receipt_paths(directory)
 
-        stale: list[tuple[Path, NurtureRunV1]] = []
+        active_runs: list[tuple[Path, NurtureRunV1]] = []
         for _path, run_id in json_paths:
             run_path = self._run_path(directory, run_id, must_exist=True)
             assert run_path is not None
             run = self._read_run(run_path, run_id)
-            if run.account_id == owner.account_id and run.outcome == "RUNNING":
-                stale.append((run_path, run))
-        for path, run in stale:
-            interrupted = replace(
-                run,
-                finished_at=run.started_at,
-                outcome="INTERRUPTED",
-                error_code="INTERRUPTED",
-                failed_stage="recovery",
-            )
-            self._write_replace(path, _encode_run(interrupted), MAX_NURTURE_RUN_BYTES)
+            if run.account_id != owner.account_id:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            active_runs.append((run_path, run))
+        for path, run in active_runs:
+            if run.outcome == "RUNNING":
+                run = replace(
+                    run,
+                    finished_at=run.started_at,
+                    outcome="INTERRUPTED",
+                    error_code="INTERRUPTED",
+                    failed_stage="recovery",
+                )
+                self._write_replace(path, _encode_run(run), MAX_NURTURE_RUN_BYTES)
+            self._move_run_to_completed(path.parent, run)
 
     @staticmethod
     def _run_receipt_paths(directory: Path) -> list[tuple[Path, UUID]]:
@@ -339,9 +342,33 @@ class NurtureStore:
             except NurtureStateError:
                 raise NurtureStateError("NURTURE_STATE_INVALID") from None
             json_paths.append((path, run_id))
-        if len(json_paths) > MAX_NURTURE_RUN_RECEIPTS:
+        if len(json_paths) > _MAX_ACTIVE_RUNS_TO_REPAIR:
             raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
         return json_paths
+
+    def _find_run_path(self, account_id: UUID, run_id: UUID) -> Path | None:
+        for stage in ("active", "completed"):
+            directory = self._run_directory(account_id, stage, create=False)
+            if directory is None:
+                continue
+            path = self._run_path(directory, run_id, must_exist=False)
+            if path is not None:
+                return path
+        return None
+
+    def _move_run_to_completed(self, active_directory: Path, run: NurtureRunV1) -> None:
+        completed = self._run_directory(run.account_id, "completed", create=True)
+        assert completed is not None
+        source = self._run_path(active_directory, run.id, must_exist=True)
+        assert source is not None
+        target = self._run_path(completed, run.id, must_exist=False)
+        if target is not None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        try:
+            os.replace(source, completed / f"{run.id}.json")
+        except OSError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        self._run_path(completed, run.id, must_exist=True)
 
     def lock_directory(self) -> Path:
         directory = self._subdirectory("locks", create=True)
@@ -351,11 +378,20 @@ class NurtureStore:
     def validate_lock_file(self, path: Path, parent: Path) -> None:
         self._regular_file_path(path, parent, must_exist=True)
 
-    def _run_directory(self, account_id: UUID, *, create: bool) -> Path | None:
+    def _run_directory(self, account_id: UUID, stage: str, *, create: bool) -> Path | None:
+        if stage not in {"active", "completed"}:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
         runs = self._subdirectory("runs", create=create)
         if runs is None:
             return None
-        return self._ensure_directory(runs / str(account_id), runs, create=create)
+        account_directory = self._ensure_directory(runs / str(account_id), runs, create=create)
+        if account_directory is None:
+            return None
+        return self._ensure_directory(
+            account_directory / stage,
+            account_directory,
+            create=create,
+        )
 
     def _state_account_directory(self, account_id: UUID, *, create: bool) -> Path | None:
         state = self._subdirectory("state", create=create)

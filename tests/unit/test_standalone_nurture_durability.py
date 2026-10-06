@@ -27,7 +27,11 @@ def _setup(tmp_path: Path) -> tuple[NurtureStore, UUID, NurturePresetV1]:
 
 
 def _run_path(root: Path, account_id: UUID, run_id: UUID) -> Path:
-    return root / "nurture" / "runs" / str(account_id) / f"{run_id}.json"
+    return root / "nurture" / "runs" / str(account_id) / "active" / f"{run_id}.json"
+
+
+def _completed_run_path(root: Path, account_id: UUID, run_id: UUID) -> Path:
+    return root / "nurture" / "runs" / str(account_id) / "completed" / f"{run_id}.json"
 
 
 def _state_path(root: Path, account_id: UUID, preset: NurturePresetV1) -> Path:
@@ -106,7 +110,7 @@ def test_failed_run_creation_leaves_no_partial_receipt(
         with pytest.raises(NurtureStateError) as caught:
             owner.start_run(preset, now=_START)
         _assert_code(caught, "NURTURE_STATE_INVALID")
-        run_directory = tmp_path / "nurture" / "runs" / str(account_id)
+        run_directory = tmp_path / "nurture" / "runs" / str(account_id) / "active"
         assert not list(run_directory.glob("*.json"))
         assert not list(run_directory.glob("*.tmp"))
 
@@ -345,7 +349,7 @@ def test_symlinked_run_and_state_files_fail_closed(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-outside.json"
     outside.write_text("{}", encoding="utf-8")
     for path in (
-        _run_path(tmp_path, account_id, run.receipt.id),
+        _completed_run_path(tmp_path, account_id, run.receipt.id),
         _state_path(tmp_path, account_id, preset),
     ):
         original = path.read_bytes()
@@ -566,21 +570,44 @@ def test_stale_running_receipt_repairs_only_during_lock_acquisition(tmp_path: Pa
         assert repaired.finished_at == _START
         assert repaired.error_code == "INTERRUPTED"
         assert repaired.failed_stage == "recovery"
+        assert not _run_path(tmp_path, account_id, run.id).exists()
+        assert _completed_run_path(tmp_path, account_id, run.id).exists()
 
 
-def test_run_receipt_cap_fails_closed_without_pruning_history(
+def test_terminal_move_failure_leaves_valid_receipt_for_next_lock_repair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(nurture_store_module, "MAX_NURTURE_RUN_RECEIPTS", 1)
     store, account_id, preset = _setup(tmp_path)
     with store.acquire_account_lock(account_id) as owner:
-        first = owner.start_run(preset, now=_START)
-        first.finish("SUCCESS", now=_START + timedelta(seconds=1))
+        scope = owner.start_run(preset, now=_START)
+        real_replace = nurture_store_module.os.replace
+        replace_calls = 0
+
+        def fail_move(source: Path, destination: Path) -> None:
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls == 2:
+                raise OSError("private failure detail")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(nurture_store_module.os, "replace", fail_move)
         with pytest.raises(NurtureStateError) as caught:
-            owner.start_run(preset, now=_START + timedelta(seconds=2))
-        _assert_code(caught, "NURTURE_STATE_CAP_REACHED")
-        assert owner.get_run(first.receipt.id).outcome == "SUCCESS"
+            scope.finish("SUCCESS", now=_START + timedelta(seconds=1))
+        _assert_code(caught, "NURTURE_STATE_INVALID")
+        assert (
+            json.loads(
+                _run_path(tmp_path, account_id, scope.receipt.id).read_text(encoding="utf-8")
+            )["outcome"]
+            == "SUCCESS"
+        )
+        assert not _completed_run_path(tmp_path, account_id, scope.receipt.id).exists()
+
+    monkeypatch.undo()
+    with store.acquire_account_lock(account_id) as owner:
+        assert owner.get_run(scope.receipt.id).outcome == "SUCCESS"
+        assert not _run_path(tmp_path, account_id, scope.receipt.id).exists()
+        assert _completed_run_path(tmp_path, account_id, scope.receipt.id).exists()
 
 
 def test_keyboard_interrupt_persists_interrupted_and_propagates(tmp_path: Path) -> None:
