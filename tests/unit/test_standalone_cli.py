@@ -32,6 +32,7 @@ from threads_platform.config.settings import Settings
 from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
 from threads_platform.standalone.__main__ import main
+from threads_platform.standalone.accounts import LocalAccountStore
 from threads_platform.standalone.api import LocalThreadsApiRuntime, StandaloneApiError
 from threads_platform.standalone.mutations import (
     CarouselItem,
@@ -86,6 +87,92 @@ def _install_fake_api_client(
         fake_builder,
     )
     return context
+
+
+_CLI_MODERATION_TOKEN = "cli-token-sentinel-never-journal-this"
+_CLI_MODERATION_CREDENTIAL_REF = "env://THREADS_PLATFORM_THREADS_TOKEN_CLI"
+_CLI_MODERATION_REPLY_ID = "reply-target-private-sentinel-42"
+
+
+class _CliModerationResolver:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def resolve(self, credential_ref: str) -> SecretStr:
+        self.calls.append(credential_ref)
+        return SecretStr(_CLI_MODERATION_TOKEN)
+
+
+class _CliModerationAPI:
+    def __init__(
+        self,
+        root: Path,
+        operations: LocalOperationStore,
+        *,
+        failure: Exception | None = None,
+    ) -> None:
+        self.root = root
+        self.operations = operations
+        self.failure = failure
+        self.calls: list[tuple[str, str, bool]] = []
+
+    async def get_publishing_quota(self, _token: SecretStr) -> PublishingQuota:
+        raise AssertionError("moderation does not call the publishing quota")
+
+    async def manage_reply(self, token: SecretStr, reply_id: str, *, hide: bool) -> None:
+        self._record(token, reply_id)
+        self.calls.append(("manage_reply", reply_id, hide))
+        if self.failure is not None:
+            raise self.failure
+
+    async def manage_pending_reply(self, token: SecretStr, reply_id: str, *, approve: bool) -> None:
+        self._record(token, reply_id)
+        self.calls.append(("manage_pending_reply", reply_id, approve))
+        if self.failure is not None:
+            raise self.failure
+
+    def _record(self, token: SecretStr, reply_id: str) -> None:
+        assert token.get_secret_value() == _CLI_MODERATION_TOKEN
+        assert reply_id == _CLI_MODERATION_REPLY_ID
+        operation_paths = tuple((self.root / "operations").glob("*.json"))
+        assert len(operation_paths) == 1
+        operation = self.operations.get(UUID(operation_paths[0].stem))
+        assert operation.kind == "MODERATE_REPLY"
+        assert operation.phase == "MUTATION_REQUESTED"
+
+
+def _install_cli_moderation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure: Exception | None = None,
+) -> tuple[
+    Path,
+    LocalOperationStore,
+    _CliModerationAPI,
+    _CliModerationResolver,
+    _FakeAsyncClientContext,
+]:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    accounts = LocalAccountStore(root)
+    accounts.add("alice")
+    accounts.set_credential_ref("alice", _CLI_MODERATION_CREDENTIAL_REF)
+    operations = LocalOperationStore(root)
+    api = _CliModerationAPI(root, operations, failure=failure)
+    resolver = _CliModerationResolver()
+    context = _install_fake_api_client(monkeypatch)
+
+    def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
+        return cast(HttpThreadsAPI, api)
+
+    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+    monkeypatch.setattr(
+        cli_module,
+        "EnvironmentThreadsCredentialSecretResolver",
+        lambda: resolver,
+    )
+    return root, operations, api, resolver, context
 
 
 def test_cli_add_prints_alias_and_uuid(
@@ -1734,3 +1821,182 @@ def test_cli_workflow_ambiguous_post_error_includes_step_and_operation_without_s
     assert token_sentinel not in captured.out + captured.err
     assert context.enter_count == 1
     assert context.exit_count == 1
+
+
+def test_cli_moderate_reply_success_is_safe_and_uses_canonical_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, operations, api, resolver, context = _install_cli_moderation(tmp_path, monkeypatch)
+
+    result = main(["moderate-reply", "alice", _CLI_MODERATION_REPLY_ID, "hide"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    match = re.fullmatch(r"moderated operation=([0-9a-f-]{36}) action=hide\n", captured.out)
+    assert match is not None
+    operation_id = UUID(match.group(1))
+    assert captured.err == ""
+    assert api.calls == [("manage_reply", _CLI_MODERATION_REPLY_ID, True)]
+    assert resolver.calls == [_CLI_MODERATION_CREDENTIAL_REF]
+    operation = operations.get(operation_id)
+    assert operation.phase == "CONFIRMED"
+    assert operation.action == "hide"
+    journal = (root / "operations" / f"{operation_id}.json").read_text()
+    for forbidden in (
+        _CLI_MODERATION_REPLY_ID,
+        _CLI_MODERATION_TOKEN,
+        _CLI_MODERATION_CREDENTIAL_REF,
+    ):
+        assert forbidden not in captured.out + captured.err + journal
+    assert context.enter_count == context.exit_count == 1
+
+
+def test_cli_moderate_reply_error_is_ambiguous_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    raw_response = "private raw moderation response sentinel"
+    root, operations, api, _, _ = _install_cli_moderation(
+        tmp_path,
+        monkeypatch,
+        failure=RuntimeError(raw_response),
+    )
+
+    result = main(["moderate-reply", "alice", _CLI_MODERATION_REPLY_ID, "approve"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    match = re.fullmatch(
+        r"ERROR MODERATION_OUTCOME_AMBIGUOUS operation=([0-9a-f-]{36})\n",
+        captured.err,
+    )
+    assert match is not None
+    operation_id = UUID(match.group(1))
+    assert api.calls == [("manage_pending_reply", _CLI_MODERATION_REPLY_ID, True)]
+    operation = operations.get(operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.action == "approve"
+    journal = (root / "operations" / f"{operation_id}.json").read_text()
+    for forbidden in (
+        _CLI_MODERATION_REPLY_ID,
+        _CLI_MODERATION_TOKEN,
+        _CLI_MODERATION_CREDENTIAL_REF,
+        raw_response,
+    ):
+        assert forbidden not in captured.out + captured.err + journal
+
+
+def test_cli_moderate_reply_validates_reply_id_before_data_root_or_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    def forbidden_root() -> Path:
+        calls.append("root")
+        raise AssertionError("invalid reply ID must fail before data-root lookup")
+
+    def forbidden_settings() -> Settings:
+        calls.append("settings")
+        raise AssertionError("invalid reply ID must fail before Settings")
+
+    monkeypatch.setattr(cli_module, "resolve_standalone_data_root", forbidden_root)
+    monkeypatch.setattr(cli_module, "Settings", forbidden_settings)
+
+    result = main(["moderate-reply", "alice", "replies/private-42", "hide"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_REPLY_ID\n"
+    assert calls == []
+
+
+def test_cli_moderate_reply_rejects_action_before_data_root_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    def forbidden_root() -> Path:
+        calls.append("root")
+        raise AssertionError("invalid action must fail before data-root lookup")
+
+    monkeypatch.setattr(cli_module, "resolve_standalone_data_root", forbidden_root)
+
+    result = main(["moderate-reply", "alice", "reply-42", "delete"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_MODERATION_ACTION\n"
+    assert calls == []
+
+
+def test_cli_moderate_reply_uses_existing_alias_validation_before_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    LocalAccountStore(root).add("alice")
+    calls: list[str] = []
+
+    def forbidden_settings() -> Settings:
+        calls.append("settings")
+        raise AssertionError("invalid account alias must fail before Settings")
+
+    def forbidden_client(_settings: Settings) -> httpx2.AsyncClient:
+        calls.append("http")
+        raise AssertionError("invalid account alias must fail before HTTP client")
+
+    monkeypatch.setattr(cli_module, "Settings", forbidden_settings)
+    monkeypatch.setattr(cli_module, "build_threads_http_client", forbidden_client)
+
+    result = main(["moderate-reply", "../alice", "reply-target-42", "hide"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_ACCOUNT_ALIAS\n"
+    assert calls == []
+    assert not (root / "operations").exists()
+
+
+def test_cli_operation_show_renders_moderation_action_without_target_or_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "local"
+    _set_data_root(monkeypatch, root)
+    root.mkdir(parents=True)
+    store = LocalOperationStore(root)
+    operation = store.create_received(
+        UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+        kind="MODERATE_REPLY",
+        action="unhide",
+    )
+    requested = store.update(replace(operation, phase="MUTATION_REQUESTED"))
+    confirmed = store.update(replace(requested, phase="CONFIRMED"))
+
+    def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
+        raise AssertionError("operation show must not build an HTTP client")
+
+    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+
+    result = main(["operation", "show", str(confirmed.id)])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert captured.out == (
+        f"operation {confirmed.id} kind=MODERATE_REPLY phase=CONFIRMED "
+        "container=- media=- outcome=- action=unhide\n"
+    )
+    assert _CLI_MODERATION_REPLY_ID not in captured.out
+    assert captured.err == ""
