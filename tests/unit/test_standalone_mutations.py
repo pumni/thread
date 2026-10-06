@@ -30,12 +30,17 @@ from threads_platform.standalone.mutations import (
     LocalOperation,
     LocalOperationStore,
     LocalThreadsMutationRuntime,
+    PublishedMediaResult,
     StandaloneMutationError,
 )
 
 _TOKEN = "token-sentinel-never-journal-this"
 _CREDENTIAL_REF = "env://THREADS_PLATFORM_THREADS_TOKEN_TEST"
 _TEXT = "text-sentinel-never-journal-this"
+
+
+class _InjectedPublishBaseException(BaseException):
+    pass
 
 
 class _FakeResolver:
@@ -60,6 +65,9 @@ class _FakeAPI:
         create_error: BaseException | None = None,
         publish_error: BaseException | None = None,
         container_id: str = "container-123",
+        container_statuses: tuple[str | None, ...] | None = None,
+        container_status_error: BaseException | None = None,
+        container_response_id: str | None = None,
         media_id: str = "media-123",
     ) -> None:
         self.root = root
@@ -68,6 +76,12 @@ class _FakeAPI:
         self.create_error = create_error
         self.publish_error = publish_error
         self.container_id = container_id
+        self.container_statuses = container_statuses
+        self.container_status_error = container_status_error
+        self.container_response_id = (
+            container_id if container_response_id is None else container_response_id
+        )
+        self.status_check_count = 0
         self.media_id = media_id
         self.calls: list[str] = []
         self.events: list[tuple[str, str | None]] = []
@@ -103,9 +117,23 @@ class _FakeAPI:
             raise self.publish_error
         return self.media_id
 
-    async def get_container(self, *_args: object, **_kwargs: object) -> MediaContainer:
-        self.calls.append("get_container")
-        raise AssertionError("container reconciliation is forbidden")
+    async def get_container(self, token: SecretStr, container_id: str) -> MediaContainer:
+        assert token.get_secret_value() == _TOKEN
+        assert container_id == self.container_id
+        self.calls.append("status")
+        self.status_check_count += 1
+        operation = _only_operation(self.operations, self.root)
+        assert operation.container_id == container_id
+        self.events.append(("status", operation.phase))
+        if self.container_status_error is not None:
+            raise self.container_status_error
+        if not self.container_statuses:
+            raise AssertionError("media status polling was not configured")
+        index = min(self.status_check_count - 1, len(self.container_statuses) - 1)
+        return MediaContainer(
+            container_id=self.container_response_id,
+            status=self.container_statuses[index],
+        )
 
     async def get_media(self, *_args: object, **_kwargs: object) -> object:
         self.calls.append("get_media")
@@ -130,6 +158,9 @@ def _setup(
     create_error: BaseException | None = None,
     publish_error: BaseException | None = None,
     container_id: str = "container-123",
+    container_statuses: tuple[str | None, ...] | None = None,
+    container_status_error: BaseException | None = None,
+    container_response_id: str | None = None,
     media_id: str = "media-123",
 ) -> tuple[
     LocalAccountStore,
@@ -151,6 +182,9 @@ def _setup(
         create_error=create_error,
         publish_error=publish_error,
         container_id=container_id,
+        container_statuses=container_statuses,
+        container_status_error=container_status_error,
+        container_response_id=container_response_id,
         media_id=media_id,
     )
     runtime = LocalThreadsMutationRuntime(
@@ -167,6 +201,28 @@ def _only_operation(store: LocalOperationStore, root: Path) -> LocalOperation:
     paths = tuple((root / "operations").glob("*.json"))
     assert len(paths) == 1
     return store.get(UUID(paths[0].stem))
+
+
+async def _publish_media(
+    runtime: LocalThreadsMutationRuntime,
+    media_type: str,
+    media_url: str,
+    text: str | None = None,
+    alt_text: str | None = None,
+) -> PublishedMediaResult:
+    if media_type == "IMAGE":
+        return await runtime.publish_image("alice", media_url, text, alt_text=alt_text)
+    return await runtime.publish_video("alice", media_url, text, alt_text=alt_text)
+
+
+def _patch_instant_polling(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    delays: list[float] = []
+
+    async def no_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(mutation_module.asyncio, "sleep", no_sleep)
+    return delays
 
 
 @pytest.mark.parametrize("text", [None, "", "   \t", "x" * 501])
@@ -246,6 +302,117 @@ async def test_invalid_reply_inputs_are_rejected_before_account_lock_secret_or_a
     assert not (tmp_path / "operations").exists()
 
 
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.parametrize(
+    "media_url",
+    [
+        None,
+        "",
+        " " * 1,
+        "x" * 2049,
+        "file:///tmp/image.jpg",
+        "data:image/png;base64,AA==",
+        "/tmp/image.jpg",
+        "C:\\tmp\\image.jpg",
+        "https:///image.jpg",
+        ("https://" + "user" + ":" + "password" + "@media.example/image.jpg"),
+        "http://localhost/image.jpg",
+        "http://localhost./image.jpg",
+        "https://cdn.localhost/image.jpg",
+        "http://localhost.localdomain/image.jpg",
+        "http://127.0.0.1/image.jpg",
+        "http://127.1/image.jpg",
+        "http://2130706433/image.jpg",
+        "http://0x7f000001/image.jpg",
+        "http://[::1]/image.jpg",
+        "http://[::ffff:127.0.0.1]/image.jpg",
+        "http://0.0.0.0/image.jpg",
+        "http://printer.local/image.jpg",
+        "https://media.example/image\n.jpg",
+        "https://media.example/bad%2.jpg",
+        "https://media.example/bad%xx.jpg",
+        r"https://media.example\image.jpg",
+        "https://[broken/image.jpg",
+        "https://bad host/image.jpg",
+        "https://media.example:99999/image.jpg",
+        "media.example/image.jpg",
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_media_url_is_rejected_before_account_lock_secret_or_api(
+    tmp_path: Path, media_type: str, media_url: object
+) -> None:
+    accounts = _CountingAccounts(tmp_path)
+    operations = LocalOperationStore(tmp_path)
+    resolver = _FakeResolver()
+    api = _FakeAPI(tmp_path, operations)
+    runtime = LocalThreadsMutationRuntime(
+        tmp_path,
+        accounts,
+        cast(ThreadsAPI, api),
+        cast(ThreadsCredentialSecretResolver, resolver),
+        operations,
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, cast(str, media_url))
+
+    assert caught.value.code == "INVALID_MEDIA_URL"
+    assert accounts.get_calls == 0
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "locks").exists()
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.parametrize(
+    ("text", "alt_text", "expected_code"),
+    [
+        ("", "description", "INVALID_POST_TEXT"),
+        (" \t ", "description", "INVALID_POST_TEXT"),
+        ("x" * 501, "description", "INVALID_POST_TEXT"),
+        (None, "x" * 1001, "INVALID_ALT_TEXT"),
+        (None, 123, "INVALID_ALT_TEXT"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_optional_media_text_is_rejected_before_account_lock_secret_or_api(
+    tmp_path: Path,
+    media_type: str,
+    text: object,
+    alt_text: object,
+    expected_code: str,
+) -> None:
+    accounts = _CountingAccounts(tmp_path)
+    operations = LocalOperationStore(tmp_path)
+    resolver = _FakeResolver()
+    api = _FakeAPI(tmp_path, operations)
+    runtime = LocalThreadsMutationRuntime(
+        tmp_path,
+        accounts,
+        cast(ThreadsAPI, api),
+        cast(ThreadsCredentialSecretResolver, resolver),
+        operations,
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(
+            runtime,
+            media_type,
+            "https://media.example/image.jpg",
+            cast(str | None, text),
+            cast(str | None, alt_text),
+        )
+
+    assert caught.value.code == expected_code
+    assert accounts.get_calls == 0
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "locks").exists()
+    assert not (tmp_path / "operations").exists()
+
+
 @pytest.mark.asyncio
 async def test_missing_credential_and_missing_environment_secret_are_safe(
     tmp_path: Path,
@@ -267,6 +434,10 @@ async def test_missing_credential_and_missing_environment_secret_are_safe(
     with pytest.raises(ThreadsCredentialError) as missing_reply:
         await runtime.create_reply("alice", "thread-1", _TEXT)
     assert missing_reply.value.code == "THREADS_CREDENTIAL_NOT_CONFIGURED"
+    for media_type in ("IMAGE", "VIDEO"):
+        with pytest.raises(ThreadsCredentialError) as missing_media:
+            await _publish_media(runtime, media_type, "https://media.example/image.jpg")
+        assert missing_media.value.code == "THREADS_CREDENTIAL_NOT_CONFIGURED"
     assert api.calls == []
 
     accounts.set_credential_ref("alice", _CREDENTIAL_REF)
@@ -284,6 +455,10 @@ async def test_missing_credential_and_missing_environment_secret_are_safe(
     with pytest.raises(ThreadsCredentialError) as unavailable_reply:
         await runtime.create_reply("alice", "thread-1", _TEXT)
     assert unavailable_reply.value.code == "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
+    for media_type in ("IMAGE", "VIDEO"):
+        with pytest.raises(ThreadsCredentialError) as unavailable_media:
+            await _publish_media(runtime, media_type, "https://media.example/image.jpg")
+        assert unavailable_media.value.code == "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
     assert _TOKEN not in str(unavailable.value)
     assert _CREDENTIAL_REF not in str(unavailable.value)
     assert api.calls == []
@@ -304,6 +479,44 @@ async def test_quota_is_called_once_before_journal_and_quota_limit_has_no_mutati
     assert api.events == [("quota", None)]
     assert resolver.calls == [_CREDENTIAL_REF]
     assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_uses_post_quota_once_and_known_exhaustion_creates_no_journal(
+    tmp_path: Path, media_type: str
+) -> None:
+    _, _, api, resolver, runtime, _ = _setup(
+        tmp_path,
+        quota=PublishingQuota(usage=25, total=25, reply_usage=0, reply_total=1000),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/image.jpg")
+
+    assert caught.value.code == "THREADS_PUBLISHING_QUOTA_REACHED"
+    assert api.calls == ["quota"]
+    assert api.events == [("quota", None)]
+    assert resolver.calls == [_CREDENTIAL_REF]
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_media_with_unknown_post_quota_fields_does_not_invent_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        quota=PublishingQuota(usage=None, total=100),
+        container_statuses=("FINISHED",),
+    )
+    _patch_instant_polling(monkeypatch)
+
+    result = await runtime.publish_image("alice", "https://media.example/image.jpg")
+
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert result.media_id == "media-123"
+    assert operations.get(result.operation_id).kind == "POST_IMAGE"
 
 
 @pytest.mark.asyncio
@@ -398,6 +611,442 @@ async def test_create_reply_uses_exact_text_request_and_journals_safe_phase_orde
         "container_id",
         "media_id",
     }
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_publish_uses_exact_request_and_safe_journal_phase_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, media_type: str
+) -> None:
+    image_url = "https://image-url-secret-sentinel.media.example/photo.png?key=private"
+    video_url = "https://video-url-secret-sentinel.media.example/clip.mp4?key=private"
+    media_url = image_url if media_type == "IMAGE" else video_url
+    alt_text = "alt-text-secret-sentinel\nordinary description"
+    kind = "POST_IMAGE" if media_type == "IMAGE" else "POST_VIDEO"
+    _, operations, api, _, runtime, _ = _setup(tmp_path, container_statuses=("FINISHED",))
+    _patch_instant_polling(monkeypatch)
+
+    result = await _publish_media(runtime, media_type, media_url, _TEXT, alt_text)
+
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert api.events == [
+        ("quota", None),
+        ("create", "RECEIVED"),
+        ("status", "CONTAINER_CREATED"),
+        ("publish", "PUBLISH_REQUESTED"),
+    ]
+    if media_type == "IMAGE":
+        expected_request = MediaContainerRequest(
+            media_type="IMAGE",
+            image_url=image_url,
+            text=_TEXT,
+            alt_text=alt_text,
+        )
+    else:
+        expected_request = MediaContainerRequest(
+            media_type="VIDEO",
+            video_url=video_url,
+            text=_TEXT,
+            alt_text=alt_text,
+        )
+    assert api.create_request == expected_request
+    assert result.media_id == "media-123"
+    operation = operations.get(result.operation_id)
+    assert operation.version == 1
+    assert operation.kind == kind
+    assert operation.phase == "PUBLISHED"
+    assert operation.container_id == "container-123"
+    assert operation.media_id == "media-123"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    for forbidden in (
+        media_url,
+        _TEXT,
+        alt_text,
+        _TOKEN,
+        _CREDENTIAL_REF,
+        "Authorization",
+    ):
+        assert forbidden not in journal
+    assert set(json.loads(journal)) == {
+        "version",
+        "id",
+        "account_id",
+        "kind",
+        "phase",
+        "container_id",
+        "media_id",
+    }
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_publish_without_optional_copy_keeps_request_fields_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, media_type: str
+) -> None:
+    _, _, api, _, runtime, _ = _setup(tmp_path, container_statuses=("FINISHED",))
+    _patch_instant_polling(monkeypatch)
+    media_url = f"https://media.example/{media_type.lower()}.bin"
+
+    await _publish_media(runtime, media_type, media_url)
+
+    if media_type == "IMAGE":
+        expected = MediaContainerRequest(media_type="IMAGE", image_url=media_url)
+    else:
+        expected = MediaContainerRequest(media_type="VIDEO", video_url=media_url)
+    assert api.create_request == expected
+    assert api.calls.count("publish") == 1
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_invalid_media_container_id_fails_before_status_or_publish(
+    tmp_path: Path, media_type: str
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, container_id="../unsafe")
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+    assert api.calls == ["quota", "create"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.container_id is None
+
+
+@pytest.mark.asyncio
+async def test_in_progress_container_polls_with_count_and_wall_clock_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    statuses = ("IN_PROGRESS",) * 9 + ("FINISHED",)
+    _, _, api, _, runtime, _ = _setup(tmp_path, container_statuses=statuses)
+    delays = _patch_instant_polling(monkeypatch)
+    real_timeout = mutation_module.asyncio.timeout
+    timeout_budgets: list[float] = []
+
+    def record_timeout(seconds: float):
+        timeout_budgets.append(seconds)
+        return real_timeout(seconds)
+
+    monkeypatch.setattr(mutation_module.asyncio, "timeout", record_timeout)
+
+    await runtime.publish_video("alice", "https://media.example/video.mp4")
+
+    assert api.status_check_count == 10
+    assert api.calls == ["quota", "create", *("status" for _ in range(10)), "publish"]
+    assert delays == [3.0] * 9
+    assert sum(delays) <= 30.0
+    assert timeout_budgets == [30.0]
+
+
+@pytest.mark.asyncio
+async def test_processing_poll_exhaustion_fails_final_without_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, container_statuses=("IN_PROGRESS",))
+    delays = _patch_instant_polling(monkeypatch)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_image("alice", "https://media.example/image.jpg")
+
+    assert caught.value.code == "THREADS_CONTAINER_PROCESSING_TIMEOUT"
+    assert api.status_check_count == 10
+    assert api.calls == ["quota", "create", *("status" for _ in range(10))]
+    assert delays == [3.0] * 9
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "POST_IMAGE"
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "THREADS_CONTAINER_PROCESSING_TIMEOUT"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [
+        ("ERROR", "THREADS_CONTAINER_ERROR"),
+        ("EXPIRED", "THREADS_CONTAINER_EXPIRED"),
+        ("PUBLISHED", "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"),
+        ("UNRECOGNIZED", "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"),
+        (None, "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"),
+    ],
+)
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_non_ready_container_status_fails_closed_before_publish(
+    tmp_path: Path,
+    media_type: str,
+    status: str | None,
+    expected_code: str,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, container_statuses=(status,))
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == expected_code
+    assert api.calls == ["quota", "create", "status"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == expected_code
+
+
+@pytest.mark.asyncio
+async def test_container_status_response_must_match_created_container(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        container_statuses=("FINISHED",),
+        container_response_id="different-container",
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_image("alice", "https://media.example/image.jpg")
+
+    assert caught.value.code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+    assert api.calls == ["quota", "create", "status"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.container_id == "container-123"
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_container_status_api_failure_is_final_without_publish(
+    tmp_path: Path, media_type: str
+) -> None:
+    error = ThreadsAPIError("THREADS_RATE_LIMITED")
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        container_status_error=error,
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "THREADS_RATE_LIMITED"
+    assert api.calls == ["quota", "create", "status"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "THREADS_RATE_LIMITED"
+
+
+@pytest.mark.asyncio
+async def test_container_status_timeout_is_final_without_publish(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        container_status_error=TimeoutError("private status timeout"),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_image("alice", "https://media.example/image.jpg")
+
+    assert caught.value.code == "THREADS_CONTAINER_PROCESSING_TIMEOUT"
+    assert api.calls == ["quota", "create", "status"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "THREADS_CONTAINER_PROCESSING_TIMEOUT"
+
+
+@pytest.mark.parametrize("cancel_at", ["status", "sleep"])
+@pytest.mark.asyncio
+async def test_container_processing_cancellation_is_final_without_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_at: str
+) -> None:
+    status_error = asyncio.CancelledError("private processing cancellation")
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        container_statuses=("IN_PROGRESS",),
+        container_status_error=status_error if cancel_at == "status" else None,
+    )
+    if cancel_at == "sleep":
+
+        async def cancel_sleep(_delay: float) -> None:
+            raise asyncio.CancelledError("private processing cancellation")
+
+        monkeypatch.setattr(mutation_module.asyncio, "sleep", cancel_sleep)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_video("alice", "https://media.example/video.mp4")
+
+    assert caught.value.code == "OPERATION_CANCELLED"
+    assert "private processing cancellation" not in str(caught.value)
+    assert api.calls == ["quota", "create", "status"]
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "POST_VIDEO"
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "OPERATION_CANCELLED"
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        ThreadsAPIError("THREADS_RATE_LIMITED"),
+        ThreadsAPIError("THREADS_SERVER_ERROR"),
+        ThreadsTransportError(),
+        ThreadsContractError(),
+        RuntimeError("raw media publish response"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_media_publish_failure_after_boundary_is_ambiguous_without_retry(
+    tmp_path: Path,
+    media_type: str,
+    error: Exception,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=error,
+        container_statuses=("FINISHED",),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert api.calls.count("publish") == 1
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == getattr(error, "code", "THREADS_TRANSPORT_FAILURE")
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    assert "raw media publish response" not in journal
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_publish_cancellation_after_boundary_is_ambiguous_without_retry(
+    tmp_path: Path, media_type: str
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=asyncio.CancelledError("private media publish cancellation"),
+        container_statuses=("FINISHED",),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert api.calls.count("publish") == 1
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert "private media publish cancellation" not in str(caught.value)
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_base_exception_after_boundary_still_marks_ambiguous(
+    tmp_path: Path, media_type: str
+) -> None:
+    failure = _InjectedPublishBaseException("private base exception")
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=failure,
+        container_statuses=("FINISHED",),
+    )
+
+    with pytest.raises(_InjectedPublishBaseException):
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert api.calls.count("publish") == 1
+    operation = _only_operation(operations, tmp_path)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    assert "private base exception" not in journal
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_invalid_published_media_id_is_ambiguous(tmp_path: Path, media_type: str) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        container_statuses=("FINISHED",),
+        media_id="../unsafe",
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert api.calls.count("publish") == 1
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == "THREADS_DOCUMENTATION_CONTRACT_MISMATCH"
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_publish_requested_is_durable_before_one_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    media_type: str,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, container_statuses=("FINISHED",))
+    original_update = operations.update
+
+    def fail_publish_requested(operation: LocalOperation) -> LocalOperation:
+        if operation.phase == "PUBLISH_REQUESTED":
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_publish_requested)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "OPERATION_STATE_INVALID"
+    assert api.calls == ["quota", "create", "status"]
+    operation = _only_operation(operations, tmp_path)
+    assert operation.kind == f"POST_{media_type}"
+    assert operation.phase == "CONTAINER_CREATED"
+
+
+@pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
+@pytest.mark.asyncio
+async def test_media_final_journal_failure_after_publish_is_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    media_type: str,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(tmp_path, container_statuses=("FINISHED",))
+    original_update = operations.update
+
+    def fail_terminal_updates(operation: LocalOperation) -> LocalOperation:
+        if operation.phase in {"PUBLISHED", "AMBIGUOUS"}:
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_terminal_updates)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await _publish_media(runtime, media_type, "https://media.example/media.bin")
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "status", "publish"]
+    assert api.calls.count("publish") == 1
+    assert caught.value.operation_id is not None
+    durable = operations.get(caught.value.operation_id)
+    assert durable.kind == f"POST_{media_type}"
+    assert durable.phase == "PUBLISH_REQUESTED"
 
 
 @pytest.mark.asyncio
@@ -935,6 +1584,10 @@ async def test_same_account_lock_conflict_is_bounded_and_lock_releases_after_suc
     with pytest.raises(StandaloneMutationError) as reply_caught:
         await runtime.create_reply("alice", "thread-1", _TEXT)
     assert reply_caught.value.code == "ACCOUNT_BUSY"
+    for media_type in ("IMAGE", "VIDEO"):
+        with pytest.raises(StandaloneMutationError) as media_caught:
+            await _publish_media(runtime, media_type, "https://media.example/media.bin")
+        assert media_caught.value.code == "ACCOUNT_BUSY"
     assert api.calls == []
     held.release()
 
@@ -1043,6 +1696,8 @@ def test_post_text_journal_remains_readable_with_shared_reply_journal(tmp_path: 
     operations_path = tmp_path / "operations"
     operations_path.mkdir()
     legacy_path = operations_path / f"{operation_id}.json"
+    legacy_reply_id = UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
+    legacy_reply_path = operations_path / f"{legacy_reply_id}.json"
     legacy_path.write_text(
         json.dumps(
             {
@@ -1057,20 +1712,45 @@ def test_post_text_journal_remains_readable_with_shared_reply_journal(tmp_path: 
         ),
         encoding="utf-8",
     )
+    legacy_reply_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "id": str(legacy_reply_id),
+                "account_id": str(account_id),
+                "kind": "CREATE_REPLY",
+                "phase": "PUBLISHED",
+                "container_id": "container-reply-legacy",
+                "media_id": "media-reply-legacy",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     legacy = store.get(operation_id)
+    legacy_reply = store.get(legacy_reply_id)
     reply = store.create_received(account_id, kind="CREATE_REPLY")
+    image = store.create_received(account_id, kind="POST_IMAGE")
+    video = store.create_received(account_id, kind="POST_VIDEO")
 
     assert legacy.kind == "POST_TEXT"
     assert legacy.phase == "PUBLISHED"
     assert legacy.media_id == "media-legacy"
+    assert legacy_reply.kind == "CREATE_REPLY"
+    assert legacy_reply.phase == "PUBLISHED"
+    assert legacy_reply.media_id == "media-reply-legacy"
     assert reply.version == 1
     assert reply.kind == "CREATE_REPLY"
     assert reply.phase == "RECEIVED"
-    assert set(json.loads((operations_path / f"{reply.id}.json").read_text())) == {
-        "version",
-        "id",
-        "account_id",
-        "kind",
-        "phase",
-    }
+    for media_operation, kind in ((image, "POST_IMAGE"), (video, "POST_VIDEO")):
+        assert media_operation.version == 1
+        assert media_operation.kind == kind
+        assert media_operation.phase == "RECEIVED"
+    for operation in (reply, image, video):
+        assert set(json.loads((operations_path / f"{operation.id}.json").read_text())) == {
+            "version",
+            "id",
+            "account_id",
+            "kind",
+            "phase",
+        }
