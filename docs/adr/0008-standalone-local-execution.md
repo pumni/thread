@@ -45,6 +45,14 @@ The initial standalone browser scope is read-only: feed browse, profile open, an
 
 This ADR does not authorize browser Like, Follow, Reply, Repost, Share, Create/Post, Publish/Submit, or local media staging. Standalone official Threads API work is a separate LOCAL checkpoint using the existing adapter contracts.
 
+### Optional foreground recurrence
+
+An operator may explicitly start an optional fixed-interval recurrence in the foreground over a previously validated standalone workflow. The recurrence may contain only approved READ capabilities; recurring mutations are not authorized. The workflow remains an explicit deterministic list and recurrence does not invent, select, randomize, or reorder actions.
+
+Recurrence definitions and their workflow snapshots are machine-local operational state under the Standalone data root. The existing `threads-local workflow run FILE` model remains the single-occurrence executor. Recurrence uses fixed intervals and anchored due times; it does not add cron or calendar scheduling, catch-up bursts, a daemon, autostart, background service, or Desktop integration.
+
+Standalone recurrence does not use the distributed Scheduler, `AccountActivityPlan` persistence, PostgreSQL, `Command`, `WorkerJob`, Worker leases/fencing, or Control Plane clients. It does not change the distributed execution contract or the existing Standalone browser safety, human challenge, and secret-handling requirements.
+
 ### Reliability tradeoffs
 
 Standalone deliberately gives up central scheduling, central audit, distributed leases/fencing, Worker failover, fleet visibility, automatic reassignment, and durable Command/WorkerJob recovery.
