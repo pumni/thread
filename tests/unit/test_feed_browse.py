@@ -13,8 +13,6 @@ from threads_platform.application.ports.browser import (
     BrowserNetworkProtocol,
     BrowserNetworkRoute,
     BrowserSurface,
-    FeedAncestorObservation,
-    FeedCandidateObservation,
     RemoteSessionStateUncertain,
 )
 from threads_platform.application.ports.worker_agent import (
@@ -33,7 +31,6 @@ from threads_platform.workers.browser import (
 )
 from threads_platform.workers.control_client import WorkerControlClientError
 from threads_platform.workers.feed_browse import (
-    FEED_ANCESTOR_BOUND,
     FEED_CANDIDATE_BOUND,
     FEED_CAPABILITY_NAME,
     FEED_CAPABILITY_VERSION,
@@ -41,87 +38,45 @@ from threads_platform.workers.feed_browse import (
     BrowserFeedBrowseWorker,
     FeedBrowserSessionManager,
     FeedWorkerControlClient,
-    normalize_feed_candidates,
+    normalize_feed_permalinks,
 )
 from threads_platform.workers.sessions import BrowserSessionOpenResult, WorkerNetworkRoute
 
 
-def test_permalink_pivot_uses_nearest_unique_bounded_ancestor() -> None:
-    item = _candidate("post-1", excerpt="  Hello   feed  ")
-    farther = FeedAncestorObservation(
-        hrefs=("/@alice/post/post-1", "/@alice/"),
-        text_regions=("farther text",),
-    )
-    observed = replace(item, ancestors=(item.ancestors[0], farther))
-
-    normalized = normalize_feed_candidates((observed,), max_items=5)
-
-    assert len(normalized) == 1
-    assert normalized[0].thread_ref == "https://www.threads.com/@alice/post/post-1"
-    assert normalized[0].author_username == "alice"
-    assert normalized[0].text_excerpt == "Hello feed"
-    two_items = normalize_feed_candidates(
-        (item, _candidate("post-2", username="bob", excerpt="second item")),
+def test_feed_permalinks_normalize_and_skip_invalid_individual_hrefs() -> None:
+    normalized = normalize_feed_permalinks(
+        (
+            "https://www.threads.com/@Alice/post/post-1/",
+            "/@alice/post/post-1",
+            "/@bob/post/post-2",
+            "/@alice/post/post-query?source=feed",
+            "https://example.test/@mallory/post/off-origin",
+            "http://[invalid/@bad/post/uri",
+            "unrelated",
+        ),
         max_items=5,
     )
-    assert len(two_items) == 2
-    assert two_items[1].position == 1
-    assert two_items[1].author_username == "bob"
+
+    assert [(item.thread_ref, item.author_username, item.position) for item in normalized] == [
+        ("https://www.threads.com/@alice/post/post-1", "alice", 0),
+        ("https://www.threads.com/@bob/post/post-2", "bob", 1),
+    ]
+    assert all(item.text_excerpt is None for item in normalized)
 
 
-@pytest.mark.parametrize(
-    "hrefs",
-    [
-        ("/@alice/post/post-1", "/@alice/post/neighbor", "/@alice/"),
-        ("/@alice/post/post-1", "/@alice/post/post-1", "/@alice/"),
-        ("/@alice/post/post-1", "/@alice/", "/@alice/"),
-    ],
-)
-def test_ambiguous_or_cross_post_association_fails_closed(
-    hrefs: tuple[str, ...],
-) -> None:
-    candidate = _candidate("post-1", hrefs=hrefs)
+def test_feed_permalink_count_and_max_items_are_bounded() -> None:
+    permalinks = tuple(_candidate(f"post-{index}") for index in range(FEED_CANDIDATE_BOUND + 1))
     with pytest.raises(BrowserContractError):
-        normalize_feed_candidates((candidate,), max_items=5)
+        normalize_feed_permalinks(permalinks, max_items=20)
 
-
-def test_missing_or_over_bound_ancestor_fails_closed() -> None:
-    candidate = _candidate("post-1")
-    no_association = replace(
-        candidate,
-        ancestors=tuple(FeedAncestorObservation((), ("text",)) for _ in range(FEED_ANCESTOR_BOUND))
-        + candidate.ancestors,
+    normalized = normalize_feed_permalinks(
+        tuple(_candidate(f"post-{index}") for index in range(5)), max_items=2
     )
-
-    with pytest.raises(BrowserContractError):
-        normalize_feed_candidates((no_association,), max_items=5)
-
-    truncated = replace(
-        candidate,
-        ancestors=(replace(candidate.ancestors[0], links_truncated=True),),
-    )
-    with pytest.raises(BrowserContractError):
-        normalize_feed_candidates((truncated,), max_items=5)
-
-    no_text = replace(
-        candidate,
-        ancestors=(replace(candidate.ancestors[0], text_regions=()),),
-    )
-    with pytest.raises(BrowserContractError):
-        normalize_feed_candidates((no_text,), max_items=5)
-
-
-def test_candidate_bounds_and_normalized_deduplication() -> None:
-    candidate = _candidate("post-1")
-    with pytest.raises(BrowserContractError):
-        normalize_feed_candidates(
-            tuple(candidate for _ in range(FEED_CANDIDATE_BOUND + 1)), max_items=20
-        )
-    normalized = normalize_feed_candidates(
-        (candidate, replace(candidate, permalink_href="/@ALICE/post/post-1/")),
-        max_items=5,
-    )
-    assert len(normalized) == 1
+    assert [item.position for item in normalized] == [0, 1]
+    assert [item.thread_ref for item in normalized] == [
+        "https://www.threads.com/@alice/post/post-0",
+        "https://www.threads.com/@alice/post/post-1",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -374,6 +329,32 @@ async def test_feed_worker_intervenes_on_session_transition_after_navigation() -
     await handler.aclose()
 
 
+@pytest.mark.asyncio
+async def test_feed_worker_checks_one_followup_when_no_usable_permalink_is_found() -> None:
+    worker_id, account_id = uuid4(), uuid4()
+    client = _MemoryControl(worker_id, account_id)
+    manager = _MemorySessionManager(
+        worker_id,
+        account_id,
+        batches=[(), ("/not-a-thread",)],
+    )
+    handler = BrowserFeedBrowseWorker(
+        worker_id,
+        cast(FeedWorkerControlClient, client),
+        cast(FeedBrowserSessionManager, manager),
+    )
+
+    await handler(client.snapshot)
+
+    assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
+    assert client.interventions == [("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")]
+    assert manager.session.collect_count == 2
+    assert manager.session.scroll_count == 1
+    assert client.completed_result is None
+    assert client.failures == []
+    await handler.aclose()
+
+
 @pytest.mark.parametrize("operation", ("navigate", "collect", "scroll"))
 @pytest.mark.asyncio
 async def test_browser_operation_does_not_start_after_worker_job_lease_loss(
@@ -424,7 +405,7 @@ async def test_browser_operation_does_not_start_after_worker_job_lease_loss(
                 BrowserNavigationPolicy(frozenset({BROWSER_FEED_ORIGIN})),
             )
         elif operation == "collect":
-            await session.collect_feed_candidates(ancestor_bound=FEED_ANCESTOR_BOUND)
+            await session.collect_feed_permalinks(candidate_bound=FEED_CANDIDATE_BOUND)
         else:
             await session.scroll_feed()
     assert engine.navigation_count == engine.collect_count == engine.scroll_count == 0
@@ -434,19 +415,8 @@ def _candidate(
     post_id: str,
     *,
     username: str = "alice",
-    excerpt: str = "visible text",
-    hrefs: tuple[str, ...] | None = None,
-) -> FeedCandidateObservation:
-    permalink = f"/@{username}/post/{post_id}"
-    return FeedCandidateObservation(
-        permalink_href=permalink,
-        ancestors=(
-            FeedAncestorObservation(
-                hrefs=hrefs or (permalink, f"/@{username}/"),
-                text_regions=(excerpt,),
-            ),
-        ),
-    )
+) -> str:
+    return f"/@{username}/post/{post_id}"
 
 
 class _MemoryControl:
@@ -593,7 +563,7 @@ class _MemorySession:
         self,
         account_id: UUID,
         profile_ref: str,
-        batches: list[tuple[FeedCandidateObservation, ...]],
+        batches: list[tuple[str, ...]],
         state: BrowserSessionState,
         *,
         transition_after_navigation: bool = False,
@@ -615,10 +585,8 @@ class _MemorySession:
         _ = policy
         self.navigated.append(url)
 
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]:
-        assert ancestor_bound == FEED_ANCESTOR_BOUND
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
+        assert candidate_bound == FEED_CANDIDATE_BOUND
         index = self.collect_count
         self.collect_count += 1
         if self.transition_after_navigation and self.navigated:
@@ -637,7 +605,7 @@ class _MemorySessionManager:
         worker_id: UUID,
         account_id: UUID,
         *,
-        batches: list[tuple[FeedCandidateObservation, ...]],
+        batches: list[tuple[str, ...]],
         session_state: BrowserSessionState = BrowserSessionState.AUTHENTICATED,
         transition_after_navigation: bool = False,
     ) -> None:
@@ -693,10 +661,8 @@ class _MemoryEngineSession:
     async def inspect_surface(self) -> BrowserSurface:
         return BrowserSurface(None, None, None, False)
 
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]:
-        _ = ancestor_bound
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
+        _ = candidate_bound
         self.collect_count += 1
         return ()
 

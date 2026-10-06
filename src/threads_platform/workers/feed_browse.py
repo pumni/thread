@@ -12,11 +12,10 @@ from threads_platform.application.browser_capabilities import (
     BrowserFeedResultV1,
 )
 from threads_platform.application.browser_read_semantics import (
-    BROWSER_FEED_ANCESTOR_BOUND,
     BROWSER_FEED_CANDIDATE_BOUND,
     BROWSER_FEED_ITERATION_BOUND,
     BROWSER_FEED_URL,
-    normalize_feed_candidates,
+    normalize_feed_permalinks,
 )
 from threads_platform.application.ports.browser import (
     BROWSER_FEED_ORIGIN,
@@ -44,7 +43,6 @@ THREADS_WEB_ORIGIN = BROWSER_FEED_ORIGIN
 THREADS_FEED_URL = BROWSER_FEED_URL
 FEED_CAPABILITY_NAME = "threads.browser.feed.browse"
 FEED_CAPABILITY_VERSION = 1
-FEED_ANCESTOR_BOUND = BROWSER_FEED_ANCESTOR_BOUND
 FEED_ITERATION_BOUND = BROWSER_FEED_ITERATION_BOUND
 FEED_CANDIDATE_BOUND = BROWSER_FEED_CANDIDATE_BOUND
 FEED_NAVIGATION_POLICY = BrowserNavigationPolicy(frozenset({THREADS_WEB_ORIGIN}))
@@ -192,16 +190,13 @@ class BrowserFeedBrowseWorker:
             self._check_deadline(deadline)
             if iteration:
                 await browser_session.scroll_feed()
-            candidates = await browser_session.collect_feed_candidates(
-                ancestor_bound=FEED_ANCESTOR_BOUND
+            permalinks = await browser_session.collect_feed_permalinks(
+                candidate_bound=FEED_CANDIDATE_BOUND
             )
-            if not candidates and not observations:
-                raise BrowserContractError()
             remaining_items = max_items - len(observations)
-            batch = normalize_feed_candidates(
-                candidates,
+            batch = normalize_feed_permalinks(
+                permalinks,
                 max_items=remaining_items,
-                ancestor_bound=FEED_ANCESTOR_BOUND,
                 existing_refs=frozenset(seen_refs),
                 position_start=len(observations),
             )
@@ -218,9 +213,16 @@ class BrowserFeedBrowseWorker:
             if len(observations) >= max_items:
                 truncated = True
                 break
-            if iteration and not batch:
-                truncated = True
-                break
+            if not batch:
+                if observations:
+                    truncated = True
+                    break
+                if iteration == 0:
+                    continue
+                await execution.request_intervention(
+                    "REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN"
+                )
+                return
             if iteration == FEED_ITERATION_BOUND - 1:
                 truncated = True
 

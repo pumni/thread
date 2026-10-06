@@ -58,9 +58,6 @@ from threads_platform.application.ports.browser import (
     ChallengeDetected as _ChallengeDetected,
 )
 from threads_platform.application.ports.browser import (
-    FeedCandidateObservation as _FeedCandidateObservation,
-)
-from threads_platform.application.ports.browser import (
     LocatorNotFound as _LocatorNotFound,
 )
 from threads_platform.application.ports.browser import (
@@ -593,9 +590,7 @@ class WorkerBrowserSession:
                 )
             raise
 
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[_FeedCandidateObservation, ...]:
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
         if self._closed:
             raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
@@ -605,7 +600,7 @@ class WorkerBrowserSession:
         await self._job_execution.before_browser_action()
         engine_session = cast(_BrowserFeedEngineSession, self._engine_session)
         try:
-            return await engine_session.collect_feed_candidates(ancestor_bound=ancestor_bound)
+            return await engine_session.collect_feed_permalinks(candidate_bound=candidate_bound)
         except _SessionExpired:
             await self._report_state_and_intervention(
                 BrowserSessionState.SESSION_EXPIRED, "SESSION_EXPIRED", "SESSION_EXPIRED"
@@ -649,9 +644,7 @@ class WorkerBrowserSession:
             await self._request_intervention("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")
             raise
 
-    async def verify_thread_target(
-        self, *, target_ref: str, author_username: str, ancestor_bound: int
-    ) -> None:
+    async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
         if self._closed:
             raise _BrowserProcessCrashed()
         if self._session_state is not BrowserSessionState.AUTHENTICATED:
@@ -664,7 +657,6 @@ class WorkerBrowserSession:
             await engine_session.verify_thread_target(
                 target_ref=target_ref,
                 author_username=author_username,
-                ancestor_bound=ancestor_bound,
             )
         except _SessionExpired:
             await self._report_state_and_intervention(

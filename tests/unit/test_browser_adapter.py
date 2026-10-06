@@ -17,7 +17,7 @@ import pytest
 from playwright.async_api import Page
 
 import threads_platform.infrastructure.browser.playwright_engine as playwright_engine
-from threads_platform.application.browser_read_semantics import normalize_feed_candidates
+from threads_platform.application.browser_read_semantics import normalize_feed_permalinks
 from threads_platform.application.ports.browser import (
     BrowserAdapterError,
     BrowserContractError,
@@ -34,7 +34,6 @@ from threads_platform.application.ports.browser import (
     BrowserSurface,
     BrowserThreadOpenEngineSession,
     ChallengeDetected,
-    FeedCandidateObservation,
     LocatorNotFound,
     MediaUploadFailed,
     NavigationTimeout,
@@ -267,6 +266,76 @@ def test_playwright_managed_profile_contract_navigation_and_cleanup(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("context_close_fails", "playwright_stop_fails"),
+    ((True, False), (False, True), (True, True)),
+)
+def test_playwright_session_close_is_best_effort_idempotent_and_keeps_action_crashes(
+    context_close_fails: bool,
+    playwright_stop_fails: bool,
+) -> None:
+    class _FakePage:
+        def on(self, *_: object) -> None:
+            return None
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def evaluate(self, *_: object) -> dict[str, str]:
+            return {"outcome": "recognized"}
+
+    class _FakeContext:
+        browser = None
+
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def on(self, *_: object) -> None:
+            return None
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if context_close_fails:
+                raise playwright_engine.PlaywrightError("synthetic close error")
+
+    class _FakePlaywright:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            if playwright_stop_fails:
+                raise playwright_engine.PlaywrightError("synthetic stop error")
+
+    async def scenario() -> None:
+        page = _FakePage()
+        context = _FakeContext()
+        playwright = _FakePlaywright()
+        session_type = cast(Any, playwright_engine)._PlaywrightBrowserSession
+        session = session_type(
+            cast(Any, playwright),
+            cast(Any, context),
+            cast(Any, page),
+            navigation_timeout_ms=1_000,
+        )
+
+        await session.verify_thread_target(
+            target_ref="/@alice/post/post-1",
+            author_username="alice",
+        )
+        session._on_page_crash(cast(Page, page))
+        with pytest.raises(BrowserProcessCrashed):
+            await session.collect_feed_permalinks(candidate_bound=100)
+
+        await session.close()
+        await session.close()
+
+        assert context.close_calls == 1
+        assert playwright.stop_calls == 1
+
+    asyncio.run(scenario())
+
+
 def test_playwright_same_origin_redirects_are_followed_by_the_browser(
     tmp_path: Path,
     synthetic_origin: str,
@@ -351,7 +420,6 @@ def test_off_origin_redirect_fails_closed_and_navigation_state_resets(
                 await cast(BrowserThreadOpenEngineSession, session).verify_thread_target(
                     target_ref="/@alice/post/post-1",
                     author_username="alice",
-                    ancestor_bound=8,
                 )
 
             await session.navigate(
@@ -361,7 +429,6 @@ def test_off_origin_redirect_fails_closed_and_navigation_state_resets(
             await cast(BrowserThreadOpenEngineSession, session).verify_thread_target(
                 target_ref="/@alice/post/post-1",
                 author_username="alice",
-                ancestor_bound=8,
             )
         finally:
             await session.close()
@@ -575,7 +642,6 @@ def test_page_initiated_off_origin_navigation_blocks_thread_inspection_after_loa
                 await session.verify_thread_target(
                     target_ref="/@alice/post/post-1",
                     author_username="alice",
-                    ancestor_bound=8,
                 )
         finally:
             await session.close()
@@ -586,7 +652,7 @@ def test_page_initiated_off_origin_navigation_blocks_thread_inspection_after_loa
     asyncio.run(scenario())
 
 
-def test_playwright_feed_without_reviewed_permalink_evidence_is_uncertain(
+def test_playwright_feed_scan_returns_no_permalink_for_empty_or_unrelated_page(
     tmp_path: Path,
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -607,17 +673,17 @@ def test_playwright_feed_without_reviewed_permalink_evidence_is_uncertain(
                 f"{synthetic_origin}/login",
                 allowed_origins=frozenset({synthetic_origin}),
             )
-            with pytest.raises(RemoteSessionStateUncertain):
-                await cast(BrowserFeedEngineSession, session).collect_feed_candidates(
-                    ancestor_bound=8
-                )
+            permalinks = await cast(BrowserFeedEngineSession, session).collect_feed_permalinks(
+                candidate_bound=100
+            )
+            assert permalinks == ()
         finally:
             await session.close()
 
     asyncio.run(scenario())
 
 
-def test_playwright_feed_scan_uses_reviewed_semantic_markers_only(
+def test_playwright_feed_scan_returns_only_bounded_post_permalinks(
     tmp_path: Path,
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -636,30 +702,43 @@ def test_playwright_feed_scan_uses_reviewed_semantic_markers_only(
         await session.navigate(
             f"{synthetic_origin}/feed", allowed_origins=frozenset({synthetic_origin})
         )
-        candidates = await cast(BrowserFeedEngineSession, session).collect_feed_candidates(
-            ancestor_bound=8
+        permalinks = await cast(BrowserFeedEngineSession, session).collect_feed_permalinks(
+            candidate_bound=100
         )
-        normalized = normalize_feed_candidates(candidates, max_items=5)
+        normalized = normalize_feed_permalinks(permalinks, max_items=5)
+        await session.navigate(
+            f"{synthetic_origin}/feed-over-bound",
+            allowed_origins=frozenset({synthetic_origin}),
+        )
+        with pytest.raises(BrowserContractError):
+            await cast(BrowserFeedEngineSession, session).collect_feed_permalinks(
+                candidate_bound=100
+            )
         await session.close()
 
         assert len(normalized) == 1
         assert normalized[0].thread_ref == "https://www.threads.com/@alice/post/post-1"
-        assert normalized[0].text_excerpt == "Synthetic public text"
-        assert candidates[0].ancestors[0].text_regions == ("Synthetic public text",)
+        assert normalized[0].author_username == "alice"
+        assert normalized[0].text_excerpt is None
+        assert permalinks == ("/@alice/post/post-1",)
 
     asyncio.run(scenario())
 
 
-def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
+def test_playwright_thread_open_uses_bounded_permalink_and_author_evidence(
     tmp_path: Path,
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_TIMEOUT_SECONDS", 0.25)
+    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_POLL_SECONDS", 0.01)
+
     async def verify(
         path: str,
         target_ref: str,
         *,
         error: type[Exception] | None = None,
+        author_username: str = "alice",
     ) -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
         profile_directory = tmp_path / f"thread-{uuid4()}"
@@ -680,8 +759,7 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
                 assert (
                     await engine_session.verify_thread_target(
                         target_ref=target_ref,
-                        author_username="alice",
-                        ancestor_bound=8,
+                        author_username=author_username,
                     )
                     is None
                 )
@@ -689,8 +767,7 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
                 with pytest.raises(error):
                     await engine_session.verify_thread_target(
                         target_ref=target_ref,
-                        author_username="alice",
-                        ancestor_bound=8,
+                        author_username=author_username,
                     )
         finally:
             await session.close()
@@ -702,32 +779,37 @@ def test_playwright_thread_open_uses_exact_permalink_author_and_bounded_root(
         await verify(
             "/@alice/post/post-duplicate-author",
             "/@alice/post/post-duplicate-author",
-            error=BrowserContractError,
         )
         await verify(
             "/@alice/post/post-competing",
             "/@alice/post/post-competing",
-            error=BrowserContractError,
         )
         await verify(
             "/@alice/post/post-reply-cross",
             "/@alice/post/post-reply-cross",
-            error=BrowserContractError,
         )
-        await verify(
-            "/@alice/post/post-over-bound",
-            "/@alice/post/post-over-bound",
-            error=BrowserContractError,
-        )
+        await verify("/@alice/post/post-over-bound", "/@alice/post/post-over-bound")
+        await verify("/@alice/post/post-no-text", "/@alice/post/post-no-text")
+        await verify("/@alice/post/post-delayed", "/@alice/post/post-delayed")
         await verify(
             "/@alice/post/post-author-mismatch",
             "/@alice/post/post-author-mismatch",
+            error=BrowserContractError,
+        )
+        await verify(
+            "/@alice/post/post-no-author",
+            "/@alice/post/post-no-author",
             error=BrowserContractError,
         )
         await verify(
             "/@alice/post/post-no-anchor",
             "/@alice/post/post-no-anchor",
             error=RemoteSessionStateUncertain,
+        )
+        await verify(
+            "/@alice/post/post-over-anchor-bound",
+            "/@alice/post/post-over-anchor-bound",
+            error=BrowserContractError,
         )
         await verify(
             "/@alice/post/post-prefix-extra",
@@ -938,7 +1020,7 @@ def test_session_transition_after_navigation_records_durable_intervention(
             "http://127.0.0.1:41000/feed", _local_policy("http://127.0.0.1:41000")
         )
         with pytest.raises(RemoteSessionStateUncertain):
-            await session.collect_feed_candidates(ancestor_bound=8)
+            await session.collect_feed_permalinks(candidate_bound=100)
 
         assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
         assert client.interventions == [("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")]
@@ -1561,7 +1643,12 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
         b'<a href="/@alice/post/post-1">permalink</a>'
         b'<a href="/@alice/">author</a>'
         b'<div dir="auto">Synthetic   public text</div>'
+        b'<a href="https://example.test/@mallory/post/off-origin">external</a>'
+        b'<a href="/@alice/post/post-query?source=feed">query</a>'
         b"</div></section></body></html>"
+    ),
+    "/feed-over-bound": _profile_document(
+        b"".join(f'<a href="/@alice/post/post-{index}">post</a>'.encode() for index in range(101))
     ),
     "/@alice/post/post-1": _thread_document(
         b'<section class="css-hash-919"><a href="/@alice/post/post-1">open</a>'
@@ -1596,6 +1683,30 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
         + b'<a href="/@alice/post/post-over-bound">target</a>'
         + b"</div>" * 9
         + b"</div>"
+    ),
+    "/@alice/post/post-no-text": _thread_document(
+        b'<a href="/@alice/post/post-no-text">permalink</a><a href="/@alice/">author</a>'
+    ),
+    "/@alice/post/post-no-author": _thread_document(
+        b'<a href="/@alice/post/post-no-author">permalink</a>'
+    ),
+    "/@alice/post/post-delayed": _thread_document(
+        b"""<script>
+        setTimeout(() => {
+          const target = document.createElement('a');
+          target.href = '/@alice/post/post-delayed';
+          document.body.append(target);
+        }, 30);
+        setTimeout(() => {
+          const author = document.createElement('a');
+          author.href = '/@alice/';
+          document.body.append(author);
+        }, 60);
+        </script>"""
+    ),
+    "/@alice/post/post-over-anchor-bound": _thread_document(
+        b'<a href="/@alice/post/post-over-anchor-bound">target</a>'
+        + b"".join(b'<a href="/@bob/post/reply">other</a>' for _ in range(1000))
     ),
     "/@alice/post/post-author-mismatch": _thread_document(
         b'<section><a href="/@alice/post/post-author-mismatch">target</a>'
@@ -1764,10 +1875,8 @@ class _MemoryBrowserSession:
     async def inspect_surface(self) -> BrowserSurface:
         return self.surface
 
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]:
-        _ = ancestor_bound
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
+        _ = candidate_bound
         self.collect_count += 1
         if self.remote_uncertain_on_collect:
             raise RemoteSessionStateUncertain()

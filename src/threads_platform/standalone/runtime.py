@@ -14,11 +14,11 @@ from threads_platform.application.browser_capabilities import (
     BrowserTargetOpenResultV1,
 )
 from threads_platform.application.browser_read_semantics import (
-    BROWSER_FEED_ANCESTOR_BOUND,
+    BROWSER_FEED_CANDIDATE_BOUND,
     BROWSER_FEED_ITERATION_BOUND,
     BROWSER_FEED_URL,
     BROWSER_READ_TARGET_ANCESTOR_BOUND,
-    normalize_feed_candidates,
+    normalize_feed_permalinks,
     normalize_profile_username,
     parse_thread_ref,
 )
@@ -34,6 +34,7 @@ from threads_platform.application.ports.browser import (
     BrowserNetworkRoute,
     BrowserProfileOpenEngineSession,
     BrowserThreadOpenEngineSession,
+    RemoteSessionStateUncertain,
 )
 from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
 from threads_platform.infrastructure.browser.playwright_engine import PlaywrightBrowserEngine
@@ -175,15 +176,12 @@ class LocalRuntime:
                     for iteration in range(BROWSER_FEED_ITERATION_BOUND):
                         if iteration:
                             await feed_session.scroll_feed()
-                        candidates = await feed_session.collect_feed_candidates(
-                            ancestor_bound=BROWSER_FEED_ANCESTOR_BOUND
+                        permalinks = await feed_session.collect_feed_permalinks(
+                            candidate_bound=BROWSER_FEED_CANDIDATE_BOUND
                         )
-                        if not candidates and not observations:
-                            raise BrowserContractError()
-                        batch = normalize_feed_candidates(
-                            candidates,
+                        batch = normalize_feed_permalinks(
+                            permalinks,
                             max_items=max_items - len(observations),
-                            ancestor_bound=BROWSER_FEED_ANCESTOR_BOUND,
                             existing_refs=frozenset(seen_refs),
                             position_start=len(observations),
                         )
@@ -195,9 +193,13 @@ class LocalRuntime:
                         if len(observations) >= max_items:
                             truncated = True
                             break
-                        if iteration and not batch:
-                            truncated = True
-                            break
+                        if not batch:
+                            if observations:
+                                truncated = True
+                                break
+                            if iteration == 0:
+                                continue
+                            raise RemoteSessionStateUncertain()
                         if iteration == BROWSER_FEED_ITERATION_BOUND - 1:
                             truncated = True
 
@@ -215,10 +217,6 @@ class LocalRuntime:
                     try:
                         if session is not None:
                             await session.close()
-                    except BrowserAdapterError as error:
-                        raise StandaloneRuntimeError(error.code) from None
-                    except Exception:
-                        raise StandaloneRuntimeError("BROWSER_RUNTIME_UNAVAILABLE") from None
                     finally:
                         try:
                             lock.release()
@@ -279,7 +277,6 @@ class LocalRuntime:
                         await thread_session.verify_thread_target(
                             target_ref=target_ref,
                             author_username=author_username,
-                            ancestor_bound=BROWSER_READ_TARGET_ANCESTOR_BOUND,
                         )
                     return BrowserTargetOpenResultV1(
                         target_kind=target_kind,
@@ -296,10 +293,6 @@ class LocalRuntime:
                     try:
                         if session is not None:
                             await session.close()
-                    except BrowserAdapterError as error:
-                        raise StandaloneRuntimeError(error.code) from None
-                    except Exception:
-                        raise StandaloneRuntimeError("BROWSER_RUNTIME_UNAVAILABLE") from None
                     finally:
                         try:
                             lock.release()

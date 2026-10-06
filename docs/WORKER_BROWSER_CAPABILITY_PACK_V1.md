@@ -81,13 +81,14 @@ The four versioned command envelopes use strict, bounded payloads:
 - unknown payload fields are rejected.
 
 The normalized result models are independent of Playwright and DOM types. Feed
-observations contain only an optional Thread reference, optional author username,
-a text excerpt capped at 500 characters, and an observation position. A successful
-target-open result contains a recognized target kind/reference with
-`recognized: true`; an unknown or mismatched UI produces a typed failure rather
-than a successful result. Local media staging returns media kind, byte size, and
-staged status only. Schemas reject extra fields such as HTML, screenshots, browser
-storage, or filesystem paths.
+observations contain a normalized Thread reference, its permalink-derived author,
+an optional text excerpt, and a deterministic position. Browser READ v1 leaves
+`text_excerpt` as `null`; it does not extract post text. A successful target-open
+result contains a recognized target kind/reference with `recognized: true`; an
+unknown or mismatched UI produces a typed failure rather than a successful
+result. Local media staging returns media kind, byte size, and staged status
+only. Schemas reject extra fields such as HTML, screenshots, browser storage, or
+filesystem paths.
 
 ## Thread open v1 reviewed contract
 
@@ -97,14 +98,16 @@ navigates only to the approved Threads Web origin plus that path. The current
 removes at most one trailing slash. A path prefix or extended path is not a
 match.
 
-Recognition uses exact relative href paths. The target permalink href must
-equal the input after the same trailing-slash normalization; the author profile
-href must equal `/@<username>` for the exact target author. The same bounded
-ancestor must also contain non-empty text from the observed `span[dir="auto"]`
-marker. Ancestor traversal is limited to eight levels. Multiple exact target
-anchors are allowed only if every anchor resolves to the same root association.
-Competing roots, a reply permalink/author in the candidate association, missing
-author or text evidence, and evidence beyond the bound fail closed.
+Recognition requires the current page origin and normalized pathname to match
+the approved origin and exact requested target. A bounded scan of at most 1,000
+page anchors must find at least one exact target permalink and at least one
+matching `/@<username>` author profile href. A short bounded readiness poll
+allows client-rendered links to appear. Duplicate target or author links,
+unrelated post/profile links elsewhere on the page, and a missing post body do
+not affect recognition. An over-bound scan fails with
+`BROWSER_CONTRACT_MISMATCH`; a target permalink without matching author evidence
+after readiness also fails with that code. A wrong origin/path or missing target
+permalink after readiness yields `REMOTE_STATE_UNCERTAIN`.
 
 Off-origin redirects, page-initiated off-origin navigation, an exact pathname
 mismatch, or a loaded target without the reviewed target href create durable
@@ -139,19 +142,19 @@ use normal browser handling. A navigation that settles on an off-origin page
 fails with durable `REMOTE_STATE_UNCERTAIN` before any semantic read; direct
 page-initiated off-origin requests are aborted by the navigation guard. The
 final page origin and every semantic read are checked against the same
-allowlist. A bounded read with no reviewed permalink candidates does the same,
-including when the feed may simply be exhausted; the available production
-evidence cannot distinguish that from a remote session transition. This path
-does not guess a login or challenge selector. Malformed,
-ambiguous, or over-bound feed association evidence remains a fail-closed
-contract failure. Thread open applies its target path, anchor, author, and text
-checks under the same durable WorkerJob intervention and lease fencing. Profile
-open applies exact-path and bounded-header recognition under the same durable
-WorkerJob intervention and lease fencing. Local media staging uses the durable
-WorkerJob irreversible boundary and lease fencing; once file selection may
-have started, an uncertain result is reconciled rather than retried. Existing
-C3 session reporting and WorkerJob fencing are the required implementation
-paths; these contracts add no alternate session or job journal.
+allowlist. A bounded feed read with no usable permalink after the initial
+collection and one follow-up scroll yields `REMOTE_STATE_UNCERTAIN`; available
+evidence cannot distinguish an empty/exhausted feed from a remote session
+transition. Malformed or unrelated individual hrefs are skipped. Page-anchor or
+candidate-permalink bound violations fail with `BROWSER_CONTRACT_MISMATCH`.
+Thread open applies its origin/path/permalink/author checks under the same
+durable WorkerJob intervention and lease fencing. Profile open applies
+exact-path and bounded-header recognition under the same durable WorkerJob
+intervention and lease fencing. Local media staging uses the durable WorkerJob
+irreversible boundary and lease fencing; once file selection may have started,
+an uncertain result is reconciled rather than retried. Existing C3 session
+reporting and WorkerJob fencing are the required implementation paths; these
+contracts add no alternate session or job journal.
 
 Declared bounded failure codes are `BROWSER_CONTRACT_MISMATCH`,
 `BROWSER_REQUIRED_MARKER_NOT_FOUND`, `UNSUPPORTED_UI_STATE`,
@@ -169,25 +172,6 @@ stops all subsequent browser work. Browser timeout or crash does not prove that
 a target is absent. Local media renews the lease before file selection and
 through upload completion; lease loss stops later browser work and yields an
 ambiguous outcome after the irreversible boundary.
-
-## Accepted feed evidence record
-
-- **Observation date:** 2026-09-28.
-- **Surface:** authenticated Threads Web feed; three consecutive feed items were
-  sampled.
-- **Observed semantic markers:** author profile href `/@<username>`; Thread
-  permalink href `/@<username>/post/<id>`; post text in `span[dir="auto"]` or
-  `div[dir="auto"]`.
-- **Session-state classification:** `AUTHENTICATED`.
-- **Proposed contract mapping:** `threads.browser.feed` v1, permalink-pivot
-  association.
-- **Reviewer note:** all three markers appeared for each sampled item. No common
-  stable semantic/data ancestor exists; `data-pressable-container` was not
-  stable enough. The coordinator accepted a nearest-ancestor strategy with a
-  strict finite bound and fail-closed ambiguity checks.
-
-This record contains no username, post ID, private text, cookies, tokens, full
-DOM, or screenshot. The accepted evidence unblocks feed.browse only.
 
 ## Accepted profile evidence record
 
@@ -221,32 +205,30 @@ The record contains no username, profile identifier, private content, cookies,
 tokens, full DOM, or screenshot. Synthetic fixtures exercise this accepted
 contract but are not production evidence.
 
-## Feed permalink-pivot workflow
+## Feed permalink READ v1
 
 The worker navigates only to the canonical Threads Web origin
 `https://www.threads.com/`; Meta announced the move from Threads.net to
 [Threads.com](https://about.fb.com/news/2025/04/new-features-threads-web-experience/).
-For every candidate permalink matching the observed path, it walks at most eight
-ancestors from the anchor's parent and selects the nearest ancestor that contains
-exactly one matching permalink, exactly one compatible author profile href, and
-at least one bounded `[dir="auto"]` text region. It rejects a repeated pivot,
-another candidate post permalink, multiple compatible author links, missing
-markers, overflow, or an association not proven within the bound. It does not
-anchor on static container attributes, generated classes, absolute DOM indexes,
-`<main>`, tab roles, or action-button roles.
+The engine scans at most 1,000 page anchors and returns no more than 100
+same-origin post permalink paths. It does not inspect ancestors, author links,
+or post text. Shared pure semantics accept relative or canonical absolute
+Threads post permalinks, skip malformed, unrelated, and off-origin hrefs,
+normalize the author from the permalink, deduplicate normalized Thread
+references in first-seen order, assign deterministic positions, and set
+`text_excerpt` to `null`.
 
-The worker normalizes only the canonical Thread reference, visible author
-username, excerpt capped at 500 characters, and observation position. It
-deduplicates by normalized Thread reference within the job. Each feed iteration
-scans at most 100 candidate permalink anchors; the page scan fails closed above
-1,000 anchor nodes. Five total feed iterations include the initial read and at
-most four fixed viewport scrolls. The WorkerJob input stores only the validated
-`max_items` bound. Chromium handles normal navigation and same-origin redirects.
-The adapter rejects initial and direct top-level requests outside the approved
-origin, checks the final page origin after navigation, and rechecks the current
-origin before each semantic read. Service workers are blocked so they cannot
-bypass this guard. No Like, Reply, Repost, Share, Create, Publish, or Submit
-action is invoked.
+Five total collection iterations include the initial read and at most four
+fixed viewport scrolls. If the initial collection yields no usable item, one
+bounded scroll/read follow-up is allowed; another empty result becomes
+`REMOTE_STATE_UNCERTAIN`. After an observation exists, an iteration with no new
+normalized item stops as truncated. The WorkerJob input stores only the
+validated `max_items` bound. Chromium handles normal navigation and same-origin
+redirects. The adapter rejects initial and direct top-level requests outside the
+approved origin, checks the final page origin after navigation, and rechecks
+the current origin before each semantic read. Service workers are blocked so
+they cannot bypass this guard. No Like, Reply, Repost, Share, Create, Publish,
+or Submit action is invoked.
 
 Migration `20260928_0010` adds durable WorkerJob input data. Its downgrade refuses
 to drop the column while any job contains nonempty input data, preserving queued

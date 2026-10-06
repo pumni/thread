@@ -88,8 +88,6 @@ MOVED_BROWSER_SYMBOLS = frozenset(
         "BrowserRuntimeUnavailable",
         "BrowserNetworkRouteUnsupported",
         "BrowserSurface",
-        "FeedAncestorObservation",
-        "FeedCandidateObservation",
         "PreparedMediaComposer",
         "BrowserNetworkProtocol",
         "BrowserNetworkRoute",
@@ -695,6 +693,24 @@ def test_shared_browser_contract_shapes() -> None:
             expected_bases=("Protocol",),
             expected_methods=("navigate", "close"),
             forbidden_members=frozenset({"inspect_surface"}),
+        )
+    )
+    violations.extend(
+        class_contract_violations(
+            browser_port,
+            tree,
+            "BrowserFeedEngineSession",
+            expected_bases=("BrowserEngineSession", "Protocol"),
+            expected_methods=("collect_feed_permalinks", "scroll_feed"),
+        )
+    )
+    violations.extend(
+        class_contract_violations(
+            browser_port,
+            tree,
+            "BrowserThreadOpenEngineSession",
+            expected_bases=("BrowserEngineSession", "Protocol"),
+            expected_methods=("verify_thread_target",),
         )
     )
     violations.extend(

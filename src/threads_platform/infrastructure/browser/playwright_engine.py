@@ -38,8 +38,6 @@ from threads_platform.application.ports.browser import (
     BrowserProcessCrashed,
     BrowserRuntimeUnavailable,
     BrowserSurface,
-    FeedAncestorObservation,
-    FeedCandidateObservation,
     LocatorNotFound,
     MediaUploadFailed,
     NavigationTimeout,
@@ -49,51 +47,29 @@ from threads_platform.application.ports.browser import (
 )
 
 _FEED_SCAN_SCRIPT = r"""
-({allowedOrigin, ancestorBound, candidateBound}) => {
+({allowedOrigin, candidateBound}) => {
   if (window.location.origin !== allowedOrigin) {
     return {ok: false, reason: 'origin_mismatch'};
   }
-  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  const anchors = document.querySelectorAll('a[href]');
   if (anchors.length > 1000) return {ok: false};
-  const parsePath = (href) => {
+  const permalinks = [];
+  for (const anchor of anchors) {
+    const href = anchor.getAttribute('href');
+    if (typeof href !== 'string') continue;
     try {
       const url = new URL(href, window.location.href);
-      if (url.origin !== allowedOrigin || url.search || url.hash) return null;
-      if (/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(url.pathname)) {
-        return 'post';
+      if (url.origin !== allowedOrigin || url.search || url.hash) continue;
+      if (!/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(url.pathname)) {
+        continue;
       }
-      if (/^\/@[A-Za-z0-9._]{1,30}\/?$/.test(url.pathname)) return 'profile';
+      permalinks.push(url.pathname);
+      if (permalinks.length > candidateBound) return {ok: false};
     } catch (_) {
-      return null;
+      continue;
     }
-    return null;
-  };
-  const candidates = anchors.filter((anchor) => parsePath(anchor.getAttribute('href')) === 'post');
-  if (candidates.length > candidateBound) return {ok: false};
-  const candidateEvidence = candidates.map((anchor) => {
-    const ancestors = [];
-    let node = anchor.parentElement;
-    while (node && ancestors.length < ancestorBound) {
-      const descendantAnchors = Array.from(node.querySelectorAll('a[href]'));
-      const semanticHrefs = descendantAnchors
-        .map((link) => link.getAttribute('href'))
-        .filter((href) => href !== null && parsePath(href) !== null);
-      const textNodes = Array.from(
-        node.querySelectorAll('span[dir="auto"], div[dir="auto"]')
-      );
-      ancestors.push({
-        hrefs: semanticHrefs.slice(0, 64),
-        linksTruncated: semanticHrefs.length > 64,
-        textRegions: textNodes.slice(0, 20).map((element) =>
-          (element.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 501)
-        ),
-        textRegionsTruncated: textNodes.length > 20,
-      });
-      node = node.parentElement;
-    }
-    return {permalinkHref: anchor.getAttribute('href'), ancestors};
-  });
-  return {ok: true, candidates: candidateEvidence};
+  }
+  return {ok: true, permalinks};
 }
 """
 
@@ -122,66 +98,32 @@ class _PreparedMediaComposerElements:
 
 
 _THREAD_OPEN_SCRIPT = r"""
-({allowedOrigin, targetRef, targetAuthor, ancestorBound}) => {
+({allowedOrigin, targetRef, targetAuthor}) => {
   const normalizePath = (path) => path.endsWith('/') ? path.slice(0, -1) : path;
   const semanticPath = (href) => {
-    if (typeof href !== 'string' || !href.startsWith('/') || href.startsWith('//')) return null;
-    if (href.includes('?') || href.includes('#')) return null;
-    return normalizePath(href);
+    if (typeof href !== 'string') return null;
+    try {
+      const url = new URL(href, allowedOrigin);
+      if (url.origin !== allowedOrigin || url.search || url.hash) return null;
+      return normalizePath(url.pathname);
+    } catch (_) {
+      return null;
+    }
   };
   if (window.location.origin !== allowedOrigin) return {outcome: 'uncertain'};
   if (normalizePath(window.location.pathname) !== targetRef) return {outcome: 'uncertain'};
 
-  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  const anchors = document.querySelectorAll('a[href]');
   if (anchors.length > 1000) return {outcome: 'invalid'};
-  const targetAnchors = anchors.filter(
+  const hasTargetPermalink = Array.from(anchors).some(
     (anchor) => semanticPath(anchor.getAttribute('href')) === targetRef
   );
-  if (targetAnchors.length === 0) return {outcome: 'uncertain'};
-  if (targetAnchors.length > 64) return {outcome: 'invalid'};
-
+  if (!hasTargetPermalink) return {outcome: 'missing_permalink'};
   const authorPath = `/@${targetAuthor}`;
-  const roots = [];
-  for (const targetAnchor of targetAnchors) {
-    let node = targetAnchor.parentElement;
-    let associatedRoot = null;
-    for (let depth = 1; node && depth <= ancestorBound; depth += 1) {
-      const links = Array.from(node.querySelectorAll('a[href]'));
-      if (links.length > 64) return {outcome: 'invalid'};
-      let targetLinkCount = 0;
-      let hasCompetingPost = false;
-      let targetAuthorCount = 0;
-      let hasCompetingAuthor = false;
-      for (const link of links) {
-        const path = semanticPath(link.getAttribute('href'));
-        if (path === null) continue;
-        if (/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(path)) {
-          if (path === targetRef) targetLinkCount += 1;
-          else hasCompetingPost = true;
-        } else if (/^\/@[A-Za-z0-9._]{1,30}\/?$/.test(path)) {
-          if (path === authorPath) targetAuthorCount += 1;
-          else hasCompetingAuthor = true;
-        }
-      }
-      if ((hasCompetingPost || hasCompetingAuthor) && targetLinkCount > 0) {
-        return {outcome: 'invalid'};
-      }
-      const textRegions = Array.from(node.querySelectorAll('span[dir="auto"]'));
-      if (textRegions.length > 32) return {outcome: 'invalid'};
-      const hasBoundedText = textRegions.some((region) => {
-        const text = (region.textContent || '').replace(/\s+/g, ' ').trim();
-        return text.length > 0 && text.length <= 1000;
-      });
-      if (targetLinkCount > 0 && targetAuthorCount === 1 && hasBoundedText) {
-        associatedRoot = node;
-        break;
-      }
-      node = node.parentElement;
-    }
-    if (associatedRoot === null) return {outcome: 'invalid'};
-    if (roots.length > 0 && roots[0] !== associatedRoot) return {outcome: 'invalid'};
-    roots.push(associatedRoot);
-  }
+  const hasTargetAuthor = Array.from(anchors).some(
+    (anchor) => semanticPath(anchor.getAttribute('href')) === authorPath
+  );
+  if (!hasTargetAuthor) return {outcome: 'missing_author'};
   return {outcome: 'recognized'};
 }
 """
@@ -409,54 +351,70 @@ class _PlaywrightBrowserSession:
             required_root_present=True,
         )
 
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]:
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
         self._ensure_alive()
         await self._raise_navigation_policy_error()
-        if not 1 <= ancestor_bound <= 12:
+        if (
+            type(candidate_bound) is not int
+            or not 1 <= candidate_bound <= BROWSER_FEED_CANDIDATE_BOUND
+        ):
             raise BrowserContractError()
         try:
             payload = await self._page.evaluate(
                 _FEED_SCAN_SCRIPT,
                 {
                     "allowedOrigin": BROWSER_FEED_ORIGIN,
-                    "ancestorBound": ancestor_bound,
-                    "candidateBound": BROWSER_FEED_CANDIDATE_BOUND,
+                    "candidateBound": candidate_bound,
                 },
             )
         except PlaywrightError:
             self._ensure_alive()
             raise BrowserRuntimeUnavailable("BROWSER_FEED_INSPECTION_FAILED") from None
-        return _feed_candidate_observations(payload)
+        return _feed_permalinks(payload)
 
-    async def verify_thread_target(
-        self, *, target_ref: str, author_username: str, ancestor_bound: int
-    ) -> None:
+    async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
         self._ensure_alive()
         await self._raise_navigation_policy_error()
         target_match = re.fullmatch(
             r"/@([A-Za-z0-9._]{1,30})/post/[A-Za-z0-9_-]{1,120}", target_ref
         )
-        if (
-            not 1 <= ancestor_bound <= 8
-            or target_match is None
-            or target_match.group(1) != author_username
-        ):
+        if target_match is None or target_match.group(1) != author_username:
             raise BrowserContractError()
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _PROFILE_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        script_args = {
+            "allowedOrigin": BROWSER_FEED_ORIGIN,
+            "targetRef": target_ref,
+            "targetAuthor": author_username,
+        }
         try:
             payload = await self._page.evaluate(
                 _THREAD_OPEN_SCRIPT,
-                {
-                    "allowedOrigin": BROWSER_FEED_ORIGIN,
-                    "targetRef": target_ref,
-                    "targetAuthor": author_username,
-                    "ancestorBound": ancestor_bound,
-                },
+                script_args,
             )
         except PlaywrightError:
             self._ensure_alive()
             raise BrowserRuntimeUnavailable("BROWSER_THREAD_INSPECTION_FAILED") from None
+        outcome = _thread_target_outcome(payload)
+        while outcome in {"missing_permalink", "missing_author"}:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_PROFILE_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                break
+            try:
+                payload = await self._page.evaluate(_THREAD_OPEN_SCRIPT, script_args)
+            except PlaywrightError:
+                self._ensure_alive()
+                raise BrowserRuntimeUnavailable("BROWSER_THREAD_INSPECTION_FAILED") from None
+            outcome = _thread_target_outcome(payload)
+            if outcome == "recognized":
+                return
         _verify_thread_target_result(payload)
 
     async def verify_profile_target(self, *, target_ref: str, ancestor_bound: int) -> None:
@@ -667,23 +625,15 @@ class _PlaywrightBrowserSession:
         if self._closed:
             return
         self._closed = True
-        was_dead = (
-            self._crashed
-            or self._page.is_closed()
-            or (self._browser is not None and not self._browser.is_connected())
-        )
-        close_error = False
         try:
             await self._context.close()
-        except PlaywrightError:
-            close_error = not was_dead
+        except Exception:
+            pass
         finally:
             try:
                 await self._playwright.stop()
-            except PlaywrightError:
-                close_error = close_error or not was_dead
-        if close_error:
-            raise BrowserProcessCrashed() from None
+            except Exception:
+                pass
 
     async def _required_meta(self, name: str) -> str:
         locator = self._page.locator(f'meta[name="{name}"]')
@@ -714,73 +664,46 @@ class _PlaywrightBrowserSession:
             self._crashed = True
 
 
-def _feed_candidate_observations(payload: object) -> tuple[FeedCandidateObservation, ...]:
+def _feed_permalinks(payload: object) -> tuple[str, ...]:
     if not isinstance(payload, dict):
         raise BrowserContractError()
     data = cast(dict[str, object], payload)
     if data.get("reason") == "origin_mismatch":
         raise RemoteSessionStateUncertain()
-    candidate_value = data.get("candidates")
-    if data.get("ok") is not True or not isinstance(candidate_value, list):
+    permalink_value = data.get("permalinks")
+    if data.get("ok") is not True or not isinstance(permalink_value, list):
         raise BrowserContractError()
-    raw_candidates = cast(list[object], candidate_value)
-    if not raw_candidates:
-        raise RemoteSessionStateUncertain()
-
-    candidates: list[FeedCandidateObservation] = []
-    for raw_candidate in raw_candidates:
-        if not isinstance(raw_candidate, dict):
-            raise BrowserContractError()
-        candidate = cast(dict[str, object], raw_candidate)
-        permalink_href = candidate.get("permalinkHref")
-        ancestor_value = candidate.get("ancestors")
-        if not isinstance(permalink_href, str) or not isinstance(ancestor_value, list):
-            raise BrowserContractError()
-        raw_ancestors = cast(list[object], ancestor_value)
-        ancestors: list[FeedAncestorObservation] = []
-        for raw_ancestor in raw_ancestors:
-            if not isinstance(raw_ancestor, dict):
-                raise BrowserContractError()
-            ancestor = cast(dict[str, object], raw_ancestor)
-            href_values = ancestor.get("hrefs")
-            text_values = ancestor.get("textRegions")
-            links_truncated = ancestor.get("linksTruncated")
-            text_regions_truncated = ancestor.get("textRegionsTruncated")
-            if (
-                not isinstance(href_values, list)
-                or not isinstance(text_values, list)
-                or not isinstance(links_truncated, bool)
-                or not isinstance(text_regions_truncated, bool)
-            ):
-                raise BrowserContractError()
-            hrefs = cast(list[object], href_values)
-            text_regions = cast(list[object], text_values)
-            if not all(isinstance(href, str) for href in hrefs) or not all(
-                isinstance(text, str) for text in text_regions
-            ):
-                raise BrowserContractError()
-            ancestors.append(
-                FeedAncestorObservation(
-                    hrefs=tuple(cast(str, href) for href in hrefs),
-                    text_regions=tuple(cast(str, text) for text in text_regions),
-                    links_truncated=links_truncated,
-                    text_regions_truncated=text_regions_truncated,
-                )
-            )
-        candidates.append(
-            FeedCandidateObservation(permalink_href=permalink_href, ancestors=tuple(ancestors))
-        )
-    return tuple(candidates)
+    permalinks = cast(list[object], permalink_value)
+    if len(permalinks) > BROWSER_FEED_CANDIDATE_BOUND or not all(
+        isinstance(permalink, str) for permalink in permalinks
+    ):
+        raise BrowserContractError()
+    return tuple(cast(str, permalink) for permalink in permalinks)
 
 
-def _verify_thread_target_result(payload: object) -> None:
+def _thread_target_outcome(payload: object) -> str:
     if not isinstance(payload, dict):
         raise BrowserContractError()
     data = cast(dict[str, object], payload)
     if set(data) != {"outcome"}:
         raise BrowserContractError()
     outcome = data.get("outcome")
+    if not isinstance(outcome, str) or outcome not in {
+        "recognized",
+        "uncertain",
+        "missing_permalink",
+        "missing_author",
+        "invalid",
+    }:
+        raise BrowserContractError()
+    return outcome
+
+
+def _verify_thread_target_result(payload: object) -> None:
+    outcome = _thread_target_outcome(payload)
     if outcome == "uncertain":
+        raise RemoteSessionStateUncertain()
+    if outcome == "missing_permalink":
         raise RemoteSessionStateUncertain()
     if outcome != "recognized":
         raise BrowserContractError()

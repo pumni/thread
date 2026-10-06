@@ -12,7 +12,7 @@ from threads_platform.application.browser_capabilities import (
     BrowserTargetOpenResultV1,
 )
 from threads_platform.application.browser_read_semantics import (
-    BROWSER_FEED_ANCESTOR_BOUND,
+    BROWSER_FEED_CANDIDATE_BOUND,
     BROWSER_FEED_ITERATION_BOUND,
     BROWSER_READ_TARGET_ANCESTOR_BOUND,
     normalize_profile_ref,
@@ -26,8 +26,6 @@ from threads_platform.application.ports.browser import (
     BrowserLaunchRequest,
     BrowserNetworkProtocol,
     BrowserNetworkRoute,
-    FeedAncestorObservation,
-    FeedCandidateObservation,
 )
 from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
@@ -43,14 +41,14 @@ class _FakeSession:
         thread_error: Exception | None = None,
         navigation_gate: asyncio.Event | None = None,
         navigation_started: asyncio.Event | None = None,
-        feed_batches: list[tuple[FeedCandidateObservation, ...]] | None = None,
+        feed_batches: list[tuple[str, ...]] | None = None,
         feed_error: Exception | None = None,
     ) -> None:
         self.close_calls = 0
         self.navigate_calls = 0
         self.navigations: list[tuple[str, frozenset[str]]] = []
         self.profile_verifications: list[tuple[str, int]] = []
-        self.thread_verifications: list[tuple[str, str, int]] = []
+        self.thread_verifications: list[tuple[str, str]] = []
         self.feed_batches = feed_batches
         self.feed_error = feed_error
         self.collect_calls = 0
@@ -76,17 +74,13 @@ class _FakeSession:
         if self.profile_error is not None:
             raise self.profile_error
 
-    async def verify_thread_target(
-        self, *, target_ref: str, author_username: str, ancestor_bound: int
-    ) -> None:
-        self.thread_verifications.append((target_ref, author_username, ancestor_bound))
+    async def verify_thread_target(self, *, target_ref: str, author_username: str) -> None:
+        self.thread_verifications.append((target_ref, author_username))
         if self.thread_error is not None:
             raise self.thread_error
 
-    async def collect_feed_candidates(
-        self, *, ancestor_bound: int
-    ) -> tuple[FeedCandidateObservation, ...]:
-        assert ancestor_bound == BROWSER_FEED_ANCESTOR_BOUND
+    async def collect_feed_permalinks(self, *, candidate_bound: int) -> tuple[str, ...]:
+        assert candidate_bound == BROWSER_FEED_CANDIDATE_BOUND
         self.collect_calls += 1
         if self.feed_error is not None:
             raise self.feed_error
@@ -132,17 +126,8 @@ def _assert_lock_can_be_acquired(root: Path, account: LocalAccount) -> None:
     lock.release()
 
 
-def _feed_candidate(post_id: str, text: str = "bounded feed excerpt") -> FeedCandidateObservation:
-    permalink = f"/@alice/post/{post_id}"
-    return FeedCandidateObservation(
-        permalink_href=permalink,
-        ancestors=(
-            FeedAncestorObservation(
-                hrefs=(permalink, "/@alice/"),
-                text_regions=(text,),
-            ),
-        ),
-    )
+def _feed_candidate(post_id: str, username: str = "alice") -> str:
+    return f"/@{username}/post/{post_id}"
 
 
 @pytest.mark.asyncio
@@ -410,7 +395,7 @@ async def test_open_thread_normalizes_trailing_slash_and_verifies_author_and_bou
             frozenset({BROWSER_FEED_ORIGIN}),
         )
     ]
-    assert session.thread_verifications == [("/@alice/post/post-ID_9", "alice", 8)]
+    assert session.thread_verifications == [("/@alice/post/post-ID_9", "alice")]
     assert session.profile_verifications == []
     assert session.close_calls == 1
     _assert_lock_can_be_acquired(root, account)
@@ -444,7 +429,7 @@ async def test_browse_feed_reuses_headed_direct_account_profile_and_returns_boun
     account = store.add("alice")
     profile_directory = root / "profiles" / str(account.id)
     profile_directory.mkdir(parents=True)
-    session = _FakeSession(feed_batches=[(_feed_candidate("post-1", "  First   excerpt  "),)])
+    session = _FakeSession(feed_batches=[(_feed_candidate("post-1"),)])
     engine = _FakeEngine(session=session)
 
     result = await LocalRuntime(root, store, engine).browse_feed("alice", 1)
@@ -456,7 +441,7 @@ async def test_browse_feed_reuses_headed_direct_account_profile_and_returns_boun
             {
                 "thread_ref": f"{BROWSER_FEED_ORIGIN}/@alice/post/post-1",
                 "author_username": "alice",
-                "text_excerpt": "First excerpt",
+                "text_excerpt": None,
                 "position": 0,
             }
         ],
@@ -507,7 +492,7 @@ async def test_browse_feed_deduplicates_across_iterations_and_enforces_limit(
     account = store.add("alice")
     (root / "profiles" / str(account.id)).mkdir(parents=True)
     repeated = _feed_candidate("post-1")
-    second = _feed_candidate("post-2", "second excerpt")
+    second = _feed_candidate("post-2")
     session = _FakeSession(
         feed_batches=[(repeated,), (repeated, second), (_feed_candidate("post-3"),)]
     )
@@ -526,6 +511,25 @@ async def test_browse_feed_deduplicates_across_iterations_and_enforces_limit(
     assert len(result.observations) <= 2
     assert session.close_calls == 1
     _assert_lock_can_be_acquired(root, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_checks_one_followup_before_empty_result_fails_safely(
+    tmp_path: Path,
+) -> None:
+    store = LocalAccountStore(tmp_path)
+    account = store.add("alice")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    session = _FakeSession(feed_batches=[(), ("/not-a-thread",)])
+    engine = _FakeEngine(session=session)
+
+    with pytest.raises(StandaloneRuntimeError, match="^REMOTE_STATE_UNCERTAIN$"):
+        await LocalRuntime(tmp_path, store, engine).browse_feed("alice", 3)
+
+    assert session.collect_calls == 2
+    assert session.scroll_calls == 1
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(tmp_path, account)
 
 
 @pytest.mark.asyncio
