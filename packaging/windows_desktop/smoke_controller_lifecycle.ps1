@@ -795,7 +795,8 @@ function Invoke-ResolvedInputMutation {
         [string]$FieldId,
         [string]$Value,
         [scriptblock]$ResolveControl,
-        [int]$ExpectedPort
+        [int]$ExpectedPort,
+        [switch]$KeyboardOnly
     )
 
     $isPassword = $FieldId -eq "password"
@@ -832,7 +833,7 @@ function Invoke-ResolvedInputMutation {
 
     try { $record.control_type = [string]$control.Current.ControlType.ProgrammaticName } catch { }
     $isEdit = $record.control_type -eq "ControlType.Edit"
-    if (-not $isPassword -and $isEdit) {
+    if (-not $KeyboardOnly -and -not $isPassword -and $isEdit) {
         $valuePattern = $null
         try {
             $valuePattern = $control.GetCurrentPattern(
@@ -971,7 +972,8 @@ function Set-LoginInput {
         [string]$AutomationId,
         [System.Windows.Automation.ControlType[]]$AllowedControlTypes = @(
             [System.Windows.Automation.ControlType]::Edit
-        )
+        ),
+        [switch]$KeyboardOnly
     )
 
     $fieldId = [regex]::Replace($Name.Trim().ToLowerInvariant(), "[^a-z0-9]+", "_").Trim("_")
@@ -1019,7 +1021,8 @@ function Set-LoginInput {
         -FieldId $fieldId `
         -Value $Value `
         -ResolveControl $resolveCurrentInput `
-        -ExpectedPort $expectedPort
+        -ExpectedPort $expectedPort `
+        -KeyboardOnly:$KeyboardOnly
 }
 
 function Get-ActiveOwnerSessionCount([object]$Config) {
@@ -1934,7 +1937,8 @@ function Set-ControllerEndpointFields([int]$ProcessId, [string]$Address, [int]$P
         -Name "Stable LAN IPv4 address" `
         -Value $Address `
         -AutomationId "controller-lan-address" `
-        -AllowedControlTypes @([System.Windows.Automation.ControlType]::Edit)
+        -AllowedControlTypes @([System.Windows.Automation.ControlType]::Edit) `
+        -KeyboardOnly
     Set-LoginInput `
         -ProcessId $ProcessId `
         -Name "HTTPS port" `

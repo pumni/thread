@@ -276,9 +276,13 @@ function Get-Invocations($body, [string]$memberName) {{
 $allowedParameter = @($loginBody.ParamBlock.Parameters | Where-Object {{
     $_.Name.VariablePath.UserPath -eq 'AllowedControlTypes'
 }})
+$keyboardOnlyParameter = @($loginBody.ParamBlock.Parameters | Where-Object {{
+    $_.Name.VariablePath.UserPath -eq 'KeyboardOnly'
+}})
 if ($allowedParameter.Count -ne 1 -or
     ($allowedParameter[0].DefaultValue.Extent.Text -replace '\s+', '') -ne
-        '@([System.Windows.Automation.ControlType]::Edit)') {{
+        '@([System.Windows.Automation.ControlType]::Edit)' -or
+    $keyboardOnlyParameter.Count -ne 1) {{
     throw "Default and text input control type must remain Edit-only"
 }}
 
@@ -291,8 +295,10 @@ $portCall = @($endpointCalls | Where-Object {{ $_.Extent.Text -match 'HTTPS port
 if ($addressCall.Count -ne 1 -or
     $addressCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-lan-address"' -or
     $addressCall[0].Extent.Text -notmatch 'ControlType\]::Edit' -or
+    $addressCall[0].Extent.Text -notmatch '(?m)-KeyboardOnly(?:\s|$)' -or
     $portCall.Count -ne 1 -or
-    $portCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-https-port"') {{
+    $portCall[0].Extent.Text -notmatch '-AutomationId\s+"controller-https-port"' -or
+    $portCall[0].Extent.Text -match '-KeyboardOnly') {{
     throw "Endpoint helper must target its unique automation IDs"
 }}
 $portTypeNames = @([regex]::Matches(
@@ -321,11 +327,20 @@ $mutationCalls = @($commands | Where-Object {{
 if ($waitCalls.Count -ne 1 -or $mutationCalls.Count -ne 1 -or
     $waitCalls[0].Extent.StartOffset -ge $mutationCalls[0].Extent.StartOffset -or
     $waitCalls[0].Extent.Text -notmatch '\}}\s+20\s+\$inputUnavailableCode' -or
+    $mutationCalls[0].Extent.Text -notmatch '-KeyboardOnly:\$KeyboardOnly' -or
     $loginBody.Extent.Text -match 'SendWait|\.SetFocus\(') {{
     throw "Bounded exact-control lookup must complete before delegated input mutation"
 }}
 
 $mutationBody = $functions['Invoke-ResolvedInputMutation'].Body
+$keyboardOnlyMutationParameter = @(
+    $mutationBody.ParamBlock.Parameters | Where-Object {{
+        $_.Name.VariablePath.UserPath -eq 'KeyboardOnly'
+    }}
+)
+if ($keyboardOnlyMutationParameter.Count -ne 1) {{
+    throw "Mutation helper must accept an explicit KeyboardOnly option"
+}}
 $mutationCommands = @($mutationBody.FindAll({{
     param($node) $node -is [System.Management.Automation.Language.CommandAst]
 }}, $true))
@@ -360,7 +375,8 @@ if ($mutationWaits.Count -ne 3 -or $keyboardCalls.Count -ne 1 -or
 $programmaticGate = @($mutationBody.FindAll({{
     param($node)
     $node -is [System.Management.Automation.Language.IfStatementAst] -and
-        $node.Clauses[0].Item1.Extent.Text -match '-not\s+\$isPassword\s+-and\s+\$isEdit'
+        $node.Clauses[0].Item1.Extent.Text -match
+            '-not\s+\$KeyboardOnly\s+-and\s+-not\s+\$isPassword\s+-and\s+\$isEdit'
 }}, $true))
 if ($programmaticGate.Count -ne 1 -or
     $programmaticGate[0].Extent.Text -notmatch 'ValuePattern' -or
@@ -600,7 +616,8 @@ function Invoke-TestMutation(
     [string]$PatternMode = 'available',
     [bool]$FocusWorks = $true,
     [bool]$KeyboardCorrupt = $false,
-    [bool]$ReplaceOnFallback = $false
+    [bool]$ReplaceOnFallback = $false,
+    [bool]$KeyboardOnly = $false
 ) {{
     $initialMode = if ($PatternMode -eq 'replace') {{ 'replace' }} else {{ $PatternMode }}
     $script:initialControl = New-FakeControl $initialMode $FocusWorks
@@ -623,7 +640,8 @@ function Invoke-TestMutation(
     $expectedPort = if ($FieldId -eq 'https_port') {{ [int]$Value }} else {{ 0 }}
     try {{
         Invoke-ResolvedInputMutation `
-            -FieldId $FieldId -Value $Value -ResolveControl $resolve -ExpectedPort $expectedPort
+            -FieldId $FieldId -Value $Value -ResolveControl $resolve `
+            -ExpectedPort $expectedPort -KeyboardOnly:$KeyboardOnly
     }} catch {{ $script:failure = $_.Exception.Message }}
     $evidence = if ($script:inputMutationEvidence.Count -eq 1) {{
         $script:inputMutationEvidence[0]
@@ -652,6 +670,8 @@ $unverifiedPatternFallback = Invoke-TestMutation 'username' 'synthetic-user' 'mi
 $setFailureFallback = Invoke-TestMutation 'username' 'synthetic-user' 'throw_set'
 $focusFailure = Invoke-TestMutation 'username' 'synthetic-user' 'unavailable' $false
 $verificationFailure = Invoke-TestMutation 'username' 'synthetic-user' 'unavailable' $true $true
+$keyboardOnlyEdit = Invoke-TestMutation `
+    'stable_lan_ipv4_address' '192.0.2.10' 'available' $true $false $false $true
 $secret = 'synthetic-password-never-in-evidence'
 $passwordFallback = Invoke-TestMutation 'password' $secret
 $passwordReplacementFallback = Invoke-TestMutation 'password' $secret 'available' $true $false $true
@@ -665,6 +685,7 @@ $result = [ordered]@{{
     set_failure_fallback = $setFailureFallback
     focus_failure = $focusFailure
     verification_failure = $verificationFailure
+    keyboard_only_edit = $keyboardOnlyEdit
     password_fallback = $passwordFallback
     password_replacement_fallback = $passwordReplacementFallback
     password_secret_leaked = $passwordFallback.evidence_json.Contains($secret)
@@ -755,6 +776,19 @@ $result = [ordered]@{{
     assert verification_failure["evidence_count"] == 1
     assert verification_failure["evidence"]["verification_performed"] is True
     assert verification_failure["evidence"]["verification_succeeded"] is False
+
+    keyboard_only = result["keyboard_only_edit"]
+    assert keyboard_only["failure"] is None
+    assert keyboard_only["set_count"] == 0
+    assert keyboard_only["sends"] == 1
+    assert keyboard_only["evidence"]["mutation_method"] == "KEYBOARD"
+    assert keyboard_only["evidence"]["fallback_control_reacquired"] is True
+    assert keyboard_only["resolve_calls"] > 1
+    assert keyboard_only["evidence"]["focus_requested"] is True
+    assert keyboard_only["evidence"]["focus_confirmed"] is True
+    assert keyboard_only["evidence"]["verification_performed"] is True
+    assert keyboard_only["evidence"]["verification_succeeded"] is True
+    assert "192.0.2.10" not in keyboard_only["evidence_json"]
 
     password = result["password_fallback"]
     password_record = password["evidence"]
