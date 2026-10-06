@@ -35,8 +35,19 @@ _NUMERIC_HOST = re.compile(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F
 _JOURNAL_VERSION = 1
 _JOURNAL_KIND = "POST_TEXT"
 _CAROUSEL_KIND = "POST_CAROUSEL"
+_MODERATION_KIND = "MODERATE_REPLY"
+_MODERATION_ACTIONS = frozenset({"hide", "unhide", "approve", "ignore"})
+_MODERATION_PHASES = frozenset({"RECEIVED", "MUTATION_REQUESTED", "CONFIRMED", "AMBIGUOUS"})
+_MODERATION_ONLY_PHASES = frozenset({"MUTATION_REQUESTED", "CONFIRMED"})
 _JOURNAL_KINDS = frozenset(
-    {_JOURNAL_KIND, "CREATE_REPLY", "POST_IMAGE", "POST_VIDEO", _CAROUSEL_KIND}
+    {
+        _JOURNAL_KIND,
+        "CREATE_REPLY",
+        "POST_IMAGE",
+        "POST_VIDEO",
+        _CAROUSEL_KIND,
+        _MODERATION_KIND,
+    }
 )
 _MAX_CAROUSEL_MANIFEST_BYTES = 65_536
 _MAX_CAROUSEL_JSON_DEPTH = 3
@@ -49,9 +60,11 @@ _JOURNAL_PHASES = frozenset(
     {
         "RECEIVED",
         "CHILDREN_CREATING",
+        "MUTATION_REQUESTED",
         "CONTAINER_CREATED",
         "PUBLISH_REQUESTED",
         "PUBLISHED",
+        "CONFIRMED",
         "AMBIGUOUS",
         "FAILED_FINAL",
     }
@@ -67,6 +80,7 @@ _JOURNAL_KEYS = frozenset(
         "media_id",
         "outcome_code",
         "child_container_ids",
+        "action",
     }
 )
 _REQUIRED_JOURNAL_KEYS = frozenset({"version", "id", "account_id", "kind", "phase"})
@@ -77,6 +91,10 @@ _TRANSITIONS = {
     "CHILDREN_CREATING": frozenset({"CHILDREN_CREATING", "CONTAINER_CREATED", "FAILED_FINAL"}),
     "CONTAINER_CREATED": frozenset({"PUBLISH_REQUESTED", "FAILED_FINAL"}),
     "PUBLISH_REQUESTED": frozenset({"PUBLISHED", "AMBIGUOUS"}),
+}
+_MODERATION_TRANSITIONS = {
+    "RECEIVED": frozenset({"MUTATION_REQUESTED"}),
+    "MUTATION_REQUESTED": frozenset({"CONFIRMED", "AMBIGUOUS"}),
 }
 
 
@@ -105,6 +123,7 @@ class LocalOperation:
     media_id: str | None = None
     outcome_code: str | None = None
     child_container_ids: tuple[str, ...] = ()
+    action: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +161,12 @@ class CarouselManifest:
 class PublishedCarouselResult:
     operation_id: UUID
     media_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModeratedReplyResult:
+    operation_id: UUID
+    action: str
 
 
 def load_carousel_manifest(path: Path) -> CarouselManifest:
@@ -295,6 +320,7 @@ class LocalOperationStore:
         account_id: UUID,
         *,
         kind: str = _JOURNAL_KIND,
+        action: str | None = None,
     ) -> LocalOperation:
         if kind not in _JOURNAL_KINDS:
             raise StandaloneMutationError("OPERATION_STATE_INVALID")
@@ -304,6 +330,7 @@ class LocalOperationStore:
             account_id=account_id,
             kind=kind,
             phase="RECEIVED",
+            action=action,
         )
         operations = self._operations_directory(create=True)
         if operations is None:
@@ -318,10 +345,16 @@ class LocalOperationStore:
             current = self.get(operation.id)
         except StandaloneMutationError:
             raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id) from None
+        allowed_phases = (
+            _MODERATION_TRANSITIONS.get(current.phase, frozenset())
+            if current.kind == _MODERATION_KIND
+            else _TRANSITIONS.get(current.phase, frozenset())
+        )
         if (
             current.account_id != operation.account_id
             or current.kind != operation.kind
-            or operation.phase not in _TRANSITIONS.get(current.phase, frozenset())
+            or current.action != operation.action
+            or operation.phase not in allowed_phases
             or (
                 current.kind == _CAROUSEL_KIND
                 and not _valid_carousel_child_transition(current, operation)
@@ -595,6 +628,87 @@ class LocalThreadsMutationRuntime:
             reply_quota=True,
         )
         return CreatedReplyResult(operation_id=operation_id, reply_id=reply_id)
+
+    async def moderate_reply(
+        self,
+        alias: str,
+        reply_id: str,
+        action: str,
+    ) -> ModeratedReplyResult:
+        validated_reply_id, validated_action = validate_reply_moderation_inputs(reply_id, action)
+        operation_id = await self._moderate_reply(alias, validated_reply_id, validated_action)
+        return ModeratedReplyResult(operation_id=operation_id, action=validated_action)
+
+    async def _moderate_reply(
+        self,
+        alias: str,
+        reply_id: str,
+        action: str,
+    ) -> UUID:
+        account = self._accounts.get(alias)
+        lock = FilesystemProcessLock(_account_lock_path(self._root, account.id))
+        try:
+            lock.acquire()
+        except ProcessAlreadyRunning:
+            raise StandaloneMutationError("ACCOUNT_BUSY") from None
+        except OSError:
+            raise StandaloneMutationError("LOCAL_OPERATION_UNAVAILABLE") from None
+
+        try:
+            if account.credential_ref is None:
+                raise ThreadsCredentialError(ThreadsCredentialErrorCode.NOT_CONFIGURED)
+            try:
+                token = await self._secret_resolver.resolve(account.credential_ref)
+            except ThreadsCredentialError:
+                raise
+            except Exception:
+                raise StandaloneMutationError("THREADS_CREDENTIAL_SECRET_UNAVAILABLE") from None
+            operation = self._operations.create_received(
+                account.id,
+                kind=_MODERATION_KIND,
+                action=action,
+            )
+            try:
+                requested = self._operations.update(replace(operation, phase="MUTATION_REQUESTED"))
+            except Exception:
+                raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id) from None
+
+            try:
+                if action in {"hide", "unhide"}:
+                    response: object = await self._api.manage_reply(
+                        token, reply_id, hide=action == "hide"
+                    )
+                else:
+                    response = await self._api.manage_pending_reply(
+                        token, reply_id, approve=action == "approve"
+                    )
+            except asyncio.CancelledError:
+                self._raise_moderation_ambiguous(requested)
+            except Exception:
+                self._raise_moderation_ambiguous(requested)
+            except BaseException:
+                self._best_effort_moderation_ambiguous(requested)
+                raise
+
+            if response is not None:
+                self._raise_moderation_ambiguous(requested)
+
+            try:
+                self._operations.update(replace(requested, phase="CONFIRMED"))
+            except Exception:
+                # The durable MUTATION_REQUESTED record prevents any blind retry.
+                raise StandaloneMutationError(
+                    "MODERATION_OUTCOME_AMBIGUOUS", requested.id
+                ) from None
+            except BaseException:
+                self._best_effort_moderation_ambiguous(requested)
+                raise
+            return requested.id
+        finally:
+            try:
+                lock.release()
+            except OSError:
+                pass
 
     async def _publish_container(
         self,
@@ -873,6 +987,22 @@ class LocalThreadsMutationRuntime:
         except StandaloneMutationError:
             pass
 
+    def _raise_moderation_ambiguous(self, operation: LocalOperation) -> NoReturn:
+        self._best_effort_moderation_ambiguous(operation)
+        raise StandaloneMutationError("MODERATION_OUTCOME_AMBIGUOUS", operation.id) from None
+
+    def _best_effort_moderation_ambiguous(self, operation: LocalOperation) -> None:
+        try:
+            self._operations.update(
+                replace(
+                    operation,
+                    phase="AMBIGUOUS",
+                    outcome_code="MODERATION_OUTCOME_AMBIGUOUS",
+                )
+            )
+        except BaseException:
+            pass
+
 
 def _account_lock_path(root: Path, account_id: UUID) -> Path:
     try:
@@ -1018,6 +1148,14 @@ def _valid_remote_id(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and _REMOTE_ID.fullmatch(value) is not None
 
 
+def validate_reply_moderation_inputs(reply_id: object, action: object) -> tuple[str, str]:
+    if type(reply_id) is not str or reply_id in {".", ".."} or not _valid_remote_id(reply_id):
+        raise StandaloneMutationError("INVALID_REPLY_ID")
+    if type(action) is not str or action not in _MODERATION_ACTIONS:
+        raise StandaloneMutationError("INVALID_MODERATION_ACTION")
+    return reply_id, action
+
+
 def _safe_exception_code(error: Exception) -> str:
     code = getattr(error, "code", None)
     if isinstance(code, str) and _SAFE_CODE.fullmatch(code) is not None:
@@ -1043,7 +1181,25 @@ def _validate_operation(operation: LocalOperation) -> None:
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
     if operation.outcome_code is not None and _SAFE_CODE.fullmatch(operation.outcome_code) is None:
         raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
-    if operation.kind == _CAROUSEL_KIND:
+    if operation.kind == _MODERATION_KIND:
+        if (
+            type(operation.action) is not str
+            or operation.action not in _MODERATION_ACTIONS
+            or operation.phase not in _MODERATION_PHASES
+            or operation.container_id is not None
+            or operation.media_id is not None
+            or operation.child_container_ids
+        ):
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        valid_shape = {
+            "RECEIVED": operation.outcome_code is None,
+            "MUTATION_REQUESTED": operation.outcome_code is None,
+            "CONFIRMED": operation.outcome_code is None,
+            "AMBIGUOUS": operation.outcome_code is not None,
+        }
+    elif operation.action is not None or operation.phase in _MODERATION_ONLY_PHASES:
+        raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+    elif operation.kind == _CAROUSEL_KIND:
         has_ready_children = _MIN_CAROUSEL_ITEMS <= len(operation.child_container_ids)
         parent_is_distinct = (
             operation.container_id is None
@@ -1144,6 +1300,8 @@ def _encode_operation(operation: LocalOperation) -> str:
         data["outcome_code"] = operation.outcome_code
     if operation.child_container_ids:
         data["child_container_ids"] = list(operation.child_container_ids)
+    if operation.action is not None:
+        data["action"] = operation.action
     return json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n"
 
 
@@ -1195,6 +1353,7 @@ def _decode_operation(data: object, requested_id: UUID) -> LocalOperation:
     media_id = journal_data.get("media_id")
     outcome_code = journal_data.get("outcome_code")
     raw_child_ids = journal_data.get("child_container_ids", [])
+    raw_action = journal_data.get("action")
     if (
         (container_id is not None and not isinstance(container_id, str))
         or (media_id is not None and not isinstance(media_id, str))
@@ -1202,6 +1361,8 @@ def _decode_operation(data: object, requested_id: UUID) -> LocalOperation:
         or not isinstance(raw_child_ids, list)
         or any(type(child_id) is not str for child_id in cast(list[object], raw_child_ids))
         or (kind != _CAROUSEL_KIND and "child_container_ids" in journal_data)
+        or (raw_action is not None and type(raw_action) is not str)
+        or (kind != _MODERATION_KIND and "action" in journal_data)
     ):
         raise StandaloneMutationError("OPERATION_STATE_INVALID", requested_id)
     operation = LocalOperation(
@@ -1214,6 +1375,7 @@ def _decode_operation(data: object, requested_id: UUID) -> LocalOperation:
         media_id=media_id,
         outcome_code=outcome_code,
         child_container_ids=tuple(cast(list[str], raw_child_ids)),
+        action=raw_action,
     )
     try:
         _validate_operation(operation)

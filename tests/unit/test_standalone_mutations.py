@@ -27,7 +27,7 @@ from threads_platform.infrastructure.local.process_lock import FilesystemProcess
 from threads_platform.infrastructure.threads_api.environment_credentials import (
     EnvironmentThreadsCredentialSecretResolver,
 )
-from threads_platform.standalone.accounts import LocalAccountStore
+from threads_platform.standalone.accounts import LocalAccountStore, StandaloneAccountError
 from threads_platform.standalone.mutations import (
     CarouselItem,
     CarouselManifest,
@@ -45,6 +45,10 @@ _TEXT = "text-sentinel-never-journal-this"
 
 
 class _InjectedPublishBaseException(BaseException):
+    pass
+
+
+class _InjectedModerationBaseException(BaseException):
     pass
 
 
@@ -153,6 +157,54 @@ class _CountingAccounts(LocalAccountStore):
     def get(self, alias: str):
         self.get_calls += 1
         return super().get(alias)
+
+
+class _ModerationFakeAPI:
+    def __init__(
+        self,
+        root: Path,
+        operations: LocalOperationStore,
+        *,
+        failure: BaseException | None = None,
+        response: object = None,
+    ) -> None:
+        self.root = root
+        self.operations = operations
+        self.failure = failure
+        self.response = response
+        self.calls: list[tuple[str, str | None, bool | None]] = []
+        self.snapshots: list[LocalOperation] = []
+
+    async def get_publishing_quota(self, _token: SecretStr) -> PublishingQuota:
+        self.calls.append(("quota", None, None))
+        raise AssertionError("moderation does not use publishing quota")
+
+    async def manage_reply(self, token: SecretStr, reply_id: str, *, hide: bool) -> object:
+        self._record(token, reply_id)
+        self.calls.append(("manage_reply", reply_id, hide))
+        self._raise_failure()
+        return self.response
+
+    async def manage_pending_reply(
+        self, token: SecretStr, reply_id: str, *, approve: bool
+    ) -> object:
+        self._record(token, reply_id)
+        self.calls.append(("manage_pending_reply", reply_id, approve))
+        self._raise_failure()
+        return self.response
+
+    def _record(self, token: SecretStr, reply_id: str) -> None:
+        assert token.get_secret_value() == _TOKEN
+        operation = _only_operation(self.operations, self.root)
+        assert operation.kind == "MODERATE_REPLY"
+        assert operation.phase == "MUTATION_REQUESTED"
+        assert operation.action in {"hide", "unhide", "approve", "ignore"}
+        assert reply_id
+        self.snapshots.append(operation)
+
+    def _raise_failure(self) -> None:
+        if self.failure is not None:
+            raise self.failure
 
 
 class _CarouselFakeAPI:
@@ -367,6 +419,39 @@ def _setup_carousel(
         publish_error=publish_error,
         media_id=media_id,
     )
+    runtime = LocalThreadsMutationRuntime(
+        root,
+        accounts,
+        cast(ThreadsAPI, api),
+        cast(ThreadsCredentialSecretResolver, secret_resolver),
+        operations,
+    )
+    return accounts, operations, api, secret_resolver, runtime, account.id
+
+
+def _setup_moderation(
+    root: Path,
+    *,
+    resolver: _FakeResolver | None = None,
+    credential: bool = True,
+    failure: BaseException | None = None,
+    response: object = None,
+) -> tuple[
+    _CountingAccounts,
+    LocalOperationStore,
+    _ModerationFakeAPI,
+    _FakeResolver,
+    LocalThreadsMutationRuntime,
+    UUID,
+]:
+    accounts = _CountingAccounts(root)
+    account = accounts.add("alice")
+    if credential:
+        accounts.set_credential_ref("alice", _CREDENTIAL_REF)
+    accounts.get_calls = 0
+    operations = LocalOperationStore(root)
+    secret_resolver = resolver or _FakeResolver()
+    api = _ModerationFakeAPI(root, operations, failure=failure, response=response)
     runtime = LocalThreadsMutationRuntime(
         root,
         accounts,
@@ -2991,3 +3076,452 @@ def test_malformed_carousel_child_metadata_fails_closed(tmp_path: Path, child_id
         store.get(operation.id)
 
     assert caught.value.code == "OPERATION_STATE_INVALID"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "expected_call"),
+    [
+        ("hide", ("manage_reply", "reply-target-sentinel-42", True)),
+        ("unhide", ("manage_reply", "reply-target-sentinel-42", False)),
+        ("approve", ("manage_pending_reply", "reply-target-sentinel-42", True)),
+        ("ignore", ("manage_pending_reply", "reply-target-sentinel-42", False)),
+    ],
+)
+async def test_moderation_action_uses_exact_api_mapping_once_and_confirms(
+    tmp_path: Path,
+    action: str,
+    expected_call: tuple[str, str, bool],
+) -> None:
+    _, operations, api, resolver, runtime, _ = _setup_moderation(tmp_path)
+
+    result = await runtime.moderate_reply("alice", "reply-target-sentinel-42", action)
+
+    assert api.calls == [expected_call]
+    assert len(api.snapshots) == 1
+    assert api.snapshots[0].phase == "MUTATION_REQUESTED"
+    assert api.snapshots[0].action == action
+    assert resolver.calls == [_CREDENTIAL_REF]
+    operation = operations.get(result.operation_id)
+    assert operation.version == 1
+    assert operation.kind == "MODERATE_REPLY"
+    assert operation.phase == "CONFIRMED"
+    assert operation.action == action
+    assert operation.container_id is None
+    assert operation.media_id is None
+    assert operation.child_container_ids == ()
+    journal = (tmp_path / "operations" / f"{result.operation_id}.json").read_text()
+    assert "reply-target-sentinel-42" not in journal
+    assert _TOKEN not in journal
+    assert _CREDENTIAL_REF not in journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "endpoint", "flag"),
+    [
+        ("hide", "manage_reply", True),
+        ("unhide", "manage_reply", False),
+        ("approve", "manage_pending_reply", True),
+        ("ignore", "manage_pending_reply", False),
+    ],
+)
+async def test_moderation_never_falls_back_to_other_endpoint(
+    tmp_path: Path,
+    action: str,
+    endpoint: str,
+    flag: bool,
+) -> None:
+    _, _, api, _, runtime, _ = _setup_moderation(
+        tmp_path,
+        failure=ThreadsAPIError("THREADS_OBJECT_NOT_FOUND"),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-42", action)
+
+    assert caught.value.code == "MODERATION_OUTCOME_AMBIGUOUS"
+    assert api.calls == [(endpoint, "reply-target-42", flag)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply_id",
+    [
+        "",
+        "https://threads.example/replies/42",
+        "../reply-42",
+        "replies/reply-42",
+        ".",
+        "..",
+        "x" * 256,
+    ],
+)
+async def test_moderation_rejects_invalid_reply_id_before_account_or_side_effects(
+    tmp_path: Path,
+    reply_id: str,
+) -> None:
+    accounts, _, api, resolver, runtime, _ = _setup_moderation(tmp_path)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", reply_id, "hide")
+
+    assert caught.value.code == "INVALID_REPLY_ID"
+    assert accounts.get_calls == 0
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["HIDE", "hide ", "approve\n", "delete"])
+async def test_moderation_rejects_invalid_action_before_account_or_side_effects(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    accounts, _, api, resolver, runtime, _ = _setup_moderation(tmp_path)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-sentinel-42", action)
+
+    assert caught.value.code == "INVALID_MODERATION_ACTION"
+    assert accounts.get_calls == 0
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_moderation_does_not_coerce_action_or_reply_id(tmp_path: Path) -> None:
+    accounts, _, api, resolver, runtime, _ = _setup_moderation(tmp_path)
+
+    with pytest.raises(StandaloneMutationError) as bad_action:
+        await runtime.moderate_reply("alice", "reply-target-42", cast(str, 1))
+    with pytest.raises(StandaloneMutationError) as bad_reply_id:
+        await runtime.moderate_reply("alice", cast(str, 42), "hide")
+
+    assert bad_action.value.code == "INVALID_MODERATION_ACTION"
+    assert bad_reply_id.value.code == "INVALID_REPLY_ID"
+    assert accounts.get_calls == 0
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_moderation_lock_conflict_creates_no_journal_or_api_call(tmp_path: Path) -> None:
+    accounts, _, api, resolver, runtime, account_id = _setup_moderation(tmp_path)
+    lock_directory = tmp_path / "locks"
+    lock_directory.mkdir()
+    held_lock = FilesystemProcessLock(lock_directory / f"{account_id}.lock")
+    held_lock.acquire()
+
+    try:
+        with pytest.raises(StandaloneMutationError) as caught:
+            await runtime.moderate_reply("alice", "reply-target-42", "hide")
+    finally:
+        held_lock.release()
+
+    assert caught.value.code == "ACCOUNT_BUSY"
+    assert accounts.get_calls == 1
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential", [False, True])
+async def test_moderation_credential_failure_creates_no_journal_or_api_call(
+    tmp_path: Path,
+    credential: bool,
+) -> None:
+    resolver = _FakeResolver(
+        error=ThreadsCredentialError(ThreadsCredentialErrorCode.SECRET_UNAVAILABLE)
+    )
+    accounts, _, api, _, runtime, _ = _setup_moderation(
+        tmp_path,
+        resolver=resolver,
+        credential=credential,
+    )
+
+    with pytest.raises(ThreadsCredentialError):
+        await runtime.moderate_reply("alice", "reply-target-42", "hide")
+
+    assert accounts.get_calls == 1
+    assert resolver.calls == ([] if not credential else [_CREDENTIAL_REF])
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_moderation_unexpected_resolver_failure_is_sanitized_before_journal(
+    tmp_path: Path,
+) -> None:
+    raw_credential_error = f"resolver failed for {_CREDENTIAL_REF} {_TOKEN}"
+    resolver = _FakeResolver(error=RuntimeError(raw_credential_error))
+    _, _, api, _, runtime, _ = _setup_moderation(tmp_path, resolver=resolver)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-42", "hide")
+
+    assert caught.value.code == "THREADS_CREDENTIAL_SECRET_UNAVAILABLE"
+    assert raw_credential_error not in str(caught.value)
+    assert api.calls == []
+    assert resolver.calls == [_CREDENTIAL_REF]
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_moderation_missing_account_creates_no_journal_or_api_call(tmp_path: Path) -> None:
+    _, _, api, resolver, runtime, _ = _setup_moderation(tmp_path)
+
+    with pytest.raises(StandaloneAccountError) as caught:
+        await runtime.moderate_reply("missing", "reply-target-42", "hide")
+
+    assert caught.value.code == "ACCOUNT_NOT_FOUND"
+    assert resolver.calls == []
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ThreadsAPIError("THREADS_RATE_LIMITED"),
+        ThreadsAPIError("THREADS_SERVER_ERROR"),
+        ThreadsTransportError(),
+        ThreadsContractError(),
+        RuntimeError("raw moderation response sentinel"),
+    ],
+)
+async def test_moderation_api_uncertainty_is_ambiguous_without_retry(
+    tmp_path: Path,
+    failure: BaseException,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup_moderation(tmp_path, failure=failure)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-sentinel-42", "approve")
+
+    assert caught.value.code == "MODERATION_OUTCOME_AMBIGUOUS"
+    assert caught.value.operation_id is not None
+    assert len(api.calls) == 1
+    assert api.calls[0][0] == "manage_pending_reply"
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.action == "approve"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text()
+    for forbidden in (
+        "reply-target-sentinel-42",
+        _TOKEN,
+        _CREDENTIAL_REF,
+        "raw moderation response sentinel",
+        "Authorization",
+    ):
+        assert forbidden not in journal
+
+
+@pytest.mark.asyncio
+async def test_moderation_cancellation_after_boundary_is_ambiguous(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup_moderation(
+        tmp_path,
+        failure=asyncio.CancelledError("private moderation cancellation"),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-42", "hide")
+
+    assert caught.value.code == "MODERATION_OUTCOME_AMBIGUOUS"
+    assert caught.value.operation_id is not None
+    assert len(api.calls) == 1
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "AMBIGUOUS"
+
+
+@pytest.mark.asyncio
+async def test_moderation_base_exception_marks_ambiguous_then_reraises(tmp_path: Path) -> None:
+    failure = _InjectedModerationBaseException("private moderation interruption")
+    _, operations, api, _, runtime, _ = _setup_moderation(tmp_path, failure=failure)
+
+    with pytest.raises(_InjectedModerationBaseException):
+        await runtime.moderate_reply("alice", "reply-target-42", "unhide")
+
+    assert len(api.calls) == 1
+    operation = _only_operation(operations, tmp_path)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.action == "unhide"
+
+
+@pytest.mark.asyncio
+async def test_moderation_invalid_success_result_is_ambiguous(tmp_path: Path) -> None:
+    _, operations, api, _, runtime, _ = _setup_moderation(
+        tmp_path,
+        response={"body": "raw response sentinel", "header": "private-header"},
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-sentinel-42", "ignore")
+
+    assert caught.value.code == "MODERATION_OUTCOME_AMBIGUOUS"
+    assert caught.value.operation_id is not None
+    assert len(api.calls) == 1
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text()
+    assert "raw response sentinel" not in journal
+    assert "private-header" not in journal
+    assert "reply-target-sentinel-42" not in journal
+
+
+@pytest.mark.asyncio
+async def test_moderation_requested_is_durable_before_api_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup_moderation(tmp_path)
+    updates: list[tuple[str, str]] = []
+    original_update = operations.update
+
+    def record_update(operation: LocalOperation) -> LocalOperation:
+        current = operations.get(operation.id)
+        updates.append((current.phase, operation.phase))
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", record_update)
+
+    await runtime.moderate_reply("alice", "reply-target-42", "approve")
+
+    assert updates == [("RECEIVED", "MUTATION_REQUESTED"), ("MUTATION_REQUESTED", "CONFIRMED")]
+    assert api.snapshots[0].phase == "MUTATION_REQUESTED"
+
+
+@pytest.mark.asyncio
+async def test_moderation_requested_persist_failure_makes_no_remote_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup_moderation(tmp_path)
+    original_update = operations.update
+
+    def fail_requested(operation: LocalOperation) -> LocalOperation:
+        if operation.phase == "MUTATION_REQUESTED":
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_requested)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-42", "approve")
+
+    assert caught.value.code == "OPERATION_STATE_INVALID"
+    assert caught.value.operation_id is not None
+    assert api.calls == []
+    operation = operations.get(caught.value.operation_id)
+    assert operation.phase == "RECEIVED"
+
+
+@pytest.mark.asyncio
+async def test_moderation_confirmation_journal_failure_is_ambiguous_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup_moderation(tmp_path)
+    original_update = operations.update
+
+    def fail_confirmed(operation: LocalOperation) -> LocalOperation:
+        if operation.phase == "CONFIRMED":
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_confirmed)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.moderate_reply("alice", "reply-target-42", "ignore")
+
+    assert caught.value.code == "MODERATION_OUTCOME_AMBIGUOUS"
+    assert caught.value.operation_id is not None
+    assert len(api.calls) == 1
+    assert operations.get(caught.value.operation_id).phase == "MUTATION_REQUESTED"
+
+
+def test_moderation_journal_action_and_kind_are_immutable(tmp_path: Path) -> None:
+    store = LocalOperationStore(tmp_path)
+    account_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    operation = store.create_received(
+        account_id,
+        kind="MODERATE_REPLY",
+        action="hide",
+    )
+
+    with pytest.raises(StandaloneMutationError) as action_error:
+        store.update(replace(operation, action="unhide"))
+    with pytest.raises(StandaloneMutationError) as kind_error:
+        store.update(replace(operation, kind="POST_TEXT", action=None))
+    assert action_error.value.code == "OPERATION_STATE_INVALID"
+    assert kind_error.value.code == "OPERATION_STATE_INVALID"
+    requested = store.update(replace(operation, phase="MUTATION_REQUESTED"))
+    confirmed = store.update(replace(requested, phase="CONFIRMED"))
+    assert store.get(operation.id) == confirmed
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["POST_TEXT", "CREATE_REPLY", "POST_IMAGE", "POST_VIDEO", "POST_CAROUSEL"],
+)
+def test_publish_journals_reject_moderation_phase_and_action_metadata(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    store = LocalOperationStore(tmp_path)
+    operation = store.create_received(
+        UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        kind=kind,
+    )
+
+    for replacement in (
+        replace(operation, phase="MUTATION_REQUESTED"),
+        replace(operation, phase="CONFIRMED"),
+        replace(operation, action="hide"),
+    ):
+        with pytest.raises(StandaloneMutationError) as caught:
+            store.update(replacement)
+        assert caught.value.code == "OPERATION_STATE_INVALID"
+        assert store.get(operation.id) == operation
+
+    journal_path = tmp_path / "operations" / f"{operation.id}.json"
+    data = cast(dict[str, object], json.loads(journal_path.read_text(encoding="utf-8")))
+    data["action"] = "hide"
+    journal_path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(StandaloneMutationError) as caught:
+        store.get(operation.id)
+    assert caught.value.code == "OPERATION_STATE_INVALID"
+
+
+def test_legacy_carousel_journal_without_moderation_action_is_readable(tmp_path: Path) -> None:
+    store = LocalOperationStore(tmp_path)
+    operation_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    account_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    operations_path = tmp_path / "operations"
+    operations_path.mkdir()
+    (operations_path / f"{operation_id}.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "id": str(operation_id),
+                "account_id": str(account_id),
+                "kind": "POST_CAROUSEL",
+                "phase": "CHILDREN_CREATING",
+                "child_container_ids": ["carousel-child-legacy"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    operation = store.get(operation_id)
+
+    assert operation.version == 1
+    assert operation.kind == "POST_CAROUSEL"
+    assert operation.phase == "CHILDREN_CREATING"
+    assert operation.child_container_ids == ("carousel-child-legacy",)
+    assert operation.action is None

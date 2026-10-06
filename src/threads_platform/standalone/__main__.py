@@ -46,6 +46,7 @@ from threads_platform.standalone.mutations import (
     StandaloneMutationError,
     load_carousel_manifest,
     validate_media_post_inputs,
+    validate_reply_moderation_inputs,
 )
 from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
 from threads_platform.standalone.workflows import (
@@ -251,6 +252,28 @@ async def _run_reply_command(
         return f"replied operation={result.operation_id} reply={result.reply_id}\n"
 
 
+async def _run_moderate_reply_command(
+    alias: str,
+    reply_id: str,
+    action: str,
+    root: Path,
+    store: LocalAccountStore,
+) -> str:
+    settings = Settings()
+    async with build_threads_http_client(settings) as client:
+        api = HttpThreadsAPI(client)
+        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
+        runtime = LocalThreadsMutationRuntime(
+            root,
+            store,
+            api,
+            secret_resolver,
+            LocalOperationStore(root),
+        )
+        result = await runtime.moderate_reply(alias, reply_id, action)
+    return f"moderated operation={result.operation_id} action={result.action}\n"
+
+
 async def _run_media_post_command(
     args: argparse.Namespace,
     root: Path,
@@ -427,6 +450,10 @@ def _build_parser() -> argparse.ArgumentParser:
     reply_parser.add_argument("thread_id")
     reply_parser.add_argument("text")
     reply_parser.add_argument("--parent-reply-id")
+    moderation_parser = commands.add_parser("moderate-reply")
+    moderation_parser.add_argument("alias")
+    moderation_parser.add_argument("reply_id")
+    moderation_parser.add_argument("action")
     image_parser = commands.add_parser("post-image")
     image_parser.add_argument("alias")
     image_parser.add_argument("image_url")
@@ -473,6 +500,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.write(output)
             return 0
 
+        if args.command == "moderate-reply":
+            reply_id, action = validate_reply_moderation_inputs(args.reply_id, args.action)
+            root = resolve_standalone_data_root()
+            store = LocalAccountStore(root)
+            store.get(args.alias)
+            output = asyncio.run(
+                _run_moderate_reply_command(args.alias, reply_id, action, root, store)
+            )
+            sys.stdout.write(output)
+            return 0
+
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
         if args.command == "account":
@@ -504,11 +542,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if operation.kind == "POST_CAROUSEL"
                 else ""
             )
+            moderation_summary = (
+                f" action={operation.action}" if operation.kind == "MODERATE_REPLY" else ""
+            )
             sys.stdout.write(
                 f"operation {operation.id} kind={operation.kind} phase={operation.phase} "
                 f"container={operation.container_id or '-'} "
                 f"media={operation.media_id or '-'} "
-                f"outcome={operation.outcome_code or '-'}{child_summary}\n"
+                f"outcome={operation.outcome_code or '-'}"
+                f"{child_summary}{moderation_summary}\n"
             )
             return 0
 
