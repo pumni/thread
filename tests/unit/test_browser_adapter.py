@@ -716,11 +716,18 @@ def test_playwright_feed_scan_returns_only_bounded_post_permalinks(
             )
         await session.close()
 
-        assert len(normalized) == 1
-        assert normalized[0].thread_ref == "https://www.threads.com/@alice/post/post-1"
+        assert len(normalized) == 2
+        assert [item.thread_ref for item in normalized] == [
+            "https://www.threads.com/@alice/post/post-1",
+            "https://www.threads.com/@alice/post/post-2",
+        ]
         assert normalized[0].author_username == "alice"
         assert normalized[0].text_excerpt is None
-        assert permalinks == ("/@alice/post/post-1",)
+        assert permalinks == (
+            "/@alice/post/post-1",
+            "/@alice/post/post-1",
+            "/@alice/post/post-2",
+        )
 
     asyncio.run(scenario())
 
@@ -1641,10 +1648,11 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/feed": (
         b"<!doctype html><html><body><section><div>"
         b'<a href="/@alice/post/post-1">permalink</a>'
+        b'<a href="/@alice/post/post-1?xmt=tracking#fragment">decorated permalink</a>'
+        b'<a href="/@alice/post/post-2#fragment">fragment permalink</a>'
         b'<a href="/@alice/">author</a>'
         b'<div dir="auto">Synthetic   public text</div>'
         b'<a href="https://example.test/@mallory/post/off-origin">external</a>'
-        b'<a href="/@alice/post/post-query?source=feed">query</a>'
         b"</div></section></body></html>"
     ),
     "/feed-over-bound": _profile_document(

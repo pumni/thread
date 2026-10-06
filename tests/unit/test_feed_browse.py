@@ -48,6 +48,9 @@ def test_feed_permalinks_normalize_and_skip_invalid_individual_hrefs() -> None:
         (
             "https://www.threads.com/@Alice/post/post-1/",
             "/@alice/post/post-1",
+            "/@alice/post/post-1?xmt=anything",
+            "/@alice/post/post-1#fragment",
+            "https://www.threads.com/@alice/post/post-1?x=1#fragment",
             "/@bob/post/post-2",
             "/@alice/post/post-query?source=feed",
             "https://example.test/@mallory/post/off-origin",
@@ -60,6 +63,7 @@ def test_feed_permalinks_normalize_and_skip_invalid_individual_hrefs() -> None:
     assert [(item.thread_ref, item.author_username, item.position) for item in normalized] == [
         ("https://www.threads.com/@alice/post/post-1", "alice", 0),
         ("https://www.threads.com/@bob/post/post-2", "bob", 1),
+        ("https://www.threads.com/@alice/post/post-query", "alice", 2),
     ]
     assert all(item.text_excerpt is None for item in normalized)
 
@@ -330,13 +334,13 @@ async def test_feed_worker_intervenes_on_session_transition_after_navigation() -
 
 
 @pytest.mark.asyncio
-async def test_feed_worker_checks_one_followup_when_no_usable_permalink_is_found() -> None:
+async def test_feed_worker_uses_full_bounded_window_before_empty_feed_intervention() -> None:
     worker_id, account_id = uuid4(), uuid4()
     client = _MemoryControl(worker_id, account_id)
     manager = _MemorySessionManager(
         worker_id,
         account_id,
-        batches=[(), ("/not-a-thread",)],
+        batches=[(), (), (), (), ()],
     )
     handler = BrowserFeedBrowseWorker(
         worker_id,
@@ -348,10 +352,42 @@ async def test_feed_worker_checks_one_followup_when_no_usable_permalink_is_found
 
     assert client.snapshot.status is WorkerJobStatus.WAITING_INTERVENTION
     assert client.interventions == [("REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN")]
-    assert manager.session.collect_count == 2
-    assert manager.session.scroll_count == 1
+    assert manager.session.collect_count == FEED_ITERATION_BOUND == 5
+    assert manager.session.scroll_count == FEED_ITERATION_BOUND - 1 == 4
     assert client.completed_result is None
     assert client.failures == []
+    await handler.aclose()
+
+
+@pytest.mark.asyncio
+async def test_feed_worker_succeeds_when_valid_permalink_appears_later() -> None:
+    worker_id, account_id = uuid4(), uuid4()
+    client = _MemoryControl(worker_id, account_id, max_items=1)
+    manager = _MemorySessionManager(
+        worker_id,
+        account_id,
+        batches=[(), (), (_candidate("late-post"),)],
+    )
+    handler = BrowserFeedBrowseWorker(
+        worker_id,
+        cast(FeedWorkerControlClient, client),
+        cast(FeedBrowserSessionManager, manager),
+    )
+
+    await handler(client.snapshot)
+
+    assert client.snapshot.status is WorkerJobStatus.SUCCEEDED
+    assert manager.session.collect_count == 3
+    assert manager.session.scroll_count == 2
+    assert client.completed_result is not None
+    assert client.completed_result["observations"] == [
+        {
+            "thread_ref": f"{BROWSER_FEED_ORIGIN}/@alice/post/late-post",
+            "author_username": "alice",
+            "text_excerpt": None,
+            "position": 0,
+        }
+    ]
     await handler.aclose()
 
 

@@ -59,7 +59,7 @@ _FEED_SCAN_SCRIPT = r"""
     if (typeof href !== 'string') continue;
     try {
       const url = new URL(href, window.location.href);
-      if (url.origin !== allowedOrigin || url.search || url.hash) continue;
+      if (url.origin !== allowedOrigin) continue;
       if (!/^\/@[A-Za-z0-9._]{1,30}\/post\/[A-Za-z0-9_-]{1,120}\/?$/.test(url.pathname)) {
         continue;
       }

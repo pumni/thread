@@ -95,8 +95,6 @@ def _thread_reference(href: object) -> tuple[str, str] | None:
             return None
     elif parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
         return None
-    if parsed.query or parsed.fragment:
-        return None
     match = _THREAD_REF.fullmatch(parsed.path)
     if match is None:
         return None

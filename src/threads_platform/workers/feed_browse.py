@@ -217,12 +217,12 @@ class BrowserFeedBrowseWorker:
                 if observations:
                     truncated = True
                     break
-                if iteration == 0:
-                    continue
-                await execution.request_intervention(
-                    "REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN"
-                )
-                return
+                if iteration == FEED_ITERATION_BOUND - 1:
+                    await execution.request_intervention(
+                        "REMOTE_STATE_UNCERTAIN", "REMOTE_STATE_UNCERTAIN"
+                    )
+                    return
+                continue
             if iteration == FEED_ITERATION_BOUND - 1:
                 truncated = True
 

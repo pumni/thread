@@ -514,22 +514,65 @@ async def test_browse_feed_deduplicates_across_iterations_and_enforces_limit(
 
 
 @pytest.mark.asyncio
-async def test_browse_feed_checks_one_followup_before_empty_result_fails_safely(
+async def test_browse_feed_uses_full_bounded_window_before_empty_result_fails_safely(
     tmp_path: Path,
 ) -> None:
     store = LocalAccountStore(tmp_path)
     account = store.add("alice")
     (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
-    session = _FakeSession(feed_batches=[(), ("/not-a-thread",)])
+    session = _FakeSession(feed_batches=[(), (), (), (), ()])
     engine = _FakeEngine(session=session)
 
     with pytest.raises(StandaloneRuntimeError, match="^REMOTE_STATE_UNCERTAIN$"):
         await LocalRuntime(tmp_path, store, engine).browse_feed("alice", 3)
 
+    assert session.collect_calls == BROWSER_FEED_ITERATION_BOUND == 5
+    assert session.scroll_calls == BROWSER_FEED_ITERATION_BOUND - 1 == 4
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(tmp_path, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_succeeds_when_valid_permalink_appears_later(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    store = LocalAccountStore(root)
+    account = store.add("alice")
+    (root / "profiles" / str(account.id)).mkdir(parents=True)
+    session = _FakeSession(feed_batches=[(), (), (_feed_candidate("late-post"),)])
+    engine = _FakeEngine(session=session)
+
+    result = await LocalRuntime(root, store, engine).browse_feed("alice", 1)
+
+    assert len(result.observations) == 1
+    assert result.observations[0].thread_ref == f"{BROWSER_FEED_ORIGIN}/@alice/post/late-post"
+    assert session.collect_calls == 3
+    assert session.scroll_calls == 2
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(root, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_stops_truncated_after_a_batch_has_no_new_items(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    store = LocalAccountStore(root)
+    account = store.add("alice")
+    (root / "profiles" / str(account.id)).mkdir(parents=True)
+    item = _feed_candidate("post-1")
+    session = _FakeSession(feed_batches=[(item,), (f"{item}?tracking=1",)])
+    engine = _FakeEngine(session=session)
+
+    result = await LocalRuntime(root, store, engine).browse_feed("alice", 3)
+
+    assert len(result.observations) == 1
+    assert result.truncated is True
     assert session.collect_calls == 2
     assert session.scroll_calls == 1
     assert session.close_calls == 1
-    _assert_lock_can_be_acquired(tmp_path, account)
+    _assert_lock_can_be_acquired(root, account)
 
 
 @pytest.mark.asyncio

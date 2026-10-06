@@ -197,9 +197,9 @@ class LocalRuntime:
                             if observations:
                                 truncated = True
                                 break
-                            if iteration == 0:
-                                continue
-                            raise RemoteSessionStateUncertain()
+                            if iteration == BROWSER_FEED_ITERATION_BOUND - 1:
+                                raise RemoteSessionStateUncertain()
+                            continue
                         if iteration == BROWSER_FEED_ITERATION_BOUND - 1:
                             truncated = True
 
