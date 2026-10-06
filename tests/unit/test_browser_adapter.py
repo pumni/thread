@@ -643,6 +643,9 @@ def test_playwright_profile_open_uses_unique_bounded_header_association(
     synthetic_origin: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_TIMEOUT_SECONDS", 0.08)
+    monkeypatch.setattr(playwright_engine, "_PROFILE_READINESS_POLL_SECONDS", 0.005)
+
     async def verify(
         path: str,
         target_ref: str,
@@ -650,8 +653,15 @@ def test_playwright_profile_open_uses_unique_bounded_header_association(
         error: type[Exception] | None = None,
         ancestor_bound: int = 8,
         expected_origin: str | None = None,
+        readiness_timeout_seconds: float | None = None,
     ) -> None:
         monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        if readiness_timeout_seconds is not None:
+            monkeypatch.setattr(
+                playwright_engine,
+                "_PROFILE_READINESS_TIMEOUT_SECONDS",
+                readiness_timeout_seconds,
+            )
         profile_directory = tmp_path / f"profile-open-{uuid4()}"
         profile_directory.mkdir()
         session = await PlaywrightBrowserEngine(navigation_timeout_ms=1_000).open(
@@ -733,6 +743,11 @@ def test_playwright_profile_open_uses_unique_bounded_header_association(
             error=BrowserContractError,
         )
         await verify("/@alice/extended", target, error=RemoteSessionStateUncertain)
+        await verify(
+            "/@delayedprofile",
+            "/@delayedprofile",
+            readiness_timeout_seconds=0.75,
+        )
 
     asyncio.run(scenario())
 
@@ -1497,6 +1512,16 @@ _SYNTHETIC_DOCUMENTS: dict[str, bytes] = {
     "/@duph1": _profile_document(
         b"<header><div><h1>First profile</h1><h1>Second profile</h1>"
         b'<a href="/@duph1">profile identity</a></div></header>'
+    ),
+    "/@delayedprofile": _profile_document(
+        b"""<main id="delayed-profile"></main><script>
+        setTimeout(() => {
+          const header = document.createElement("div");
+          header.innerHTML = '<h1>Delayed profile</h1>' +
+            '<a href="/@delayedprofile">profile identity</a>';
+          document.getElementById("delayed-profile").append(header);
+        }, 100);
+        </script>"""
     ),
     "/@ambiguousheaders": _profile_document(
         b"<section><div><h1>First profile</h1>"

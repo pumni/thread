@@ -186,6 +186,9 @@ _THREAD_OPEN_SCRIPT = r"""
 }
 """
 
+_PROFILE_READINESS_TIMEOUT_SECONDS = 2.0
+_PROFILE_READINESS_POLL_SECONDS = 0.05
+
 _PROFILE_OPEN_SCRIPT = r"""
 ({allowedOrigin, targetRef, ancestorBound}) => {
   const normalizePath = (path) => path.endsWith('/') ? path.slice(0, -1) : path;
@@ -497,18 +500,37 @@ class _PlaywrightBrowserSession:
             or re.fullmatch(r"/@[A-Za-z0-9._]{1,30}", target_ref) is None
         ):
             raise BrowserContractError()
+        loop = asyncio.get_running_loop()
+        readiness_timeout_seconds = min(
+            _PROFILE_READINESS_TIMEOUT_SECONDS,
+            self._navigation_timeout_ms / 1000,
+        )
+        deadline = loop.time() + readiness_timeout_seconds
+        script_args = {
+            "allowedOrigin": BROWSER_FEED_ORIGIN,
+            "targetRef": target_ref,
+            "ancestorBound": ancestor_bound,
+        }
         try:
-            payload = await self._page.evaluate(
-                _PROFILE_OPEN_SCRIPT,
-                {
-                    "allowedOrigin": BROWSER_FEED_ORIGIN,
-                    "targetRef": target_ref,
-                    "ancestorBound": ancestor_bound,
-                },
-            )
+            payload = await self._page.evaluate(_PROFILE_OPEN_SCRIPT, script_args)
         except PlaywrightError:
             self._ensure_alive()
             raise BrowserRuntimeUnavailable("BROWSER_PROFILE_INSPECTION_FAILED") from None
+
+        while payload != {"outcome": "recognized"}:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_PROFILE_READINESS_POLL_SECONDS, remaining))
+            if loop.time() >= deadline:
+                break
+            try:
+                payload = await self._page.evaluate(_PROFILE_OPEN_SCRIPT, script_args)
+            except PlaywrightError:
+                self._ensure_alive()
+                raise BrowserRuntimeUnavailable("BROWSER_PROFILE_INSPECTION_FAILED") from None
+            if payload == {"outcome": "recognized"}:
+                return
         _verify_profile_target_result(payload)
 
     async def prepare_media_composer(self) -> PreparedMediaComposer | None:
