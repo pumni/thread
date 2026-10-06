@@ -38,6 +38,7 @@ from threads_platform.standalone.api import (
     build_threads_http_client,
 )
 from threads_platform.standalone.mutations import (
+    CreatedReplyResult,
     LocalOperationStore,
     LocalThreadsMutationRuntime,
     StandaloneMutationError,
@@ -221,6 +222,31 @@ async def _run_post_command(
         return f"published operation={result.operation_id} media={result.media_id}\n"
 
 
+async def _run_reply_command(
+    args: argparse.Namespace,
+    root: Path,
+    store: LocalAccountStore,
+) -> str:
+    settings = Settings()
+    async with build_threads_http_client(settings) as client:
+        api = HttpThreadsAPI(client)
+        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
+        runtime = LocalThreadsMutationRuntime(
+            root,
+            store,
+            api,
+            secret_resolver,
+            LocalOperationStore(root),
+        )
+        result: CreatedReplyResult = await runtime.create_reply(
+            args.alias,
+            args.thread_id,
+            args.text,
+            parent_reply_id=args.parent_reply_id,
+        )
+        return f"replied operation={result.operation_id} reply={result.reply_id}\n"
+
+
 async def _run_workflow_command(
     plan: WorkflowPlan,
     root: Path,
@@ -331,6 +357,11 @@ def _build_parser() -> argparse.ArgumentParser:
     post_parser = commands.add_parser("post")
     post_parser.add_argument("alias")
     post_parser.add_argument("text")
+    reply_parser = commands.add_parser("reply")
+    reply_parser.add_argument("alias")
+    reply_parser.add_argument("thread_id")
+    reply_parser.add_argument("text")
+    reply_parser.add_argument("--parent-reply-id")
 
     workflow_parser = commands.add_parser("workflow")
     workflow_commands = workflow_parser.add_subparsers(dest="workflow_command", required=True)
@@ -392,6 +423,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "post":
             output = asyncio.run(_run_post_command(args, root, store))
+            sys.stdout.write(output)
+            return 0
+
+        if args.command == "reply":
+            output = asyncio.run(_run_reply_command(args, root, store))
             sys.stdout.write(output)
             return 0
 
