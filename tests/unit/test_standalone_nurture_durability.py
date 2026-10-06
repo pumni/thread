@@ -674,6 +674,52 @@ def test_target_operation_link_is_local_and_confirmation_requires_it(tmp_path: P
         assert owner.get_targets(preset)[0].last_operation_id == operation_id
 
 
+def test_ambiguous_target_requires_operation_id_and_failed_completion_stays_pending(
+    tmp_path: Path,
+) -> None:
+    store, account_id, preset = _setup(tmp_path)
+    fingerprint = fingerprint_remote_thread("ambiguous-operation-link-target")
+    operation_id = uuid4()
+    with store.acquire_account_lock(account_id) as owner:
+        run = owner.start_run(preset, now=_START)
+        pending = owner.reserve_target(preset, fingerprint, run.receipt.id, _DECISION, now=_START)
+        assert pending.action_state == "PENDING"
+        assert pending.last_operation_id is None
+
+        with pytest.raises(NurtureStateError) as caught:
+            owner.complete_target_action(
+                preset,
+                fingerprint,
+                run.receipt.id,
+                "AMBIGUOUS",
+                None,
+                now=_START + timedelta(seconds=1),
+            )
+        _assert_code(caught, "NURTURE_STATE_INVALID")
+
+        persisted = owner.get_targets(preset)[0]
+        assert persisted.action_state == "PENDING"
+        assert persisted.last_operation_id is None
+
+        with pytest.raises(NurtureStateError) as caught:
+            replace(pending, action_state="AMBIGUOUS")
+        _assert_code(caught, "NURTURE_STATE_INVALID")
+
+        ambiguous = owner.complete_target_action(
+            preset,
+            fingerprint,
+            run.receipt.id,
+            "AMBIGUOUS",
+            operation_id,
+            now=_START + timedelta(seconds=2),
+        )
+        assert ambiguous.action_state == "AMBIGUOUS"
+        assert ambiguous.last_operation_id == operation_id
+        persisted = owner.get_targets(preset)[0]
+        assert persisted.action_state == "AMBIGUOUS"
+        assert persisted.last_operation_id == operation_id
+
+
 def test_preset_and_account_path_identity_rejects_traversal(tmp_path: Path) -> None:
     store, account_id, preset = _setup(tmp_path)
     with pytest.raises(NurtureStateError):

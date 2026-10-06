@@ -787,7 +787,7 @@ class NurtureAccountLock:
             raise NurtureStateError("NURTURE_STATE_INVALID")
         if operation_id is not None:
             _validate_uuid(operation_id, version=4)
-        if action_state == "CONFIRMED" and operation_id is None:
+        if action_state in {"CONFIRMED", "AMBIGUOUS"} and operation_id is None:
             raise NurtureStateError("NURTURE_STATE_INVALID")
         action_at = _as_utc(datetime.now(UTC) if now is None else now)
         document = self._store.load_target_state(self, validated_preset)
@@ -1033,7 +1033,7 @@ def _validate_target(target: NurtureTargetV1) -> None:
         raise NurtureStateError("NURTURE_STATE_INVALID")
     if target.action_state == "PENDING" and target.last_operation_id is not None:
         raise NurtureStateError("NURTURE_STATE_INVALID")
-    if target.action_state == "CONFIRMED" and target.last_operation_id is None:
+    if target.action_state in {"CONFIRMED", "AMBIGUOUS"} and target.last_operation_id is None:
         raise NurtureStateError("NURTURE_STATE_INVALID")
 
 
