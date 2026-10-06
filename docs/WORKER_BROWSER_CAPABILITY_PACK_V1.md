@@ -106,8 +106,8 @@ anchors are allowed only if every anchor resolves to the same root association.
 Competing roots, a reply permalink/author in the candidate association, missing
 author or text evidence, and evidence beyond the bound fail closed.
 
-Redirects, page-initiated off-origin navigation, an exact pathname mismatch, or
-a loaded target without the reviewed target href create durable
+Off-origin redirects, page-initiated off-origin navigation, an exact pathname
+mismatch, or a loaded target without the reviewed target href create durable
 `REMOTE_STATE_UNCERTAIN` intervention. Known persisted login, expired-session,
 and challenge states use their existing durable interventions. No new login or
 challenge selector is inferred. Canonical metadata, `main`, `article`, generated
@@ -134,12 +134,15 @@ closed before file selection.
 All capabilities require the existing C3 managed account session to be
 `AUTHENTICATED`. The declared session interventions are `LOGIN_REQUIRED`,
 `SESSION_EXPIRED`, and `CHALLENGE_REQUIRED`. Feed browse, thread open, profile
-open, and local upload permit `REMOTE_STATE_UNCERTAIN`. If an authenticated feed navigation receives a
-redirect, it is blocked before following and requests durable
-`REMOTE_STATE_UNCERTAIN` intervention. A bounded read with no reviewed permalink
-candidates does the same, including when the feed may simply be exhausted; the
-available production evidence cannot distinguish that from a remote session
-transition. This path does not guess a login or challenge selector. Malformed,
+open, and local upload permit `REMOTE_STATE_UNCERTAIN`. Same-origin redirects
+use normal browser handling. A navigation that settles on an off-origin page
+fails with durable `REMOTE_STATE_UNCERTAIN` before any semantic read; direct
+page-initiated off-origin requests are aborted by the navigation guard. The
+final page origin and every semantic read are checked against the same
+allowlist. A bounded read with no reviewed permalink candidates does the same,
+including when the feed may simply be exhausted; the available production
+evidence cannot distinguish that from a remote session transition. This path
+does not guess a login or challenge selector. Malformed,
 ambiguous, or over-bound feed association evidence remains a fail-closed
 contract failure. Thread open applies its target path, anchor, author, and text
 checks under the same durable WorkerJob intervention and lease fencing. Profile
@@ -238,10 +241,11 @@ deduplicates by normalized Thread reference within the job. Each feed iteration
 scans at most 100 candidate permalink anchors; the page scan fails closed above
 1,000 anchor nodes. Five total feed iterations include the initial read and at
 most four fixed viewport scrolls. The WorkerJob input stores only the validated
-`max_items` bound. Top-level requests are fetched with redirects disabled and
-only an allowlisted response is fulfilled into the browser. A persistent guard
-rejects later top-level navigation attempts; service workers are blocked so
-they cannot bypass it. No Like, Reply, Repost, Share, Create, Publish, or Submit
+`max_items` bound. Chromium handles normal navigation and same-origin redirects.
+The adapter rejects initial and direct top-level requests outside the approved
+origin, checks the final page origin after navigation, and rechecks the current
+origin before each semantic read. Service workers are blocked so they cannot
+bypass this guard. No Like, Reply, Repost, Share, Create, Publish, or Submit
 action is invoked.
 
 Migration `20260928_0010` adds durable WorkerJob input data. Its downgrade refuses

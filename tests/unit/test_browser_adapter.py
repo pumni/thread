@@ -14,8 +14,10 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import pytest
+from playwright.async_api import Page
 
 import threads_platform.infrastructure.browser.playwright_engine as playwright_engine
+from threads_platform.application.browser_read_semantics import normalize_feed_candidates
 from threads_platform.application.ports.browser import (
     BrowserAdapterError,
     BrowserContractError,
@@ -72,7 +74,6 @@ from threads_platform.workers.browser import (
     WorkerJobRetrySafetyViolation,
     classify_browser_surface,
 )
-from threads_platform.workers.feed_browse import normalize_feed_candidates
 from threads_platform.workers.sessions import (
     BrowserSessionOpenResult,
     LocalBrowserSessionManager,
@@ -122,7 +123,24 @@ def synthetic_origin(
                 self.send_response(302)
                 self.send_header(
                     "Location",
-                    f"http://localhost:{server.server_address[1]}/redirect-target",
+                    f"http://localhost:{server.server_address[1]}"
+                    "/redirect-target?location-query-sentinel",
+                )
+                self.end_headers()
+                return
+            if path == "/redirect-same":
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://{server.server_address[0]}:{server.server_address[1]}/redirect-middle",
+                )
+                self.end_headers()
+                return
+            if path == "/redirect-middle":
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://{server.server_address[0]}:{server.server_address[1]}/redirect-target",
                 )
                 self.end_headers()
                 return
@@ -249,7 +267,7 @@ def test_playwright_managed_profile_contract_navigation_and_cleanup(
     asyncio.run(scenario())
 
 
-def test_playwright_redirect_requests_intervention_without_following_target(
+def test_playwright_same_origin_redirects_are_followed_by_the_browser(
     tmp_path: Path,
     synthetic_origin: str,
     synthetic_redirect_target_requests: list[str],
@@ -265,14 +283,92 @@ def test_playwright_redirect_requests_intervention_without_following_target(
             )
         )
         try:
-            with pytest.raises(RemoteSessionStateUncertain):
+            await session.navigate(
+                f"{synthetic_origin}/redirect-same",
+                allowed_origins=frozenset({synthetic_origin}),
+            )
+            assert cast(Any, session)._page.url == f"{synthetic_origin}/redirect-target"
+        finally:
+            await session.close()
+        assert synthetic_redirect_target_requests == ["/redirect-target"]
+
+    asyncio.run(scenario())
+
+
+def test_playwright_rejects_initial_navigation_outside_allowlist(
+    tmp_path: Path,
+    synthetic_origin: str,
+) -> None:
+    async def scenario() -> None:
+        profile_directory = tmp_path / "off-origin-profile"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine(navigation_timeout_ms=1_000).open(
+            BrowserLaunchRequest(
+                profile_directory=profile_directory,
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        try:
+            with pytest.raises(UnsupportedUIState):
                 await session.navigate(
-                    f"{synthetic_origin}/redirect-out",
+                    "https://example.test/",
                     allowed_origins=frozenset({synthetic_origin}),
                 )
         finally:
             await session.close()
-        assert synthetic_redirect_target_requests == []
+
+    asyncio.run(scenario())
+
+
+def test_off_origin_redirect_fails_closed_and_navigation_state_resets(
+    tmp_path: Path,
+    synthetic_origin: str,
+    synthetic_redirect_target_requests: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(playwright_engine, "BROWSER_FEED_ORIGIN", synthetic_origin)
+        profile_directory = tmp_path / "redirect-profile"
+        profile_directory.mkdir()
+        session = await PlaywrightBrowserEngine(navigation_timeout_ms=5_000).open(
+            BrowserLaunchRequest(
+                profile_directory=profile_directory,
+                network_route=BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None),
+                headless=True,
+            )
+        )
+        allowed_origins = frozenset({synthetic_origin})
+        try:
+            with pytest.raises(RemoteSessionStateUncertain) as error:
+                await session.navigate(
+                    f"{synthetic_origin}/redirect-out?requested-query-sentinel",
+                    allowed_origins=allowed_origins,
+                )
+            assert str(error.value) == "REMOTE_STATE_UNCERTAIN"
+            with pytest.raises(RemoteSessionStateUncertain):
+                await cast(BrowserThreadOpenEngineSession, session).verify_thread_target(
+                    target_ref="/@alice/post/post-1",
+                    author_username="alice",
+                    ancestor_bound=8,
+                )
+
+            await session.navigate(
+                f"{synthetic_origin}/@alice/post/post-1",
+                allowed_origins=allowed_origins,
+            )
+            await cast(BrowserThreadOpenEngineSession, session).verify_thread_target(
+                target_ref="/@alice/post/post-1",
+                author_username="alice",
+                ancestor_bound=8,
+            )
+        finally:
+            await session.close()
+
+        assert synthetic_redirect_target_requests == ["/redirect-target"]
+        assert "requested-query-sentinel" not in caplog.text
+        assert "location-query-sentinel" not in caplog.text
 
     asyncio.run(scenario())
 
@@ -460,12 +556,21 @@ def test_page_initiated_off_origin_navigation_blocks_thread_inspection_after_loa
             job_execution=execution,
             headless=True,
         )
+        page = cast(Page, cast(Any, session)._engine_session._page)
+        blocked_navigation = asyncio.create_task(
+            page.wait_for_event(
+                "requestfailed",
+                predicate=lambda request: request.is_navigation_request(),
+                timeout=2_000,
+            )
+        )
         try:
             await session.navigate(
                 f"{synthetic_origin}/delayed-redirect",
                 _local_policy(synthetic_origin),
             )
-            await asyncio.sleep(0.3)
+            request = await blocked_navigation
+            assert request.is_navigation_request()
             with pytest.raises(RemoteSessionStateUncertain):
                 await session.verify_thread_target(
                     target_ref="/@alice/post/post-1",

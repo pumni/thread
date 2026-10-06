@@ -7,8 +7,13 @@ from threading import Event
 import pytest
 
 import threads_platform.standalone.runtime as runtime_module
-from threads_platform.application.browser_capabilities import BrowserTargetOpenResultV1
+from threads_platform.application.browser_capabilities import (
+    BrowserFeedResultV1,
+    BrowserTargetOpenResultV1,
+)
 from threads_platform.application.browser_read_semantics import (
+    BROWSER_FEED_ANCESTOR_BOUND,
+    BROWSER_FEED_ITERATION_BOUND,
     BROWSER_READ_TARGET_ANCESTOR_BOUND,
     normalize_profile_ref,
     normalize_profile_username,
@@ -21,6 +26,8 @@ from threads_platform.application.ports.browser import (
     BrowserLaunchRequest,
     BrowserNetworkProtocol,
     BrowserNetworkRoute,
+    FeedAncestorObservation,
+    FeedCandidateObservation,
 )
 from threads_platform.infrastructure.local.process_lock import FilesystemProcessLock
 from threads_platform.standalone.accounts import LocalAccount, LocalAccountStore
@@ -36,12 +43,18 @@ class _FakeSession:
         thread_error: Exception | None = None,
         navigation_gate: asyncio.Event | None = None,
         navigation_started: asyncio.Event | None = None,
+        feed_batches: list[tuple[FeedCandidateObservation, ...]] | None = None,
+        feed_error: Exception | None = None,
     ) -> None:
         self.close_calls = 0
         self.navigate_calls = 0
         self.navigations: list[tuple[str, frozenset[str]]] = []
         self.profile_verifications: list[tuple[str, int]] = []
         self.thread_verifications: list[tuple[str, str, int]] = []
+        self.feed_batches = feed_batches
+        self.feed_error = feed_error
+        self.collect_calls = 0
+        self.scroll_calls = 0
         self.navigation_error = navigation_error
         self.profile_error = profile_error
         self.thread_error = thread_error
@@ -69,6 +82,21 @@ class _FakeSession:
         self.thread_verifications.append((target_ref, author_username, ancestor_bound))
         if self.thread_error is not None:
             raise self.thread_error
+
+    async def collect_feed_candidates(
+        self, *, ancestor_bound: int
+    ) -> tuple[FeedCandidateObservation, ...]:
+        assert ancestor_bound == BROWSER_FEED_ANCESTOR_BOUND
+        self.collect_calls += 1
+        if self.feed_error is not None:
+            raise self.feed_error
+        batches = self.feed_batches or []
+        if not batches:
+            return ()
+        return batches[min(self.collect_calls - 1, len(batches) - 1)]
+
+    async def scroll_feed(self) -> None:
+        self.scroll_calls += 1
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -102,6 +130,19 @@ def _assert_lock_can_be_acquired(root: Path, account: LocalAccount) -> None:
     lock = FilesystemProcessLock(_lock_path(root, account))
     lock.acquire()
     lock.release()
+
+
+def _feed_candidate(post_id: str, text: str = "bounded feed excerpt") -> FeedCandidateObservation:
+    permalink = f"/@alice/post/{post_id}"
+    return FeedCandidateObservation(
+        permalink_href=permalink,
+        ancestors=(
+            FeedAncestorObservation(
+                hrefs=(permalink, "/@alice/"),
+                text_regions=(text,),
+            ),
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -373,6 +414,200 @@ async def test_open_thread_normalizes_trailing_slash_and_verifies_author_and_bou
     assert session.profile_verifications == []
     assert session.close_calls == 1
     _assert_lock_can_be_acquired(root, account)
+
+
+@pytest.mark.parametrize("max_items", (0, 21, True, "3"))
+@pytest.mark.asyncio
+async def test_invalid_feed_limit_is_rejected_before_account_lookup_or_browser_open(
+    tmp_path: Path,
+    max_items: object,
+) -> None:
+    class NoLookupStore:
+        def get(self, _alias: str) -> LocalAccount:
+            raise AssertionError("invalid feed limit must be rejected before account lookup")
+
+    engine = _FakeEngine()
+    runtime = LocalRuntime(tmp_path, NoLookupStore(), engine)  # type: ignore[arg-type]
+
+    with pytest.raises(StandaloneRuntimeError, match="^INVALID_FEED_LIMIT$"):
+        await runtime.browse_feed("alice", max_items)  # type: ignore[arg-type]
+
+    assert engine.requests == []
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_reuses_headed_direct_account_profile_and_returns_bounded_result(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    store = LocalAccountStore(root)
+    account = store.add("alice")
+    profile_directory = root / "profiles" / str(account.id)
+    profile_directory.mkdir(parents=True)
+    session = _FakeSession(feed_batches=[(_feed_candidate("post-1", "  First   excerpt  "),)])
+    engine = _FakeEngine(session=session)
+
+    result = await LocalRuntime(root, store, engine).browse_feed("alice", 1)
+
+    assert isinstance(result, BrowserFeedResultV1)
+    assert result.model_dump(mode="json") == {
+        "result_version": 1,
+        "observations": [
+            {
+                "thread_ref": f"{BROWSER_FEED_ORIGIN}/@alice/post/post-1",
+                "author_username": "alice",
+                "text_excerpt": "First excerpt",
+                "position": 0,
+            }
+        ],
+        "truncated": True,
+    }
+    assert len(engine.requests) == 1
+    request = engine.requests[0]
+    assert request.profile_directory == profile_directory
+    assert request.profile_directory.is_dir()
+    assert request.headless is False
+    assert request.network_route == BrowserNetworkRoute(BrowserNetworkProtocol.DIRECT, None, None)
+    assert request.proxy_credentials is None
+    assert session.navigations == [(f"{BROWSER_FEED_ORIGIN}/", frozenset({BROWSER_FEED_ORIGIN}))]
+    assert session.collect_calls == 1
+    assert session.scroll_calls == 0
+    assert session.close_calls == 1
+    assert not hasattr(request, "worker_id")
+    assert not hasattr(request, "account_id")
+    assert not hasattr(request, "profile_ref")
+    assert str(profile_directory) not in result.model_dump_json()
+    assert "<html" not in result.model_dump_json()
+    _assert_lock_can_be_acquired(root, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_lock_conflict_does_not_launch_browser(tmp_path: Path) -> None:
+    store = LocalAccountStore(tmp_path)
+    account = store.add("alice")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    held_lock = FilesystemProcessLock(_lock_path(tmp_path, account))
+    held_lock.acquire()
+    engine = _FakeEngine()
+
+    try:
+        with pytest.raises(StandaloneRuntimeError, match="^ACCOUNT_BUSY$"):
+            await LocalRuntime(tmp_path, store, engine).browse_feed("alice", 3)
+        assert engine.requests == []
+    finally:
+        held_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_deduplicates_across_iterations_and_enforces_limit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    store = LocalAccountStore(root)
+    account = store.add("alice")
+    (root / "profiles" / str(account.id)).mkdir(parents=True)
+    repeated = _feed_candidate("post-1")
+    second = _feed_candidate("post-2", "second excerpt")
+    session = _FakeSession(
+        feed_batches=[(repeated,), (repeated, second), (_feed_candidate("post-3"),)]
+    )
+    engine = _FakeEngine(session=session)
+
+    result = await LocalRuntime(root, store, engine).browse_feed("alice", 2)
+
+    assert len(result.observations) == 2
+    assert [item.thread_ref for item in result.observations] == [
+        f"{BROWSER_FEED_ORIGIN}/@alice/post/post-1",
+        f"{BROWSER_FEED_ORIGIN}/@alice/post/post-2",
+    ]
+    assert [item.position for item in result.observations] == [0, 1]
+    assert session.collect_calls == 2
+    assert session.scroll_calls == 1
+    assert len(result.observations) <= 2
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(root, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_stops_after_five_collections_and_four_scrolls(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    store = LocalAccountStore(root)
+    account = store.add("alice")
+    (root / "profiles" / str(account.id)).mkdir(parents=True)
+    batches = [(_feed_candidate(f"post-{index}"),) for index in range(BROWSER_FEED_ITERATION_BOUND)]
+    session = _FakeSession(feed_batches=batches)
+    engine = _FakeEngine(session=session)
+
+    result = await LocalRuntime(root, store, engine).browse_feed("alice", 20)
+
+    assert session.collect_calls == BROWSER_FEED_ITERATION_BOUND == 5
+    assert session.scroll_calls == BROWSER_FEED_ITERATION_BOUND - 1 == 4
+    assert len(result.observations) == 5
+    assert result.truncated is True
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(root, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_adapter_failure_closes_session_and_releases_lock(
+    tmp_path: Path,
+) -> None:
+    store = LocalAccountStore(tmp_path)
+    account = store.add("alice")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    session = _FakeSession(feed_error=BrowserAdapterError("REMOTE_STATE_UNCERTAIN"))
+    engine = _FakeEngine(session=session)
+
+    with pytest.raises(StandaloneRuntimeError, match="^REMOTE_STATE_UNCERTAIN$"):
+        await LocalRuntime(tmp_path, store, engine).browse_feed("alice", 3)
+
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(tmp_path, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_timeout_closes_session_and_releases_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_module, "_BROWSER_READ_TIMEOUT_SECONDS", 0.05)
+    store = LocalAccountStore(tmp_path)
+    account = store.add("alice")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    started = asyncio.Event()
+    session = _FakeSession(navigation_gate=asyncio.Event(), navigation_started=started)
+    engine = _FakeEngine(session=session)
+    task = asyncio.create_task(LocalRuntime(tmp_path, store, engine).browse_feed("alice", 3))
+    await started.wait()
+
+    with pytest.raises(StandaloneRuntimeError, match="^BROWSER_NAVIGATION_TIMEOUT$"):
+        await task
+
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(tmp_path, account)
+
+
+@pytest.mark.asyncio
+async def test_browse_feed_cancellation_closes_session_and_releases_lock(
+    tmp_path: Path,
+) -> None:
+    store = LocalAccountStore(tmp_path)
+    account = store.add("alice")
+    (tmp_path / "profiles" / str(account.id)).mkdir(parents=True)
+    started = asyncio.Event()
+    session = _FakeSession(navigation_gate=asyncio.Event(), navigation_started=started)
+    engine = _FakeEngine(session=session)
+    task = asyncio.create_task(LocalRuntime(tmp_path, store, engine).browse_feed("alice", 3))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session.close_calls == 1
+    _assert_lock_can_be_acquired(tmp_path, account)
 
 
 @pytest.mark.asyncio

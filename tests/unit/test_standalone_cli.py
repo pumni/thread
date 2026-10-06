@@ -14,7 +14,11 @@ from pydantic import SecretStr
 
 import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.accounts as account_module
-from threads_platform.application.browser_capabilities import BrowserTargetOpenResultV1
+from threads_platform.application.browser_capabilities import (
+    BrowserFeedItemResultV1,
+    BrowserFeedResultV1,
+    BrowserTargetOpenResultV1,
+)
 from threads_platform.application.ports.threads import (
     DiscoveryPage,
     MediaContainer,
@@ -387,6 +391,74 @@ def test_cli_thread_success_has_bounded_canonical_output(
     assert calls == [("devtest1", "/@alice/post/post-1/")]
     assert captured.out == "thread recognized target=/@alice/post/post-1\n"
     assert captured.err == ""
+
+
+def test_cli_feed_success_prints_only_bounded_normalized_items(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_root = tmp_path / "private-profile-path"
+    _set_data_root(monkeypatch, data_root)
+    calls: list[tuple[str, int]] = []
+
+    async def fake_browse_feed(
+        runtime: LocalRuntime, alias: str, max_items: int
+    ) -> BrowserFeedResultV1:
+        calls.append((alias, max_items))
+        return BrowserFeedResultV1(
+            observations=(
+                BrowserFeedItemResultV1(
+                    thread_ref="https://www.threads.com/@alice/post/post-1",
+                    author_username="alice",
+                    text_excerpt="first   excerpt",
+                    position=0,
+                ),
+            ),
+            truncated=False,
+        )
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "browse_feed", fake_browse_feed)
+
+    result = main(["feed", "devtest1", "--limit", "3"])
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls == [("devtest1", 3)]
+    assert captured.out == (
+        "feed count=1 truncated=false\n"
+        "item position=0 thread_ref=https://www.threads.com/@alice/post/post-1 "
+        "author=alice text=first excerpt\n"
+    )
+    assert str(data_root) not in captured.out + captured.err
+    assert "<html" not in captured.out + captured.err
+    assert captured.err == ""
+
+
+def test_cli_feed_invalid_limit_reports_bounded_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_data_root(monkeypatch, tmp_path / "private-profile-path")
+
+    async def reject_limit(
+        runtime: LocalRuntime, alias: str, max_items: int
+    ) -> BrowserFeedResultV1:
+        assert alias == "devtest1"
+        assert max_items == 0
+        raise StandaloneRuntimeError("INVALID_FEED_LIMIT")
+
+    monkeypatch.setattr(cli_module.LocalRuntime, "browse_feed", reject_limit)
+
+    result = main(["feed", "devtest1", "--limit", "0"])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "ERROR INVALID_FEED_LIMIT\n"
+    assert "private-profile-path" not in captured.out + captured.err
+    assert "DOM" not in captured.out + captured.err
 
 
 def test_cli_browser_read_error_does_not_echo_path_or_page_content(

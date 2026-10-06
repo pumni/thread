@@ -313,11 +313,7 @@ class _PlaywrightBrowserSession:
         self._closed = False
         self._allowed_navigation_origins: frozenset[str] = frozenset()
         self._navigation_guard_installed = False
-        self._navigation_guard_lock = asyncio.Lock()
-        self._blocked_navigation = False
-        self._approved_document_loaded = False
         self._remote_state_uncertain = False
-        self._navigation_timed_out = False
         self._prepared_media_composers: dict[UUID, _PreparedMediaComposerElements] = {}
         page.on("crash", self._on_page_crash)
         context.on("close", self._on_context_close)
@@ -335,7 +331,11 @@ class _PlaywrightBrowserSession:
             normalized_allowed_origins != self._allowed_navigation_origins
         ):
             raise UnsupportedUIState()
+        if _normalized_browser_origin(url) not in normalized_allowed_origins:
+            raise UnsupportedUIState()
+
         self._allowed_navigation_origins = normalized_allowed_origins
+        self._remote_state_uncertain = False
 
         try:
             if not self._navigation_guard_installed:
@@ -348,11 +348,11 @@ class _PlaywrightBrowserSession:
             )
             await self._raise_navigation_policy_error()
         except PlaywrightTimeoutError:
-            await self._raise_guard_rejection()
+            await self._raise_navigation_policy_error()
             raise NavigationTimeout() from None
         except PlaywrightError:
             self._ensure_alive()
-            await self._raise_guard_rejection()
+            await self._raise_navigation_policy_error()
             raise BrowserRuntimeUnavailable("BROWSER_NAVIGATION_FAILED") from None
 
     async def _guard_navigation(self, route: Route) -> None:
@@ -366,57 +366,24 @@ class _PlaywrightBrowserSession:
         if not is_main_navigation:
             await route.continue_()
             return
-        async with self._navigation_guard_lock:
-            if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
-                if self._approved_document_loaded:
-                    self._remote_state_uncertain = True
-                else:
-                    self._blocked_navigation = True
-                await route.abort("blockedbyclient")
-                return
-            try:
-                response = await route.fetch(
-                    max_redirects=0,
-                    timeout=max(1, int(self._navigation_timeout_ms * 0.9)),
-                )
-            except PlaywrightTimeoutError:
-                self._navigation_timed_out = True
-                try:
-                    await route.abort()
-                except PlaywrightError:
-                    pass
-                return
-            except PlaywrightError:
-                try:
-                    await route.abort()
-                except PlaywrightError:
-                    pass
-                return
-            if 300 <= response.status < 400:
-                self._remote_state_uncertain = True
-                await route.abort("blockedbyclient")
-                return
-            self._approved_document_loaded = True
-            await route.fulfill(response=response)
+        if _normalized_browser_origin(request.url) not in self._allowed_navigation_origins:
+            self._remote_state_uncertain = True
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
 
     async def _raise_navigation_policy_error(self) -> None:
         await self._raise_guard_rejection()
-        async with self._navigation_guard_lock:
-            if (
-                self._allowed_navigation_origins
-                and _normalized_browser_origin(self._page.url)
-                not in self._allowed_navigation_origins
-            ):
-                raise RemoteSessionStateUncertain()
+        if (
+            self._allowed_navigation_origins
+            and self._page.url != "about:blank"
+            and _normalized_browser_origin(self._page.url) not in self._allowed_navigation_origins
+        ):
+            raise RemoteSessionStateUncertain()
 
     async def _raise_guard_rejection(self) -> None:
-        async with self._navigation_guard_lock:
-            if self._blocked_navigation:
-                raise UnsupportedUIState()
-            if self._remote_state_uncertain:
-                raise RemoteSessionStateUncertain()
-            if self._navigation_timed_out:
-                raise NavigationTimeout()
+        if self._remote_state_uncertain:
+            raise RemoteSessionStateUncertain()
 
     async def inspect_surface(self) -> BrowserSurface:
         self._ensure_alive()

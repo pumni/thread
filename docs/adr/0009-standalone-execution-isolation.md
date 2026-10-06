@@ -128,10 +128,12 @@ or changing their semantics. This interface extraction does not change browser
 behavior.
 
 `BrowserNavigationPolicy` chooses the allowlist for a specific Worker
-capability. The shared Playwright adapter continues enforcing the supplied
-allowlist, rejecting origin changes and redirects, and reporting its existing
-typed outcomes. This assignment changes ownership only; it does not widen the
-allowlist or alter navigation, timeout, redirect, or fail-closed behavior.
+capability. The shared Playwright adapter enforces the supplied origin
+allowlist for initial and direct top-level navigation requests. Chromium
+handles redirects normally; the adapter checks the final page origin after
+navigation and rechecks it before each semantic operation. A final off-origin
+page is rejected with the existing typed outcome. This keeps the allowlist
+unchanged while avoiding manual redirect fetching in the adapter.
 
 ### Exact browser launch and network contracts
 
