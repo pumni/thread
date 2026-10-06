@@ -26,28 +26,21 @@ from threads_platform.application.ports.threads import (
     ThreadsAPIError,
     ThreadsCredentialError,
 )
-from threads_platform.config.settings import Settings
 from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
-from threads_platform.infrastructure.threads_api.client import HttpThreadsAPI
-from threads_platform.infrastructure.threads_api.environment_credentials import (
-    EnvironmentThreadsCredentialSecretResolver,
-)
 from threads_platform.standalone.accounts import (
     LocalAccountStore,
     StandaloneAccountError,
     resolve_standalone_data_root,
 )
 from threads_platform.standalone.api import (
-    LocalThreadsApiRuntime,
     StandaloneApiError,
     bind_env_credential,
-    build_threads_http_client,
 )
+from threads_platform.standalone.app import build_standalone_app
 from threads_platform.standalone.mutations import (
     CarouselManifest,
     CreatedReplyResult,
     LocalOperationStore,
-    LocalThreadsMutationRuntime,
     StandaloneMutationError,
     load_carousel_manifest,
     validate_media_post_inputs,
@@ -59,7 +52,7 @@ from threads_platform.standalone.recurrences import (
     RecurrenceRecord,
     StandaloneRecurrenceError,
 )
-from threads_platform.standalone.runtime import LocalRuntime, StandaloneRuntimeError
+from threads_platform.standalone.runtime import StandaloneRuntimeError
 from threads_platform.standalone.workflows import (
     LocalWorkflowRuntime,
     StandaloneWorkflowError,
@@ -172,12 +165,15 @@ def _format_discovery_page(
     return "".join(lines)
 
 
-async def _run_api_command(args: argparse.Namespace, store: LocalAccountStore) -> str:
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        runtime = LocalThreadsApiRuntime(store, api, secret_resolver)
+async def _run_api_command(args: argparse.Namespace, root: Path, store: LocalAccountStore) -> str:
+    async with build_standalone_app(
+        root,
+        store,
+        include_mutations=False,
+        include_browser=False,
+    ) as app:
+        runtime = app.api
+        assert runtime is not None
 
         if args.api_command == "quota":
             quota = await runtime.quota(args.alias)
@@ -243,23 +239,64 @@ async def _run_api_command(args: argparse.Namespace, store: LocalAccountStore) -
         return "".join(lines)
 
 
+async def _run_login_command(root: Path, store: LocalAccountStore, alias: str) -> None:
+    async with build_standalone_app(
+        root,
+        store,
+        include_api=False,
+        include_mutations=False,
+    ) as app:
+        assert app.browser is not None
+        await app.browser.login(alias)
+
+
+async def _run_profile_command(
+    root: Path, store: LocalAccountStore, alias: str, username: str
+) -> BrowserTargetOpenResultV1:
+    async with build_standalone_app(
+        root,
+        store,
+        include_api=False,
+        include_mutations=False,
+    ) as app:
+        assert app.browser is not None
+        return await app.browser.open_profile(alias, username)
+
+
+async def _run_thread_command(
+    root: Path, store: LocalAccountStore, alias: str, thread_ref: str
+) -> BrowserTargetOpenResultV1:
+    async with build_standalone_app(
+        root,
+        store,
+        include_api=False,
+        include_mutations=False,
+    ) as app:
+        assert app.browser is not None
+        return await app.browser.open_thread(alias, thread_ref)
+
+
+async def _run_feed_command(
+    root: Path, store: LocalAccountStore, alias: str, limit: int
+) -> BrowserFeedResultV1:
+    async with build_standalone_app(
+        root,
+        store,
+        include_api=False,
+        include_mutations=False,
+    ) as app:
+        assert app.browser is not None
+        return await app.browser.browse_feed(alias, limit)
+
+
 async def _run_post_command(
     args: argparse.Namespace,
     root: Path,
     store: LocalAccountStore,
 ) -> str:
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        operations = LocalOperationStore(root)
-        runtime = LocalThreadsMutationRuntime(
-            root,
-            store,
-            api,
-            secret_resolver,
-            operations,
-        )
+    async with build_standalone_app(root, store, include_browser=False) as app:
+        runtime = app.mutations
+        assert runtime is not None
         result = await runtime.publish_text(args.alias, args.text)
         return f"published operation={result.operation_id} media={result.media_id}\n"
 
@@ -269,17 +306,9 @@ async def _run_reply_command(
     root: Path,
     store: LocalAccountStore,
 ) -> str:
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        runtime = LocalThreadsMutationRuntime(
-            root,
-            store,
-            api,
-            secret_resolver,
-            LocalOperationStore(root),
-        )
+    async with build_standalone_app(root, store, include_browser=False) as app:
+        runtime = app.mutations
+        assert runtime is not None
         result: CreatedReplyResult = await runtime.create_reply(
             args.alias,
             args.thread_id,
@@ -296,17 +325,9 @@ async def _run_moderate_reply_command(
     root: Path,
     store: LocalAccountStore,
 ) -> str:
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        runtime = LocalThreadsMutationRuntime(
-            root,
-            store,
-            api,
-            secret_resolver,
-            LocalOperationStore(root),
-        )
+    async with build_standalone_app(root, store, include_browser=False) as app:
+        runtime = app.mutations
+        assert runtime is not None
         result = await runtime.moderate_reply(alias, reply_id, action)
     return f"moderated operation={result.operation_id} action={result.action}\n"
 
@@ -320,17 +341,9 @@ async def _run_media_post_command(
 ) -> str:
     media_url = args.image_url if media_type == "IMAGE" else args.video_url
     validate_media_post_inputs(media_url, args.text, args.alt_text)
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        runtime = LocalThreadsMutationRuntime(
-            root,
-            store,
-            api,
-            secret_resolver,
-            LocalOperationStore(root),
-        )
+    async with build_standalone_app(root, store, include_browser=False) as app:
+        runtime = app.mutations
+        assert runtime is not None
         if media_type == "IMAGE":
             result = await runtime.publish_image(
                 args.alias,
@@ -357,17 +370,9 @@ async def _run_carousel_post_command(
     root: Path,
     store: LocalAccountStore,
 ) -> str:
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        runtime = LocalThreadsMutationRuntime(
-            root,
-            store,
-            api,
-            secret_resolver,
-            LocalOperationStore(root),
-        )
+    async with build_standalone_app(root, store, include_browser=False) as app:
+        runtime = app.mutations
+        assert runtime is not None
         result = await runtime.publish_carousel(alias, manifest)
     return f"published-carousel operation={result.operation_id} media={result.media_id}\n"
 
@@ -386,20 +391,11 @@ async def _execute_workflow_plan(
     root: Path,
     store: LocalAccountStore,
 ) -> tuple[WorkflowStepResult, ...]:
-    settings = Settings()
-    async with build_threads_http_client(settings) as client:
-        api = HttpThreadsAPI(client)
-        secret_resolver = EnvironmentThreadsCredentialSecretResolver()
-        api_runtime = LocalThreadsApiRuntime(store, api, secret_resolver)
-        mutation_runtime = LocalThreadsMutationRuntime(
-            root,
-            store,
-            api,
-            secret_resolver,
-            LocalOperationStore(root),
-        )
-        browser_runtime = LocalRuntime(root, store)
-        runtime = LocalWorkflowRuntime(api_runtime, mutation_runtime, browser_runtime)
+    async with build_standalone_app(root, store) as app:
+        assert app.api is not None
+        assert app.mutations is not None
+        assert app.browser is not None
+        runtime = LocalWorkflowRuntime(app.api, app.mutations, app.browser)
         results = await runtime.run(plan)
     return results
 
@@ -679,8 +675,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sys.stdout.write(f"added {account.alias} {account.id}\n")
                 return 0
             if args.account_command == "login":
-                runtime = LocalRuntime(root, store)
-                asyncio.run(runtime.login(args.alias))
+                asyncio.run(_run_login_command(root, store, args.alias))
                 sys.stdout.write(f"login browser closed {args.alias}\n")
                 return 0
             if args.account_command == "credential":
@@ -692,17 +687,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "profile":
-            result = asyncio.run(LocalRuntime(root, store).open_profile(args.alias, args.username))
+            result = asyncio.run(_run_profile_command(root, store, args.alias, args.username))
             sys.stdout.write(f"profile recognized target={result.target_ref}\n")
             return 0
 
         if args.command == "thread":
-            result = asyncio.run(LocalRuntime(root, store).open_thread(args.alias, args.thread_ref))
+            result = asyncio.run(_run_thread_command(root, store, args.alias, args.thread_ref))
             sys.stdout.write(f"thread recognized target={result.target_ref}\n")
             return 0
 
         if args.command == "feed":
-            result = asyncio.run(LocalRuntime(root, store).browse_feed(args.alias, args.limit))
+            result = asyncio.run(_run_feed_command(root, store, args.alias, args.limit))
             sys.stdout.write(_format_feed_result(result))
             return 0
 
@@ -749,7 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.write(output)
             return 0
 
-        sys.stdout.write(asyncio.run(_run_api_command(args, store)))
+        sys.stdout.write(asyncio.run(_run_api_command(args, root, store)))
         return 0
     except StandaloneWorkflowError as error:
         suffix = f" step={error.step_index}" if error.step_index is not None else ""

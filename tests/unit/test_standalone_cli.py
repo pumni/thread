@@ -14,6 +14,7 @@ from pydantic import SecretStr
 
 import threads_platform.standalone.__main__ as cli_module
 import threads_platform.standalone.accounts as account_module
+import threads_platform.standalone.app as app_module
 from threads_platform.application.browser_capabilities import (
     BrowserFeedItemResultV1,
     BrowserFeedResultV1,
@@ -87,7 +88,7 @@ def _install_fake_api_client(
         return cast(httpx2.AsyncClient, context)
 
     monkeypatch.setattr(
-        cli_module,
+        app_module,
         "build_threads_http_client",
         fake_builder,
     )
@@ -171,9 +172,9 @@ def _install_cli_moderation(
     def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
         return cast(HttpThreadsAPI, api)
 
-    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+    monkeypatch.setattr(app_module, "HttpThreadsAPI", fake_http_api)
     monkeypatch.setattr(
-        cli_module,
+        app_module,
         "EnvironmentThreadsCredentialSecretResolver",
         lambda: resolver,
     )
@@ -274,7 +275,7 @@ def test_cli_login_success_prints_exact_output(
     async def fake_login(runtime: LocalRuntime, alias: str) -> None:
         calls.append(alias)
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "login", fake_login)
+    monkeypatch.setattr(app_module.LocalRuntime, "login", fake_login)
 
     result = main(["account", "login", "alice"])
 
@@ -307,7 +308,7 @@ def test_cli_login_busy_has_exact_error(
     async def busy_login(runtime: LocalRuntime, alias: str) -> None:
         raise StandaloneRuntimeError("ACCOUNT_BUSY")
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "login", busy_login)
+    monkeypatch.setattr(app_module.LocalRuntime, "login", busy_login)
 
     result = main(["account", "login", "alice"])
 
@@ -326,7 +327,7 @@ def test_cli_login_keyboard_interrupt_returns_130(
     async def interrupt_login(runtime: LocalRuntime, alias: str) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "login", interrupt_login)
+    monkeypatch.setattr(app_module.LocalRuntime, "login", interrupt_login)
 
     result = main(["account", "login", "alice"])
 
@@ -353,7 +354,7 @@ def test_cli_profile_success_has_bounded_canonical_output(
             target_kind="PROFILE", target_ref="/@alice", recognized=True
         )
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "open_profile", fake_open_profile)
+    monkeypatch.setattr(app_module.LocalRuntime, "open_profile", fake_open_profile)
 
     result = main(["profile", "devtest1", "alice"])
 
@@ -382,7 +383,7 @@ def test_cli_thread_success_has_bounded_canonical_output(
             recognized=True,
         )
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "open_thread", fake_open_thread)
+    monkeypatch.setattr(app_module.LocalRuntime, "open_thread", fake_open_thread)
 
     result = main(["thread", "devtest1", "/@alice/post/post-1/"])
 
@@ -418,7 +419,7 @@ def test_cli_feed_success_prints_only_bounded_normalized_items(
             truncated=False,
         )
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "browse_feed", fake_browse_feed)
+    monkeypatch.setattr(app_module.LocalRuntime, "browse_feed", fake_browse_feed)
 
     result = main(["feed", "devtest1", "--limit", "3"])
 
@@ -449,7 +450,7 @@ def test_cli_feed_invalid_limit_reports_bounded_error(
         assert max_items == 0
         raise StandaloneRuntimeError("INVALID_FEED_LIMIT")
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "browse_feed", reject_limit)
+    monkeypatch.setattr(app_module.LocalRuntime, "browse_feed", reject_limit)
 
     result = main(["feed", "devtest1", "--limit", "0"])
 
@@ -472,7 +473,7 @@ def test_cli_browser_read_error_does_not_echo_path_or_page_content(
     async def fail_open_profile(runtime: LocalRuntime, alias: str, username: str) -> None:
         raise StandaloneRuntimeError("BROWSER_CONTRACT_MISMATCH")
 
-    monkeypatch.setattr(cli_module.LocalRuntime, "open_profile", fail_open_profile)
+    monkeypatch.setattr(app_module.LocalRuntime, "open_profile", fail_open_profile)
 
     result = main(["profile", "devtest1", "alice"])
 
@@ -535,7 +536,7 @@ def test_cli_api_quota_exact_output_and_client_close(
         assert alias == "alice"
         return PublishingQuota(usage=4, total=250, reply_usage=None, reply_total=100)
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "quota", fake_quota)
 
     result = main(["api", "quota", "alice"])
 
@@ -558,7 +559,7 @@ def test_cli_api_media_collapses_and_caps_text(
         assert (alias, media_id) == ("alice", "media-1")
         return RemoteMedia("media-1", text, None, "2026-10-05T00:00:00Z")
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "media", fake_media)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "media", fake_media)
 
     result = main(["api", "media", "alice", "media-1"])
 
@@ -592,7 +593,7 @@ def test_cli_api_replies_formats_one_page_and_forwards_cursor_once(
             True,
         )
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "replies", fake_replies)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "replies", fake_replies)
 
     result = main(["api", "replies", "alice", "thread-1", "--after", "cursor opaque"])
 
@@ -625,7 +626,7 @@ def test_cli_api_conversation_formats_one_page(
             False,
         )
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
 
     result = main(["api", "conversation", "alice", "thread-1"])
 
@@ -657,7 +658,7 @@ def test_cli_api_public_profile_normalizes_and_bounds_output(
             "http://example.test/profile.jpg",
         )
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "public_profile", fake_profile)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "public_profile", fake_profile)
 
     result = main(["api", "public-profile", "alice", "public_user"])
 
@@ -701,7 +702,7 @@ def test_cli_api_profile_posts_forwards_pagination_and_formats_page(
         return DiscoveryPage((thread,), "next-posts", True)
 
     monkeypatch.setattr(
-        cli_module.LocalThreadsApiRuntime,
+        app_module.LocalThreadsApiRuntime,
         "profile_posts",
         fake_profile_posts,
     )
@@ -756,7 +757,7 @@ def test_cli_api_search_maps_choices_and_bounds_page_output_without_query(
         second = RemoteDiscoveryThread("thread-2", None, None, None, None, None, None, None, None)
         return DiscoveryPage((first, second), "next-search", True)
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "search", fake_search)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "search", fake_search)
 
     result = main(
         [
@@ -816,7 +817,7 @@ def test_cli_api_mentions_formats_cursor_and_accepts_canonical_options(
         calls.append((alias, after, limit))
         return DiscoveryPage((), "next-mentions", True)
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "mentions", fake_mentions)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "mentions", fake_mentions)
 
     result = main(["api", "mentions", "alice", "--after", "mentions-cursor", "--limit", "4"])
 
@@ -891,7 +892,7 @@ def test_cli_api_errors_are_safe_and_close_client(
     async def fail_call(runtime: LocalThreadsApiRuntime, *args: object, **kwargs: object) -> object:
         raise failure
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, method_name, fail_call)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, method_name, fail_call)
 
     result = main(argv)
 
@@ -923,7 +924,7 @@ def test_cli_never_prints_resolved_token_on_api_failure(
     def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
         return cast(HttpThreadsAPI, _FailingApi())
 
-    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+    monkeypatch.setattr(app_module, "HttpThreadsAPI", fake_http_api)
 
     result = main(["api", "quota", "alice"])
 
@@ -948,7 +949,7 @@ def test_cli_post_success_has_exact_output_and_closes_http_context(
         calls.append((alias, text))
         return PublishedTextResult(operation_id, "media-123")
 
-    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "publish_text", fake_publish)
+    monkeypatch.setattr(app_module.LocalThreadsMutationRuntime, "publish_text", fake_publish)
 
     result = main(["post", "alice", "chosen text"])
 
@@ -982,7 +983,7 @@ def test_cli_reply_success_has_exact_output_and_closes_http_context(
         calls.append((alias, thread_id, text, parent_reply_id))
         return CreatedReplyResult(operation_id, "reply-123")
 
-    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "create_reply", fake_reply)
+    monkeypatch.setattr(app_module.LocalThreadsMutationRuntime, "create_reply", fake_reply)
 
     result = main(
         [
@@ -1051,7 +1052,7 @@ def test_cli_media_post_success_has_exact_safe_output_and_closes_http_context(
 
     method = "publish_image" if media_type == "IMAGE" else "publish_video"
     replacement = fake_image if media_type == "IMAGE" else fake_video
-    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, method, replacement)
+    monkeypatch.setattr(app_module.LocalThreadsMutationRuntime, method, replacement)
 
     result = main([command, "alice", media_url, text, "--alt-text", alt_text])
 
@@ -1135,7 +1136,7 @@ def test_cli_media_publish_ambiguous_error_redacts_all_mutation_inputs(
     def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
         return cast(HttpThreadsAPI, _FailingMediaApi())
 
-    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+    monkeypatch.setattr(app_module, "HttpThreadsAPI", fake_http_api)
 
     result = main([command, "alice", media_url, text, "--alt-text", alt_text])
 
@@ -1195,8 +1196,8 @@ def test_cli_media_inputs_fail_before_settings_or_http(
         calls.append("http")
         raise AssertionError("invalid media input must be rejected before HTTP client")
 
-    monkeypatch.setattr(cli_module, "Settings", fail_settings)
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+    monkeypatch.setattr(app_module, "Settings", fail_settings)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_client)
     argv = [command, "alice", url]
     if text is not None:
         argv.append(text)
@@ -1260,9 +1261,9 @@ def test_cli_carousel_manifest_errors_precede_settings_account_and_http(
         calls.append("http")
         raise AssertionError("invalid manifest must fail before HTTP client")
 
-    monkeypatch.setattr(cli_module, "Settings", fail_settings)
+    monkeypatch.setattr(app_module, "Settings", fail_settings)
     monkeypatch.setattr(cli_module, "resolve_standalone_data_root", fail_data_root)
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_client)
 
     result = main(["post-carousel", "alice", str(path)])
 
@@ -1455,7 +1456,7 @@ def test_cli_post_ambiguous_error_includes_operation_and_redacts_token_and_text(
     def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
         return cast(HttpThreadsAPI, _FailingPublishApi())
 
-    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+    monkeypatch.setattr(app_module, "HttpThreadsAPI", fake_http_api)
 
     result = main(["post", "alice", text_sentinel])
 
@@ -1520,7 +1521,7 @@ def test_cli_reply_ambiguous_error_redacts_token_text_and_target_ids(
     def fake_http_api(_client: httpx2.AsyncClient) -> HttpThreadsAPI:
         return cast(HttpThreadsAPI, _FailingReplyApi())
 
-    monkeypatch.setattr(cli_module, "HttpThreadsAPI", fake_http_api)
+    monkeypatch.setattr(app_module, "HttpThreadsAPI", fake_http_api)
 
     result = main(
         [
@@ -1571,7 +1572,7 @@ def test_cli_operation_show_is_local_only_and_bounded(
     def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
         raise AssertionError("operation show must not build an HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_if_http_is_built)
 
     result = main(["operation", "show", str(operation.id)])
 
@@ -1599,7 +1600,7 @@ def test_cli_operation_show_renders_create_reply_journal_without_http(
     def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
         raise AssertionError("operation show must not build an HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_if_http_is_built)
 
     result = main(["operation", "show", str(operation.id)])
 
@@ -1629,7 +1630,7 @@ def test_cli_operation_show_renders_media_journal_without_http(
     def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
         raise AssertionError("operation show must not build an HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_if_http_is_built)
 
     result = main(["operation", "show", str(operation.id)])
 
@@ -1663,7 +1664,7 @@ def test_cli_operation_show_reports_carousel_child_count_without_ids(
     def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
         raise AssertionError("operation show must not build an HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_if_http_is_built)
 
     result = main(["operation", "show", str(operation.id)])
 
@@ -1686,7 +1687,7 @@ def test_cli_operation_show_invalid_id_has_safe_error_without_http(
     def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
         raise AssertionError("operation show must not build an HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_if_http_is_built)
 
     result = main(["operation", "show", "not-an-operation-id"])
 
@@ -1720,8 +1721,8 @@ def test_cli_workflow_invalid_plan_is_rejected_before_settings_or_http_client(
         calls.append("http")
         raise AssertionError("invalid workflow must be rejected before HTTP client")
 
-    monkeypatch.setattr(cli_module, "Settings", fail_settings)
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+    monkeypatch.setattr(app_module, "Settings", fail_settings)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_client)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -1746,7 +1747,7 @@ def test_cli_workflow_missing_account_is_rejected_before_http_client(
         calls.append("http")
         raise AssertionError("missing local account must fail before HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_client)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_client)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -1812,11 +1813,11 @@ def test_cli_workflow_mixed_reads_buffer_exact_output_and_uses_one_http_context(
     def fail_if_browser_login(*args: object, **kwargs: object) -> None:
         raise AssertionError("workflow commands must not invoke browser login")
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "media", fake_media)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "replies", fake_replies)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
-    monkeypatch.setattr(cli_module.LocalRuntime, "login", fail_if_browser_login)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "media", fake_media)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "replies", fake_replies)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
+    monkeypatch.setattr(app_module.LocalRuntime, "login", fail_if_browser_login)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -1954,11 +1955,11 @@ def test_cli_workflow_formats_mixed_api_and_browser_reads_with_step_identity(
             events.append(("thread", alias, thread_ref))
             return BrowserTargetOpenResultV1(target_kind="THREAD", target_ref=thread_ref)
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "public_profile", fake_public_profile)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "search", fake_search)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "profile_posts", fake_profile_posts)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "mentions", fake_mentions)
-    monkeypatch.setattr(cli_module, "LocalRuntime", FakeLocalRuntime)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "public_profile", fake_public_profile)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "search", fake_search)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "profile_posts", fake_profile_posts)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "mentions", fake_mentions)
+    monkeypatch.setattr(app_module, "LocalRuntime", FakeLocalRuntime)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -2028,7 +2029,7 @@ def test_cli_workflow_post_success_is_exact_and_never_echoes_text(
         calls.append((alias, text))
         return PublishedTextResult(operation_id, "published-123")
 
-    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "publish_text", fake_publish)
+    monkeypatch.setattr(app_module.LocalThreadsMutationRuntime, "publish_text", fake_publish)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -2083,9 +2084,9 @@ def test_cli_workflow_failure_discards_buffered_output_and_closes_http_context(
         calls.append("conversation")
         return ReplyPage((), None, False)
 
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "media", fail_media)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "media", fail_media)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "conversation", fake_conversation)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -2125,8 +2126,8 @@ def test_cli_workflow_ambiguous_post_error_includes_step_and_operation_without_s
         raise StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation_id)
 
     monkeypatch.setenv("THREADS_PLATFORM_THREADS_TOKEN_WORKFLOW_TEST", token_sentinel)
-    monkeypatch.setattr(cli_module.LocalThreadsApiRuntime, "quota", fake_quota)
-    monkeypatch.setattr(cli_module.LocalThreadsMutationRuntime, "publish_text", fail_publish)
+    monkeypatch.setattr(app_module.LocalThreadsApiRuntime, "quota", fake_quota)
+    monkeypatch.setattr(app_module.LocalThreadsMutationRuntime, "publish_text", fail_publish)
 
     result = main(["workflow", "run", str(workflow_path)])
 
@@ -2223,7 +2224,7 @@ def test_cli_moderate_reply_validates_reply_id_before_data_root_or_settings(
         raise AssertionError("invalid reply ID must fail before Settings")
 
     monkeypatch.setattr(cli_module, "resolve_standalone_data_root", forbidden_root)
-    monkeypatch.setattr(cli_module, "Settings", forbidden_settings)
+    monkeypatch.setattr(app_module, "Settings", forbidden_settings)
 
     result = main(["moderate-reply", "alice", "replies/private-42", "hide"])
 
@@ -2273,8 +2274,8 @@ def test_cli_moderate_reply_uses_existing_alias_validation_before_settings(
         calls.append("http")
         raise AssertionError("invalid account alias must fail before HTTP client")
 
-    monkeypatch.setattr(cli_module, "Settings", forbidden_settings)
-    monkeypatch.setattr(cli_module, "build_threads_http_client", forbidden_client)
+    monkeypatch.setattr(app_module, "Settings", forbidden_settings)
+    monkeypatch.setattr(app_module, "build_threads_http_client", forbidden_client)
 
     result = main(["moderate-reply", "../alice", "reply-target-42", "hide"])
 
@@ -2306,7 +2307,7 @@ def test_cli_operation_show_renders_moderation_action_without_target_or_http(
     def fail_if_http_is_built(_settings: Settings) -> httpx2.AsyncClient:
         raise AssertionError("operation show must not build an HTTP client")
 
-    monkeypatch.setattr(cli_module, "build_threads_http_client", fail_if_http_is_built)
+    monkeypatch.setattr(app_module, "build_threads_http_client", fail_if_http_is_built)
 
     result = main(["operation", "show", str(confirmed.id)])
 
