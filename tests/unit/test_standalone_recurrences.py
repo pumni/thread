@@ -425,6 +425,38 @@ def test_keyboard_interrupt_during_occurrence_is_recorded_and_not_replayed(tmp_p
     assert calls == 1
 
 
+def test_cancelled_error_during_occurrence_is_recorded_and_not_replayed(tmp_path: Path) -> None:
+    anchor = datetime(2026, 1, 1, 10, tzinfo=UTC)
+    store, _ = _fixture_store(tmp_path)
+    record = store.create(_simple_workflow(tmp_path / "workflow.json"), 300, now=anchor)
+    timing = FakeTiming(anchor + timedelta(seconds=299))
+    calls = 0
+
+    async def cancel(_plan: WorkflowPlan) -> object:
+        nonlocal calls
+        calls += 1
+        running = store.get(record.id)
+        assert running.last_outcome == "RUNNING"
+        assert running.next_due_at == anchor + timedelta(minutes=10)
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(LocalRecurrenceRunner(store, timing).run(record.id, cancel))
+
+    interrupted = store.get(record.id)
+    assert calls == 1
+    assert interrupted.last_outcome == "INTERRUPTED"
+    assert interrupted.last_error_code == "INTERRUPTED"
+    assert interrupted.last_step_index is None
+    assert interrupted.last_finished_at == interrupted.last_started_at
+    assert interrupted.next_due_at == anchor + timedelta(minutes=10)
+
+    second_timing = FakeTiming(anchor + timedelta(minutes=5), interrupt_on_sleep=1)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(LocalRecurrenceRunner(store, second_timing).run(record.id, cancel))
+    assert calls == 1
+
+
 def test_runner_lock_excludes_second_runner_and_disable(tmp_path: Path) -> None:
     store, _ = _fixture_store(tmp_path)
     record = store.create(_simple_workflow(tmp_path / "workflow.json"), 300)
@@ -489,6 +521,38 @@ def test_corrupt_or_unsupported_record_fails_closed(
     with pytest.raises(StandaloneRecurrenceError) as caught:
         store.get(record.id)
     assert caught.value.code == expected
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error_code"),
+    [("FAILED", "SOME_FAILURE"), ("SKIPPED", "ACCOUNT_BUSY")],
+)
+def test_failed_or_skipped_record_requires_step_index(
+    tmp_path: Path,
+    outcome: str,
+    error_code: str,
+) -> None:
+    store, _ = _fixture_store(tmp_path)
+    record = store.create(_simple_workflow(tmp_path / "workflow.json"), 300)
+    document = json.loads(_record_path(tmp_path, record).read_text(encoding="utf-8"))
+    started_at = record.anchor_at + timedelta(seconds=300)
+    finished_at = started_at + timedelta(seconds=1)
+    document.update(
+        {
+            "updated_at": finished_at.isoformat(),
+            "next_due_at": (record.anchor_at + timedelta(seconds=600)).isoformat(),
+            "last_started_at": started_at.isoformat(),
+            "last_finished_at": finished_at.isoformat(),
+            "last_outcome": outcome,
+            "last_error_code": error_code,
+            "last_step_index": None,
+        }
+    )
+    _record_path(tmp_path, record).write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(StandaloneRecurrenceError) as caught:
+        store.get(record.id)
+    assert caught.value.code == "RECURRENCE_STATE_INVALID"
 
 
 def test_missing_snapshot_fails_closed_before_runner_starts(tmp_path: Path) -> None:

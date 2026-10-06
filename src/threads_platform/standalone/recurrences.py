@@ -540,7 +540,7 @@ class LocalRecurrenceRunner:
                             last_step_index=error.step_index,
                         )
                     )
-                except KeyboardInterrupt:
+                except KeyboardInterrupt, asyncio.CancelledError:
                     finished = max(_utc_now(self._timing.utc_now()), record.last_started_at or now)
                     record = self._store.update(
                         replace(
@@ -709,6 +709,7 @@ def _validate_record(record: RecurrenceRecord, expected_id: str) -> None:
                 )
                 or (record.last_outcome == "FAILED" and record.last_error_code == "ACCOUNT_BUSY")
                 or (record.last_outcome == "INTERRUPTED" and record.last_step_index is not None)
+                or (record.last_outcome in ("FAILED", "SKIPPED") and record.last_step_index is None)
             ):
                 raise StandaloneRecurrenceError("RECURRENCE_STATE_INVALID")
     if record.last_step_index is not None and (
