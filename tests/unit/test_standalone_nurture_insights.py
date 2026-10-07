@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import pytest
 
 import threads_platform.standalone.__main__ as cli_module
+import threads_platform.standalone.nurture_insights as nurture_insights_module
 import threads_platform.standalone.nurture_store as nurture_store_module
 from threads_platform.application.ports.threads import (
     THREAD_POST_INSIGHT_ORDER,
@@ -333,6 +334,75 @@ async def test_refresh_caps_calls_and_uses_no_snapshot_then_oldest_order(tmp_pat
 
     assert api.calls == [("alice", media_id) for _, media_id in expected]
     assert result.refreshed == MAX_FETCHES_PER_REFRESH
+
+
+@pytest.mark.asyncio
+async def test_snapshot_capped_content_stays_classifiable_and_does_not_block_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cap = 2
+    monkeypatch.setattr(nurture_insights_module, "MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT", cap)
+    monkeypatch.setattr(nurture_store_module, "MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT", cap)
+    root, account, store, preset = _setup(tmp_path)
+    capped_record, _ = _published(
+        root,
+        store,
+        account,
+        preset,
+        source_id="capped-source",
+        text="capped-draft",
+        media_id="capped-media",
+    )
+    uncapped_record, _ = _published(
+        root,
+        store,
+        account,
+        preset,
+        source_id="uncapped-source",
+        text="uncapped-draft",
+        media_id="uncapped-media",
+    )
+    with store.acquire_account_lock(account.id) as owner:
+        for index in range(cap):
+            owner.append_insights_snapshot(
+                preset,
+                _snapshot(
+                    capped_record,
+                    account.id,
+                    preset.id,
+                    observed_at=_NOW - timedelta(hours=6 * (cap - index)),
+                ),
+            )
+        snapshots_before = owner.get_insights_snapshots(
+            preset,
+            content_fingerprint(capped_record.source_fingerprint, capped_record.draft_fingerprint),
+        )
+        assert len(snapshots_before) == cap
+    api = _FakeApi(values=(5, 4, 3, 2))
+
+    result = await _service(root, store, api).refresh(account, preset, now=_NOW)
+
+    assert api.calls == [("alice", "uncapped-media")]
+    assert result.refreshed == 1
+    with store.acquire_account_lock(account.id) as owner:
+        capped_after = owner.get_insights_snapshots(
+            preset,
+            content_fingerprint(capped_record.source_fingerprint, capped_record.draft_fingerprint),
+        )
+        uncapped_after = owner.get_insights_snapshots(
+            preset,
+            content_fingerprint(
+                uncapped_record.source_fingerprint, uncapped_record.draft_fingerprint
+            ),
+        )
+    assert capped_after == snapshots_before
+    assert len(uncapped_after) == 1
+    performances = {item.content_fingerprint: item for item in result.performances}
+    capped_fingerprint = content_fingerprint(
+        capped_record.source_fingerprint, capped_record.draft_fingerprint
+    )
+    assert performances[capped_fingerprint].interaction_score == 10
+    assert performances[capped_fingerprint].bucket == "INSUFFICIENT_DATA"
 
 
 @pytest.mark.asyncio

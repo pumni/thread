@@ -181,7 +181,12 @@ class NurtureInsightsService:
         try:
             with self._nurture_store.acquire_account_lock(account.id) as owner:
                 linked, skipped_spacing = self._load_eligible(owner, account, preset, captured_now)
-                fetchable = [item for item in linked if self._is_fetchable(item, captured_now)]
+                fetchable = [
+                    item
+                    for item in linked
+                    if len(item.snapshots) < MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT
+                    and self._is_fetchable(item, captured_now)
+                ]
                 fetchable.sort(
                     key=lambda item: (
                         item.snapshots != (),
@@ -195,8 +200,6 @@ class NurtureInsightsService:
                     if item.media_id in seen_media:
                         continue
                     seen_media.add(item.media_id)
-                    if len(item.snapshots) >= MAX_NURTURE_INSIGHTS_SNAPSHOTS_PER_CONTENT:
-                        raise NurtureInsightsError("NURTURE_STATE_CAP_REACHED")
                     selected.append(item)
                     if len(selected) == MAX_FETCHES_PER_REFRESH:
                         break
