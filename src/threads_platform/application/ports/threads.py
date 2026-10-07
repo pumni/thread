@@ -40,6 +40,65 @@ class RemoteMedia:
     published_at: str | None = None
 
 
+class ThreadPostInsightName(StrEnum):
+    LIKES = "likes"
+    REPLIES = "replies"
+    REPOSTS = "reposts"
+    QUOTES = "quotes"
+
+
+THREAD_POST_INSIGHT_ORDER = (
+    ThreadPostInsightName.LIKES,
+    ThreadPostInsightName.REPLIES,
+    ThreadPostInsightName.REPOSTS,
+    ThreadPostInsightName.QUOTES,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadPostInsightMetric:
+    name: ThreadPostInsightName
+    value: int | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.name) is not ThreadPostInsightName
+            or (self.value is not None and type(self.value) is not int)
+            or (self.value is not None and self.value < 0)
+        ):
+            raise ValueError("invalid Threads post insight metric")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ThreadPostInsights:
+    media_id: str
+    period: Literal["lifetime"]
+    metrics: tuple[ThreadPostInsightMetric, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.media_id) is not str
+            or not self.media_id
+            or type(self.period) is not str
+            or self.period != "lifetime"
+            or type(self.metrics) is not tuple
+        ):
+            raise ValueError("invalid Threads post insights result")
+        for metric in self.metrics:
+            if (
+                type(metric) is not ThreadPostInsightMetric
+                or type(metric.name) is not ThreadPostInsightName
+                or (metric.value is not None and type(metric.value) is not int)
+                or (metric.value is not None and metric.value < 0)
+            ):
+                raise ValueError("invalid Threads post insight metric")
+        if tuple(metric.name for metric in self.metrics) != THREAD_POST_INSIGHT_ORDER:
+            raise ValueError("invalid Threads post insights result")
+
+    def __repr__(self) -> str:
+        return f"ThreadPostInsights(period={self.period!r}, metrics={self.metrics!r})"
+
+
 @dataclass(frozen=True, slots=True)
 class PublishingQuota:
     usage: int | None = None
@@ -125,6 +184,8 @@ class ThreadsAPI(Protocol):
     async def publish_container(self, token: SecretStr, container_id: str) -> str: ...
 
     async def get_media(self, token: SecretStr, media_id: str) -> RemoteMedia: ...
+
+    async def get_post_insights(self, token: SecretStr, media_id: str) -> ThreadPostInsights: ...
 
     async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota: ...
 

@@ -6,6 +6,7 @@ import httpx2
 from pydantic import SecretStr, TypeAdapter, ValidationError
 
 from threads_platform.application.ports.threads import (
+    THREAD_POST_INSIGHT_ORDER,
     DiscoveryPage,
     MediaContainer,
     MediaContainerRequest,
@@ -15,6 +16,9 @@ from threads_platform.application.ports.threads import (
     RemotePublicProfile,
     RemoteReply,
     ReplyPage,
+    ThreadPostInsightMetric,
+    ThreadPostInsightName,
+    ThreadPostInsights,
     ThreadsAPIError,
     ThreadsContractError,
     ThreadsTransportError,
@@ -99,6 +103,60 @@ class HttpThreadsAPI:
         permalink = self._optional_string(payload.get("permalink"))
         timestamp = self._optional_string(payload.get("timestamp"))
         return RemoteMedia(remote_id, text, permalink, timestamp)
+
+    async def get_post_insights(self, token: SecretStr, media_id: str) -> ThreadPostInsights:
+        response = await self._request(
+            "GET",
+            f"{quote(media_id, safe='')}/insights",
+            token,
+            params={"metric": ",".join(metric.value for metric in THREAD_POST_INSIGHT_ORDER)},
+        )
+        payload = self._object(response)
+        values = payload.get("data")
+        if type(values) is not list:
+            raise ThreadsContractError()
+        rows = self._object_list(cast(object, values))
+        parsed: dict[ThreadPostInsightName, int | None] = {}
+        for value in rows:
+            row = self._mapping(value)
+            if row is None:
+                raise ThreadsContractError()
+            raw_name = row.get("name")
+            raw_period = row.get("period")
+            raw_values = row.get("values")
+            if type(raw_name) is not str:
+                raise ThreadsContractError()
+            try:
+                name = ThreadPostInsightName(raw_name)
+            except ValueError:
+                raise ThreadsContractError() from None
+            if name not in THREAD_POST_INSIGHT_ORDER or name in parsed:
+                raise ThreadsContractError()
+            if type(raw_period) is not str or raw_period != "lifetime":
+                raise ThreadsContractError()
+            if type(raw_values) is not list:
+                raise ThreadsContractError()
+            value_rows = cast(list[object], raw_values)
+            if len(value_rows) != 1:
+                raise ThreadsContractError()
+            value_row = self._mapping(value_rows[0])
+            if value_row is None or "value" not in value_row:
+                raise ThreadsContractError()
+            raw_metric_value = value_row["value"]
+            metric_value: int | None = None
+            if raw_metric_value is not None:
+                if type(raw_metric_value) is not int or raw_metric_value < 0:
+                    raise ThreadsContractError()
+                metric_value = raw_metric_value
+            parsed[name] = metric_value
+        return ThreadPostInsights(
+            media_id=media_id,
+            period="lifetime",
+            metrics=tuple(
+                ThreadPostInsightMetric(name, parsed.get(name))
+                for name in THREAD_POST_INSIGHT_ORDER
+            ),
+        )
 
     async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
         response = await self._request(

@@ -1,4 +1,5 @@
 from datetime import timedelta
+from typing import cast
 from urllib.parse import parse_qs
 
 import httpx2
@@ -6,7 +7,11 @@ import pytest
 from pydantic import SecretStr
 
 from threads_platform.application.ports.threads import (
+    THREAD_POST_INSIGHT_ORDER,
     MediaContainerRequest,
+    ThreadPostInsightMetric,
+    ThreadPostInsightName,
+    ThreadPostInsights,
     ThreadsAPIError,
     ThreadsContractError,
     ThreadsTransportError,
@@ -25,6 +30,165 @@ DOCUMENTATION_QUOTA_FIXTURE = {
         }
     ]
 }
+
+# Synthetic fixture following Meta's current official post-insights example shape;
+# this is documentation-contract evidence, not a live response.
+DOCUMENTATION_POST_INSIGHTS_FIXTURE = {
+    "data": [
+        {
+            "name": "likes",
+            "period": "lifetime",
+            "values": [{"value": 12}],
+            "title": "Likes",
+            "description": "Ignored adapter metadata",
+            "id": "ignored-row-metadata",
+        },
+        {"name": "replies", "period": "lifetime", "values": [{"value": 3}]},
+        {"name": "reposts", "period": "lifetime", "values": [{"value": 2}]},
+        {"name": "quotes", "period": "lifetime", "values": [{"value": 1}]},
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_documented_post_insights_requests_exact_metric_subset_and_maps_values() -> None:
+    requests: list[httpx2.Request] = []
+
+    async def respond(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(200, json=DOCUMENTATION_POST_INSIGHTS_FIXTURE)
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/",
+        transport=httpx2.MockTransport(respond),
+    ) as client:
+        result = await HttpThreadsAPI(client).get_post_insights(
+            SecretStr("test-placeholder"), "media-doc-example"
+        )
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path.endswith("/media-doc-example/insights")
+    assert parse_qs(requests[0].url.query.decode()) == {"metric": ["likes,replies,reposts,quotes"]}
+    assert tuple(metric.name for metric in result.metrics) == THREAD_POST_INSIGHT_ORDER
+    assert tuple(metric.value for metric in result.metrics) == (12, 3, 2, 1)
+    assert result.period == "lifetime"
+    assert "media-doc-example" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_post_insights_missing_row_and_null_value_remain_unknown() -> None:
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={"data": [{"name": "likes", "period": "lifetime", "values": [{"value": None}]}]},
+        )
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/", transport=httpx2.MockTransport(respond)
+    ) as client:
+        result = await HttpThreadsAPI(client).get_post_insights(
+            SecretStr("test-placeholder"), "media-doc-example"
+        )
+
+    values = {metric.name: metric.value for metric in result.metrics}
+    assert values == {
+        ThreadPostInsightName.LIKES: None,
+        ThreadPostInsightName.REPLIES: None,
+        ThreadPostInsightName.REPOSTS: None,
+        ThreadPostInsightName.QUOTES: None,
+    }
+
+
+def test_post_insights_dto_rejects_boolean_as_integer_and_noncanonical_order() -> None:
+    with pytest.raises(ValueError):
+        ThreadPostInsightMetric(ThreadPostInsightName.LIKES, True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ThreadPostInsights(
+            "media-doc-example",
+            "lifetime",
+            (ThreadPostInsightMetric(ThreadPostInsightName.REPLIES, 1),),
+        )
+
+
+@pytest.mark.parametrize(
+    "rows",
+    cast(
+        list[object],
+        [
+            [
+                {"name": "likes", "period": "lifetime", "values": [{"value": 1}]},
+                {"name": "likes", "period": "lifetime", "values": [{"value": 2}]},
+            ],
+            [{"name": "views", "period": "lifetime", "values": [{"value": 1}]}],
+            [{"name": "likes", "period": "day", "values": [{"value": 1}]}],
+            [{"name": "likes", "period": "lifetime", "values": [{"value": True}]}],
+            [{"name": "likes", "period": "lifetime", "values": [{"value": -1}]}],
+            [{"name": "likes", "period": "lifetime", "values": [{"value": "1"}]}],
+            [{"name": "likes", "period": "lifetime", "values": [{}]}],
+            [{"name": "likes", "period": "lifetime", "values": []}],
+            [{"name": "likes", "period": "lifetime", "values": [{"value": 1}, {"value": 2}]}],
+        ],
+    ),
+)
+@pytest.mark.asyncio
+async def test_post_insights_malformed_rows_fail_closed(rows: object) -> None:
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"data": rows})
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/", transport=httpx2.MockTransport(respond)
+    ) as client:
+        with pytest.raises(ThreadsContractError):
+            await HttpThreadsAPI(client).get_post_insights(
+                SecretStr("test-placeholder"), "media-doc-example"
+            )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [(403, "THREADS_PERMISSION_DENIED"), (429, "THREADS_RATE_LIMITED")],
+)
+@pytest.mark.asyncio
+async def test_post_insights_permission_and_rate_errors_are_sanitized(
+    status: int,
+    expected_code: str,
+) -> None:
+    sentinel = "INSIGHTS_RAW_ERROR_BODY_SENTINEL"
+
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status, json={"error": {"message": sentinel}})
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/", transport=httpx2.MockTransport(respond)
+    ) as client:
+        with pytest.raises(ThreadsAPIError) as error:
+            await HttpThreadsAPI(client).get_post_insights(
+                SecretStr("INSIGHTS_TOKEN_SENTINEL"), "media-doc-example"
+            )
+
+    assert error.value.code == expected_code
+    assert sentinel not in str(error.value)
+    assert sentinel not in repr(error.value)
+    assert "INSIGHTS_TOKEN_SENTINEL" not in repr(error.value)
+
+
+@pytest.mark.asyncio
+async def test_post_insights_transport_error_is_sanitized() -> None:
+    async def respond(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("INSIGHTS_RAW_TRANSPORT_SENTINEL", request=request)
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/", transport=httpx2.MockTransport(respond)
+    ) as client:
+        with pytest.raises(ThreadsAPIError) as error:
+            await HttpThreadsAPI(client).get_post_insights(
+                SecretStr("INSIGHTS_TOKEN_SENTINEL"), "media-doc-example"
+            )
+
+    assert error.value.code == "THREADS_TRANSPORT_FAILURE"
+    assert "INSIGHTS_RAW_TRANSPORT_SENTINEL" not in str(error.value)
+    assert "INSIGHTS_TOKEN_SENTINEL" not in repr(error.value)
 
 
 @pytest.mark.asyncio

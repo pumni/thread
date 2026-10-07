@@ -14,6 +14,7 @@ from threads_platform.application.commands.threads_handlers import (
 )
 from threads_platform.application.crm_protocol_v1 import CommandEnvelopeV1
 from threads_platform.application.ports.threads import (
+    THREAD_POST_INSIGHT_ORDER,
     DiscoveryPage,
     MediaContainer,
     MediaContainerRequest,
@@ -22,6 +23,8 @@ from threads_platform.application.ports.threads import (
     RemotePublicProfile,
     RemoteReply,
     ReplyPage,
+    ThreadPostInsightMetric,
+    ThreadPostInsights,
     ThreadsAPIError,
 )
 from threads_platform.application.retry import RetryPolicy
@@ -122,6 +125,14 @@ class FakeThreadsAPI:
             self.crash_on_media_once = False
             raise SimulatedProcessCrash
         return RemoteMedia(media_id, "Documentation example post", None, None)
+
+    async def get_post_insights(self, token: SecretStr, media_id: str) -> ThreadPostInsights:
+        assert token.get_secret_value() == "test-placeholder"
+        return ThreadPostInsights(
+            media_id,
+            "lifetime",
+            tuple(ThreadPostInsightMetric(name, 0) for name in THREAD_POST_INSIGHT_ORDER),
+        )
 
     async def get_publishing_quota(self, token: SecretStr) -> PublishingQuota:
         assert token.get_secret_value() == "test-placeholder"
