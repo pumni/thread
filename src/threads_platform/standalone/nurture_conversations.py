@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from threads_platform.application.ports.threads import (
@@ -50,10 +50,13 @@ _CONVERSATION_STAGE = "conversation"
 
 @dataclass(frozen=True, slots=True, repr=False)
 class NurtureInboundCandidate:
-    """An ephemeral proven reply identity, without reply text or remote IDs."""
+    """An ephemeral proven reply with repr-hidden IDs for explicit apply only."""
 
     fingerprint: str
     timestamp: datetime | None
+    root_thread_id: str = field(repr=False)
+    reply_id: str = field(repr=False)
+    replied_to_id: str | None = field(repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -156,6 +159,9 @@ async def collect_nurture_inbound(
             candidate = NurtureInboundCandidate(
                 fingerprint=fingerprint,
                 timestamp=_parse_reply_timestamp(reply.timestamp),
+                root_thread_id=own_thread_id,
+                reply_id=reply.reply_id,
+                replied_to_id=reply.replied_to_id,
             )
             # The first proven occurrence keeps its timestamp; repeated hits never
             # improve a candidate's relative priority.

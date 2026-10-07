@@ -52,12 +52,18 @@ from threads_platform.standalone.nurture import (
     NurturePresetV1,
     get_nurture_preset,
 )
+from threads_platform.standalone.nurture_draft import (
+    NurtureDraft,
+    NurtureDraftError,
+    load_nurture_draft,
+)
 from threads_platform.standalone.nurture_runner import (
     NurtureRunner,
     NurtureRunnerError,
     NurtureRunnerInterrupted,
+    NurtureRunResult,
 )
-from threads_platform.standalone.nurture_store import NurtureRunV1, NurtureStore
+from threads_platform.standalone.nurture_store import NurtureStore
 from threads_platform.standalone.recurrences import (
     LocalRecurrenceRunner,
     LocalRecurrenceStore,
@@ -256,26 +262,81 @@ async def _run_nurture_command(
     accounts: LocalAccountStore,
     account: LocalAccount,
     preset: NurturePresetV1,
-) -> NurtureRunV1:
+    *,
+    apply_requested: bool = False,
+    draft: NurtureDraft | None = None,
+) -> NurtureRunResult:
     async with build_standalone_app(
         root,
         accounts,
         include_api=True,
-        include_mutations=False,
+        include_mutations=draft is not None,
         include_browser=False,
     ) as app:
         if app.api is None:
             raise NurtureRunnerError("RUN_FAILED")
-        return await NurtureRunner(app.api, NurtureStore(root)).run(account, preset)
+        if draft is not None and app.mutations is None:
+            raise NurtureRunnerError("RUN_FAILED")
+        return await NurtureRunner(app.api, NurtureStore(root)).run_with_selection(
+            account,
+            preset,
+            apply_requested=apply_requested,
+            draft=draft,
+            mutations=app.mutations,
+        )
 
 
-def _format_nurture_run(account: LocalAccount, preset: NurturePresetV1, run: NurtureRunV1) -> str:
+def _format_nurture_run(
+    account: LocalAccount,
+    preset: NurturePresetV1,
+    result: NurtureRunResult,
+) -> str:
+    run = result.receipt
     decision = run.decision_codes[0] if run.decision_codes else "NO_ACTION"
+    target = f" target={result.target_fingerprint}" if result.target_fingerprint else ""
     return (
         f"nurture run={run.id} account={account.alias} preset={preset.id} "
         f"outcome={run.outcome} discovered={run.discovered_count} "
-        f"selected={run.selected_count} decision={decision}\n"
+        f"selected={run.selected_count} decision={decision}{target}\n"
     )
+
+
+def _run_nurture_cli(
+    args: argparse.Namespace,
+    root: Path,
+    accounts: LocalAccountStore,
+) -> str:
+    try:
+        preset = get_nurture_preset(args.preset)
+    except NurturePresetError as error:
+        raise NurtureRunnerError(error.code) from None
+    account = accounts.get(args.alias)
+    draft: NurtureDraft | None = None
+    if args.reply_file is not None:
+        try:
+            draft = load_nurture_draft(Path(args.reply_file))
+        except NurtureDraftError as error:
+            raise NurtureRunnerError(error.code) from None
+    result = asyncio.run(
+        _run_nurture_command(
+            root,
+            accounts,
+            account,
+            preset,
+            apply_requested=args.apply,
+            draft=draft,
+        )
+    )
+    return _format_nurture_run(account, preset, result)
+
+
+def _handle_nurture_cli_command(args: argparse.Namespace) -> int:
+    if args.reply_file is not None and not args.apply:
+        raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
+    root = resolve_standalone_data_root()
+    store = LocalAccountStore(root)
+    sys.stdout.write(_run_nurture_cli(args, root, store))
+    return 0
 
 
 async def _run_login_command(root: Path, store: LocalAccountStore, alias: str) -> None:
@@ -646,6 +707,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_nurture_parser = nurture_commands.add_parser("run")
     run_nurture_parser.add_argument("alias")
     run_nurture_parser.add_argument("--preset", required=True)
+    run_nurture_parser.add_argument("--apply", action="store_true")
+    run_nurture_parser.add_argument("--reply-file")
     return parser
 
 
@@ -712,17 +775,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.write(output)
             return 0
 
+        if args.command == "nurture":
+            return _handle_nurture_cli_command(args)
+
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
-        if args.command == "nurture":
-            try:
-                preset = get_nurture_preset(args.preset)
-            except NurturePresetError as error:
-                raise NurtureRunnerError(error.code) from None
-            account = store.get(args.alias)
-            run = asyncio.run(_run_nurture_command(root, store, account, preset))
-            sys.stdout.write(_format_nurture_run(account, preset, run))
-            return 0
 
         if args.command == "account":
             if args.account_command == "add":
@@ -803,6 +860,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except NurtureRunnerError as error:
         suffix = f" run={error.run_id}" if error.run_id is not None else ""
+        if error.operation_id is not None:
+            suffix += f" operation={error.operation_id}"
         sys.stderr.write(f"ERROR {error.code}{suffix}\n")
         return 1
     except NurtureRunnerInterrupted as error:
