@@ -13,7 +13,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NoReturn, cast
 from uuid import UUID, uuid4
 
 from threads_platform.application.ports.process_lock import ProcessAlreadyRunning
@@ -22,10 +22,13 @@ from threads_platform.standalone.nurture import NurturePresetV1
 
 NurtureOutcome = Literal["RUNNING", "SUCCESS", "FAILED", "INTERRUPTED", "AMBIGUOUS"]
 NurtureActionState = Literal["NONE", "PENDING", "CONFIRMED", "AMBIGUOUS"]
+NurtureContentPublicationState = Literal["NEW", "RESERVED", "PUBLISHED", "AMBIGUOUS", "REJECTED"]
 
 MAX_NURTURE_TARGETS = 2_000
 MAX_NURTURE_RUN_BYTES = 8_192
 MAX_NURTURE_TARGET_STATE_BYTES = 2_097_152
+MAX_NURTURE_CONTENT_RECORDS = 2_000
+MAX_NURTURE_CONTENT_STATE_BYTES = 2_097_152
 _MAX_ACTIVE_RUNS_TO_REPAIR = 32
 _MAX_COUNTER = 1_000_000
 _MAX_DECISION_CODES = 32
@@ -37,6 +40,16 @@ _REMOTE_THREAD_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _OUTCOMES = frozenset({"RUNNING", "SUCCESS", "FAILED", "INTERRUPTED", "AMBIGUOUS"})
 _ACTION_STATES = frozenset({"NONE", "PENDING", "CONFIRMED", "AMBIGUOUS"})
+_CONTENT_CATEGORIES = frozenset(
+    {
+        "CAREER_TIP",
+        "CV_GUIDANCE",
+        "INTERVIEW_PREP",
+        "RECRUITMENT_MARKET",
+        "EMPLOYER_GUIDANCE",
+        "AUTHORIZED_CANDIDATE_EXAMPLE",
+    }
+)
 _COUNTER_FIELDS = (
     "discovered_count",
     "deduped_count",
@@ -64,6 +77,20 @@ _RUN_KEYS = frozenset(
     }
 )
 _TARGET_STATE_KEYS = frozenset({"version", "account_id", "preset_id", "targets"})
+_CONTENT_STATE_KEYS = frozenset({"version", "account_id", "preset_id", "candidates"})
+_CONTENT_CANDIDATE_KEYS = frozenset(
+    {
+        "candidate_id",
+        "source_fingerprint",
+        "draft_fingerprint",
+        "category",
+        "first_seen_at",
+        "last_action_at",
+        "publication_state",
+        "last_run_id",
+        "operation_id",
+    }
+)
 _TARGET_KEYS = frozenset(
     {
         "fingerprint",
@@ -93,6 +120,10 @@ class NurtureStateError(Exception):
             "NURTURE_TARGET_AMBIGUOUS",
             "NURTURE_TARGET_RESERVED",
             "NURTURE_STATE_CAP_REACHED",
+            "NURTURE_CONTENT_PROVENANCE_CONFLICT",
+            "NURTURE_CONTENT_DRAFT_REUSE_CONFLICT",
+            "NURTURE_CONTENT_ALREADY_USED",
+            "NURTURE_CONTENT_UNRESOLVED",
         }:
             raise ValueError("unsupported Nurture state error code")
         self.code = code
@@ -162,6 +193,48 @@ class NurtureTargetStateV1:
 
     def __post_init__(self) -> None:
         _validate_target_document(self)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureContentRecordV1:
+    candidate_id: UUID
+    source_fingerprint: str
+    draft_fingerprint: str
+    category: str
+    first_seen_at: datetime
+    last_action_at: datetime | None
+    publication_state: NurtureContentPublicationState
+    last_run_id: UUID
+    operation_id: UUID | None
+
+    def __post_init__(self) -> None:
+        _validate_content_record(self)
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureContentRecordV1("
+            f"candidate_id={self.candidate_id}, source_fingerprint={self.source_fingerprint}, "
+            f"draft_fingerprint={self.draft_fingerprint}, category={self.category}, "
+            f"publication_state={self.publication_state})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class NurtureContentStateV1:
+    version: int
+    account_id: UUID
+    preset_id: str
+    candidates: tuple[NurtureContentRecordV1, ...]
+
+    def __post_init__(self) -> None:
+        _validate_content_document(self)
+
+    def __repr__(self) -> str:
+        return (
+            "NurtureContentStateV1("
+            f"version={self.version}, account_id={self.account_id}, "
+            f"preset_id={self.preset_id!r}, candidates={len(self.candidates)})"
+        )
 
 
 class NurtureStore:
@@ -300,6 +373,60 @@ class NurtureStore:
         else:
             self._write_replace(path, encoded, MAX_NURTURE_TARGET_STATE_BYTES)
 
+    def load_content_state(
+        self,
+        owner: NurtureAccountLock,
+        preset: NurturePresetV1,
+    ) -> NurtureContentStateV1:
+        owner.require_held(self)
+        preset = _validated_preset(preset)
+        directory = self._content_account_directory(owner.account_id, create=False)
+        if directory is None:
+            return NurtureContentStateV1(1, owner.account_id, preset.id, ())
+        path = self._content_state_path(directory, preset.id, must_exist=False)
+        if path is None:
+            return NurtureContentStateV1(1, owner.account_id, preset.id, ())
+        document = self._read_content_document(path, owner.account_id, preset.id)
+        return document
+
+    def save_content_state(
+        self,
+        owner: NurtureAccountLock,
+        document: NurtureContentStateV1,
+    ) -> None:
+        owner.require_held(self)
+        if type(document) is not NurtureContentStateV1:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if owner.account_id != document.account_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_content_document(document)
+        directory = self._content_account_directory(document.account_id, create=True)
+        assert directory is not None
+        path = self._content_state_path(directory, document.preset_id, must_exist=False)
+        if path is None:
+            current = NurtureContentStateV1(1, owner.account_id, document.preset_id, ())
+        else:
+            current = self._read_content_document(path, owner.account_id, document.preset_id)
+        _validate_content_transition(current, document)
+        previous = {
+            (item.source_fingerprint, item.draft_fingerprint): item for item in current.candidates
+        }
+        for item in document.candidates:
+            old = previous.get((item.source_fingerprint, item.draft_fingerprint))
+            if old is None or old != item:
+                run = self.read_run(owner, item.last_run_id)
+                if run.preset_id != document.preset_id or run.outcome != "RUNNING":
+                    raise NurtureStateError("NURTURE_STATE_INVALID")
+        encoded = _encode_content_document(document)
+        if path is None:
+            self._write_new_document(
+                directory / f"{document.preset_id}.json",
+                encoded,
+                MAX_NURTURE_CONTENT_STATE_BYTES,
+            )
+        else:
+            self._write_replace(path, encoded, MAX_NURTURE_CONTENT_STATE_BYTES)
+
     def repair_stale_runs(self, owner: NurtureAccountLock) -> None:
         owner.require_held(self)
         directory = self._run_directory(owner.account_id, "active", create=False)
@@ -399,6 +526,12 @@ class NurtureStore:
             return None
         return self._ensure_directory(state / str(account_id), state, create=create)
 
+    def _content_account_directory(self, account_id: UUID, *, create: bool) -> Path | None:
+        content = self._subdirectory("content", create=create)
+        if content is None:
+            return None
+        return self._ensure_directory(content / str(account_id), content, create=create)
+
     def _subdirectory(self, name: str, *, create: bool) -> Path | None:
         root = self._validate_root()
         nurture = self._ensure_directory(root / "nurture", root, create=create)
@@ -454,6 +587,17 @@ class NurtureStore:
         return self._regular_file_path(directory / f"{run_id}.json", directory, must_exist)
 
     def _target_state_path(
+        self,
+        directory: Path,
+        preset_id: str,
+        *,
+        must_exist: bool,
+    ) -> Path | None:
+        if _PRESET_ID.fullmatch(preset_id) is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return self._regular_file_path(directory / f"{preset_id}.json", directory, must_exist)
+
+    def _content_state_path(
         self,
         directory: Path,
         preset_id: str,
@@ -537,6 +681,26 @@ class NurtureStore:
         except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
             raise NurtureStateError("NURTURE_STATE_INVALID") from None
         document = _decode_target_document(value)
+        if document.account_id != account_id or document.preset_id != preset_id:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        return document
+
+    def _read_content_document(
+        self,
+        path: Path,
+        account_id: UUID,
+        preset_id: str,
+    ) -> NurtureContentStateV1:
+        raw = self._read_bytes(path, path.parent, MAX_NURTURE_CONTENT_STATE_BYTES)
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_unique_object,
+                parse_constant=_reject_constant,
+            )
+        except UnicodeError, json.JSONDecodeError, RecursionError, ValueError:
+            raise NurtureStateError("NURTURE_STATE_INVALID") from None
+        document = _decode_content_document(value)
         if document.account_id != account_id or document.preset_id != preset_id:
             raise NurtureStateError("NURTURE_STATE_INVALID")
         return document
@@ -809,6 +973,150 @@ class NurtureAccountLock:
         validated_preset = _validated_preset(preset)
         return self._store.load_target_state(self, validated_preset).targets
 
+    def get_content_state(self, preset: NurturePresetV1) -> NurtureContentStateV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        return self._store.load_content_state(self, validated_preset)
+
+    def register_content_candidate(
+        self,
+        preset: NurturePresetV1,
+        candidate_id: UUID,
+        source_fingerprint: str,
+        draft_fingerprint: str,
+        category: str,
+        run_id: UUID,
+        *,
+        now: datetime,
+    ) -> NurtureContentRecordV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_uuid(candidate_id, version=4)
+        _validate_fingerprint(source_fingerprint)
+        _validate_fingerprint(draft_fingerprint)
+        if type(category) is not str or category not in _CONTENT_CATEGORIES:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        first_seen_at = _as_utc(now)
+        document = self._store.load_content_state(self, validated_preset)
+        source_matches = [
+            item for item in document.candidates if item.source_fingerprint == source_fingerprint
+        ]
+        draft_matches = [
+            item for item in document.candidates if item.draft_fingerprint == draft_fingerprint
+        ]
+        if len(source_matches) > 1 or len(draft_matches) > 1:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        source_match = source_matches[0] if source_matches else None
+        draft_match = draft_matches[0] if draft_matches else None
+        if source_match is not None or draft_match is not None:
+            if source_match is not None and source_match is not draft_match:
+                if source_match.publication_state != "NEW":
+                    _raise_content_used(source_match.publication_state)
+                raise NurtureStateError("NURTURE_CONTENT_PROVENANCE_CONFLICT")
+            if draft_match is not None and draft_match is not source_match:
+                if draft_match.publication_state != "NEW":
+                    _raise_content_used(draft_match.publication_state)
+                raise NurtureStateError("NURTURE_CONTENT_DRAFT_REUSE_CONFLICT")
+            assert source_match is not None and draft_match is source_match
+            if source_match.publication_state != "NEW":
+                _raise_content_used(source_match.publication_state)
+            if source_match.category != category:
+                raise NurtureStateError("NURTURE_CONTENT_PROVENANCE_CONFLICT")
+            updated = replace(source_match, last_run_id=run_id)
+            if updated != source_match:
+                document = _replace_content_candidate(document, updated)
+                self._store.save_content_state(self, document)
+            return updated
+
+        if len(document.candidates) >= MAX_NURTURE_CONTENT_RECORDS:
+            raise NurtureStateError("NURTURE_STATE_CAP_REACHED")
+        record = NurtureContentRecordV1(
+            candidate_id=candidate_id,
+            source_fingerprint=source_fingerprint,
+            draft_fingerprint=draft_fingerprint,
+            category=category,
+            first_seen_at=first_seen_at,
+            last_action_at=None,
+            publication_state="NEW",
+            last_run_id=run_id,
+            operation_id=None,
+        )
+        self._store.save_content_state(
+            self,
+            replace(document, candidates=(*document.candidates, record)),
+        )
+        return record
+
+    def reserve_content_candidate(
+        self,
+        preset: NurturePresetV1,
+        source_fingerprint: str,
+        draft_fingerprint: str,
+        run_id: UUID,
+    ) -> NurtureContentRecordV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(source_fingerprint)
+        _validate_fingerprint(draft_fingerprint)
+        document = self._store.load_content_state(self, validated_preset)
+        current = _find_content_candidate(
+            document.candidates, source_fingerprint, draft_fingerprint
+        )
+        if current is None or current.publication_state != "NEW" or current.last_run_id != run_id:
+            raise NurtureStateError("NURTURE_CONTENT_UNRESOLVED")
+        reserved = replace(
+            current,
+            publication_state="RESERVED",
+            last_run_id=run_id,
+        )
+        self._store.save_content_state(self, _replace_content_candidate(document, reserved))
+        return reserved
+
+    def complete_content_candidate(
+        self,
+        preset: NurturePresetV1,
+        source_fingerprint: str,
+        draft_fingerprint: str,
+        run_id: UUID,
+        publication_state: Literal["PUBLISHED", "AMBIGUOUS"],
+        operation_id: UUID,
+        *,
+        now: datetime,
+    ) -> NurtureContentRecordV1:
+        self.require_held()
+        validated_preset = _validated_preset(preset)
+        _validate_run_link(self, validated_preset, run_id)
+        _validate_fingerprint(source_fingerprint)
+        _validate_fingerprint(draft_fingerprint)
+        if type(publication_state) is not str or publication_state not in {
+            "PUBLISHED",
+            "AMBIGUOUS",
+        }:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        _validate_uuid(operation_id, version=4)
+        action_at = _as_utc(now)
+        document = self._store.load_content_state(self, validated_preset)
+        current = _find_content_candidate(
+            document.candidates, source_fingerprint, draft_fingerprint
+        )
+        if (
+            current is None
+            or current.publication_state != "RESERVED"
+            or current.last_run_id != run_id
+        ):
+            raise NurtureStateError("NURTURE_CONTENT_UNRESOLVED")
+        completed = replace(
+            current,
+            last_action_at=max(current.first_seen_at, action_at),
+            publication_state=publication_state,
+            last_run_id=run_id,
+            operation_id=operation_id,
+        )
+        self._store.save_content_state(self, _replace_content_candidate(document, completed))
+        return completed
+
     def _prepare_lock_file(self, path: Path, parent: Path) -> None:
         try:
             path.lstat()
@@ -983,6 +1291,15 @@ def _validate_run(run: NurtureRunV1) -> None:
         count = getattr(run, field_name)
         if type(count) is not int or not 0 <= count <= _MAX_COUNTER:
             raise NurtureStateError("NURTURE_STATE_INVALID")
+    if (
+        run.selected_count not in {0, 1}
+        or run.replied_count not in {0, 1}
+        or run.published_count not in {0, 1}
+        or run.replied_count + run.published_count > 1
+        or run.selected_count > run.deduped_count
+        or run.skipped_count != run.deduped_count - run.selected_count
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
     for code in run.decision_codes:
         _validate_code(code)
     for operation_id in run.operation_ids:
@@ -1203,6 +1520,225 @@ def _validate_target_document(document: NurtureTargetStateV1) -> None:
         if target.fingerprint in fingerprints:
             raise NurtureStateError("NURTURE_STATE_INVALID")
         fingerprints.add(target.fingerprint)
+
+
+def _validate_content_record(record: NurtureContentRecordV1) -> None:
+    if type(record) is not NurtureContentRecordV1:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_uuid(record.candidate_id, version=4)
+    _validate_fingerprint(record.source_fingerprint)
+    _validate_fingerprint(record.draft_fingerprint)
+    if type(record.category) is not str or record.category not in _CONTENT_CATEGORIES:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    _validate_datetime(record.first_seen_at)
+    if record.last_action_at is not None:
+        _validate_datetime(record.last_action_at)
+    if (
+        type(record.publication_state) is not str
+        or record.publication_state not in {"NEW", "RESERVED", "PUBLISHED", "AMBIGUOUS", "REJECTED"}
+        or type(record.last_run_id) is not UUID
+        or record.last_run_id.version != 4
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    if record.operation_id is not None:
+        _validate_uuid(record.operation_id, version=4)
+    if record.publication_state in {"NEW", "RESERVED", "REJECTED"}:
+        if record.last_action_at is not None or record.operation_id is not None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    elif record.last_action_at is None or record.operation_id is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    elif _as_utc(record.last_action_at) < _as_utc(record.first_seen_at):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _validate_content_document(document: NurtureContentStateV1) -> None:
+    if (
+        type(document) is not NurtureContentStateV1
+        or type(document.version) is not int
+        or document.version != 1
+        or type(document.account_id) is not UUID
+        or document.account_id.version != 4
+        or type(document.preset_id) is not str
+        or _PRESET_ID.fullmatch(document.preset_id) is None
+        or type(document.candidates) is not tuple
+        or len(document.candidates) > MAX_NURTURE_CONTENT_RECORDS
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    sources: set[str] = set()
+    drafts: set[str] = set()
+    for record in document.candidates:
+        _validate_content_record(record)
+        if record.source_fingerprint in sources or record.draft_fingerprint in drafts:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        sources.add(record.source_fingerprint)
+        drafts.add(record.draft_fingerprint)
+
+
+def _validate_content_transition(
+    current: NurtureContentStateV1,
+    updated: NurtureContentStateV1,
+) -> None:
+    if (
+        current.account_id != updated.account_id
+        or current.preset_id != updated.preset_id
+        or updated.version != 1
+    ):
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    old_items = {
+        (item.source_fingerprint, item.draft_fingerprint): item for item in current.candidates
+    }
+    new_items = {
+        (item.source_fingerprint, item.draft_fingerprint): item for item in updated.candidates
+    }
+    for key, old in old_items.items():
+        new = new_items.get(key)
+        if new is None:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if (
+            new.candidate_id != old.candidate_id
+            or new.source_fingerprint != old.source_fingerprint
+            or new.draft_fingerprint != old.draft_fingerprint
+            or new.category != old.category
+            or new.first_seen_at != old.first_seen_at
+        ):
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        if old.publication_state == "NEW":
+            if new.publication_state not in {"NEW", "RESERVED", "REJECTED"}:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new.publication_state != "NEW" and new.last_run_id != old.last_run_id:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+        elif old.publication_state == "RESERVED":
+            if new.publication_state not in {"RESERVED", "PUBLISHED", "AMBIGUOUS"}:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new.publication_state == "RESERVED" and new != old:
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+            if new.publication_state in {"PUBLISHED", "AMBIGUOUS"} and (
+                new.last_run_id != old.last_run_id
+            ):
+                raise NurtureStateError("NURTURE_STATE_INVALID")
+        elif new != old:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+    for key, item in new_items.items():
+        if key not in old_items and item.publication_state != "NEW":
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+
+
+def _encode_content_document(document: NurtureContentStateV1) -> str:
+    _validate_content_document(document)
+    value = {
+        "version": document.version,
+        "account_id": str(document.account_id),
+        "preset_id": document.preset_id,
+        "candidates": [
+            {
+                "candidate_id": str(item.candidate_id),
+                "source_fingerprint": item.source_fingerprint,
+                "draft_fingerprint": item.draft_fingerprint,
+                "category": item.category,
+                "first_seen_at": _timestamp_text(item.first_seen_at),
+                "last_action_at": (
+                    None if item.last_action_at is None else _timestamp_text(item.last_action_at)
+                ),
+                "publication_state": item.publication_state,
+                "last_run_id": str(item.last_run_id),
+                "operation_id": None if item.operation_id is None else str(item.operation_id),
+            }
+            for item in sorted(
+                document.candidates,
+                key=lambda candidate: (candidate.source_fingerprint, candidate.draft_fingerprint),
+            )
+        ],
+    }
+    return json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+def _decode_content_document(value: object) -> NurtureContentStateV1:
+    if type(value) is not dict:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    document = cast(dict[str, object], value)
+    if frozenset(document) != _CONTENT_STATE_KEYS:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    version = document["version"]
+    if type(version) is int and version != 1:
+        raise NurtureStateError("NURTURE_VERSION_UNSUPPORTED")
+    if type(version) is not int:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    raw_candidates = document["candidates"]
+    if type(raw_candidates) is not list:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    candidates: list[NurtureContentRecordV1] = []
+    for raw_candidate in cast(list[object], raw_candidates):
+        if type(raw_candidate) is not dict:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        item = cast(dict[str, object], raw_candidate)
+        if frozenset(item) != _CONTENT_CANDIDATE_KEYS:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        state = item["publication_state"]
+        if type(state) is not str or state not in {
+            "NEW",
+            "RESERVED",
+            "PUBLISHED",
+            "AMBIGUOUS",
+            "REJECTED",
+        }:
+            raise NurtureStateError("NURTURE_STATE_INVALID")
+        candidates.append(
+            NurtureContentRecordV1(
+                candidate_id=_parse_uuid(item["candidate_id"], version=4),
+                source_fingerprint=_required_string(item["source_fingerprint"]),
+                draft_fingerprint=_required_string(item["draft_fingerprint"]),
+                category=_required_string(item["category"]),
+                first_seen_at=_parse_timestamp(item["first_seen_at"]),
+                last_action_at=_nullable_timestamp(item["last_action_at"]),
+                publication_state=cast(NurtureContentPublicationState, state),
+                last_run_id=_parse_uuid(item["last_run_id"], version=4),
+                operation_id=_nullable_uuid(item["operation_id"], version=4),
+            )
+        )
+    result = NurtureContentStateV1(
+        version=version,
+        account_id=_parse_uuid(document["account_id"], version=4),
+        preset_id=_required_string(document["preset_id"]),
+        candidates=tuple(candidates),
+    )
+    _validate_content_document(result)
+    return result
+
+
+def _find_content_candidate(
+    candidates: tuple[NurtureContentRecordV1, ...],
+    source_fingerprint: str,
+    draft_fingerprint: str,
+) -> NurtureContentRecordV1 | None:
+    return next(
+        (
+            item
+            for item in candidates
+            if item.source_fingerprint == source_fingerprint
+            and item.draft_fingerprint == draft_fingerprint
+        ),
+        None,
+    )
+
+
+def _replace_content_candidate(
+    document: NurtureContentStateV1,
+    candidate: NurtureContentRecordV1,
+) -> NurtureContentStateV1:
+    candidates = tuple(
+        candidate
+        if item.source_fingerprint == candidate.source_fingerprint
+        and item.draft_fingerprint == candidate.draft_fingerprint
+        else item
+        for item in document.candidates
+    )
+    return replace(document, candidates=candidates)
+
+
+def _raise_content_used(state: NurtureContentPublicationState) -> NoReturn:
+    if state in {"RESERVED", "AMBIGUOUS"}:
+        raise NurtureStateError("NURTURE_CONTENT_UNRESOLVED")
+    raise NurtureStateError("NURTURE_CONTENT_ALREADY_USED")
 
 
 def _validate_target_transition(

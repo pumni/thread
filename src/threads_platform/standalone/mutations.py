@@ -543,7 +543,7 @@ class LocalThreadsMutationRuntime:
         self._operations = operations
 
     async def publish_text(self, alias: str, text: str) -> PublishedTextResult:
-        _validate_post_text(text)
+        validate_publish_text(text)
         operation_id, media_id = await self._publish_container(
             alias,
             MediaContainerRequest(media_type="TEXT", text=text),
@@ -1050,6 +1050,12 @@ def _account_lock_path(root: Path, account_id: UUID) -> Path:
 
 def _validate_post_text(text: object) -> None:
     _validate_mutation_text(text, "INVALID_POST_TEXT")
+
+
+def validate_publish_text(text: object) -> None:
+    """Apply the same bounded text contract used by the journaled publish method."""
+
+    _validate_post_text(text)
 
 
 def _validate_optional_post_text(text: object) -> None:
