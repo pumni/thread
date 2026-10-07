@@ -1,4 +1,4 @@
-"""One bounded observe-only or explicitly approved reply run for Standalone Nurture."""
+"""One bounded Nurture run with observe-only default and explicit apply inputs."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from threads_platform.standalone.mutations import (
     PublishedTextResult,
     StandaloneMutationError,
 )
-from threads_platform.standalone.nurture import NurturePresetV1
+from threads_platform.standalone.nurture import NurturePresetV1, nurture_quote_allowed
 from threads_platform.standalone.nurture_content import ContentCandidateV1
 from threads_platform.standalone.nurture_conversations import (
     NurtureConversationError,
@@ -31,6 +31,7 @@ from threads_platform.standalone.nurture_discovery import (
     discover_nurture_candidates,
 )
 from threads_platform.standalone.nurture_draft import NurtureDraft
+from threads_platform.standalone.nurture_quote_draft import NurtureQuoteDraft
 from threads_platform.standalone.nurture_store import (
     NurtureAccountLock,
     NurtureContentRecordV1,
@@ -51,6 +52,7 @@ _SAFE_RUNNER_CODES = frozenset(
         "INVALID_LIMIT",
         "INVALID_MEDIA_ID",
         "INVALID_NURTURE_DRAFT",
+        "INVALID_NURTURE_QUOTE_DRAFT",
         "INVALID_NURTURE_CONTENT",
         "INVALID_NURTURE_PRESET",
         "INVALID_QUERY",
@@ -64,6 +66,8 @@ _SAFE_RUNNER_CODES = frozenset(
         "NURTURE_BUSY",
         "NURTURE_DRAFT_TARGET_MISMATCH",
         "NURTURE_REPLY_APPLY_DISABLED",
+        "NURTURE_QUOTE_APPLY_DISABLED",
+        "NURTURE_QUOTE_TARGET_MISMATCH",
         "NURTURE_CONTENT_ACCOUNT_MISMATCH",
         "NURTURE_CONTENT_APPLY_DISABLED",
         "NURTURE_CONTENT_PROVENANCE_CONFLICT",
@@ -179,6 +183,7 @@ class NurtureRunner:
         now: datetime | None = None,
         apply_requested: bool = False,
         draft: NurtureDraft | None = None,
+        quote_draft: NurtureQuoteDraft | None = None,
         content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
     ) -> NurtureRunV1:
@@ -189,6 +194,7 @@ class NurtureRunner:
                 now=now,
                 apply_requested=apply_requested,
                 draft=draft,
+                quote_draft=quote_draft,
                 content_candidate=content_candidate,
                 mutations=mutations,
             )
@@ -202,6 +208,7 @@ class NurtureRunner:
         now: datetime | None = None,
         apply_requested: bool = False,
         draft: NurtureDraft | None = None,
+        quote_draft: NurtureQuoteDraft | None = None,
         content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
     ) -> NurtureRunResult:
@@ -213,6 +220,8 @@ class NurtureRunner:
             raise NurtureRunnerError("RUN_FAILED")
         if draft is not None and type(draft) is not NurtureDraft:
             raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
+        if quote_draft is not None and type(quote_draft) is not NurtureQuoteDraft:
+            raise NurtureRunnerError("INVALID_NURTURE_QUOTE_DRAFT")
         if content_candidate is not None and type(content_candidate) is not ContentCandidateV1:
             raise NurtureRunnerError("INVALID_NURTURE_CONTENT")
         if content_candidate is not None and (
@@ -220,9 +229,18 @@ class NurtureRunner:
             or content_candidate.preset_id != preset.id
         ):
             raise NurtureRunnerError("NURTURE_CONTENT_ACCOUNT_MISMATCH")
-        if draft is not None and content_candidate is not None:
+        provided_inputs = sum(item is not None for item in (draft, quote_draft, content_candidate))
+        if provided_inputs > 1:
             raise NurtureRunnerError("NURTURE_INPUT_CONFLICT")
-        expects_mutations = draft is not None or (content_candidate is not None and apply_requested)
+        if quote_draft is not None and not apply_requested:
+            raise NurtureRunnerError("INVALID_NURTURE_QUOTE_DRAFT")
+        if quote_draft is not None and not nurture_quote_allowed(preset):
+            raise NurtureRunnerError("NURTURE_QUOTE_APPLY_DISABLED")
+        expects_mutations = (
+            draft is not None
+            or quote_draft is not None
+            or (content_candidate is not None and apply_requested)
+        )
         if (expects_mutations != (mutations is not None)) or (
             draft is not None and not apply_requested
         ):
@@ -244,6 +262,7 @@ class NurtureRunner:
                         captured_now,
                         apply_requested=apply_requested,
                         draft=draft,
+                        quote_draft=quote_draft,
                         content_candidate=content_candidate,
                         mutations=mutations,
                     )
@@ -265,6 +284,7 @@ class NurtureRunner:
         *,
         apply_requested: bool,
         draft: NurtureDraft | None,
+        quote_draft: NurtureQuoteDraft | None,
         content_candidate: ContentCandidateV1 | None,
         mutations: LocalThreadsMutationRuntime | None,
     ) -> NurtureRunResult:
@@ -279,15 +299,20 @@ class NurtureRunner:
                     preset,
                     now,
                     draft,
+                    quote_draft,
                 )
                 chosen = selection.candidate
                 selected_count = 1 if chosen is not None else 0
                 if chosen is not None:
-                    decision = _selection_decision(
-                        chosen,
-                        apply_requested,
-                        draft,
-                        own_content_requested=content_candidate is not None,
+                    decision = (
+                        "QUOTE_APPLY"
+                        if quote_draft is not None
+                        else _selection_decision(
+                            chosen,
+                            apply_requested,
+                            draft,
+                            own_content_requested=content_candidate is not None,
+                        )
                     )
                     stage = "receipt"
                     scope.update(
@@ -301,6 +326,20 @@ class NurtureRunner:
                         decision_codes=(decision,),
                     )
                     selected_fingerprint = chosen.fingerprint
+                    if quote_draft is not None:
+                        stage = "quote"
+                        return await self._apply_quote(
+                            owner,
+                            scope,
+                            account,
+                            preset,
+                            now,
+                            run_id,
+                            chosen,
+                            selection,
+                            quote_draft,
+                            mutations,
+                        )
                     if draft is not None:
                         if selected_fingerprint != draft.target_fingerprint or mutations is None:
                             raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
@@ -520,6 +559,58 @@ class NurtureRunner:
                 raise NurtureRunnerError(code, run_id) from None
         raise NurtureRunnerError("RUN_FAILED", run_id) from None
 
+    async def _apply_quote(
+        self,
+        owner: NurtureAccountLock,
+        scope: NurtureRunScope,
+        account: LocalAccount,
+        preset: NurturePresetV1,
+        now: datetime,
+        run_id: UUID,
+        candidate: NurtureInboundCandidate | NurtureCandidate,
+        selection: _NurtureSelection,
+        quote_draft: NurtureQuoteDraft,
+        mutations: LocalThreadsMutationRuntime | None,
+    ) -> NurtureRunResult:
+        fingerprint = candidate.fingerprint
+        if (
+            not isinstance(candidate, NurtureCandidate)
+            or fingerprint != quote_draft.target_fingerprint
+            or mutations is None
+        ):
+            raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
+        previous = selection.target_by_fingerprint.get(fingerprint)
+        if previous is not None and previous.action_state != "NONE":
+            raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
+
+        quota = await self._api.quota(account.alias)
+        if _publishing_quota_exhausted(quota):
+            raise NurtureRunnerError("THREADS_PUBLISHING_QUOTA_REACHED")
+        owner.reserve_target(preset, fingerprint, run_id, "QUOTE_APPLY", now=now)
+        result = await mutations.publish_quote(
+            account.alias,
+            candidate.remote_thread_id,
+            quote_draft.text,
+        )
+        if (
+            type(result) is not PublishedTextResult
+            or type(result.operation_id) is not UUID
+            or result.operation_id.version != 4
+        ):
+            raise NurtureRunnerError("RUN_FAILED")
+
+        owner.complete_target_action(
+            preset,
+            fingerprint,
+            run_id,
+            "CONFIRMED",
+            result.operation_id,
+            now=now,
+        )
+        scope.link_operation(result.operation_id)
+        scope.update(published_count=1, decision_codes=("QUOTE_PUBLISHED",))
+        return NurtureRunResult(scope.finish("SUCCESS", now=now), fingerprint)
+
     async def _select_current_candidate(
         self,
         owner: NurtureAccountLock,
@@ -527,6 +618,7 @@ class NurtureRunner:
         preset: NurturePresetV1,
         now: datetime,
         draft: NurtureDraft | None,
+        quote_draft: NurtureQuoteDraft | None,
     ) -> _NurtureSelection:
         state = NurtureTargetStateV1(
             version=1,
@@ -535,12 +627,24 @@ class NurtureRunner:
             targets=owner.get_targets(preset),
         )
         targets = {target.fingerprint: target for target in state.targets}
-        bound_target = None if draft is None else targets.get(draft.target_fingerprint)
+        bound_fingerprint = (
+            draft.target_fingerprint
+            if draft is not None
+            else quote_draft.target_fingerprint
+            if quote_draft is not None
+            else None
+        )
+        bound_target = None if bound_fingerprint is None else targets.get(bound_fingerprint)
         if draft is not None:
             if not preset.engagement_enabled or preset.max_replies_per_explicit_run < 1:
                 raise NurtureRunnerError("NURTURE_REPLY_APPLY_DISABLED")
             if bound_target is not None and bound_target.action_state != "NONE":
                 raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
+        if quote_draft is not None:
+            if not nurture_quote_allowed(preset):
+                raise NurtureRunnerError("NURTURE_QUOTE_APPLY_DISABLED")
+            if bound_target is not None and bound_target.action_state != "NONE":
+                raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
 
         inbound = await collect_nurture_inbound(self._api, account.alias, preset)
         chosen = next(
@@ -553,6 +657,7 @@ class NurtureRunner:
                     preset.seen_cooldown_seconds,
                     now,
                     draft,
+                    quote_draft,
                 )
             ),
             None,
@@ -562,12 +667,21 @@ class NurtureRunner:
         if chosen is not None:
             if draft is not None and chosen.fingerprint != draft.target_fingerprint:
                 raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
+            if quote_draft is not None and (
+                not isinstance(chosen, NurtureCandidate)
+                or chosen.fingerprint != quote_draft.target_fingerprint
+            ):
+                raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
         else:
             discovery = await discover_nurture_candidates(
                 self._api,
                 account.alias,
                 preset,
-                _discovery_state_for_draft(state, bound_target, draft),
+                _discovery_state_for_bound_target(
+                    state,
+                    bound_target,
+                    bound_fingerprint,
+                ),
                 now,
             )
             discovered_count += discovery.discovered_count
@@ -592,6 +706,7 @@ class NurtureRunner:
                         preset.seen_cooldown_seconds,
                         now,
                         draft,
+                        quote_draft,
                     )
                 ),
                 None,
@@ -600,6 +715,10 @@ class NurtureRunner:
                 chosen is None or chosen.fingerprint != draft.target_fingerprint
             ):
                 raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
+            if quote_draft is not None and (
+                chosen is None or chosen.fingerprint != quote_draft.target_fingerprint
+            ):
+                raise NurtureRunnerError("NURTURE_QUOTE_TARGET_MISMATCH")
         return _NurtureSelection(chosen, targets, discovered_count, deduped_count)
 
 
@@ -621,12 +740,16 @@ def _candidate_surface_eligible(
     cooldown_seconds: int,
     now: datetime,
     draft: NurtureDraft | None,
+    quote_draft: NurtureQuoteDraft | None,
 ) -> bool:
-    if (
-        draft is not None
-        and fingerprint == draft.target_fingerprint
-        and _can_bypass_seen_cooldown(target, now)
-    ):
+    bound_fingerprint = (
+        draft.target_fingerprint
+        if draft is not None
+        else quote_draft.target_fingerprint
+        if quote_draft is not None
+        else None
+    )
+    if fingerprint == bound_fingerprint and _can_bypass_seen_cooldown(target, now):
         return True
     return _surface_eligible(target, cooldown_seconds, now)
 
@@ -703,19 +826,19 @@ def _publishing_quota_exhausted(quota: object) -> bool:
     return usage is not None and total is not None and usage >= total
 
 
-def _discovery_state_for_draft(
+def _discovery_state_for_bound_target(
     state: NurtureTargetStateV1,
     bound_target: NurtureTargetV1 | None,
-    draft: NurtureDraft | None,
+    bound_fingerprint: str | None,
 ) -> NurtureTargetStateV1:
-    if draft is None or bound_target is None or bound_target.action_state != "NONE":
+    if bound_fingerprint is None or bound_target is None or bound_target.action_state != "NONE":
         return state
     return NurtureTargetStateV1(
         version=state.version,
         account_id=state.account_id,
         preset_id=state.preset_id,
         targets=tuple(
-            target for target in state.targets if target.fingerprint != draft.target_fingerprint
+            target for target in state.targets if target.fingerprint != bound_fingerprint
         ),
     )
 

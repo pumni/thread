@@ -67,6 +67,11 @@ from threads_platform.standalone.nurture_insights import (
     NurtureInsightsResult,
     NurtureInsightsService,
 )
+from threads_platform.standalone.nurture_quote_draft import (
+    NurtureQuoteDraft,
+    NurtureQuoteDraftError,
+    load_nurture_quote_draft,
+)
 from threads_platform.standalone.nurture_runner import (
     NurtureRunner,
     NurtureRunnerError,
@@ -282,24 +287,32 @@ async def _run_nurture_command(
     *,
     apply_requested: bool = False,
     draft: NurtureDraft | None = None,
+    quote_draft: NurtureQuoteDraft | None = None,
     content_candidate: ContentCandidateV1 | None = None,
 ) -> NurtureRunResult:
     async with build_standalone_app(
         root,
         accounts,
         include_api=True,
-        include_mutations=draft is not None or (content_candidate is not None and apply_requested),
+        include_mutations=(
+            draft is not None
+            or quote_draft is not None
+            or (content_candidate is not None and apply_requested)
+        ),
         include_browser=False,
     ) as app:
         if app.api is None:
             raise NurtureRunnerError("RUN_FAILED")
         if draft is not None and app.mutations is None:
             raise NurtureRunnerError("RUN_FAILED")
+        if quote_draft is not None and app.mutations is None:
+            raise NurtureRunnerError("RUN_FAILED")
         return await NurtureRunner(app.api, NurtureStore(root)).run_with_selection(
             account,
             preset,
             apply_requested=apply_requested,
             draft=draft,
+            quote_draft=quote_draft,
             content_candidate=content_candidate,
             mutations=app.mutations,
         )
@@ -387,6 +400,7 @@ def _run_nurture_cli(
         raise NurtureRunnerError(error.code) from None
     account = accounts.get(args.alias)
     draft: NurtureDraft | None = None
+    quote_draft: NurtureQuoteDraft | None = None
     content_candidate: ContentCandidateV1 | None = None
     if args.reply_file is not None:
         try:
@@ -400,6 +414,11 @@ def _run_nurture_cli(
             )
         except NurtureContentError as error:
             raise NurtureRunnerError(error.code) from None
+    if args.quote_file is not None:
+        try:
+            quote_draft = load_nurture_quote_draft(Path(args.quote_file))
+        except NurtureQuoteDraftError as error:
+            raise NurtureRunnerError(error.code) from None
     result = asyncio.run(
         _run_nurture_command(
             root,
@@ -408,6 +427,7 @@ def _run_nurture_cli(
             preset,
             apply_requested=args.apply,
             draft=draft,
+            quote_draft=quote_draft,
             content_candidate=content_candidate,
         )
     )
@@ -415,10 +435,15 @@ def _run_nurture_cli(
 
 
 def _handle_nurture_cli_command(args: argparse.Namespace) -> int:
-    if args.reply_file is not None and args.post_file is not None:
+    supplied_draft_files = sum(
+        value is not None for value in (args.reply_file, args.post_file, args.quote_file)
+    )
+    if supplied_draft_files > 1:
         raise NurtureRunnerError("NURTURE_INPUT_CONFLICT")
     if args.reply_file is not None and not args.apply:
         raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
+    if args.quote_file is not None and not args.apply:
+        raise NurtureRunnerError("INVALID_NURTURE_QUOTE_DRAFT")
     root = resolve_standalone_data_root()
     store = LocalAccountStore(root)
     sys.stdout.write(_run_nurture_cli(args, root, store))
@@ -799,6 +824,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_nurture_parser.add_argument("--apply", action="store_true")
     run_nurture_parser.add_argument("--reply-file")
     run_nurture_parser.add_argument("--post-file")
+    run_nurture_parser.add_argument("--quote-file")
     insights_nurture_parser = nurture_commands.add_parser("insights")
     nurture_insights_commands = insights_nurture_parser.add_subparsers(
         dest="nurture_insights_command", required=True
