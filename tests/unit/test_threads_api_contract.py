@@ -85,7 +85,10 @@ async def test_documented_container_publish_media_and_quota_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_documented_reply_page_maps_nested_ids_and_cursor() -> None:
+    requests: list[httpx2.Request] = []
+
     async def respond(_: httpx2.Request) -> httpx2.Response:
+        requests.append(_)
         return httpx2.Response(
             200,
             json={
@@ -96,6 +99,7 @@ async def test_documented_reply_page_maps_nested_ids_and_cursor() -> None:
                         "timestamp": "2026-01-01T00:00:00+0000",
                         "root_post": {"id": "root-doc-example"},
                         "replied_to": {"id": "parent-doc-example"},
+                        "is_reply_owned_by_me": False,
                     }
                 ],
                 "paging": {
@@ -115,8 +119,105 @@ async def test_documented_reply_page_maps_nested_ids_and_cursor() -> None:
 
     assert page.has_more is True
     assert page.next_cursor == "after-doc"
+    reply = page.replies[0]
+    assert reply.reply_id == "reply-doc-example"
+    assert reply.text == "Nested reply example"
+    assert reply.timestamp == "2026-01-01T00:00:00+0000"
+    assert reply.root_post_id == "root-doc-example"
+    assert reply.replied_to_id == "parent-doc-example"
+    assert reply.is_reply_owned_by_me is False
+    requested_fields = parse_qs(requests[0].url.query.decode())["fields"][0].split(",")
+    assert requested_fields == [
+        "id",
+        "text",
+        "timestamp",
+        "root_post",
+        "replied_to",
+        "is_reply_owned_by_me",
+    ]
+    assert requested_fields.count("is_reply_owned_by_me") == 1
+
+
+@pytest.mark.parametrize(
+    ("field_present", "ownership_value", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (True, None, None),
+        (False, None, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reply_ownership_exact_boolean_and_unknown_mapping(
+    field_present: bool,
+    ownership_value: object,
+    expected: bool | None,
+) -> None:
+    reply: dict[str, object] = {"id": "reply-doc-example"}
+    if field_present:
+        reply["is_reply_owned_by_me"] = ownership_value
+
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json={"data": [reply]})
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/",
+        transport=httpx2.MockTransport(respond),
+    ) as client:
+        page = await HttpThreadsAPI(client).get_replies(
+            SecretStr("test-placeholder"), "root-doc-example", None
+        )
+
+    assert page.replies[0].is_reply_owned_by_me is expected
+
+
+@pytest.mark.parametrize("ownership_value", [0, 1, "true", "false"])
+@pytest.mark.asyncio
+async def test_reply_ownership_rejects_non_json_boolean_values(ownership_value: object) -> None:
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={"data": [{"id": "reply-doc-example", "is_reply_owned_by_me": ownership_value}]},
+        )
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/",
+        transport=httpx2.MockTransport(respond),
+    ) as client:
+        with pytest.raises(ThreadsContractError):
+            await HttpThreadsAPI(client).get_conversation(
+                SecretStr("test-placeholder"), "root-doc-example", None
+            )
+
+
+@pytest.mark.parametrize("parent_id", ["root-doc-example", "nested-reply-doc-example"])
+@pytest.mark.asyncio
+async def test_direct_and_nested_replied_to_ids_are_preserved(parent_id: str) -> None:
+    async def respond(_: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "reply-doc-example",
+                        "root_post": {"id": "root-doc-example"},
+                        "replied_to": {"id": parent_id},
+                        "is_reply_owned_by_me": False,
+                    }
+                ]
+            },
+        )
+
+    async with httpx2.AsyncClient(
+        base_url="https://graph.threads.net/v1.0/",
+        transport=httpx2.MockTransport(respond),
+    ) as client:
+        page = await HttpThreadsAPI(client).get_conversation(
+            SecretStr("test-placeholder"), "root-doc-example", None
+        )
+
     assert page.replies[0].root_post_id == "root-doc-example"
-    assert page.replies[0].replied_to_id == "parent-doc-example"
+    assert page.replies[0].replied_to_id == parent_id
 
 
 @pytest.mark.asyncio

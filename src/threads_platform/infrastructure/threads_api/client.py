@@ -254,7 +254,7 @@ class HttpThreadsAPI:
         self, token: SecretStr, thread_id: str, edge: str, after: str | None
     ) -> ReplyPage:
         params: dict[str, str] = {
-            "fields": "id,text,timestamp,root_post,replied_to",
+            "fields": "id,text,timestamp,root_post,replied_to,is_reply_owned_by_me",
             "reverse": "false",
         }
         if after is not None:
@@ -365,12 +365,16 @@ class HttpThreadsAPI:
             raise ThreadsContractError()
         text = cls._optional_string(reply.get("text"))
         timestamp = cls._optional_string(reply.get("timestamp"))
+        owned_by_me = reply.get("is_reply_owned_by_me")
+        if owned_by_me is not None and type(owned_by_me) is not bool:
+            raise ThreadsContractError()
         return RemoteReply(
             reply_id=reply_id,
             text=text,
             timestamp=timestamp,
             root_post_id=cls._nested_id(reply.get("root_post")),
             replied_to_id=cls._nested_id(reply.get("replied_to")),
+            is_reply_owned_by_me=owned_by_me,
         )
 
     @classmethod

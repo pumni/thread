@@ -57,6 +57,7 @@ class RemoteReply:
     timestamp: str | None
     root_post_id: str | None
     replied_to_id: str | None
+    is_reply_owned_by_me: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

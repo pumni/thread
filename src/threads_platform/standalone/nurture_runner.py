@@ -10,8 +10,13 @@ from uuid import UUID
 from threads_platform.standalone.accounts import LocalAccount
 from threads_platform.standalone.api import LocalThreadsApiRuntime
 from threads_platform.standalone.nurture import NurturePresetV1
+from threads_platform.standalone.nurture_conversations import (
+    NurtureConversationError,
+    collect_nurture_inbound,
+)
 from threads_platform.standalone.nurture_discovery import (
     NurtureDiscoveryError,
+    NurtureDiscoverySource,
     discover_nurture_candidates,
 )
 from threads_platform.standalone.nurture_store import (
@@ -150,21 +155,15 @@ class NurtureRunner:
                     preset_id=preset.id,
                     targets=owner.get_targets(preset),
                 )
-                stage = "discovery"
-                discovery = await discover_nurture_candidates(
-                    self._api,
-                    account.alias,
-                    preset,
-                    target_state,
-                    now,
-                )
                 target_by_fingerprint = {
                     target.fingerprint: target for target in target_state.targets
                 }
-                chosen = next(
+                stage = "inbound"
+                inbound = await collect_nurture_inbound(self._api, account.alias, preset)
+                chosen_inbound = next(
                     (
                         candidate
-                        for candidate in discovery.selected_candidates
+                        for candidate in inbound.candidates
                         if _surface_eligible(
                             target_by_fingerprint.get(candidate.fingerprint),
                             preset.seen_cooldown_seconds,
@@ -173,31 +172,79 @@ class NurtureRunner:
                     ),
                     None,
                 )
-                decision = "OBSERVE_ONLY" if chosen is not None else "NO_ACTION"
+
+                chosen_fingerprint: str | None = None
+                selected_count = 0
+                decision = "NO_ACTION"
+                discovery_discovered_count = 0
+                discovery_deduped_count = 0
+                if chosen_inbound is not None:
+                    chosen_fingerprint = chosen_inbound.fingerprint
+                    selected_count = 1
+                    decision = "INBOUND_CANDIDATE"
+                else:
+                    stage = "discovery"
+                    discovery = await discover_nurture_candidates(
+                        self._api,
+                        account.alias,
+                        preset,
+                        target_state,
+                        now,
+                    )
+                    discovery_discovered_count = discovery.discovered_count
+                    discovery_deduped_count = discovery.deduped_count
+                    mention_candidates = tuple(
+                        candidate
+                        for candidate in discovery.selected_candidates
+                        if candidate.source_class is NurtureDiscoverySource.MENTIONS
+                    )
+                    remaining_candidates = tuple(
+                        candidate
+                        for candidate in discovery.selected_candidates
+                        if candidate.source_class is not NurtureDiscoverySource.MENTIONS
+                    )
+                    chosen_discovery = next(
+                        (
+                            candidate
+                            for candidate in (*mention_candidates, *remaining_candidates)
+                            if _surface_eligible(
+                                target_by_fingerprint.get(candidate.fingerprint),
+                                preset.seen_cooldown_seconds,
+                                now,
+                            )
+                        ),
+                        None,
+                    )
+                    if chosen_discovery is not None:
+                        chosen_fingerprint = chosen_discovery.fingerprint
+                        selected_count = 1
+                        decision = "OBSERVE_ONLY"
                 decision_codes = [decision]
+                discovered_count = inbound.discovered_count + discovery_discovered_count
+                deduped_count = inbound.deduped_count + discovery_deduped_count
 
                 stage = "receipt"
                 scope.update(
-                    discovered_count=discovery.discovered_count,
-                    deduped_count=discovery.deduped_count,
-                    selected_count=1 if chosen is not None else 0,
+                    discovered_count=discovered_count,
+                    deduped_count=deduped_count,
+                    selected_count=selected_count,
                     enriched_count=0,
                     replied_count=0,
                     published_count=0,
-                    skipped_count=discovery.deduped_count - (1 if chosen is not None else 0),
+                    skipped_count=deduped_count - selected_count,
                     decision_codes=tuple(decision_codes),
                 )
 
-                if chosen is not None:
+                if chosen_fingerprint is not None:
                     stage = "observe"
                     observed = owner.observe_target(
                         preset,
-                        chosen.fingerprint,
+                        chosen_fingerprint,
                         run_id,
-                        "OBSERVE_ONLY",
+                        decision,
                         now=now,
                     )
-                    previous = target_by_fingerprint.get(chosen.fingerprint)
+                    previous = target_by_fingerprint.get(chosen_fingerprint)
                     if previous is not None and not _action_history_preserved(previous, observed):
                         raise NurtureStateError("NURTURE_STATE_INVALID")
                     if observed.action_state not in {"NONE", "CONFIRMED"}:
@@ -210,6 +257,9 @@ class NurtureRunner:
             except NurtureDiscoveryError as error:
                 failed_stage = _safe_stage(error.stage, "discovery")
                 _finish_failed(scope, error.code, failed_stage, run_id)
+                raise NurtureRunnerError(error.code, run_id) from None
+            except NurtureConversationError as error:
+                _finish_failed(scope, error.code, error.stage, run_id)
                 raise NurtureRunnerError(error.code, run_id) from None
             except NurtureStateError as error:
                 _finish_failed(scope, error.code, stage, run_id)

@@ -941,6 +941,17 @@ def fingerprint_remote_thread(remote_thread_id: str) -> str:
     return hashlib.sha256(identity).hexdigest()
 
 
+def fingerprint_remote_reply(remote_reply_id: str) -> str:
+    """Return a namespaced SHA-256 fingerprint for a normalized reply identity."""
+
+    if type(remote_reply_id) is not str:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    normalized = unicodedata.normalize("NFC", remote_reply_id.strip())
+    if _REMOTE_THREAD_ID.fullmatch(normalized) is None:
+        raise NurtureStateError("NURTURE_STATE_INVALID")
+    return hashlib.sha256(f"reply:{normalized}".encode()).hexdigest()
+
+
 def _validate_run(run: NurtureRunV1) -> None:
     if type(run) is not NurtureRunV1:
         raise NurtureStateError("NURTURE_STATE_INVALID")
