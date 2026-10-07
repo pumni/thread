@@ -627,13 +627,15 @@ async def test_exact_ambiguous_runtime_signal_persists_ambiguous_and_never_retri
     assert run.operation_ids == (operation_id,)
 
 
+@pytest.mark.parametrize("failure_code", ["THREADS_INVALID_REQUEST", "THREADS_TRANSPORT_FAILURE"])
 @pytest.mark.asyncio
 async def test_nonambiguous_failure_keeps_pending_and_state_write_failure_never_retries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
 ) -> None:
     root, store, account, preset = _setup(tmp_path)
-    mutations = _Mutations(failure=StandaloneMutationError("THREADS_TRANSPORT_FAILURE"))
+    mutations = _Mutations(failure=StandaloneMutationError(failure_code))
     with pytest.raises(NurtureRunnerError) as error:
         await _run_apply(
             _Api(),
@@ -643,9 +645,14 @@ async def test_nonambiguous_failure_keeps_pending_and_state_write_failure_never_
             _draft(fingerprint_remote_thread(_THREAD_ID)),
             mutations,
         )
-    assert error.value.code == "THREADS_TRANSPORT_FAILURE"
+    assert error.value.code == failure_code
     assert len(mutations.calls) == 1
     assert _target_state_json(root, account, preset)["targets"][0]["action_state"] == "PENDING"
+    assert error.value.run_id is not None
+    with store.acquire_account_lock(account.id) as owner:
+        run = owner.get_run(error.value.run_id)
+    assert run.outcome == "FAILED"
+    assert run.error_code == failure_code
 
     second_root, second_store, second_account, second_preset = _setup(tmp_path / "second")
     second_mutations = _Mutations()
