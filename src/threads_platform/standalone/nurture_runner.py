@@ -14,9 +14,11 @@ from threads_platform.standalone.api import LocalThreadsApiRuntime
 from threads_platform.standalone.mutations import (
     CreatedReplyResult,
     LocalThreadsMutationRuntime,
+    PublishedTextResult,
     StandaloneMutationError,
 )
 from threads_platform.standalone.nurture import NurturePresetV1
+from threads_platform.standalone.nurture_content import ContentCandidateV1
 from threads_platform.standalone.nurture_conversations import (
     NurtureConversationError,
     NurtureInboundCandidate,
@@ -31,6 +33,7 @@ from threads_platform.standalone.nurture_discovery import (
 from threads_platform.standalone.nurture_draft import NurtureDraft
 from threads_platform.standalone.nurture_store import (
     NurtureAccountLock,
+    NurtureContentRecordV1,
     NurtureRunScope,
     NurtureRunV1,
     NurtureStateError,
@@ -48,6 +51,7 @@ _SAFE_RUNNER_CODES = frozenset(
         "INVALID_LIMIT",
         "INVALID_MEDIA_ID",
         "INVALID_NURTURE_DRAFT",
+        "INVALID_NURTURE_CONTENT",
         "INVALID_NURTURE_PRESET",
         "INVALID_QUERY",
         "INVALID_REPLY_ID",
@@ -60,6 +64,13 @@ _SAFE_RUNNER_CODES = frozenset(
         "NURTURE_BUSY",
         "NURTURE_DRAFT_TARGET_MISMATCH",
         "NURTURE_REPLY_APPLY_DISABLED",
+        "NURTURE_CONTENT_ACCOUNT_MISMATCH",
+        "NURTURE_CONTENT_APPLY_DISABLED",
+        "NURTURE_CONTENT_PROVENANCE_CONFLICT",
+        "NURTURE_CONTENT_DRAFT_REUSE_CONFLICT",
+        "NURTURE_CONTENT_ALREADY_USED",
+        "NURTURE_CONTENT_UNRESOLVED",
+        "NURTURE_INPUT_CONFLICT",
         "NURTURE_RUN_NOT_FOUND",
         "NURTURE_STATE_CAP_REACHED",
         "NURTURE_STATE_INVALID",
@@ -102,12 +113,14 @@ class NurtureRunResult:
 
     receipt: NurtureRunV1
     target_fingerprint: str | None
+    content_candidate_id: UUID | None = None
 
     def __repr__(self) -> str:
         return (
             "NurtureRunResult("
             f"run_id={self.receipt.id}, outcome={self.receipt.outcome}, "
-            f"target_fingerprint={self.target_fingerprint or '-'})"
+            f"target_fingerprint={self.target_fingerprint or '-'}, "
+            f"content_candidate_id={self.content_candidate_id or '-'})"
         )
 
 
@@ -166,6 +179,7 @@ class NurtureRunner:
         now: datetime | None = None,
         apply_requested: bool = False,
         draft: NurtureDraft | None = None,
+        content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
     ) -> NurtureRunV1:
         return (
@@ -175,6 +189,7 @@ class NurtureRunner:
                 now=now,
                 apply_requested=apply_requested,
                 draft=draft,
+                content_candidate=content_candidate,
                 mutations=mutations,
             )
         ).receipt
@@ -187,6 +202,7 @@ class NurtureRunner:
         now: datetime | None = None,
         apply_requested: bool = False,
         draft: NurtureDraft | None = None,
+        content_candidate: ContentCandidateV1 | None = None,
         mutations: LocalThreadsMutationRuntime | None = None,
     ) -> NurtureRunResult:
         if type(account) is not LocalAccount or type(account.id) is not UUID:
@@ -197,7 +213,17 @@ class NurtureRunner:
             raise NurtureRunnerError("RUN_FAILED")
         if draft is not None and type(draft) is not NurtureDraft:
             raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
-        if (draft is not None) != (mutations is not None) or (
+        if content_candidate is not None and type(content_candidate) is not ContentCandidateV1:
+            raise NurtureRunnerError("INVALID_NURTURE_CONTENT")
+        if content_candidate is not None and (
+            content_candidate.account_alias != account.alias
+            or content_candidate.preset_id != preset.id
+        ):
+            raise NurtureRunnerError("NURTURE_CONTENT_ACCOUNT_MISMATCH")
+        if draft is not None and content_candidate is not None:
+            raise NurtureRunnerError("NURTURE_INPUT_CONFLICT")
+        expects_mutations = draft is not None or (content_candidate is not None and apply_requested)
+        if (expects_mutations != (mutations is not None)) or (
             draft is not None and not apply_requested
         ):
             raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
@@ -218,6 +244,7 @@ class NurtureRunner:
                         captured_now,
                         apply_requested=apply_requested,
                         draft=draft,
+                        content_candidate=content_candidate,
                         mutations=mutations,
                     )
                 except KeyboardInterrupt:
@@ -238,6 +265,7 @@ class NurtureRunner:
         *,
         apply_requested: bool,
         draft: NurtureDraft | None,
+        content_candidate: ContentCandidateV1 | None,
         mutations: LocalThreadsMutationRuntime | None,
     ) -> NurtureRunResult:
         run_id = scope.receipt.id
@@ -254,81 +282,187 @@ class NurtureRunner:
                 )
                 chosen = selection.candidate
                 selected_count = 1 if chosen is not None else 0
-                decision = _selection_decision(chosen, apply_requested, draft)
+                if chosen is not None:
+                    decision = _selection_decision(
+                        chosen,
+                        apply_requested,
+                        draft,
+                        own_content_requested=content_candidate is not None,
+                    )
+                    stage = "receipt"
+                    scope.update(
+                        discovered_count=selection.discovered_count,
+                        deduped_count=selection.deduped_count,
+                        selected_count=selected_count,
+                        enriched_count=0,
+                        replied_count=0,
+                        published_count=0,
+                        skipped_count=selection.deduped_count - selected_count,
+                        decision_codes=(decision,),
+                    )
+                    selected_fingerprint = chosen.fingerprint
+                    if draft is not None:
+                        if selected_fingerprint != draft.target_fingerprint or mutations is None:
+                            raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
+                        thread_id, parent_reply_id = _mutation_target(chosen)
+                        stage = "quota"
+                        quota = await self._api.quota(account.alias)
+                        if _reply_quota_exhausted(quota):
+                            raise NurtureRunnerError("THREADS_REPLY_QUOTA_REACHED")
+                        stage = "reserve"
+                        owner.reserve_target(
+                            preset,
+                            selected_fingerprint,
+                            run_id,
+                            "REPLY_APPLY",
+                            now=now,
+                        )
+                        stage = "publish"
+                        result = await mutations.create_reply(
+                            account.alias,
+                            thread_id,
+                            draft.text,
+                            parent_reply_id=parent_reply_id,
+                        )
+                        if (
+                            type(result) is not CreatedReplyResult
+                            or type(result.operation_id) is not UUID
+                            or result.operation_id.version != 4
+                        ):
+                            raise NurtureRunnerError("RUN_FAILED")
+
+                        stage = "confirm"
+                        owner.complete_target_action(
+                            preset,
+                            selected_fingerprint,
+                            run_id,
+                            "CONFIRMED",
+                            result.operation_id,
+                            now=now,
+                        )
+                        scope.link_operation(result.operation_id)
+                        scope.update(replied_count=1, decision_codes=("REPLY_APPLIED",))
+                        return NurtureRunResult(
+                            scope.finish("SUCCESS", now=now), selected_fingerprint
+                        )
+
+                    stage = "observe"
+                    observed = owner.observe_target(
+                        preset,
+                        selected_fingerprint,
+                        run_id,
+                        decision,
+                        now=now,
+                    )
+                    previous = selection.target_by_fingerprint.get(selected_fingerprint)
+                    if previous is not None and not _action_history_preserved(previous, observed):
+                        raise NurtureStateError("NURTURE_STATE_INVALID")
+                    if observed.action_state not in {"NONE", "CONFIRMED"}:
+                        raise NurtureStateError("NURTURE_STATE_INVALID")
+                    return NurtureRunResult(scope.finish("SUCCESS", now=now), selected_fingerprint)
+
+                if content_candidate is None:
+                    stage = "receipt"
+                    scope.update(
+                        discovered_count=selection.discovered_count,
+                        deduped_count=selection.deduped_count,
+                        selected_count=0,
+                        enriched_count=0,
+                        replied_count=0,
+                        published_count=0,
+                        skipped_count=selection.deduped_count,
+                        decision_codes=("NO_ACTION",),
+                    )
+                    return NurtureRunResult(scope.finish("SUCCESS", now=now), None)
+
+                stage = "content_policy"
+                record = owner.register_content_candidate(
+                    preset,
+                    content_candidate.candidate_id,
+                    content_candidate.source_fingerprint,
+                    content_candidate.draft_fingerprint,
+                    content_candidate.category,
+                    run_id,
+                    now=now,
+                )
+                content_state = owner.get_content_state(preset)
+                is_due = _own_content_is_due(content_state.candidates, preset, now)
+                discovered_count = selection.discovered_count + 1
+                deduped_count = selection.deduped_count + 1
+                selected_count = 1 if is_due else 0
+                decision = (
+                    "CONTENT_NOT_DUE"
+                    if not is_due
+                    else "CONTENT_APPLY"
+                    if apply_requested
+                    else "CONTENT_RECOMMENDED_NO_APPLY"
+                )
                 stage = "receipt"
                 scope.update(
-                    discovered_count=selection.discovered_count,
-                    deduped_count=selection.deduped_count,
+                    discovered_count=discovered_count,
+                    deduped_count=deduped_count,
                     selected_count=selected_count,
                     enriched_count=0,
                     replied_count=0,
                     published_count=0,
-                    skipped_count=selection.deduped_count - selected_count,
+                    skipped_count=deduped_count - selected_count,
                     decision_codes=(decision,),
                 )
-
-                if chosen is None:
-                    return NurtureRunResult(scope.finish("SUCCESS", now=now), None)
-
-                selected_fingerprint = chosen.fingerprint
-                if draft is not None:
-                    if selected_fingerprint != draft.target_fingerprint or mutations is None:
-                        raise NurtureRunnerError("NURTURE_DRAFT_TARGET_MISMATCH")
-                    thread_id, parent_reply_id = _mutation_target(chosen)
-                    stage = "quota"
-                    quota = await self._api.quota(account.alias)
-                    if _reply_quota_exhausted(quota):
-                        raise NurtureRunnerError("THREADS_REPLY_QUOTA_REACHED")
-                    stage = "reserve"
-                    owner.reserve_target(
-                        preset,
-                        selected_fingerprint,
-                        run_id,
-                        "REPLY_APPLY",
-                        now=now,
+                if not is_due:
+                    return NurtureRunResult(
+                        scope.finish("SUCCESS", now=now),
+                        None,
+                        record.candidate_id,
                     )
-                    stage = "publish"
-                    result = await mutations.create_reply(
-                        account.alias,
-                        thread_id,
-                        draft.text,
-                        parent_reply_id=parent_reply_id,
+                if not apply_requested:
+                    return NurtureRunResult(
+                        scope.finish("SUCCESS", now=now),
+                        None,
+                        record.candidate_id,
                     )
-                    if (
-                        type(result) is not CreatedReplyResult
-                        or type(result.operation_id) is not UUID
-                        or result.operation_id.version != 4
-                    ):
-                        raise NurtureRunnerError("RUN_FAILED")
 
-                    stage = "confirm"
-                    owner.complete_target_action(
-                        preset,
-                        selected_fingerprint,
-                        run_id,
-                        "CONFIRMED",
-                        result.operation_id,
-                        now=now,
-                    )
-                    scope.link_operation(result.operation_id)
-                    scope.update(replied_count=1, decision_codes=("REPLY_APPLIED",))
-                    return NurtureRunResult(scope.finish("SUCCESS", now=now), selected_fingerprint)
+                stage = "policy"
+                if (
+                    not preset.engagement_enabled
+                    or preset.max_own_post_mutations_per_explicit_run < 1
+                ):
+                    raise NurtureRunnerError("NURTURE_CONTENT_APPLY_DISABLED")
+                if mutations is None:
+                    raise NurtureRunnerError("RUN_FAILED")
+                stage = "quota"
+                quota = await self._api.quota(account.alias)
+                if _publishing_quota_exhausted(quota):
+                    raise NurtureRunnerError("THREADS_PUBLISHING_QUOTA_REACHED")
 
-                stage = "observe"
-                observed = owner.observe_target(
+                stage = "reserve"
+                owner.reserve_content_candidate(
                     preset,
-                    selected_fingerprint,
+                    content_candidate.source_fingerprint,
+                    content_candidate.draft_fingerprint,
                     run_id,
-                    decision,
+                )
+                stage = "publish"
+                result = await mutations.publish_text(account.alias, content_candidate.text)
+                if (
+                    type(result) is not PublishedTextResult
+                    or type(result.operation_id) is not UUID
+                    or result.operation_id.version != 4
+                ):
+                    raise NurtureRunnerError("RUN_FAILED")
+
+                stage = "confirm"
+                owner.complete_content_candidate(
+                    preset,
+                    content_candidate.source_fingerprint,
+                    content_candidate.draft_fingerprint,
+                    run_id,
+                    "PUBLISHED",
+                    result.operation_id,
                     now=now,
                 )
-                previous = selection.target_by_fingerprint.get(selected_fingerprint)
-                if previous is not None and not _action_history_preserved(previous, observed):
-                    raise NurtureStateError("NURTURE_STATE_INVALID")
-                if observed.action_state not in {"NONE", "CONFIRMED"}:
-                    raise NurtureStateError("NURTURE_STATE_INVALID")
-
-                return NurtureRunResult(scope.finish("SUCCESS", now=now), selected_fingerprint)
+                scope.link_operation(result.operation_id)
+                scope.update(published_count=1, decision_codes=("CONTENT_PUBLISHED",))
+                return NurtureRunResult(scope.finish("SUCCESS", now=now), None, record.candidate_id)
             except KeyboardInterrupt, asyncio.CancelledError:
                 raise
             except NurtureDiscoveryError as error:
@@ -344,17 +478,30 @@ class NurtureRunner:
                     and type(error.operation_id) is UUID
                     and error.operation_id.version == 4
                 ):
-                    _best_effort_ambiguous(
-                        owner,
-                        scope,
-                        preset,
-                        None
-                        if selection is None or selection.candidate is None
-                        else selection.candidate.fingerprint,
-                        run_id,
-                        error.operation_id,
-                        now,
-                    )
+                    if content_candidate is not None and (
+                        selection is not None and selection.candidate is None
+                    ):
+                        _best_effort_content_ambiguous(
+                            owner,
+                            scope,
+                            preset,
+                            content_candidate,
+                            run_id,
+                            error.operation_id,
+                            now,
+                        )
+                    else:
+                        _best_effort_ambiguous(
+                            owner,
+                            scope,
+                            preset,
+                            None
+                            if selection is None or selection.candidate is None
+                            else selection.candidate.fingerprint,
+                            run_id,
+                            error.operation_id,
+                            now,
+                        )
                     raise NurtureRunnerError(
                         "PUBLISH_OUTCOME_AMBIGUOUS", run_id, error.operation_id
                     ) from None
@@ -504,16 +651,56 @@ def _selection_decision(
     candidate: NurtureInboundCandidate | NurtureCandidate | None,
     apply_requested: bool,
     draft: NurtureDraft | None,
+    *,
+    own_content_requested: bool = False,
 ) -> str:
     if candidate is None:
         return "NO_ACTION"
     if draft is not None:
         return "REPLY_APPLY"
-    if apply_requested:
+    if apply_requested and not own_content_requested:
         return "REPLY_RECOMMENDED_NO_DRAFT"
     if isinstance(candidate, NurtureInboundCandidate):
         return "INBOUND_CANDIDATE"
     return "OBSERVE_ONLY"
+
+
+def _own_content_is_due(
+    candidates: tuple[NurtureContentRecordV1, ...],
+    preset: NurturePresetV1,
+    now: datetime,
+) -> bool:
+    """Use the stricter of the preset cooldown and due interval since last publish."""
+
+    published = tuple(item for item in candidates if item.publication_state == "PUBLISHED")
+    if not published:
+        return True
+    last_action_at = max(
+        (item.last_action_at for item in published if item.last_action_at is not None),
+        default=None,
+    )
+    if last_action_at is None:
+        return False
+    try:
+        elapsed = now - last_action_at.astimezone(UTC)
+        required_seconds = max(
+            preset.own_content_cooldown_seconds,
+            preset.own_content_due_interval_seconds,
+        )
+        return elapsed >= timedelta(seconds=required_seconds)
+    except AttributeError, OverflowError, TypeError, ValueError:
+        return False
+
+
+def _publishing_quota_exhausted(quota: object) -> bool:
+    if type(quota) is not PublishingQuota:
+        raise NurtureRunnerError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+    usage = quota.usage
+    total = quota.total
+    for value in (usage, total):
+        if value is not None and (type(value) is not int or value < 0):
+            raise NurtureRunnerError("THREADS_DOCUMENTATION_CONTRACT_MISMATCH")
+    return usage is not None and total is not None and usage >= total
 
 
 def _discovery_state_for_draft(
@@ -633,6 +820,46 @@ def _best_effort_ambiguous(
             pass
     try:
         scope.link_operation(operation_id)
+    except Exception:
+        pass
+    try:
+        scope.finish(
+            "AMBIGUOUS",
+            now=now,
+            error_code="PUBLISH_OUTCOME_AMBIGUOUS",
+            failed_stage="publish",
+        )
+    except Exception:
+        pass
+
+
+def _best_effort_content_ambiguous(
+    owner: NurtureAccountLock,
+    scope: NurtureRunScope,
+    preset: NurturePresetV1,
+    candidate: ContentCandidateV1,
+    run_id: UUID,
+    operation_id: UUID,
+    now: datetime,
+) -> None:
+    try:
+        owner.complete_content_candidate(
+            preset,
+            candidate.source_fingerprint,
+            candidate.draft_fingerprint,
+            run_id,
+            "AMBIGUOUS",
+            operation_id,
+            now=now,
+        )
+    except Exception:
+        pass
+    try:
+        scope.link_operation(operation_id)
+    except Exception:
+        pass
+    try:
+        scope.update(decision_codes=("CONTENT_PUBLISH_AMBIGUOUS",))
     except Exception:
         pass
     try:

@@ -52,6 +52,11 @@ from threads_platform.standalone.nurture import (
     NurturePresetV1,
     get_nurture_preset,
 )
+from threads_platform.standalone.nurture_content import (
+    ContentCandidateV1,
+    NurtureContentError,
+    load_content_candidate,
+)
 from threads_platform.standalone.nurture_draft import (
     NurtureDraft,
     NurtureDraftError,
@@ -265,12 +270,13 @@ async def _run_nurture_command(
     *,
     apply_requested: bool = False,
     draft: NurtureDraft | None = None,
+    content_candidate: ContentCandidateV1 | None = None,
 ) -> NurtureRunResult:
     async with build_standalone_app(
         root,
         accounts,
         include_api=True,
-        include_mutations=draft is not None,
+        include_mutations=draft is not None or (content_candidate is not None and apply_requested),
         include_browser=False,
     ) as app:
         if app.api is None:
@@ -282,6 +288,7 @@ async def _run_nurture_command(
             preset,
             apply_requested=apply_requested,
             draft=draft,
+            content_candidate=content_candidate,
             mutations=app.mutations,
         )
 
@@ -294,10 +301,15 @@ def _format_nurture_run(
     run = result.receipt
     decision = run.decision_codes[0] if run.decision_codes else "NO_ACTION"
     target = f" target={result.target_fingerprint}" if result.target_fingerprint else ""
+    candidate = (
+        f" candidate={result.content_candidate_id}"
+        if result.content_candidate_id is not None
+        else ""
+    )
     return (
         f"nurture run={run.id} account={account.alias} preset={preset.id} "
         f"outcome={run.outcome} discovered={run.discovered_count} "
-        f"selected={run.selected_count} decision={decision}{target}\n"
+        f"selected={run.selected_count} decision={decision}{target}{candidate}\n"
     )
 
 
@@ -312,10 +324,18 @@ def _run_nurture_cli(
         raise NurtureRunnerError(error.code) from None
     account = accounts.get(args.alias)
     draft: NurtureDraft | None = None
+    content_candidate: ContentCandidateV1 | None = None
     if args.reply_file is not None:
         try:
             draft = load_nurture_draft(Path(args.reply_file))
         except NurtureDraftError as error:
+            raise NurtureRunnerError(error.code) from None
+    if args.post_file is not None:
+        try:
+            content_candidate = load_content_candidate(
+                Path(args.post_file), account_alias=account.alias, preset_id=preset.id
+            )
+        except NurtureContentError as error:
             raise NurtureRunnerError(error.code) from None
     result = asyncio.run(
         _run_nurture_command(
@@ -325,12 +345,15 @@ def _run_nurture_cli(
             preset,
             apply_requested=args.apply,
             draft=draft,
+            content_candidate=content_candidate,
         )
     )
     return _format_nurture_run(account, preset, result)
 
 
 def _handle_nurture_cli_command(args: argparse.Namespace) -> int:
+    if args.reply_file is not None and args.post_file is not None:
+        raise NurtureRunnerError("NURTURE_INPUT_CONFLICT")
     if args.reply_file is not None and not args.apply:
         raise NurtureRunnerError("INVALID_NURTURE_DRAFT")
     root = resolve_standalone_data_root()
@@ -709,6 +732,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_nurture_parser.add_argument("--preset", required=True)
     run_nurture_parser.add_argument("--apply", action="store_true")
     run_nurture_parser.add_argument("--reply-file")
+    run_nurture_parser.add_argument("--post-file")
     return parser
 
 
