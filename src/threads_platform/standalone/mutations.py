@@ -34,6 +34,7 @@ _REMOTE_ID = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _NUMERIC_HOST = re.compile(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)(?:\.(?:0[xX][0-9a-fA-F]+|[0-9]+))*\Z")
 _JOURNAL_VERSION = 1
 _JOURNAL_KIND = "POST_TEXT"
+_QUOTE_KIND = "POST_QUOTE"
 _CAROUSEL_KIND = "POST_CAROUSEL"
 _MODERATION_KIND = "MODERATE_REPLY"
 _MODERATION_ACTIONS = frozenset({"hide", "unhide", "approve", "ignore"})
@@ -42,6 +43,7 @@ _MODERATION_ONLY_PHASES = frozenset({"MUTATION_REQUESTED", "CONFIRMED"})
 _JOURNAL_KINDS = frozenset(
     {
         _JOURNAL_KIND,
+        _QUOTE_KIND,
         "CREATE_REPLY",
         "POST_IMAGE",
         "POST_VIDEO",
@@ -548,6 +550,27 @@ class LocalThreadsMutationRuntime:
             alias,
             MediaContainerRequest(media_type="TEXT", text=text),
             kind="POST_TEXT",
+            reply_quota=False,
+        )
+        return PublishedTextResult(operation_id=operation_id, media_id=media_id)
+
+    async def publish_quote(
+        self,
+        alias: str,
+        quote_post_id: str,
+        text: str,
+    ) -> PublishedTextResult:
+        if not _valid_remote_id(quote_post_id):
+            raise StandaloneMutationError("INVALID_THREAD_ID")
+        validate_publish_text(text)
+        operation_id, media_id = await self._publish_container(
+            alias,
+            MediaContainerRequest(
+                media_type="TEXT",
+                text=text,
+                quote_post_id=quote_post_id,
+            ),
+            kind=_QUOTE_KIND,
             reply_quota=False,
         )
         return PublishedTextResult(operation_id=operation_id, media_id=media_id)

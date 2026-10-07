@@ -1099,6 +1099,161 @@ async def test_create_reply_uses_exact_text_request_and_journals_safe_phase_orde
     }
 
 
+@pytest.mark.parametrize(
+    ("quote_post_id", "text", "expected_code"),
+    [
+        ("invalid/remote/id", _TEXT, "INVALID_THREAD_ID"),
+        ("quoted-thread-123", " \t ", "INVALID_POST_TEXT"),
+        ("quoted-thread-123", "x" * 501, "INVALID_POST_TEXT"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_quote_inputs_fail_before_quota_journal_or_api(
+    tmp_path: Path,
+    quote_post_id: str,
+    text: str,
+    expected_code: str,
+) -> None:
+    _, _, api, _, runtime, _ = _setup(tmp_path)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_quote("alice", quote_post_id, text)
+
+    assert caught.value.code == expected_code
+    assert api.calls == []
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.asyncio
+async def test_publish_quote_uses_v1_journal_and_exact_text_container_request(
+    tmp_path: Path,
+) -> None:
+    quote_post_id = "quoted-thread-target-sentinel"
+    commentary = "operator quote commentary sentinel"
+    _, operations, api, _, runtime, _ = _setup(tmp_path)
+
+    result = await runtime.publish_quote("alice", quote_post_id, commentary)
+
+    assert api.calls == ["quota", "create", "publish"]
+    assert api.events == [
+        ("quota", None),
+        ("create", "RECEIVED"),
+        ("publish", "PUBLISH_REQUESTED"),
+    ]
+    assert api.create_request == MediaContainerRequest(
+        media_type="TEXT",
+        text=commentary,
+        quote_post_id=quote_post_id,
+    )
+    operation = operations.get(result.operation_id)
+    assert operation.version == 1
+    assert operation.kind == "POST_QUOTE"
+    assert operation.phase == "PUBLISHED"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    assert set(json.loads(journal)) == {
+        "version",
+        "id",
+        "account_id",
+        "kind",
+        "phase",
+        "container_id",
+        "media_id",
+    }
+    for secret in (quote_post_id, commentary, _TOKEN, _CREDENTIAL_REF, "Authorization"):
+        assert secret not in journal
+
+
+@pytest.mark.asyncio
+async def test_quote_known_quota_exhaustion_creates_no_journal(tmp_path: Path) -> None:
+    _, _, api, _, runtime, _ = _setup(
+        tmp_path,
+        quota=PublishingQuota(usage=100, total=100),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_quote("alice", "quoted-thread-123", _TEXT)
+
+    assert caught.value.code == "THREADS_PUBLISHING_QUOTA_REACHED"
+    assert api.calls == ["quota"]
+    assert not (tmp_path / "operations").exists()
+
+
+@pytest.mark.parametrize(
+    "publish_error",
+    [ThreadsAPIError("THREADS_RATE_LIMITED"), asyncio.CancelledError()],
+    ids=["api-error", "cancellation"],
+)
+@pytest.mark.asyncio
+async def test_quote_publish_boundary_uses_existing_ambiguity_semantics_without_retry(
+    tmp_path: Path,
+    publish_error: BaseException,
+) -> None:
+    quote_post_id = "quote-target-not-in-journal"
+    commentary = "quote-commentary-not-in-journal"
+    _, operations, api, _, runtime, _ = _setup(tmp_path, publish_error=publish_error)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_quote("alice", quote_post_id, commentary)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert caught.value.operation_id is not None
+    assert api.calls == ["quota", "create", "publish"]
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "POST_QUOTE"
+    assert operation.phase == "AMBIGUOUS"
+    journal = (tmp_path / "operations" / f"{operation.id}.json").read_text(encoding="utf-8")
+    for secret in (quote_post_id, commentary, _TOKEN, _CREDENTIAL_REF):
+        assert secret not in journal
+
+
+@pytest.mark.asyncio
+async def test_quote_create_container_failure_keeps_existing_failed_final_semantics(
+    tmp_path: Path,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        create_error=ThreadsTransportError(),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_quote("alice", "quoted-thread-123", _TEXT)
+
+    assert caught.value.code == "THREADS_TRANSPORT_FAILURE"
+    assert caught.value.operation_id is not None
+    assert api.calls == ["quota", "create"]
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == "POST_QUOTE"
+    assert operation.phase == "FAILED_FINAL"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "POST_TEXT",
+        "CREATE_REPLY",
+        "POST_IMAGE",
+        "POST_VIDEO",
+        "POST_CAROUSEL",
+        "MODERATE_REPLY",
+        "POST_QUOTE",
+    ],
+)
+def test_all_v1_journal_kinds_remain_readable(tmp_path: Path, kind: str) -> None:
+    store = LocalOperationStore(tmp_path)
+    account_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+    operation = store.create_received(
+        account_id,
+        kind=kind,
+        action="hide" if kind == "MODERATE_REPLY" else None,
+    )
+
+    decoded = store.get(operation.id)
+    assert decoded.version == 1
+    assert decoded.kind == kind
+    assert decoded.phase == "RECEIVED"
+
+
 @pytest.mark.parametrize("media_type", ["IMAGE", "VIDEO"])
 @pytest.mark.asyncio
 async def test_media_publish_uses_exact_request_and_safe_journal_phase_order(

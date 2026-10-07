@@ -177,6 +177,17 @@ def get_nurture_preset(preset_id: object) -> NurturePresetV1:
     )
 
 
+def nurture_quote_allowed(preset: object) -> bool:
+    """Keep SN-11 Quote authority on the reviewed built-in recruitment policy."""
+
+    return (
+        type(preset) is NurturePresetV1
+        and preset.id == "recruitment"
+        and preset.version == 1
+        and preset.engagement_enabled is True
+    )
+
+
 def _parse_string_list(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise NurturePresetError()
