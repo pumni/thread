@@ -28,6 +28,7 @@ from threads_platform.application.ports.threads import (
 )
 from threads_platform.domain.discovery import DiscoverySearchMode, DiscoverySearchType
 from threads_platform.standalone.accounts import (
+    LocalAccount,
     LocalAccountStore,
     StandaloneAccountError,
     resolve_standalone_data_root,
@@ -46,6 +47,17 @@ from threads_platform.standalone.mutations import (
     validate_media_post_inputs,
     validate_reply_moderation_inputs,
 )
+from threads_platform.standalone.nurture import (
+    NurturePresetError,
+    NurturePresetV1,
+    get_nurture_preset,
+)
+from threads_platform.standalone.nurture_runner import (
+    NurtureRunner,
+    NurtureRunnerError,
+    NurtureRunnerInterrupted,
+)
+from threads_platform.standalone.nurture_store import NurtureRunV1, NurtureStore
 from threads_platform.standalone.recurrences import (
     LocalRecurrenceRunner,
     LocalRecurrenceStore,
@@ -237,6 +249,33 @@ async def _run_api_command(args: argparse.Namespace, root: Path, store: LocalAcc
                 f"text={_format_text(reply.text)}\n"
             )
         return "".join(lines)
+
+
+async def _run_nurture_command(
+    root: Path,
+    accounts: LocalAccountStore,
+    account: LocalAccount,
+    preset: NurturePresetV1,
+) -> NurtureRunV1:
+    async with build_standalone_app(
+        root,
+        accounts,
+        include_api=True,
+        include_mutations=False,
+        include_browser=False,
+    ) as app:
+        if app.api is None:
+            raise NurtureRunnerError("RUN_FAILED")
+        return await NurtureRunner(app.api, NurtureStore(root)).run(account, preset)
+
+
+def _format_nurture_run(account: LocalAccount, preset: NurturePresetV1, run: NurtureRunV1) -> str:
+    decision = run.decision_codes[0] if run.decision_codes else "NO_ACTION"
+    return (
+        f"nurture run={run.id} account={account.alias} preset={preset.id} "
+        f"outcome={run.outcome} discovered={run.discovered_count} "
+        f"selected={run.selected_count} decision={decision}\n"
+    )
 
 
 async def _run_login_command(root: Path, store: LocalAccountStore, alias: str) -> None:
@@ -601,6 +640,12 @@ def _build_parser() -> argparse.ArgumentParser:
     operation_commands = operation_parser.add_subparsers(dest="operation_command", required=True)
     show_parser = operation_commands.add_parser("show")
     show_parser.add_argument("operation_id")
+
+    nurture_parser = commands.add_parser("nurture")
+    nurture_commands = nurture_parser.add_subparsers(dest="nurture_command", required=True)
+    run_nurture_parser = nurture_commands.add_parser("run")
+    run_nurture_parser.add_argument("alias")
+    run_nurture_parser.add_argument("--preset", required=True)
     return parser
 
 
@@ -669,6 +714,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)
+        if args.command == "nurture":
+            try:
+                preset = get_nurture_preset(args.preset)
+            except NurturePresetError as error:
+                raise NurtureRunnerError(error.code) from None
+            account = store.get(args.alias)
+            run = asyncio.run(_run_nurture_command(root, store, account, preset))
+            sys.stdout.write(_format_nurture_run(account, preset, run))
+            return 0
+
         if args.command == "account":
             if args.account_command == "add":
                 account = store.add(args.alias)
@@ -746,6 +801,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         sys.stdout.write(asyncio.run(_run_api_command(args, root, store)))
         return 0
+    except NurtureRunnerError as error:
+        suffix = f" run={error.run_id}" if error.run_id is not None else ""
+        sys.stderr.write(f"ERROR {error.code}{suffix}\n")
+        return 1
+    except NurtureRunnerInterrupted as error:
+        sys.stderr.write(f"ERROR {error.code} run={error.run_id}\n")
+        return 130
     except StandaloneWorkflowError as error:
         suffix = f" step={error.step_index}" if error.step_index is not None else ""
         if error.operation_id is not None:
