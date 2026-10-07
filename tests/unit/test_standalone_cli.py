@@ -1148,7 +1148,7 @@ def test_cli_media_publish_ambiguous_error_redacts_all_mutation_inputs(
     )
     assert match is not None
     operation_id = UUID(match.group(1))
-    assert api_calls == ["quota", "create", "status", "publish"]
+    assert api_calls == ["quota", "create", "status", "publish", "status"]
     assert api_calls.count("publish") == 1
     operation = LocalOperationStore(root).get(operation_id)
     assert operation.kind == f"POST_{media_type}"
@@ -1447,6 +1447,12 @@ def test_cli_post_ambiguous_error_includes_operation_and_redacts_token_and_text(
             api_calls.append("create")
             return MediaContainer(container_id="container-123")
 
+        async def get_container(self, token: SecretStr, container_id: str) -> MediaContainer:
+            assert token.get_secret_value() == token_sentinel
+            assert container_id == "container-123"
+            api_calls.append("status")
+            return MediaContainer(container_id, status="FINISHED")
+
         async def publish_container(self, token: SecretStr, container_id: str) -> str:
             assert token.get_secret_value() == token_sentinel
             assert container_id == "container-123"
@@ -1468,7 +1474,7 @@ def test_cli_post_ambiguous_error_includes_operation_and_redacts_token_and_text(
     )
     assert match is not None
     operation_id = UUID(match.group(1))
-    assert api_calls == ["quota", "create", "publish"]
+    assert api_calls == ["quota", "create", "publish", "status"]
     assert LocalOperationStore(tmp_path / "local").get(operation_id).phase == "AMBIGUOUS"
     assert token_sentinel not in captured.out + captured.err
     assert text_sentinel not in captured.out + captured.err
@@ -1512,6 +1518,12 @@ def test_cli_reply_ambiguous_error_redacts_token_text_and_target_ids(
             api_calls.append("create")
             return MediaContainer(container_id="container-123")
 
+        async def get_container(self, token: SecretStr, container_id: str) -> MediaContainer:
+            assert token.get_secret_value() == token_sentinel
+            assert container_id == "container-123"
+            api_calls.append("status")
+            return MediaContainer(container_id, status="FINISHED")
+
         async def publish_container(self, token: SecretStr, container_id: str) -> str:
             assert token.get_secret_value() == token_sentinel
             assert container_id == "container-123"
@@ -1542,7 +1554,7 @@ def test_cli_reply_ambiguous_error_redacts_token_text_and_target_ids(
     )
     assert match is not None
     operation_id = UUID(match.group(1))
-    assert api_calls == ["quota", "create", "publish"]
+    assert api_calls == ["quota", "create", "publish", "status"]
     operation = LocalOperationStore(tmp_path / "local").get(operation_id)
     assert operation.kind == "CREATE_REPLY"
     assert operation.phase == "AMBIGUOUS"

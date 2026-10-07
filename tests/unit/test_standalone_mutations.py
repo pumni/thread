@@ -281,9 +281,11 @@ class _CarouselFakeAPI:
     async def get_container(self, token: SecretStr, container_id: str) -> MediaContainer:
         assert token.get_secret_value() == _TOKEN
         operation = _only_operation(self.operations, self.root)
-        if operation.phase == "CONTAINER_CREATED" and container_id == self.parent_id:
+        if container_id == self.parent_id and operation.phase in {
+            "CONTAINER_CREATED",
+            "PUBLISH_REQUESTED",
+        }:
             assert operation.container_id == container_id
-            assert operation.phase == "CONTAINER_CREATED"
         else:
             assert container_id in operation.child_container_ids
         self.calls.append(f"status:{container_id}")
@@ -1197,7 +1199,10 @@ async def test_quote_publish_boundary_uses_existing_ambiguity_semantics_without_
 
     assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
     assert caught.value.operation_id is not None
-    assert api.calls == ["quota", "create", "publish"]
+    expected_calls = ["quota", "create", "publish"]
+    if isinstance(publish_error, ThreadsAPIError):
+        expected_calls.append("status")
+    assert api.calls == expected_calls
     operation = operations.get(caught.value.operation_id)
     assert operation.kind == "POST_QUOTE"
     assert operation.phase == "AMBIGUOUS"
@@ -1552,7 +1557,10 @@ async def test_media_publish_failure_after_boundary_is_ambiguous_without_retry(
         await _publish_media(runtime, media_type, "https://media.example/media.bin")
 
     assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
-    assert api.calls == ["quota", "create", "status", "publish"]
+    expected_calls = ["quota", "create", "status", "publish"]
+    if isinstance(error, ThreadsAPIError):
+        expected_calls.append("status")
+    assert api.calls == expected_calls
     assert api.calls.count("publish") == 1
     assert caught.value.operation_id is not None
     operation = operations.get(caught.value.operation_id)
@@ -1807,15 +1815,10 @@ async def test_invalid_container_id_fails_final_without_publish(tmp_path: Path) 
 
 @pytest.mark.parametrize(
     "error",
-    [
-        ThreadsAPIError("THREADS_RATE_LIMITED"),
-        ThreadsTransportError(),
-        ThreadsContractError(),
-        RuntimeError("raw response sentinel"),
-    ],
+    [RuntimeError("raw response sentinel")],
 )
 @pytest.mark.asyncio
-async def test_publish_failure_is_ambiguous_without_retry_or_reconciliation(
+async def test_unclassified_publish_failure_is_ambiguous_without_reconciliation(
     tmp_path: Path, error: Exception
 ) -> None:
     _, operations, api, _, runtime, _ = _setup(tmp_path, publish_error=error)
@@ -1834,6 +1837,230 @@ async def test_publish_failure_is_ambiguous_without_retry_or_reconciliation(
         "raw response sentinel"
         not in (tmp_path / "operations" / f"{operation.id}.json").read_text()
     )
+
+
+@pytest.mark.parametrize(
+    ("publish_error", "status", "expected_phase", "expected_code"),
+    [
+        pytest.param(
+            ThreadsAPIError("THREADS_INVALID_REQUEST"),
+            "FINISHED",
+            "FAILED_FINAL",
+            "THREADS_INVALID_REQUEST",
+            id="invalid-request-finished",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_AUTHENTICATION_FAILED"),
+            "FINISHED",
+            "FAILED_FINAL",
+            "THREADS_AUTHENTICATION_FAILED",
+            id="authentication-finished",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_PERMISSION_DENIED"),
+            "FINISHED",
+            "FAILED_FINAL",
+            "THREADS_PERMISSION_DENIED",
+            id="permission-finished",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_OBJECT_NOT_FOUND"),
+            "FINISHED",
+            "FAILED_FINAL",
+            "THREADS_OBJECT_NOT_FOUND",
+            id="object-not-found-finished",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_INVALID_REQUEST"),
+            "ERROR",
+            "FAILED_FINAL",
+            "THREADS_CONTAINER_ERROR",
+            id="error-status",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_INVALID_REQUEST"),
+            "EXPIRED",
+            "FAILED_FINAL",
+            "THREADS_CONTAINER_EXPIRED",
+            id="expired-status",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_INVALID_REQUEST"),
+            "PUBLISHED",
+            "AMBIGUOUS",
+            "THREADS_INVALID_REQUEST",
+            id="published-status",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_INVALID_REQUEST"),
+            "IN_PROGRESS",
+            "AMBIGUOUS",
+            "THREADS_INVALID_REQUEST",
+            id="in-progress-status",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_INVALID_REQUEST"),
+            "UNKNOWN",
+            "AMBIGUOUS",
+            "THREADS_INVALID_REQUEST",
+            id="unknown-status",
+        ),
+        pytest.param(
+            ThreadsAPIError("THREADS_RATE_LIMITED"),
+            "FINISHED",
+            "AMBIGUOUS",
+            "THREADS_RATE_LIMITED",
+            id="nondeterministic-finished",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_api_error_uses_one_status_read_and_exact_classification(
+    tmp_path: Path,
+    publish_error: ThreadsAPIError,
+    status: str,
+    expected_phase: str,
+    expected_code: str,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=publish_error,
+        container_statuses=(status,),
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_text("alice", _TEXT)
+
+    expected_error = (
+        expected_code if expected_phase == "FAILED_FINAL" else "PUBLISH_OUTCOME_AMBIGUOUS"
+    )
+    assert caught.value.code == expected_error
+    assert api.calls == ["quota", "create", "publish", "status"]
+    assert api.calls.count("publish") == 1
+    assert api.calls.count("status") == 1
+    assert api.events[-1] == ("status", "PUBLISH_REQUESTED")
+    operation_id = caught.value.operation_id
+    assert operation_id is not None
+    operation = operations.get(operation_id)
+    assert operation.phase == expected_phase
+    assert operation.outcome_code == expected_code
+    assert operation.media_id is None
+
+
+@pytest.mark.parametrize(
+    ("container_statuses", "container_status_error", "container_response_id"),
+    [
+        ((None,), None, None),
+        (("FINISHED",), ThreadsAPIError("THREADS_RATE_LIMITED"), None),
+        (("FINISHED",), None, "different-container"),
+    ],
+    ids=["malformed-status", "status-read-failure", "wrong-container-id"],
+)
+@pytest.mark.asyncio
+async def test_publish_status_reconciliation_failure_stays_ambiguous(
+    tmp_path: Path,
+    container_statuses: tuple[str | None, ...] | None,
+    container_status_error: BaseException | None,
+    container_response_id: str | None,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=ThreadsAPIError("THREADS_INVALID_REQUEST"),
+        container_statuses=container_statuses,
+        container_status_error=container_status_error,
+        container_response_id=container_response_id,
+    )
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_text("alice", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "publish", "status"]
+    operation_id = caught.value.operation_id
+    assert operation_id is not None
+    operation = operations.get(operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == "THREADS_INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_failed_final_write_failure_stays_ambiguous_without_republishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, operations, api, _, runtime, _ = _setup(
+        tmp_path,
+        publish_error=ThreadsAPIError("THREADS_INVALID_REQUEST"),
+        container_statuses=("FINISHED",),
+    )
+    original_update = operations.update
+
+    def fail_failed_final_once(operation: LocalOperation) -> LocalOperation:
+        if operation.phase == "FAILED_FINAL":
+            raise StandaloneMutationError("OPERATION_STATE_INVALID", operation.id)
+        return original_update(operation)
+
+    monkeypatch.setattr(operations, "update", fail_failed_final_once)
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await runtime.publish_text("alice", _TEXT)
+
+    assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
+    assert api.calls == ["quota", "create", "publish", "status"]
+    assert api.calls.count("publish") == 1
+    operation_id = caught.value.operation_id
+    assert operation_id is not None
+    operation = operations.get(operation_id)
+    assert operation.phase == "AMBIGUOUS"
+    assert operation.outcome_code == "THREADS_INVALID_REQUEST"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["POST_TEXT", "POST_QUOTE", "CREATE_REPLY", "POST_IMAGE", "POST_VIDEO", "POST_CAROUSEL"],
+)
+@pytest.mark.asyncio
+async def test_shared_publish_classifier_covers_existing_journaled_kinds(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    failure = ThreadsAPIError("THREADS_INVALID_REQUEST")
+    if kind == "POST_CAROUSEL":
+        _, operations, api, _, runtime, _ = _setup_carousel(tmp_path, publish_error=failure)
+    else:
+        _, operations, api, _, runtime, _ = _setup(
+            tmp_path,
+            publish_error=failure,
+            container_statuses=("FINISHED",),
+        )
+
+    async def publish() -> object:
+        if kind == "POST_TEXT":
+            return await runtime.publish_text("alice", _TEXT)
+        if kind == "POST_QUOTE":
+            return await runtime.publish_quote("alice", "quoted-thread-123", _TEXT)
+        if kind == "CREATE_REPLY":
+            return await runtime.create_reply("alice", "thread-123", _TEXT)
+        if kind == "POST_IMAGE":
+            return await runtime.publish_image("alice", "https://media.example/image.jpg")
+        if kind == "POST_VIDEO":
+            return await runtime.publish_video("alice", "https://media.example/video.mp4")
+        return await runtime.publish_carousel("alice", _carousel_manifest())
+
+    with pytest.raises(StandaloneMutationError) as caught:
+        await publish()
+
+    assert caught.value.code == "THREADS_INVALID_REQUEST"
+    assert caught.value.operation_id is not None
+    operation = operations.get(caught.value.operation_id)
+    assert operation.kind == kind
+    assert operation.phase == "FAILED_FINAL"
+    assert operation.outcome_code == "THREADS_INVALID_REQUEST"
+    assert api.calls.count("publish") == 1
+    if kind == "POST_CAROUSEL":
+        assert api.calls[-1] == "status:carousel-parent"
+    else:
+        assert api.calls[-1] == "status"
 
 
 @pytest.mark.parametrize(
@@ -1856,7 +2083,10 @@ async def test_reply_publish_failure_is_ambiguous_without_retry_or_reconciliatio
         await runtime.create_reply("alice", "thread-1", _TEXT, parent_reply_id="reply-2")
 
     assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
-    assert api.calls == ["quota", "create", "publish"]
+    expected_calls = ["quota", "create", "publish"]
+    if isinstance(error, ThreadsAPIError):
+        expected_calls.append("status")
+    assert api.calls == expected_calls
     assert caught.value.operation_id is not None
     operation = operations.get(caught.value.operation_id)
     assert operation.kind == "CREATE_REPLY"
@@ -1936,7 +2166,7 @@ async def test_ambiguous_publish_outcome_wins_over_lock_release_error(
     assert caught.value.code == "PUBLISH_OUTCOME_AMBIGUOUS"
     operation_id = caught.value.operation_id
     assert operation_id is not None
-    assert api.calls == ["quota", "create", "publish"]
+    assert api.calls == ["quota", "create", "publish", "status"]
     assert operations.get(operation_id).phase == "AMBIGUOUS"
 
 

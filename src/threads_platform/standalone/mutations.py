@@ -22,6 +22,7 @@ from threads_platform.application.ports.process_lock import ProcessAlreadyRunnin
 from threads_platform.application.ports.threads import (
     MediaContainerRequest,
     ThreadsAPI,
+    ThreadsAPIError,
     ThreadsCredentialError,
     ThreadsCredentialErrorCode,
     ThreadsCredentialSecretResolver,
@@ -40,6 +41,14 @@ _MODERATION_KIND = "MODERATE_REPLY"
 _MODERATION_ACTIONS = frozenset({"hide", "unhide", "approve", "ignore"})
 _MODERATION_PHASES = frozenset({"RECEIVED", "MUTATION_REQUESTED", "CONFIRMED", "AMBIGUOUS"})
 _MODERATION_ONLY_PHASES = frozenset({"MUTATION_REQUESTED", "CONFIRMED"})
+_DETERMINISTIC_PUBLISH_REJECTION_CODES = frozenset(
+    {
+        "THREADS_INVALID_REQUEST",
+        "THREADS_AUTHENTICATION_FAILED",
+        "THREADS_PERMISSION_DENIED",
+        "THREADS_OBJECT_NOT_FOUND",
+    }
+)
 _JOURNAL_KINDS = frozenset(
     {
         _JOURNAL_KIND,
@@ -92,7 +101,7 @@ _TRANSITIONS = {
     "RECEIVED": frozenset({"CHILDREN_CREATING", "CONTAINER_CREATED", "FAILED_FINAL"}),
     "CHILDREN_CREATING": frozenset({"CHILDREN_CREATING", "CONTAINER_CREATED", "FAILED_FINAL"}),
     "CONTAINER_CREATED": frozenset({"PUBLISH_REQUESTED", "FAILED_FINAL"}),
-    "PUBLISH_REQUESTED": frozenset({"PUBLISHED", "AMBIGUOUS"}),
+    "PUBLISH_REQUESTED": frozenset({"PUBLISHED", "AMBIGUOUS", "FAILED_FINAL"}),
 }
 _MODERATION_TRANSITIONS = {
     "RECEIVED": frozenset({"MUTATION_REQUESTED"}),
@@ -950,6 +959,32 @@ class LocalThreadsMutationRuntime:
             media_id = await self._api.publish_container(token, container_id)
         except asyncio.CancelledError:
             self._raise_ambiguous(publish_requested, "PUBLISH_OUTCOME_AMBIGUOUS")
+        except ThreadsAPIError as error:
+            publish_code = _safe_exception_code(error)
+            try:
+                container = await self._api.get_container(token, container_id)
+            except asyncio.CancelledError:
+                self._raise_ambiguous(publish_requested, publish_code)
+            except Exception:
+                self._raise_ambiguous(publish_requested, publish_code)
+            except BaseException:
+                self._best_effort_ambiguous(publish_requested, publish_code)
+                raise
+            status = getattr(container, "status", None)
+            if getattr(container, "container_id", None) != container_id or type(status) is not str:
+                self._raise_ambiguous(publish_requested, publish_code)
+            if (
+                type(error.code) is not str
+                or error.code not in _DETERMINISTIC_PUBLISH_REJECTION_CODES
+            ):
+                self._raise_ambiguous(publish_requested, publish_code)
+            if status == "FINISHED":
+                self._raise_failed_final(publish_requested, publish_code)
+            if status == "ERROR":
+                self._raise_failed_final(publish_requested, "THREADS_CONTAINER_ERROR")
+            if status == "EXPIRED":
+                self._raise_failed_final(publish_requested, "THREADS_CONTAINER_EXPIRED")
+            self._raise_ambiguous(publish_requested, publish_code)
         except Exception as error:
             self._raise_ambiguous(publish_requested, _safe_exception_code(error))
         except BaseException:
@@ -1003,6 +1038,13 @@ class LocalThreadsMutationRuntime:
     def _raise_ambiguous(self, operation: LocalOperation, code: str) -> NoReturn:
         self._best_effort_ambiguous(operation, code)
         raise StandaloneMutationError("PUBLISH_OUTCOME_AMBIGUOUS", operation.id) from None
+
+    def _raise_failed_final(self, operation: LocalOperation, code: str) -> NoReturn:
+        try:
+            self._operations.update(replace(operation, phase="FAILED_FINAL", outcome_code=code))
+        except StandaloneMutationError:
+            self._raise_ambiguous(operation, code)
+        raise StandaloneMutationError(code, operation.id) from None
 
     def _best_effort_ambiguous(self, operation: LocalOperation, code: str) -> None:
         try:
