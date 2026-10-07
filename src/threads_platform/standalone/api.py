@@ -13,6 +13,7 @@ from threads_platform.application.ports.threads import (
     RemoteMedia,
     RemotePublicProfile,
     ReplyPage,
+    ThreadPostInsights,
     ThreadsAPI,
     ThreadsCredentialError,
     ThreadsCredentialErrorCode,
@@ -84,6 +85,12 @@ class LocalThreadsApiRuntime:
             raise StandaloneApiError("INVALID_MEDIA_ID")
         token = await self._resolve_token(alias)
         return await self._api.get_media(token, media_id)
+
+    async def post_insights(self, alias: str, media_id: str) -> ThreadPostInsights:
+        if type(media_id) is not str or _OPAQUE_ID.fullmatch(media_id) is None:
+            raise StandaloneApiError("INVALID_MEDIA_ID")
+        token = await self._resolve_token(alias)
+        return await self._api.get_post_insights(token, media_id)
 
     async def replies(
         self,

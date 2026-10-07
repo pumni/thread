@@ -62,6 +62,11 @@ from threads_platform.standalone.nurture_draft import (
     NurtureDraftError,
     load_nurture_draft,
 )
+from threads_platform.standalone.nurture_insights import (
+    NurtureInsightsError,
+    NurtureInsightsResult,
+    NurtureInsightsService,
+)
 from threads_platform.standalone.nurture_runner import (
     NurtureRunner,
     NurtureRunnerError,
@@ -215,6 +220,13 @@ async def _run_api_command(args: argparse.Namespace, root: Path, store: LocalAcc
                 f"text {_format_text(media.text)}\n"
             )
 
+        if args.api_command == "post-insights":
+            result = await runtime.post_insights(args.alias, args.media_id)
+            values = " ".join(
+                f"{metric.name.value}={_format_scalar(metric.value)}" for metric in result.metrics
+            )
+            return f"post-insights period={result.period} {values}\n"
+
         if args.api_command == "public-profile":
             profile = await runtime.public_profile(args.alias, args.username)
             return _format_public_profile(profile)
@@ -311,6 +323,57 @@ def _format_nurture_run(
         f"outcome={run.outcome} discovered={run.discovered_count} "
         f"selected={run.selected_count} decision={decision}{target}{candidate}\n"
     )
+
+
+async def _run_nurture_insights_command(
+    root: Path,
+    accounts: LocalAccountStore,
+    account: LocalAccount,
+    preset: NurturePresetV1,
+) -> NurtureInsightsResult:
+    async with build_standalone_app(
+        root,
+        accounts,
+        include_api=True,
+        include_mutations=False,
+        include_browser=False,
+    ) as app:
+        if app.api is None:
+            raise NurtureInsightsError("INSIGHTS_REFRESH_FAILED")
+        service = NurtureInsightsService(
+            app.api,
+            NurtureStore(root),
+            LocalOperationStore(root),
+        )
+        return await service.refresh(account, preset)
+
+
+def _format_nurture_insights(result: NurtureInsightsResult) -> str:
+    return (
+        f"nurture-insights refreshed={result.refreshed} "
+        f"skipped_spacing={result.skipped_spacing} scoreable={result.scoreable} "
+        f"insufficient={result.insufficient} below={result.below} "
+        f"baseline={result.baseline} above={result.above} top={result.top}\n"
+    )
+
+
+def _handle_nurture_insights_cli_command(args: argparse.Namespace) -> int:
+    try:
+        preset = get_nurture_preset(args.preset)
+    except NurturePresetError as error:
+        raise NurtureInsightsError(error.code) from None
+    root = resolve_standalone_data_root()
+    accounts = LocalAccountStore(root)
+    account = accounts.get(args.alias)
+    result = asyncio.run(_run_nurture_insights_command(root, accounts, account, preset))
+    sys.stdout.write(_format_nurture_insights(result))
+    return 0
+
+
+def _handle_nurture_command(args: argparse.Namespace) -> int:
+    if args.nurture_command == "insights":
+        return _handle_nurture_insights_cli_command(args)
+    return _handle_nurture_cli_command(args)
 
 
 def _run_nurture_cli(
@@ -656,6 +719,9 @@ def _build_parser() -> argparse.ArgumentParser:
     media_parser = api_commands.add_parser("media")
     media_parser.add_argument("alias")
     media_parser.add_argument("media_id")
+    post_insights_parser = api_commands.add_parser("post-insights")
+    post_insights_parser.add_argument("alias")
+    post_insights_parser.add_argument("media_id")
     public_profile_parser = api_commands.add_parser("public-profile")
     public_profile_parser.add_argument("alias")
     public_profile_parser.add_argument("username")
@@ -733,6 +799,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run_nurture_parser.add_argument("--apply", action="store_true")
     run_nurture_parser.add_argument("--reply-file")
     run_nurture_parser.add_argument("--post-file")
+    insights_nurture_parser = nurture_commands.add_parser("insights")
+    nurture_insights_commands = insights_nurture_parser.add_subparsers(
+        dest="nurture_insights_command", required=True
+    )
+    refresh_insights_parser = nurture_insights_commands.add_parser("refresh")
+    refresh_insights_parser.add_argument("alias")
+    refresh_insights_parser.add_argument("--preset", required=True)
     return parser
 
 
@@ -800,7 +873,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "nurture":
-            return _handle_nurture_cli_command(args)
+            return _handle_nurture_command(args)
 
         root = resolve_standalone_data_root()
         store = LocalAccountStore(root)

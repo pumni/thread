@@ -10,11 +10,14 @@ from pydantic import AnyHttpUrl, SecretStr
 
 import threads_platform.standalone.api as api_module
 from threads_platform.application.ports.threads import (
+    THREAD_POST_INSIGHT_ORDER,
     DiscoveryPage,
     PublishingQuota,
     RemoteMedia,
     RemotePublicProfile,
     ReplyPage,
+    ThreadPostInsightMetric,
+    ThreadPostInsights,
     ThreadsAPI,
     ThreadsCredentialError,
     ThreadsCredentialErrorCode,
@@ -51,6 +54,7 @@ class _FakeApi:
     def __init__(self) -> None:
         self.quota_calls: list[SecretStr] = []
         self.media_calls: list[tuple[SecretStr, str]] = []
+        self.post_insights_calls: list[tuple[SecretStr, str]] = []
         self.replies_calls: list[tuple[SecretStr, str, str | None]] = []
         self.conversation_calls: list[tuple[SecretStr, str, str | None]] = []
         self.public_profile_calls: list[tuple[SecretStr, str]] = []
@@ -86,6 +90,16 @@ class _FakeApi:
         if self.failure is not None:
             raise self.failure
         return self.media_result
+
+    async def get_post_insights(self, token: SecretStr, media_id: str) -> ThreadPostInsights:
+        self.post_insights_calls.append((token, media_id))
+        if self.failure is not None:
+            raise self.failure
+        return ThreadPostInsights(
+            media_id,
+            "lifetime",
+            tuple(ThreadPostInsightMetric(name, None) for name in THREAD_POST_INSIGHT_ORDER),
+        )
 
     async def get_replies(self, token: SecretStr, thread_id: str, after: str | None) -> ReplyPage:
         self.replies_calls.append((token, thread_id, after))
@@ -268,6 +282,23 @@ async def test_invalid_ids_and_cursors_are_rejected_before_account_lookup() -> N
         assert error.value.code == expected_code
 
     assert resolver.calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_insights_reuses_account_credentials_and_validates_opaque_media_id(
+    tmp_path: Path,
+) -> None:
+    _accounts, api, resolver, runtime = _configured_runtime(tmp_path)
+
+    result = await runtime.post_insights("alice", "media-opaque-1")
+
+    assert result.period == "lifetime"
+    assert api.post_insights_calls == [(resolver.token, "media-opaque-1")]
+    assert resolver.calls == [_CREDENTIAL_REF]
+    with pytest.raises(StandaloneApiError) as error:
+        await runtime.post_insights("alice", "media/id")
+    assert error.value.code == "INVALID_MEDIA_ID"
+    assert api.post_insights_calls == [(resolver.token, "media-opaque-1")]
     assert api.media_calls == []
     assert api.replies_calls == []
     assert api.conversation_calls == []

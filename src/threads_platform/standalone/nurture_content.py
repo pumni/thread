@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import unicodedata
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ ContentCategory = Literal[
 
 _MAX_CONTENT_BYTES = 16_384
 _MAX_SOURCE_ID_LENGTH = 256
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _CONTENT_CATEGORIES = frozenset(
     {
         "CAREER_TIP",
@@ -238,6 +240,23 @@ def draft_fingerprint(text: str) -> str:
         ).hexdigest()
     except UnicodeError:
         raise NurtureContentError() from None
+
+
+def content_fingerprint(source_fp: str, draft_fp: str) -> str:
+    """Return a namespaced identity for one source and one exact Threads draft."""
+    if (
+        type(source_fp) is not str
+        or _FINGERPRINT.fullmatch(source_fp) is None
+        or type(draft_fp) is not str
+        or _FINGERPRINT.fullmatch(draft_fp) is None
+    ):
+        raise NurtureContentError()
+    identity = json.dumps(
+        {"draft_fingerprint": draft_fp, "source_fingerprint": source_fp, "version": 1},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(b"threads-nurture-content:v1\x00" + identity).hexdigest()
 
 
 def _valid_source_id(value: str) -> bool:

@@ -31,6 +31,46 @@ No live account responses are represented by repository documentation-contract f
 | Permissions | threads_basic, threads_content_publish, threads_read_replies, threads_manage_replies, threads_manage_insights listed in official workspace | OPEN effective per-account grants |
 | Error payloads/headers | examples are not sufficient for full runtime error contract | OPEN |
 
+### SN-08 post-insights documentation contract (2026-10-07)
+
+The current official Meta [post insights reference](https://developers.facebook.com/documentation/threads/reference/insights)
+and [Threads insights guide](https://developers.facebook.com/documentation/threads/insights)
+were rechecked on 2026-10-07. The documented read is
+`GET /{thread_id}/insights?metric=...`. A response is an object whose `data`
+array contains metric rows with `name`, `period`, and `values`; each value row
+contains `value`. The guide example uses `period: "lifetime"` and an integer
+value. Optional row metadata such as `title`, `description`, and `id` is ignored.
+
+The Standalone SN-08 adapter requests only the ordered subset
+`likes,replies,reposts,quotes`, accepts `lifetime`, maps absent metrics and
+null values to `None`, and rejects malformed/duplicate/unsupported rows. This
+is a documentation-contract implementation tested with synthetic fixtures;
+no live API request was made and Insights remains OPEN / not LIVE-VERIFIED.
+
+The local refresh policy is fixed and bounded: at most five reads per
+invocation, with six hours between snapshots for one content item. Items with
+no snapshot are considered first, then the oldest latest observation, with the
+content fingerprint as a stable tie-break. Content identity is a versioned
+SHA-256 over the SN-07 source and draft fingerprints; media IDs are resolved
+ephemerally through the local POST_TEXT/PUBLISHED operation journal and are not
+copied into Insights snapshots. A failed request stops the refresh while prior
+immutable snapshots remain.
+
+The refresh counters mean: `refreshed` is the number of successful read/append
+pairs; `skipped_spacing` counts eligible items whose latest observation is
+younger than six hours or is future-dated; `scoreable` counts returned items
+with all four metrics present; and the remaining fields count returned items
+in each performance bucket. Bucket counts use all timestamp-valid published
+items as targets, compared with the scoreable subset of the latest-20 baseline.
+
+Feedback sums likes, replies, reposts, and quotes only when all four values are
+present. Its reference set is the latest 20 eligible PUBLISHED items for the
+same local account and preset; fewer than ten complete snapshots yields
+INSUFFICIENT_DATA. Midpoint percentiles place equal-valued scores at their
+midrank, so an all-equal set is BASELINE. Buckets are below 40, 40 to under 60,
+60 to under 80, and 80 or above. This feedback is read-only and does not change
+posting cadence, provenance checks, or mutation selection.
+
 ### C4 documentation-contract implementation
 
 C4 now has API adapter and persistence paths for keyword/tag search, public profile
