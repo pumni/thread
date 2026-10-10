@@ -168,6 +168,20 @@ conversation handler's durable `SyncState` cursor catches up remote data.
 PAUSED schedules keep their due slot without dispatching, and DISABLED
 schedules are terminal. Discovery and mentions recurrence remain deferred.
 
+## Standalone Nurture (SN-14 scoped acceptance)
+
+The developer-operated Standalone local runtime provides one bounded recruitment observe cycle without PostgreSQL, Control Plane, WorkerJob or browser. Set `THREADS_LOCAL_DATA_ROOT`, register an authorized local account and bind an environment credential reference before running:
+
+~~~powershell
+uv run --locked threads-local nurture run ACCOUNT --preset recruitment
+~~~
+
+Default observe is API-first and **does not publish**, but records local receipts and target/dedupe state. Reply/own-content publish requires separate, operator-approved explicit `--apply` inputs and an ambiguity-safe operation journal. Never retry an uncertain publication merely because the CLI exited with an error.
+
+**Scoped live evidence (2026-10-10):** Mentions first-page/one-cursor continuation, one recruitment `SUCCESS/OBSERVE_ONLY` cycle and one authorized `SUCCESS/REPLY_APPLIED` reply with `CREATE_REPLY/PUBLISHED` journal, `CONFIRMED` target and operator UI verification all passed. This does **not** establish full discovery permission/cursor coverage, cooldown/restart behavior, own-content live acceptance or production readiness. #229 and #215 remain open; #80 and #3 remain independent external gates.
+
+See the [Standalone Nurture operator runbook](docs/STANDALONE_NURTURE_OPERATOR_RUNBOOK.md) and the [capability-status matrix](docs/FEATURE_PARITY_MATRIX.md#7-standalone-nurture-status-truth-sn-14).
+
 ## TP-002 live evidence preparation
 
 The #65 tooling checkpoint provides an offline packet validator and opaque-value fingerprint helper. Validate a scrubbed packet with:
