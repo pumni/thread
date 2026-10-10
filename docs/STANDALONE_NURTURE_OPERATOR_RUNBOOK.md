@@ -11,7 +11,8 @@ Standalone is local, developer-operated execution under ADR-0008. It uses local 
 - A recruitment Nurture observe returned `SUCCESS / OBSERVE_ONLY`; one selected fingerprint was independently mapped to an approved mention.
 - One approved reply draft was applied once: `SUCCESS / REPLY_APPLIED`, journal `CREATE_REPLY / PUBLISHED`, target `CONFIRMED`; manual operator Threads UI inspection found one matching visible reply with the approved author/text.
 - Operator locally verified two scrubbed evidence files outside Git; coordinator did not directly inspect file bytes.
-- No proof of post-publish suppression after restart, broad idempotency, or independent browser-launch telemetry follows from this one case.
+- A separate default observe cycle in a new CLI process, after the reply publication, did **not** reselect the confirmed mention; the target's CONFIRMED operation linkage and local mutation journal hashes were unchanged, and one completed observe receipt was added. Another eligible target was selected. This is scoped *immediate suppression*, not broad cooldown/restart idempotency.
+- No proof of full cooldown expiry behavior, cold terminal/OS restart, broad idempotency, or independent browser-launch telemetry follows from these observations.
 
 ## Minimum setup — PowerShell 7
 
