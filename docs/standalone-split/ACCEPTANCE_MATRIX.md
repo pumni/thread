@@ -2,7 +2,7 @@
 
 ## Baseline and status meanings
 
-Assessment is against the frozen source commit `0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a`. This matrix records what exists in that checkout and what a future standalone extraction must prove. SPLIT-00 is documentation only; no tests, build, browser session, or live Threads operation was run for this checkpoint.
+Assessment is against the frozen source commit `0dfbd36ff3756f8a68edcd6cc0bd083f6f3570a1`. This matrix records what exists in that checkout and what a future standalone extraction must prove. SPLIT-00 is documentation only; no tests, build, browser session, or live Threads operation was run for this checkpoint.
 
 - **Static-reviewed** means the source, test, issue, or coordinator record was inspected; it is not runtime evidence.
 - **Automated coverage exists** means a deterministic test module is present at the baseline; the test was not run for this documentation change.
@@ -35,12 +35,13 @@ Assessment is against the frozen source commit `0dfbd36ff3756f8a68edcd6cc0bd083f
 | Capability | Status recorded at this checkpoint | Scope and limitation |
 | --- | --- | --- |
 | Mention cursor continuation | Coordinator-reported live in the public #229 status record | One-step continuation only; not evidence for terminal/invalid cursor behavior or broader pagination |
-| Recruitment observation | Coordinator-reported live in the public #229 status record | One observation only; does not establish complete discovery coverage or repeat behavior |
+| Recruitment observation | Coordinator-reported live in the public #229 status record | One bounded observation; does not establish complete discovery coverage or all-target dedupe. The separate immediate suppression result below is scoped to its one subsequent CLI invocation. |
+| Immediate post-publish target suppression on a new CLI invocation | Coordinator-reported scoped PASS in [#229 checkpoint 15](https://github.com/pumni/thread/issues/229#issuecomment-6093125926) | After the previously confirmed Reply-to-Mention, one fresh default `threads-local nurture run` with no apply/draft flags and the same local account/data root returned `SUCCESS`, selected one other candidate, did not reselect the already-published target, preserved its `CONFIRMED` state and linked operation, left mutation journal hashes unchanged, and added one completed observe receipt. This supports only immediate post-publish suppression and preservation across that subsequent CLI invocation; it does not prove full restart-safe idempotency. |
 | Reply-to-Mention publication | Coordinator-reported live in the public #229 status record | One explicitly authorized reply, one publish attempt, and UI confirmation; not evidence for retry, rate-limit, or general mutation recovery |
-| Other discovery, apply, failure, and restart paths | Pending / not established by the bounded live record | Includes invalid/terminal cursors, broader discovery matrix, rate/failure paths, repeat suppression, restart/recovery, own-content apply/dedupe, and metrics/static security acceptance |
+| Other discovery, apply, failure, and restart paths | Pending / not established by the bounded live record | Includes invalid/terminal cursors, broader discovery matrix, all-target dedupe, cooldown expiry boundaries, cold OS restart, simulated crash repair, replay safety in all cases, failure recovery, content-candidate dedupe, and complete SN-14 acceptance. The scoped immediate suppression result above does not satisfy these gates. |
 | Historical feed/profile failures | Historical records are not current acceptance evidence | #193 reports pre-isolation `REMOTE_STATE_UNCERTAIN` and `BROWSER_CONTRACT_MISMATCH`; do not present these as a current pass or current regression |
 
-Public context: [coordinator status #229](https://github.com/pumni/thread/issues/229), [historical browser report #193](https://github.com/pumni/thread/issues/193), and [Standalone boundary issue #215](https://github.com/pumni/thread/issues/215). This checkpoint did not open private evidence, account records, browser profiles, or live tokens, and did not perform live API or browser actions.
+Public context: [coordinator status #229](https://github.com/pumni/thread/issues/229), [#229 checkpoint 15](https://github.com/pumni/thread/issues/229#issuecomment-6093125926), [historical browser report #193](https://github.com/pumni/thread/issues/193), and [Standalone boundary issue #215](https://github.com/pumni/thread/issues/215). This checkpoint did not open private evidence, account records, browser profiles, or live tokens, and did not perform live API or browser actions.
 
 ## SPLIT-00 review result
 
@@ -48,4 +49,6 @@ Public context: [coordinator status #229](https://github.com/pumni/thread/issues
 - Deterministic test modules are identified but were not run for this docs-only change.
 - No isolated wheel, dependency-minimal environment, or no-PostgreSQL execution has been produced yet.
 - No new standalone repository or extracted source package is part of this checkpoint.
+- Import-isolation behavior is implemented and recorded through completed issues #176–#182, but ADR-0009 formally says Proposed; the ADR's formal status is not represented as accepted here. A correction requires a separately authorized decision.
+- First-party provenance/reuse rights and destination license/notice treatment remain unresolved. Do not copy source or tests into the private destination until the owner explicitly confirms them.
 - Acceptance remains pending for extraction, packaging, migration dry-run, and the coordinator/legal provenance decision.
