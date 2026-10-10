@@ -111,3 +111,20 @@ Meta explicitly warns that the Postman collection may lag the latest developer c
 5. Human-assisted is a valid first-class outcome.
 6. N/A/DROP rows do not need literal parity if the useful business outcome is covered elsewhere.
 7. Every future feature PR must update this matrix when its execution class or delivery status changes.
+
+## 7. Standalone Nurture status truth (SN-14)
+
+This section describes the **optional Standalone local runtime**, not the distributed `AccountActivityPlan` row above. Keep these classifications independent: `IMPLEMENTED`, `TESTED`, `LIVE-VERIFIED`, `DOCUMENTATION-CONTRACT`, `BLOCKED`, `DEFERRED`. None implies #3 release readiness.
+
+| Standalone capability | Implementation / deterministic status | Live-contract status and evidence scope | Remaining gate |
+|---|---|---|---|
+| Default recruitment Nurture observe (bounded API-first selection, local receipts) | IMPLEMENTED; TESTED in merged SN-01–SN-06 code/tests | LIVE-VERIFIED for one `SUCCESS/OBSERVE_ONLY` run with discovered=2, selected=1 (2026-10-10) | Repeat/cooldown suppression, restart smoke, timing/state-size/security acceptance under #229 |
+| Canonical Mentions read + one cursor continuation | IMPLEMENTED; TESTED under accepted API/discovery contract | LIVE-VERIFIED for two distinct single-item pages; cursor existed on both pages | Terminal/invalid cursor, effective scopes and wider B01–B13 matrix: #80 |
+| Explicit operator-approved Nurture reply to a mention | IMPLEMENTED; TESTED in SN reply/journal code | LIVE-VERIFIED for **one** published reply: `REPLY_APPLIED`, `CREATE_REPLY/PUBLISHED`, target `CONFIRMED`, UI-author/content/visibility confirmed; subsequent default observe in a fresh CLI process did **not** reselect the published target, preserving its operation and the journal | Cold restart / wider cooldown and dedupe boundaries, failure/recovery matrices and broader #229 acceptance |
+| Proven inbound reply/conversation ownership priority | IMPLEMENTED; TESTED in deterministic scenarios | DOCUMENTATION-CONTRACT in this live session; mention-target selection is **not** proof of an inbound owned-reply case | Controlled inbound ownership smoke, #229 |
+| Own-content candidate/due/provenance apply | IMPLEMENTED; TESTED in merged SN content slice | DOCUMENTATION-CONTRACT for this session (no live content mutation exercised) | One authorized content apply and nonmutating dedupe check, #229 |
+| Nurture Insights snapshots / feedback | IMPLEMENTED; TESTED in SN-08 | DOCUMENTATION-CONTRACT; not promoted to LIVE-VERIFIED by this session | Separate live Insights contract/evidence |
+| Local READ-only recurrence | IMPLEMENTED; TESTED | READ-only; mutation recurrence **DEFERRED** | #224 planning decision; no automatic mutation scheduling |
+| AI drafting/agent; Follow/Like/Repost; speculative source adapters | DEFERRED per #225, #227 and #228 decisions | No live/product status claimed | New scope requires separate business evidence and authorization |
+
+The 2026-10-10 operator confirmed the reply through both journal and manual Threads UI inspection. The two scrubbed local packets were verified by the operator but **not uploaded or independently reviewed as repository artifacts**. A one-instance UI observation does not prove restart-safe idempotency, and a code-path assertion of zero browser launches is not a telemetry measurement. #229/#215 stay OPEN; `polling_cursor_ready_evidence=false` under #80 and the production/release gate #3 stays OPEN. See [operator runbook](STANDALONE_NURTURE_OPERATOR_RUNBOOK.md).
